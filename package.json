@@ -1,0 +1,31 @@
+{
+  "name": "t3-telegram-operator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Always-on Telegram AI Operator backed by persistent T3 Code threads",
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=24.2"
+  },
+  "scripts": {
+    "dev": "tsx watch apps/daemon/src/main.ts",
+    "start": "node --enable-source-maps dist/main.mjs",
+    "build": "tsup && cp migrations/001_initial.sql dist/001_initial.sql",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "pnpm typecheck && pnpm test && pnpm build"
+  },
+  "dependencies": {
+    "pino": "^9.9.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
