@@ -95,9 +95,13 @@ function message(messageId: number, text: string): Extract<TelegramInbound, { ty
   return {
     type: "message",
     updateId: messageId,
+    edited: false,
     chatId: 7,
+    chatType: "private",
     userId: 42,
     messageId,
+    messageIds: [messageId],
+    date: Math.floor(Date.now() / 1000),
     text,
     attachments: [],
   };
@@ -229,7 +233,7 @@ class FakeTelegram implements TelegramTransport {
     return [{ chatId: 7, messageId }];
   }
   async startDraft(chatId: number): Promise<StreamDraft> {
-    return { mode: "edit", chatId, draftId: this.nextMessageId, messageId: this.nextMessageId++, text: "…" };
+    return { mode: "edit", phase: "text", chatId, draftId: this.nextMessageId, messageId: this.nextMessageId++, text: "…" };
   }
   async updateDraft(): Promise<void> {}
   async finalizeDraft(draft: StreamDraft, text: string): Promise<SentMessage[]> {
@@ -242,14 +246,37 @@ class FakeTelegram implements TelegramTransport {
   async sendPhoto(): Promise<SentMessage> {
     return { chatId: 7, messageId: this.nextMessageId++ };
   }
+  async sendGallery(): Promise<SentMessage[]> {
+    return [{ chatId: 7, messageId: this.nextMessageId++ }];
+  }
+  async sendAudio(): Promise<SentMessage> {
+    return { chatId: 7, messageId: this.nextMessageId++ };
+  }
+  async sendVoice(): Promise<SentMessage> {
+    return { chatId: 7, messageId: this.nextMessageId++ };
+  }
+  async sendVideo(): Promise<SentMessage> {
+    return { chatId: 7, messageId: this.nextMessageId++ };
+  }
+  async sendVideoNote(): Promise<SentMessage> {
+    return { chatId: 7, messageId: this.nextMessageId++ };
+  }
+  async sendAnimation(): Promise<SentMessage> {
+    return { chatId: 7, messageId: this.nextMessageId++ };
+  }
+  async sendSticker(): Promise<SentMessage> {
+    return { chatId: 7, messageId: this.nextMessageId++ };
+  }
   async sendApproval(): Promise<SentMessage> {
     return { chatId: 7, messageId: this.nextMessageId++ };
   }
   async answerCallback(): Promise<void> {}
+  async editRich(): Promise<void> {}
   async downloadFile(): Promise<Uint8Array> {
     return new Uint8Array();
   }
   async react(): Promise<void> {}
+  async sendChatAction(): Promise<void> {}
   async health(): Promise<{ healthy: boolean; username: string }> {
     return { healthy: true, username: "operator_test_bot" };
   }

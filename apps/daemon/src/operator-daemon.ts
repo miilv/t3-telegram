@@ -17,7 +17,9 @@ import { isCancelIntent, RoutingEngine, semanticProjectName, shouldDelegate } fr
 import type { ArtifactRegistry } from "../../../packages/artifacts/src/index.js";
 import type {
   SentMessage,
+  TelegramDestination,
   TelegramInbound,
+  TelegramSendOptions,
   TelegramTransport,
 } from "../../../packages/telegram/src/index.js";
 import { DraftWriter } from "../../../packages/telegram/src/index.js";
@@ -105,18 +107,59 @@ export class OperatorDaemon {
       await this.handleCallback(update);
       return;
     }
-    if (this.store.hasTelegramMessage(update.chatId, update.messageId)) return;
-    this.store.saveTelegramMessage({
-      chatId: update.chatId,
-      messageId: update.messageId,
-      relatedThreadIds: [],
-      artifactIds: [],
-      messageType: "inbound",
-      createdAt: nowIso(),
-    });
+    if (update.type === "reaction") {
+      this.store.appendEvent("telegram.reaction", {
+        correlationId: `tg:${update.chatId}:${update.messageId}`,
+        payload: {
+          userId: update.userId,
+          added: update.added,
+          removed: update.removed,
+          date: update.date,
+        },
+      });
+      return;
+    }
+    if (update.type === "topic") {
+      this.store.appendEvent(`telegram.topic.${update.action}`, {
+        correlationId: `tg:${update.chatId}:${update.messageId}`,
+        payload: {
+          messageThreadId: update.messageThreadId,
+          ...(update.name ? { name: update.name } : {}),
+          ...(update.iconColor ? { iconColor: update.iconColor } : {}),
+          ...(update.iconCustomEmojiId ? { iconCustomEmojiId: update.iconCustomEmojiId } : {}),
+        },
+      });
+      return;
+    }
+    const unseenMessageIds = update.messageIds.filter(
+      (messageId) => !this.store.hasTelegramMessage(update.chatId, messageId),
+    );
+    if (!unseenMessageIds.length) {
+      if (update.edited) {
+        this.store.appendEvent("telegram.message.edited", {
+          correlationId: `tg:${update.chatId}:${update.messageId}`,
+          payload: { messageIds: update.messageIds },
+        });
+      }
+      return;
+    }
+    for (const messageId of unseenMessageIds) {
+      this.store.saveTelegramMessage({
+        chatId: update.chatId,
+        messageId,
+        relatedThreadIds: [],
+        artifactIds: [],
+        messageType: update.mediaGroupId ? "inbound_media_group" : "inbound",
+        createdAt: nowIso(),
+      });
+    }
     this.store.appendEvent("telegram.received", {
       correlationId: `tg:${update.chatId}:${update.messageId}`,
-      payload: { attachmentCount: update.attachments.length },
+      payload: {
+        attachmentCount: update.attachments.length,
+        messageIds: update.messageIds,
+        ...(update.mediaGroupId ? { mediaGroupId: update.mediaGroupId } : {}),
+      },
     });
 
     const ingested = await Promise.all(
@@ -132,9 +175,11 @@ export class OperatorDaemon {
         });
       }),
     );
-    this.store.updateTelegramMessageBinding(update.chatId, update.messageId, {
-      artifactIds: ingested.map((artifact) => artifact.id),
-    });
+    for (const messageId of update.messageIds) {
+      this.store.updateTelegramMessageBinding(update.chatId, messageId, {
+        artifactIds: ingested.map((artifact) => artifact.id),
+      });
+    }
 
     if (update.text.startsWith("/")) {
       const handled = await this.handleCommand(update);
@@ -180,7 +225,7 @@ export class OperatorDaemon {
         `Тут два похожих рабочих контекста:\n\n${choices
           .map((thread, index) => `${index + 1}. **${thread.title}**`)
           .join("\n")}\n\nКакой продолжить?`,
-        { replyToMessageId: update.messageId },
+        replyOptions(update),
       );
       for (const message of sent) {
         this.store.saveTelegramMessage({
@@ -217,8 +262,10 @@ export class OperatorDaemon {
     artifacts: ArtifactRef[],
   ): Promise<void> {
     const operatorTurnId = newId("opturn");
-    this.store.updateTelegramMessageBinding(update.chatId, update.messageId, { operatorTurnId });
-    const draft = await this.telegram.startDraft(update.chatId, { replyToMessageId: update.messageId });
+    for (const messageId of update.messageIds) {
+      this.store.updateTelegramMessageBinding(update.chatId, messageId, { operatorTurnId });
+    }
+    const draft = await this.telegram.startDraft(update.chatId, replyOptions(update));
     const writer = new DraftWriter(this.telegram, draft);
     const prompt = [
       "Answer the user's Telegram message directly. This is a quick task and no T3 worker was created.",
@@ -301,7 +348,7 @@ export class OperatorDaemon {
     const ack = await this.telegram.sendRich(
       update.chatId,
       `Запустил работу **${project.name} — ${thread.title}**. Я останусь доступен, пока worker выполняет задачу.`,
-      { replyToMessageId: update.messageId },
+      replyOptions(update),
     );
     this.recordOutgoing(ack, { projectId: project.id, threadId: thread.id, messageType: "worker_started" });
 
@@ -316,14 +363,18 @@ export class OperatorDaemon {
     this.store.setRuntimeState(`thread_user_intent:${thread.id}`, update.text);
     this.store.setRuntimeState(`thread_completion_delivered:${thread.id}`, "");
 
-    this.store.updateTelegramMessageBinding(update.chatId, update.messageId, {
-      primaryProjectId: project.id,
-      primaryThreadId: thread.id,
-      relatedThreadIds: [thread.id],
-    });
-    this.store.linkMessageThread(update.chatId, update.messageId, thread.id, "origin");
+    for (const messageId of update.messageIds) {
+      this.store.updateTelegramMessageBinding(update.chatId, messageId, {
+        primaryProjectId: project.id,
+        primaryThreadId: thread.id,
+        relatedThreadIds: [thread.id],
+      });
+      this.store.linkMessageThread(update.chatId, messageId, thread.id, "origin");
+    }
     this.store.setRuntimeState(`thread_chat:${thread.id}`, String(update.chatId));
     this.store.setRuntimeState(`thread_origin_message:${thread.id}`, String(update.messageId));
+    this.store.setRuntimeState(`thread_message_thread:${thread.id}`, String(update.messageThreadId ?? ""));
+    this.store.setRuntimeState(`thread_direct_topic:${thread.id}`, String(update.directMessagesTopicId ?? ""));
     const focus = this.router.updateFocus(
       this.store.getFocus(String(update.userId)),
       { type: "thread", threadId: thread.id },
@@ -331,10 +382,15 @@ export class OperatorDaemon {
       Math.max(confidence, 0.85),
     );
     this.store.setFocus(String(update.userId), focus);
-    this.monitorThread(thread.id, update.chatId, update.messageId);
+    this.monitorThread(thread.id, update.chatId, update.messageId, destinationFromUpdate(update));
   }
 
-  private monitorThread(threadId: string, chatId: number, originMessageId?: number): void {
+  private monitorThread(
+    threadId: string,
+    chatId: number,
+    originMessageId?: number,
+    destination: TelegramDestination = {},
+  ): void {
     if (this.monitors.has(threadId)) return;
     const controller = new AbortController();
     this.monitors.set(threadId, controller);
@@ -344,20 +400,29 @@ export class OperatorDaemon {
         for await (const event of this.broker.subscribeThread(threadId, controller.signal)) {
           if (event.type === "progress" && Date.now() - lastProgressAt > 60_000) {
             lastProgressAt = Date.now();
-            const sent = await this.telegram.sendRich(chatId, `**${this.store.getThread(threadId)?.title ?? "Работа"}**\n\n${event.summary}`);
+            const sent = await this.telegram.sendRich(
+              chatId,
+              `**${this.store.getThread(threadId)?.title ?? "Работа"}**\n\n${event.summary}`,
+              destination,
+            );
             this.recordOutgoing(sent, { threadId, messageType: "worker_progress" });
           } else if (event.type === "approval_required") {
-            await this.requestApproval(chatId, event, originMessageId);
+            await this.requestApproval(chatId, event, originMessageId, destination);
           } else if (event.type === "completed") {
-            await this.deliverCompletion(chatId, event, originMessageId);
+            await this.deliverCompletion(chatId, event, originMessageId, destination);
           } else if (event.type === "failed") {
             const sent = await this.telegram.sendRich(
               chatId,
               `Работа **${this.store.getThread(threadId)?.title ?? threadId}** завершилась ошибкой. ${safeExcerpt(event.error, 900)}`,
+              destination,
             );
             this.recordOutgoing(sent, { threadId, messageType: "worker_failed" });
           } else if (event.type === "cancelled") {
-            const sent = await this.telegram.sendRich(chatId, `Работа **${this.store.getThread(threadId)?.title ?? threadId}** остановлена.`);
+            const sent = await this.telegram.sendRich(
+              chatId,
+              `Работа **${this.store.getThread(threadId)?.title ?? threadId}** остановлена.`,
+              destination,
+            );
             this.recordOutgoing(sent, { threadId, messageType: "worker_cancelled" });
           }
         }
@@ -373,6 +438,7 @@ export class OperatorDaemon {
     chatId: number,
     event: Extract<WorkerEvent, { type: "approval_required" }>,
     originMessageId?: number,
+    destination: TelegramDestination = {},
   ): Promise<void> {
     if (!this.store.claimEvent(`t3-approval:${event.threadId}:${event.approvalId}`)) return;
     const id = newId("approval");
@@ -387,7 +453,7 @@ export class OperatorDaemon {
       chatId,
       `Worker **${this.store.getThread(event.threadId)?.title ?? event.threadId}** запрашивает разрешение:\n\n${event.summary}`,
       id,
-      originMessageId ? { replyToMessageId: originMessageId } : {},
+      { ...destination, ...(originMessageId ? { replyToMessageId: originMessageId } : {}) },
     );
     this.store.linkMessageThread(chatId, sent.messageId, event.threadId, "approval");
     this.store.appendEvent("approval.requested", { threadId: event.threadId, payload: { approvalId: id } });
@@ -397,6 +463,7 @@ export class OperatorDaemon {
     chatId: number,
     event: Extract<WorkerEvent, { type: "completed" }>,
     originMessageId?: number,
+    destination: TelegramDestination = {},
   ): Promise<void> {
     if (this.store.getRuntimeState(`thread_completion_delivered:${event.threadId}`)) return;
     const thread = this.store.getThread(event.threadId);
@@ -409,9 +476,12 @@ export class OperatorDaemon {
         `Worker result:\n${event.result.slice(0, 18_000)}`,
       ].join("\n\n"),
     ).catch(() => fallbackWorkerSummary(event.result));
-    const sent = await this.telegram.sendRich(chatId, normalized, originMessageId ? { replyToMessageId: originMessageId } : {});
+    const sent = await this.telegram.sendRich(chatId, normalized, {
+      ...destination,
+      ...(originMessageId ? { replyToMessageId: originMessageId } : {}),
+    });
     this.recordOutgoing(sent, { threadId: event.threadId, messageType: "worker_completed" });
-    await this.deliverRequestedArtifacts(chatId, event.threadId);
+    await this.deliverRequestedArtifacts(chatId, event.threadId, destination);
     this.store.setRuntimeState(`thread_completion_delivered:${event.threadId}`, nowIso());
     this.store.updateThreadStatus(event.threadId, "completed", { result: normalized });
     this.store.appendEvent("thread.completed", { threadId: event.threadId });
@@ -452,15 +522,19 @@ export class OperatorDaemon {
           ? binding.primaryThreadId
           : focusedThreadId;
     if (!threadId) {
-      await this.telegram.sendRich(update.chatId, "Не вижу активной работы, которую нужно остановить.", {
-        replyToMessageId: update.messageId,
-      });
+      await this.telegram.sendRich(
+        update.chatId,
+        "Не вижу активной работы, которую нужно остановить.",
+        replyOptions(update),
+      );
       return;
     }
     await this.broker.interruptThread(threadId);
-    await this.telegram.sendRich(update.chatId, `Остановил **${this.store.getThread(threadId)?.title ?? "текущую работу"}**.`, {
-      replyToMessageId: update.messageId,
-    });
+    await this.telegram.sendRich(
+      update.chatId,
+      `Остановил **${this.store.getThread(threadId)?.title ?? "текущую работу"}**.`,
+      replyOptions(update),
+    );
   }
 
   private async handleCommand(update: Extract<TelegramInbound, { type: "message" }>): Promise<boolean> {
@@ -481,7 +555,7 @@ export class OperatorDaemon {
       for (const thread of active) lines.push(`- **${thread.title}** — ${thread.status}`);
       if (approvals.length) lines.push("", `Ожидают разрешения: ${approvals.length}`);
       if (focus.primary) lines.push("", `Текущий фокус: ${focus.primary.topic}`);
-      await this.telegram.sendRich(update.chatId, lines.join("\n"), { replyToMessageId: update.messageId });
+      await this.telegram.sendRich(update.chatId, lines.join("\n"), replyOptions(update));
       return true;
     }
     if (command === "/projects") {
@@ -489,7 +563,7 @@ export class OperatorDaemon {
       await this.telegram.sendRich(
         update.chatId,
         projects.length ? `## Проекты\n\n${projects.map((project) => `- **${project.name}**`).join("\n")}` : "Проектов пока нет.",
-        { replyToMessageId: update.messageId },
+        replyOptions(update),
       );
       return true;
     }
@@ -500,7 +574,7 @@ export class OperatorDaemon {
         threads.length
           ? `## Последние работы\n\n${threads.map((thread) => `- **${thread.title}** — ${thread.status}`).join("\n")}`
           : "Рабочих тредов пока нет.",
-        { replyToMessageId: update.messageId },
+        replyOptions(update),
       );
       return true;
     }
@@ -517,7 +591,7 @@ export class OperatorDaemon {
       await this.telegram.sendRich(
         update.chatId,
         `## Operator debug\n\n- T3: ${t3.healthy ? "ok" : "unavailable"}\n- Claude: ${operator.healthy ? "ok" : "unavailable"}\n- Telegram: ${telegram.healthy ? "ok" : "unavailable"}\n- Active subscriptions: ${this.monitors.size}`,
-        { replyToMessageId: update.messageId },
+        replyOptions(update),
       );
       return true;
     }
@@ -537,8 +611,20 @@ export class OperatorDaemon {
       for (const thread of recoverable) {
         const chatId = Number(this.store.getRuntimeState(`thread_chat:${thread.id}`));
         const origin = Number(this.store.getRuntimeState(`thread_origin_message:${thread.id}`));
+        const messageThreadId = Number(this.store.getRuntimeState(`thread_message_thread:${thread.id}`));
+        const directMessagesTopicId = Number(this.store.getRuntimeState(`thread_direct_topic:${thread.id}`));
         if (Number.isSafeInteger(chatId) && chatId !== 0) {
-          this.monitorThread(thread.id, chatId, Number.isSafeInteger(origin) ? origin : undefined);
+          this.monitorThread(
+            thread.id,
+            chatId,
+            Number.isSafeInteger(origin) && origin !== 0 ? origin : undefined,
+            {
+              ...(Number.isSafeInteger(messageThreadId) && messageThreadId !== 0 ? { messageThreadId } : {}),
+              ...(Number.isSafeInteger(directMessagesTopicId) && directMessagesTopicId !== 0
+                ? { directMessagesTopicId }
+                : {}),
+            },
+          );
         }
       }
       this.logger.info({ recoveredWorkers: recoverable.length }, "Worker subscriptions recovered");
@@ -547,7 +633,11 @@ export class OperatorDaemon {
     }
   }
 
-  private async deliverRequestedArtifacts(chatId: number, threadId: string): Promise<void> {
+  private async deliverRequestedArtifacts(
+    chatId: number,
+    threadId: string,
+    destination: TelegramDestination = {},
+  ): Promise<void> {
     const intent = this.store.getRuntimeState(`thread_user_intent:${threadId}`) ?? "";
     if (!/(пришл|отправ|файл|документ|фото|скрин|patch|send|attach|document|photo|screenshot|pdf)/iu.test(intent)) {
       return;
@@ -565,8 +655,8 @@ export class OperatorDaemon {
           mimeType,
         });
         const sent = mimeType.startsWith("image/")
-          ? await this.telegram.sendPhoto(chatId, artifact.localPath, artifact.filename)
-          : await this.telegram.sendDocument(chatId, artifact.localPath, artifact.filename);
+          ? await this.telegram.sendPhoto(chatId, artifact.localPath, artifact.filename, destination)
+          : await this.telegram.sendDocument(chatId, artifact.localPath, artifact.filename, destination);
         this.recordOutgoing([sent], { threadId, messageType: "artifact_sent" });
         this.store.appendEvent("artifact.sent", { threadId, payload: { artifactId: artifact.id } });
       } catch (error) {
@@ -648,6 +738,19 @@ export class OperatorDaemon {
       });
     }
   }
+}
+
+function destinationFromUpdate(
+  update: Extract<TelegramInbound, { type: "message" | "callback" }>,
+): TelegramDestination {
+  return {
+    ...(update.messageThreadId ? { messageThreadId: update.messageThreadId } : {}),
+    ...(update.directMessagesTopicId ? { directMessagesTopicId: update.directMessagesTopicId } : {}),
+  };
+}
+
+function replyOptions(update: Extract<TelegramInbound, { type: "message" }>): TelegramSendOptions {
+  return { ...destinationFromUpdate(update), replyToMessageId: update.messageId };
 }
 
 function formatWorkerPrompt(userText: string, artifacts: ArtifactRef[]): string {
