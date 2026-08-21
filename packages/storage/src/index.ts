@@ -611,24 +611,43 @@ export class OperatorStore {
         ORDER BY rank ASC, t.last_activity_at DESC LIMIT ?
       `)
       .all(...(projectId ? [match, projectId, limit] : [match, limit])) as Row[];
-    return rows.map((row, index) => {
+    const distinctiveTerms = terms.filter((term) => term.length >= 3);
+    return rows.flatMap((row, index) => {
       const thread = rowToThread(row);
-      const activeBoost = ["queued", "running", "waiting_approval", "waiting_user"].includes(
-        thread.status,
-      )
-        ? 0.06
-        : 0;
+      const active = ["queued", "running", "waiting_approval", "waiting_user"].includes(thread.status);
       const ageMs = Date.now() - Date.parse(thread.lastActivityAt);
+      // OR-prefix FTS matches almost anything; require genuine lexical overlap
+      // so small talk cannot bind to unrelated threads: at least two distinct
+      // terms, or one long distinctive term (>=6 chars), present in the metadata.
+      const haystack = `${thread.title} ${thread.shortSummary} ${thread.keywords.join(" ")}`
+        .normalize("NFKC")
+        .toLocaleLowerCase();
+      const hits = distinctiveTerms.filter((term) => haystack.includes(term));
+      const strongHit = hits.some((term) => term.length >= 6);
+      if (hits.length < 2 && !strongHit) return [];
+      // Dormant terminal threads (mostly imported history) are poor reuse
+      // candidates unless the match is strong.
+      const staleTerminal =
+        !active &&
+        ["completed", "failed", "cancelled"].includes(thread.status) &&
+        Number.isFinite(ageMs) &&
+        ageMs > 14 * 24 * 60 * 60 * 1_000;
+      if (staleTerminal && hits.length < 3 && !strongHit) return [];
+      const activeBoost = active ? 0.06 : 0;
       const recencyBoost = Number.isFinite(ageMs) && ageMs <= 24 * 60 * 60 * 1_000 ? 0.04 : 0;
-      return {
+      const overlapBoost = Math.min(0.08, Math.max(0, hits.length - 2) * 0.04);
+      return [{
         thread,
-        score: Math.max(0.45, Math.min(0.96, 0.82 - index * 0.05 + activeBoost + recencyBoost)),
+        score: Math.max(
+          0.45,
+          Math.min(0.96, 0.78 - index * 0.05 + activeBoost + recencyBoost + overlapBoost),
+        ),
         reasons: [
-          "lexical thread summary match",
+          `lexical thread summary match (${hits.length} terms)`,
           ...(activeBoost ? ["active worker status"] : []),
           ...(recencyBoost ? ["recent thread activity"] : []),
         ],
-      };
+      }];
     });
   }
 

@@ -171,7 +171,7 @@ export function shouldDelegate(text: string, artifacts: ArtifactRef[], binding: 
   const normalized = text.toLocaleLowerCase();
   if (binding.type === "thread" || binding.type === "multi_thread") return true;
   if (artifacts.length > 0) return true;
-  if (/(?:^|\s)(fix|implement|build|debug|test|review|investigate|analy[sz]e|refactor|deploy|исправ|реализ|собер|отлад|протест|проверь код|разберись|проанализ)[\p{L}\p{N}_-]*/iu.test(normalized)) {
+  if (/(?:^|\s)(fix|implement|build|debug|test|review|investigate|analy[sz]e|refactor|deploy|continue|resume|finish|исправ|реализ|собер|отлад|протест|проверь код|разберись|проанализ|продолж|доработ|допили|заверш)[\p{L}\p{N}_-]*/iu.test(normalized)) {
     return true;
   }
   if (extractPaths(text).length > 0) return true;

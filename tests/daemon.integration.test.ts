@@ -1310,6 +1310,31 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("answers small talk directly even when lexical candidates exist", async () => {
+    const home = tempDirectory("daemon-route-smalltalk-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    seedAmbiguousAuthThreads(store, broker);
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "привет! ответь одной фразой про auth work"));
+    await waitFor(() => telegram.sent.length > 0 || telegram.visible.length > 0);
+    expect(telegram.choicePrompts).toHaveLength(0);
+    expect(broker.turns).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("resolves a routing clarification from an inline button press", async () => {
     const home = tempDirectory("daemon-route-button-");
     const store = tempStore();

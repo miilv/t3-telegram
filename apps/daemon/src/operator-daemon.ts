@@ -635,7 +635,19 @@ export class OperatorDaemon {
       threadCandidates: candidates,
     });
     if (route.shouldAsk && route.binding.type === "multi_thread" && !route.binding.primaryThreadId) {
-      route = await this.arbitrateRouting(update.text, route);
+      // Small talk and standalone questions must never reach a clarification
+      // prompt: if nothing about the message reads as delegable work, drop the
+      // speculative candidate binding and answer directly.
+      if (!shouldDelegate(update.text, enrichedArtifacts, { type: "none" })) {
+        route = {
+          binding: { type: "none" },
+          confidence: 0.6,
+          reasons: [...route.reasons, "not delegable work; direct answer"],
+          shouldAsk: false,
+        };
+      } else {
+        route = await this.arbitrateRouting(update.text, route);
+      }
     }
     this.store.appendEvent("routing.selected", {
       correlationId: correlationForUpdate(update),
@@ -862,8 +874,9 @@ export class OperatorDaemon {
       const response = await this.askOperator(
         [
           "Arbitrate routing between a limited shortlist of T3 work threads.",
-          "Return ONLY JSON: {\"decision\":\"select\",\"threadId\":\"...\",\"confidence\":0.0,\"reason\":\"...\"} or {\"decision\":\"ask\",\"confidence\":0.0,\"reason\":\"material ambiguity\"}.",
+          "Return ONLY JSON: {\"decision\":\"select\",\"threadId\":\"...\",\"confidence\":0.0,\"reason\":\"...\"} or {\"decision\":\"ask\",\"confidence\":0.0,\"reason\":\"material ambiguity\"} or {\"decision\":\"none\",\"confidence\":0.0,\"reason\":\"message is not about these threads\"}.",
           "Select only when the user's wording materially distinguishes one candidate. Never guess for an expensive mutation.",
+          "Answer none when the message is small talk, a standalone question, or otherwise unrelated to every candidate.",
           `User message:\n${userText.slice(0, 8_000)}`,
           `Candidates JSON:\n${JSON.stringify(candidates)}`,
         ].join("\n\n"),
@@ -873,6 +886,14 @@ export class OperatorDaemon {
         return {
           binding: { type: "thread", threadId: arbitration.threadId },
           confidence: arbitration.confidence,
+          reasons: ["Operator shortlist arbitration", arbitration.reason],
+          shouldAsk: false,
+        };
+      }
+      if (arbitration?.decision === "none") {
+        return {
+          binding: { type: "none" },
+          confidence: Math.max(0.7, arbitration.confidence),
           reasons: ["Operator shortlist arbitration", arbitration.reason],
           shouldAsk: false,
         };
@@ -4760,6 +4781,7 @@ function parseRoutingArbitration(
 ):
   | { decision: "select"; threadId: string; confidence: number; reason: string }
   | { decision: "ask"; confidence: number; reason: string }
+  | { decision: "none"; confidence: number; reason: string }
   | undefined {
   const fenced = /```(?:json)?\s*([\s\S]*?)```/iu.exec(value)?.[1];
   const candidate = fenced ?? value.slice(value.indexOf("{"), value.lastIndexOf("}") + 1);
@@ -4770,7 +4792,10 @@ function parseRoutingArbitration(
   } catch {
     return undefined;
   }
-  if (!isRecord(parsed) || (parsed.decision !== "select" && parsed.decision !== "ask")) {
+  if (
+    !isRecord(parsed) ||
+    (parsed.decision !== "select" && parsed.decision !== "ask" && parsed.decision !== "none")
+  ) {
     return undefined;
   }
   const confidence =
@@ -4785,6 +4810,9 @@ function parseRoutingArbitration(
     allowedThreadIds.includes(parsed.threadId)
   ) {
     return { decision: "select", threadId: parsed.threadId, confidence, reason };
+  }
+  if (parsed.decision === "none" && confidence >= 0.6) {
+    return { decision: "none", confidence, reason };
   }
   return { decision: "ask", confidence, reason };
 }
