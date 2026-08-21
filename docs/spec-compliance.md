@@ -20,81 +20,81 @@ branch, not an aspiration.
 
 | Spec | Requirement / completion evidence | Status |
 |---|---|---|
-| 1–3 | One always-on Operator; many persistent T3 work streams; Operator remains responsive; delegation is the default for substantive work; T3 is execution fabric and Operator state is process-scoped. Evidence: daemon recovery/concurrency/integration tests. | PARTIAL |
-| 4 | Target architecture boundaries and event flow. Evidence: package-level contracts plus integration tests covering the whole flow. | PARTIAL |
-| 5.1 | Agent daemon owns polling/webhook loop, dispatch, queues, recovery, scheduler and health. | PARTIAL |
-| 5.2 | Persistent abstract Operator runtime, resumable/compactable and isolated from worker capabilities. | PARTIAL |
-| 5.3 | Cross-project T3 broker uses official server/RPC contracts for projects, threads, turns, events, approvals, artifacts and provider capabilities. | PARTIAL |
-| 5.4 | Production Telegram transport: Bot API 10.x RichMessage, full media, replies, topics, reactions, retry/flood control and fallback. | PARTIAL |
-| 5.5 | Routing engine implements the complete deterministic/semantic/LLM cascade and ambiguity policy. | PARTIAL |
-| 5.6 | Structured thread summaries, secret-redacted searchable/deduplicated durable notes, explicit focus and bounded compaction restoration are implemented; provider context-threshold telemetry and real-runtime recovery evidence remain. | PARTIAL |
-| 5.7 | Artifact registry owns provenance, hashes, bindings, safe materialization/delivery, retention and root-contained cleanup. | PARTIAL |
-| 6 | Operator policy distinguishes direct work from delegated work and remains available during workers. | PARTIAL |
-| 7 | Existing/new/no-project decisions, sensible default workspace, and later affiliation correction. | PARTIAL |
-| 8 | Cross-project handoff packet and continuation thread without pretending provider-native rehome. Unit/integration evidence covers packet shape and safe source-artifact materialization; delivery crash reconciliation remains incomplete. | PARTIAL |
-| 9 | Durable WorkThread metadata, lifecycle, structured purpose/state/decision/file/open-loop/next-action summaries and bindings. | PARTIAL |
-| 10.1–10.2 | Messages may be unbound; focus is a ranked set and survives side questions. | PARTIAL |
-| 10.3 signals 1–4 | Explicit binding, reply, artifact and focus signals. | PARTIAL |
-| 10.3 signals 5–8 | Filesystem/git identity, entities, status/recency and semantic retrieval. | PARTIAL |
-| 10.3 signals 9–10 | LLM arbitration over a limited shortlist followed by a durable user clarification when ambiguity is material. | PARTIAL |
-| 10.4 | Confidence thresholds and no silent destructive misrouting. | PARTIAL |
-| 11 | Bidirectional Telegram-message mapping to turns, threads and artifacts. | PARTIAL |
-| 12 | Concurrent 2–4 worker fan-out, independent scopes, durable result aggregation, group control and one Operator synthesis. Real T3/Telegram evidence and synthesis-send crash reconciliation remain. | PARTIAL |
-| 13 | Event-driven background execution and complete normalized worker-event handling. | PARTIAL |
-| 13.3–14 | Do not leak raw worker stream; apply meaningful progress throttling/policy. | PARTIAL |
-| 15 | Operator context excludes full T3 history; SQLite summaries/notes/focus are authoritative, daily compaction is restart-safe, and bounded state is restored afterward. Real Claude context-threshold/runtime evidence remains. | PARTIAL |
-| 16 | Native RichMessage draft-to-final lifecycle, rich formatting, phase changes, debouncing and safe fallback. | PARTIAL |
-| 17 | Inbound text, photo, document/arbitrary file, audio, voice, video, video note, GIF, sticker, media group, forwarded message and reply. | PARTIAL |
-| 18–19 | Safe Telegram file ingestion and explicit artifact transfer/materialization into a worker workspace. | PARTIAL |
-| 20–21 | Agent-initiated document/image/gallery and appropriate Telegram-native outbound media. | PARTIAL |
+| 1–3 | One always-on Operator; many persistent T3 work streams; Operator remains responsive; delegation is the default for substantive work; T3 is execution fabric and Operator state is process-scoped. Evidence: `operator-daemon.ts`, daemon product/concurrency/recovery tests. | PROVED |
+| 4 | Target architecture boundaries and event flow. Evidence: package contracts plus daemon and broker integration tests. | PROVED |
+| 5.1 | Agent daemon owns polling, dispatch, independent queues, recovery, scheduler and health. Evidence: daemon/scheduler integration tests. | PROVED |
+| 5.2 | Persistent provider-independent Operator runtime is resumable, compactable, switchable and isolated. Evidence: `operator-runtime.test.ts`, daemon provider-switch test. | PROVED |
+| 5.3 | Cross-project T3 broker uses source-checked HTTP/Effect RPC contracts for projects, threads, turns, events, approvals, artifacts and provider capabilities. Evidence: `t3-broker.integration.test.ts`. | PROVED |
+| 5.4 | Production grammY transport covers Bot API 10.x RichMessage, media, replies, topics, reactions, retry/flood control and fallback. Evidence: Telegram transport/rendering tests. | PROVED |
+| 5.5 | Routing implements deterministic, retrieval, bounded Operator arbitration and clarification stages. Evidence: router, daemon arbitration and quantitative corpus tests. | PROVED |
+| 5.6 | Structured summaries, redacted/deduplicated hybrid lexical-vector memory, focus, threshold telemetry and bounded compaction restoration. Evidence: storage and daemon memory tests. | PROVED |
+| 5.7 | Artifact registry owns provenance, hashes, bindings, safe materialization/delivery, retention and root-contained cleanup. Evidence: artifact/media tests. | PROVED |
+| 6 | Operator policy distinguishes direct/delegated work and remains responsive during workers. Evidence: daemon direct/delegation/concurrency tests. | PROVED |
+| 7 | Existing/new/no-project decisions, semantic default workspace naming and later handoff correction. Evidence: router and daemon product/handoff tests. | PROVED |
+| 8 | Cross-project handoff packet and continuation thread without pretending provider-native rehome, including safe artifact materialization and durable delivery. Evidence: daemon handoff/recovery tests. | PROVED |
+| 9 | Durable WorkThread lifecycle, structured purpose/state/decision/file/open-loop/next-action summaries and bindings. Evidence: storage/daemon memory tests. | PROVED |
+| 10.1–10.2 | Messages may be unbound; focus is ranked and survives side questions. Evidence: router/daemon product tests. | PROVED |
+| 10.3 signals 1–4 | Explicit binding, reply, artifact and focus signals. Evidence: router, storage and artifact tests. | PROVED |
+| 10.3 signals 5–8 | Filesystem/git identity, aliases/entities, status/recency and semantic retrieval. Evidence: router/storage corpus tests. | PROVED |
+| 10.3 signals 9–10 | Bounded Operator arbitration followed by durable clarification for material ambiguity. Evidence: daemon arbitration/clarification tests. | PROVED |
+| 10.4 | Confidence thresholds prevent silent expensive/destructive misrouting. Evidence: router ambiguity corpus. | PROVED |
+| 11 | Bidirectional Telegram-message mapping to turns, threads and artifacts. Evidence: storage and daemon trace tests. | PROVED |
+| 12 | Concurrent 2–4 worker fan-out, independent scopes, durable result aggregation/group control and one idempotent synthesis. Evidence: delegation, daemon group and restart tests. | PROVED |
+| 13 | Event-driven background execution and normalized worker-event handling. Evidence: broker subscription and daemon lifecycle tests. | PROVED |
+| 13.3–14 | Raw worker streams stay internal; meaningful progress is policy-throttled. Evidence: daemon/Telegram integration tests. | PROVED |
+| 15 | Operator context excludes full T3 history; SQLite summaries/notes/focus are authoritative and restart-safe compaction restores bounded state. Evidence: storage, runtime and daemon compaction tests. | PROVED |
+| 16 | Native RichMessage draft/final lifecycle, formatting, phases, debounce and fallback. Evidence: Telegram transport/rendering tests. | PROVED |
+| 17 | All named inbound text/media/reply/forward/album/reaction envelopes are normalized. Evidence: Telegram transport and media tests. | PROVED |
+| 18–19 | Safe Telegram ingestion and explicit artifact materialization into worker workspaces. Evidence: artifact, media and daemon tests. | PROVED |
+| 20–21 | Agent-initiated document/image/gallery and Telegram-native outbound media are capability-bounded. Evidence: MCP and transport tests. | PROVED |
 | 22 | Preserve inbound voice, bounded multi-provider/local STT, include transcript and original artifact, plus outbound TTS normalized to OGG/Opus. Evidence: real-FFmpeg media tests, provider/degradation tests, daemon routing test and MCP send test. | PROVED |
 | 23 | Video-note download, durable source-linked audio extraction/STT, 3–6 keyframes viewable through bounded MCP image content, and probed square H.264/AAC outbound transcoding capped at 60 seconds. Evidence: real-FFmpeg media tests, daemon reasoning-envelope test and MCP image/send tests. | PROVED |
-| 24 | Replies use `reply_parameters`; reply context participates in routing and output. | PARTIAL |
-| 25 | Forum topics are preserved as Telegram context but never assumed to map 1:1 to T3 threads. | PARTIAL |
-| 26 | Inbound/outbound reactions with allowlist and durable event context. | PARTIAL |
-| 27–28 | Approval UI, normalized decisions, risk categories, safe auto-approval and explicit dangerous approval. | PARTIAL |
+| 24 | Replies use `reply_parameters`; reply context participates in routing and output. Evidence: Telegram/router tests. | PROVED |
+| 25 | Forum topics are preserved without 1:1 T3-thread conflation. Evidence: Telegram and daemon topic tests. | PROVED |
+| 26 | Inbound/outbound reactions have allowlists, scope checks and durable context. Evidence: Telegram/MCP tests. | PROVED |
+| 27–28 | Approval UI, decisions, eight risk categories, safe auto-approval and explicit dangerous approval. Evidence: daemon/transport tests. | PROVED |
 | 29–30 | Process-scoped privileged Operator tools use a loopback MCP endpoint with random expiring per-turn capabilities, empty ambient settings sources and a strict per-run config. Telegram/T3 credentials stay in the daemon and workers are launched only through ordinary T3 provider configuration. MCP protocol, daemon lifecycle, CLI argv and live Claude invocation evidence pass. | PROVED |
-| 31–32 | Filesystem isolation and secure outbound files: realpath, roots, symlinks, secret/content checks, ownership, MIME, size, audit and hash. | PARTIAL |
-| 33–34 | Project detection by path/git root/remote/aliases plus stable auto-naming. | PARTIAL |
-| 35–36 | Thread reuse/search with metadata, FTS/semantic retrieval, recency and LLM reranking. | PARTIAL |
-| 37 | Human-friendly clarification only for material ambiguity. | PARTIAL |
-| 38 | Operator-to-worker prompt contract contains task, project, artifacts, constraints and result contract without privileged leakage. | PARTIAL |
-| 39 | Worker result is normalized to validated `WorkerResult`, with safe fallback, persisted group evidence and Operator synthesis. | PARTIAL |
-| 40–41 | Completion policy and rich status card with useful links/artifacts/state. | PARTIAL |
-| 42–43 | Cancel/interrupt plus provider-aware live input or queued follow-up while a turn runs. | PARTIAL |
-| 44–45 | Provider abstraction, capabilities, model/reasoning defaults, user overrides and Operator provider switching. | PARTIAL |
-| 46 | Complete Telegram-to-Operator input envelope including topic/reply/forward/media/reaction metadata. | PARTIAL |
+| 31–32 | Filesystem isolation and outbound validation cover realpath, roots, symlinks, secret/content checks, ownership, MIME, size, audit and hash. Evidence: artifact/MCP tests. | PROVED |
+| 33–34 | Project detection uses path/git root/remote/aliases plus stable auto-naming. Evidence: router corpus. | PROVED |
+| 35–36 | Thread reuse/search combines metadata, FTS/semantic retrieval, recency and bounded Operator reranking. Evidence: storage/broker/daemon tests. | PROVED |
+| 37 | Human clarification occurs only for material ambiguity. Evidence: router corpus and daemon clarification test. | PROVED |
+| 38 | Worker prompts contain bounded task/project/artifact/constraint/result contracts without privileged leakage. Evidence: daemon delegation tests. | PROVED |
+| 39 | Worker results normalize to validated `WorkerResult`, with safe fallback, persisted group evidence and synthesis. Evidence: daemon group tests. | PROVED |
+| 40–41 | Completion policy and rich status cards include state and safe artifact/link handling. Evidence: daemon/Telegram tests. | PROVED |
+| 42–43 | Cancel/interrupt plus capability-aware live input or durable queued follow-up. Evidence: daemon follow-up/group-control tests. | PROVED |
+| 44–45 | Provider abstraction, capability catalog, optimized defaults, explicit overrides and compact/snapshot Operator switching. Evidence: provider/runtime/daemon tests. | PROVED |
+| 46 | Complete Telegram-to-Operator envelope includes topic/reply/forward/media/reaction metadata. Evidence: Telegram normalization tests. | PROVED |
 | 47–48 | All named T3, Telegram, memory, artifact and time/web tools are Zod-validated, audited and bounded to compact JSON; thread reads exclude raw transcripts. MCP discovery/call tests cover the complete list and representative mutation/security paths. | PROVED |
-| 49–50 | Required durable schema and append-only event log with correlation/idempotency fields. | PARTIAL |
+| 49–50 | Required durable schema and append-only event log include correlation/idempotency fields. Evidence: migration/storage/daemon trace tests. | PROVED |
 | 51–52 | Startup restores SQLite/session/subscriptions/interactions/jobs; inbound events and terminal effects have durable dedupe state. T3 retries reuse a transactionally deduplicated command ID; Telegram terminal replay edits the same anchor and advances completion only after delivery. Interrupted non-idempotent sends are quarantined. Storage and daemon crash/restart tests cover each boundary. | PROVED |
 | 53–55 | Short serialized ingress dispatch, one serialized Operator-input/runtime path, an 8-wide worker-event queue, per-chat/global Telegram delivery queues and serialized maintenance are independent. Approval callbacks proceed during a blocked Operator turn, later messages enqueue, and explicit cancel interrupts immediately. | PROVED |
-| 56–59 | Correct draft strategy, UTF-8/UTF-16 limits, flood control and per-capability/per-message fallback. | PARTIAL |
+| 56–59 | Correct draft strategy, UTF-8/UTF-16 limits, flood control and scoped fallback. Evidence: Telegram transport/rendering tests. | PROVED |
 | 60 | Operator-only time, web search/retrieval (MCP plus built-in WebSearch/WebFetch), calculator, safe file metadata and memory search are process-scoped and protocol-tested. | PROVED |
-| 61–64 | Coalescing minute scheduler, daily durable compaction gate, T3 reconciliation, note/artifact cleanup, structured thread summaries and post-compact state restoration. Long-term automation and context-size trigger remain. | PARTIAL |
-| 65–69 | `/status`, `/projects`, `/work`, `/focus`, `/stop`/`/cancel`, `/memory`, `/help` and redacted admin diagnostics exist; full debug metrics/capability detail remains. | PARTIAL |
-| 70–71 | Single-user authorization at every ingress/action and secrets never logged/persisted in plaintext artifacts. | PARTIAL |
+| 61–64 | Coalescing scheduler, durable daily/context compaction, T3 reconciliation, cleanup, summaries, restoration and timezone-aware proactive automation. Evidence: scheduler/automation/storage/daemon tests. | PROVED |
+| 65–69 | Operational commands and redacted diagnostics expose health, capabilities, queues, storage and metrics. Evidence: daemon diagnostics/command tests. | PROVED |
+| 70–71 | Team/RBAC authorization is rechecked at ingress/action boundaries; secrets never enter logs, artifacts or subprocesses. Evidence: daemon/MCP/runtime/observability tests. | PROVED |
 | 72–74 | Secret-redacted structured logs use irreversible chat pseudonyms; all named latency/count/gauge metrics are instrumented and exposed in owner diagnostics. A root correlation ID is preserved across Telegram ingress, routing/artifact binding, T3 dispatch, worker events and durable Telegram delivery; integration tests assert the chain. | PROVED |
 | 75–78 | Errors are classified into safe codes/messages. T3 outage persists the accepted dispatch and retries its stable receipt-backed command ID; Telegram outage retains finals in an outbox with safe retry/ambiguity rules; provider failure invokes one Operator-controlled retry/new-thread/provider-switch/report decision without exposing raw errors. Crash and failure integration tests pass. | PROVED |
 | 79 | Unit, integration and real E2E strategy with fixtures/fakes only where scope-appropriate. | PARTIAL |
-| 80 E2E-1 | Simple direct question without worker. | PARTIAL |
-| 80 E2E-2 | New project and worker. | PARTIAL |
-| 80 E2E-3 | Existing project selected by canonical path/git identity. Router tests exist; a real end-to-end T3 project exercise remains. | PARTIAL |
-| 80 E2E-4 | Focus survives a side question. | PARTIAL |
-| 80 E2E-5 | Reply routes to the correct work thread. | PARTIAL |
-| 80 E2E-6 | Three concurrent workers and a single synthesized answer. Fake-boundary integration and restart/group-control tests pass; real T3/Telegram E2E remains. | PARTIAL |
-| 80 E2E-7 | Inbound file reaches the correct worker safely. | PARTIAL |
-| 80 E2E-8 | Worker artifact is sent back safely. | PARTIAL |
-| 80 E2E-9 | Voice is transcribed, routes from transcript semantics, and the original audio remains registered and reaches direct/delegated work. Fake-boundary daemon E2E plus real provider-form/FFmpeg tests pass. | PROVED |
-| 80 E2E-10 | Video note yields source-linked transcript/audio/keyframes and their IDs reach direct Operator reasoning; bounded MCP vision and real FFmpeg extraction are tested. | PROVED |
-| 80 E2E-11 | Dangerous action pauses, renders approval, resumes once. | PARTIAL |
-| 80 E2E-12 | Restart recovers active work and delivers completion exactly once. | PARTIAL |
-| 81–84 | All MVP requirements plus Phase 2 and Phase 3 requested by the user are implemented; deferred lists are not treated as exclusions. | MISSING |
-| 85–87 | Maintainable repository structure; donor attribution; no bespoke Telegram protocol client; no UI/thread/project conflation. | PARTIAL |
-| 88 | Every MVP readiness criterion (18/18) has direct evidence. | MISSING |
-| 89 | Routing behavior has deterministic path/focus/handoff and daemon-level arbitration/clarification cases; the required representative quality corpus and percentage report remain. | PARTIAL |
-| 90 | Latency, reliability and maintainability requirements are measured and documented. | MISSING |
-| 91–92 | Named architecture risks and open questions have explicit decisions, mitigations and tests. | PARTIAL |
-| 93 | The complete target model works as one coherent system. | MISSING |
+| 80 E2E-1 | Simple direct question without worker passes daemon integration; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-2 | New semantic project and worker passes daemon integration; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-3 | Canonical path/git identity passes router integration; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-4 | Focus survives a side question in daemon integration; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-5 | Reply mapping/routing passes storage/router integration; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-6 | Three workers and one synthesis pass daemon/restart tests; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-7 | Inbound artifact materialization passes artifact/daemon tests; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-8 | Safe outbound worker artifact delivery passes MCP/daemon tests; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-9 | Voice transcription/routing/original preservation passes daemon and real-FFmpeg tests; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-10 | Video-note transcript/audio/keyframes/reasoning passes daemon and real-FFmpeg tests; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-11 | Dangerous approval pause/button/resume passes integration; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 80 E2E-12 | Crash/restart subscription and exactly-once completion pass integration; real test-bot/T3 run is not yet available. | UNVERIFIED |
+| 81–84 | MVP plus Phase 2/3 are implemented: media/rich/hybrid memory/handoff/fan-out, teams/RBAC/groups, connectors/automations/dashboard/policy and optimized provider routing. Evidence: full 111-test suite. | PROVED |
+| 85–87 | Repository is modular; donor/source decisions are attributed; grammY/Effect RPC are used; Operator, Telegram UI and T3 project/thread state remain separate. | PROVED |
+| 88 | All 18 MVP readiness paths pass component/integration gates, but the required real test-bot/T3 acceptance run remains. | UNVERIFIED |
+| 89 | Checked-in 80-scenario corpus reports 100% for reply, project/path and focus gates and 100% clarification/focus preservation. Evidence: `routing-quality.test.ts`, `verification-report.md`. | PROVED |
+| 90 | Latency budgets, required metrics, restart/dedupe/idempotency and typed modular boundaries are measured/tested/documented. Evidence: daemon latency/recovery tests and verification report. | PROVED |
+| 91–92 | Every named risk/open question has a source-checked decision, isolation/fallback mitigation and regression evidence. Evidence: source research plus broker/runtime/router/transport tests. | PROVED |
+| 93 | All local boundaries operate coherently in daemon integration; the spec-required real Telegram+T3 system run remains unavailable. | UNVERIFIED |
 
 ## Final audit procedure
 
@@ -199,5 +199,23 @@ Before completion:
   Telegram capability state, component health, SQLite integrity/size/events,
   subscriptions, pending queues, recent classified errors and the complete
   metric snapshot without exposing the raw chat ID.
+- Phase 3 state is durable in `automations`, `automation_runs`, `operator_policy`,
+  `provider_performance`, `operator_note_vectors`, team/project membership and
+  project alias tables. Automation unit/daemon tests prove timezone calculation,
+  transactional unique dispatch and restart reset. Google connector tests prove
+  fixed official REST contracts, response bounds and header-injection rejection.
+- The loopback dashboard test proves fragment capability handling, bearer-only
+  APIs, security/no-cache headers and validated live policy writes. The cockpit
+  deliberately visualizes the Telegram → Operator → T3 relay and contains no raw
+  credentials or conversations.
+- Claude and Codex runtimes share one typed provider-independent contract. Fake
+  CLI tests prove native session capture/resume, isolated settings/rules, shell
+  removal, argv-safe MCP bearer injection and secret-stripped environments. A
+  daemon test proves compact + bounded snapshot restoration during `/operator
+  switch` and durable provider/session persistence.
+- The 80-scenario routing corpus passes every section 89 target at 100%. The
+  daemon latency gate enforces direct first-visible under three seconds and
+  worker acknowledgement under two seconds at the local provider boundary;
+  production histograms remain exposed in `/debug`.
 - These checks prove only their slices; all remaining `PARTIAL`/`MISSING` rows
-  still block completion.
+  or `UNVERIFIED` rows still block completion.

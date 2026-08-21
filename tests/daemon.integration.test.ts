@@ -235,6 +235,34 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("switches Operator providers through a durable compact-and-restore handoff", async () => {
+    const home = tempDirectory("daemon-provider-switch-");
+    const store = tempStore();
+    const runtime = new ProviderSwitchRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "/operator switch codex"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("claude** → **codex")));
+    expect(runtime.currentProvider()).toBe("codex");
+    expect(runtime.switches).toEqual(["codex"]);
+    expect(store.getRuntimeState("operator_provider")).toBe("codex");
+    expect(store.getRuntimeState("operator_session_id")).toBe("codex-session");
+    expect(runtime.prompts.some((prompt) => prompt.includes("Daemon snapshot JSON"))).toBe(true);
+    expect(store.listCompactions(1)[0]?.reason).toContain("provider switch claude -> codex");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("handles an approval callback while a long Operator input is still running", async () => {
     const home = tempDirectory("daemon-ingress-queue-");
     const store = tempStore();
@@ -1709,6 +1737,39 @@ class BlockingRuntime extends FakeRuntime {
     await this.gate;
     yield { type: "text_delta", text: "Париж." };
     yield { type: "result", text: "Париж.", sessionId: input.sessionId };
+  }
+}
+
+class ProviderSwitchRuntime extends FakeRuntime {
+  private provider = "claude";
+  readonly switches: string[] = [];
+
+  currentProvider(): string {
+    return this.provider;
+  }
+
+  availableProviders(): string[] {
+    return ["claude", "codex"];
+  }
+
+  async switchProvider(providerId: string): Promise<{ id: string }> {
+    this.provider = providerId;
+    this.switches.push(providerId);
+    return { id: `${providerId}-session` };
+  }
+
+  override async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (input.prompt.includes("Restore operational context after an authorized Operator provider switch")) {
+      this.prompts.push(input.prompt);
+      yield { type: "text_delta", text: "PROVIDER_CONTEXT_RESTORED" };
+      yield { type: "result", text: "PROVIDER_CONTEXT_RESTORED", sessionId: input.sessionId };
+      return;
+    }
+    yield* super.sendTurn(input);
   }
 }
 
