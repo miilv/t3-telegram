@@ -46,6 +46,15 @@ export class DraftWriter {
       .catch(() => undefined);
   }
 
+  /** Drop everything streamed so far and show a working placeholder. */
+  reset(placeholder = "⏳"): void {
+    if (this.closed) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.buffer = "";
+    this.chain = this.chain.then(() => this.transport.updateDraft(this.draft, placeholder)).catch(() => undefined);
+  }
+
   async finalize(fallbackText: string): Promise<SentMessage[]> {
     if (this.closed) throw new Error("Telegram draft was already finalized");
     this.flush();

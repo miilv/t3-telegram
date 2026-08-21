@@ -836,6 +836,7 @@ export class OperatorDaemon {
     });
     const prompt = [
       "Answer the user's Telegram message directly. This is a quick task and no T3 worker was created.",
+      "Reply strictly in Russian. Do NOT narrate before tool calls — no 'I'll take a look' preambles; if the work needs a heads-up, send it via telegram.send_message and nothing else. Your streamed text must be only the final answer.",
       `User message: ${update.text || "(attachment only)"}`,
       artifacts.length
         ? `Registered attachments (use artifact tools by id when needed): ${artifacts.map((a) => `${a.id}: ${a.filename ?? "unnamed"} (${a.mimeType ?? "unknown"})`).join(", ")}`
@@ -859,6 +860,7 @@ export class OperatorDaemon {
           writer?.append(delta);
         },
         toolLease?.access,
+        () => writer?.reset("⏳ Разбираюсь…"),
       );
       if (writer && !writer.text && answer) writer.append(answer);
       finalText = answer || writer?.text || "Не смог сформировать ответ.";
@@ -4312,6 +4314,7 @@ export class OperatorDaemon {
     prompt: string,
     onDelta?: (delta: string) => void,
     toolAccess?: OperatorToolAccess,
+    onToolStarted?: () => void,
   ): Promise<string> {
     return this.operatorRuntimeQueue.run(async () => {
       let streamed = "";
@@ -4332,6 +4335,7 @@ export class OperatorDaemon {
             // Text before a tool call is live commentary, not the answer.
             sawTool = true;
             segment = "";
+            onToolStarted?.();
           } else if (event.type === "result") {
             result = event.text;
             this.recordOperatorUsage(event.usage);
@@ -4361,6 +4365,7 @@ export class OperatorDaemon {
             } else if (event.type === "tool_started") {
               sawTool = true;
               segment = "";
+              onToolStarted?.();
             } else if (event.type === "result") {
               result = event.text;
               this.recordOperatorUsage(event.usage);
