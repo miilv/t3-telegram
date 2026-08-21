@@ -1388,6 +1388,30 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("acknowledges a bulk forwarded batch before slow media work", async () => {
+    const home = tempDirectory("daemon-bulk-ack-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const batch = message(1, "суммаризируй это всё");
+    telegram.push({ ...batch, messageIds: [1, 2, 3, 4, 5, 6, 7] });
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Принял 7 сообщ.")));
+    expect(telegram.sent.some((entry) => entry.text.includes("вложений: 0"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("resolves a routing clarification from an inline button press", async () => {
     const home = tempDirectory("daemon-route-button-");
     const store = tempStore();

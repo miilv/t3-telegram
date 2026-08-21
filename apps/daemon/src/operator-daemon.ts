@@ -538,15 +538,44 @@ export class OperatorDaemon {
         payload: { artifactId: artifact.id },
       });
     }
+    // A forwarded bulk batch takes minutes of media work before the Operator
+    // even sees it; acknowledge immediately so the chat never looks frozen.
+    const bulkBatch = update.messageIds.length >= 5 || ingested.length >= 5;
+    if (bulkBatch) {
+      this.enqueueTelegramOutbox(
+        `telegram:bulk-ack:${update.chatId}:${update.messageId}`,
+        update.chatId,
+        "rich",
+        {
+          text: `Принял ${update.messageIds.length} сообщ. (вложений: ${ingested.length}). Разбираю — расшифровка и распознавание займут пару минут.`,
+          options: replyOptions(update),
+          messageType: "bulk_ingest_ack",
+          correlationId: correlationForUpdate(update),
+        },
+      );
+      await this.flushTelegramOutbox();
+    }
+
     const enrichedArtifacts = [...ingested];
     const mediaContext: string[] = [];
     // Attachments whose textual content already reached the Operator context
     // (OCR, transcripts) must not force delegation by themselves.
     const contextCovered = new Set<number>();
     if (this.media) {
-      for (const [index, attachment] of update.attachments.entries()) {
+      // Bulk batches carry dozens of voices/photos; enriching them one by one
+      // blocks the whole chat for minutes. Run a bounded number concurrently
+      // and keep per-attachment context slots so the order stays stable.
+      const media = this.media;
+      const slots: string[][] = update.attachments.map(() => []);
+      const derived: Array<Array<(typeof ingested)[number]>> = update.attachments.map(() => []);
+      // Keep the combined excerpt budget bounded regardless of batch size.
+      const excerptBudget = Math.max(
+        600,
+        Math.floor(24_000 / Math.max(1, update.attachments.length)),
+      );
+      const enrichOne = async (attachment: TelegramAttachment, index: number): Promise<void> => {
         const original = ingested[index];
-        if (!original) continue;
+        if (!original) return;
         if (["photo", "document"].includes(attachment.type)) {
           const mime = original.mimeType ?? "";
           const lowerName = (original.filename ?? "").toLowerCase();
@@ -556,24 +585,39 @@ export class OperatorDaemon {
             lowerName.endsWith(".pdf") ||
             isOfficeDocument(mime, lowerName)
           ) {
-            const ocr = await this.media.ocrInbound(original);
-            if (ocr.artifact) enrichedArtifacts.push(ocr.artifact);
+            const ocr = await media.ocrInbound(original).catch((error) => {
+              this.logger.warn(
+                { errorCode: classifyOperationalError(error).code },
+                "OCR failed for an inbound attachment",
+              );
+              return { unavailable: "OCR backend failed" } as Awaited<ReturnType<typeof media.ocrInbound>>;
+            });
+            if (ocr.artifact) derived[index]!.push(ocr.artifact);
             if (ocr.text) {
               contextCovered.add(index);
-              mediaContext.push(
-                `[OCR of ${original.filename ?? original.id} via ${ocr.provider}; full text saved as artifact ${ocr.artifact?.id}]\n${ocr.text.slice(0, 4_000)}`,
+              slots[index]!.push(
+                `[OCR of ${original.filename ?? original.id} via ${ocr.provider}; full text saved as artifact ${ocr.artifact?.id}]\n${ocr.text.slice(0, excerptBudget)}`,
               );
             } else if (ocr.unavailable && ocr.unavailable !== "unsupported media type for OCR") {
-              mediaContext.push(
+              slots[index]!.push(
                 `[OCR unavailable for ${original.filename ?? original.id}; reason: ${ocr.unavailable}]`,
               );
             }
           }
-          continue;
+          return;
         }
-        if (!["voice", "audio", "video_note", "video"].includes(attachment.type)) continue;
-        const enrichment = await this.media.enrichInbound(attachment, original);
-        enrichedArtifacts.push(...enrichment.artifacts);
+        if (!["voice", "audio", "video_note", "video"].includes(attachment.type)) return;
+        const enrichment = await media.enrichInbound(attachment, original).catch((error) => {
+          this.logger.warn(
+            { errorCode: classifyOperationalError(error).code },
+            "Media enrichment failed for an inbound attachment",
+          );
+          return {
+            artifacts: [],
+            transcriptionUnavailable: "media pipeline failed",
+          } as Awaited<ReturnType<typeof media.enrichInbound>>;
+        });
+        derived[index]!.push(...enrichment.artifacts);
         const label =
           attachment.type === "video_note"
             ? "Video-note"
@@ -584,21 +628,32 @@ export class OperatorDaemon {
                 : "Audio";
         if (enrichment.transcript) {
           contextCovered.add(index);
-          mediaContext.push(
-            `[${label} transcript; original artifact ${original.id}]\n${enrichment.transcript}`,
+          slots[index]!.push(
+            `[${label} transcript; original artifact ${original.id}]\n${enrichment.transcript.slice(0, excerptBudget)}`,
           );
         } else {
-          mediaContext.push(
+          slots[index]!.push(
             `[${label} transcription unavailable; original artifact ${original.id}; reason: ${enrichment.transcriptionUnavailable ?? "unknown"}]`,
           );
         }
         const keyframes = enrichment.artifacts.filter((artifact) => artifact.mimeType === "image/jpeg");
         if (keyframes.length) {
-          mediaContext.push(
+          slots[index]!.push(
             `[${label} keyframes: ${keyframes.map((artifact) => artifact.id).join(", ")}]`,
           );
         }
-      }
+      };
+      const queue = update.attachments.map((attachment, index) => ({ attachment, index }));
+      const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+        for (;;) {
+          const next = queue.shift();
+          if (!next) return;
+          await enrichOne(next.attachment, next.index);
+        }
+      });
+      await Promise.all(workers);
+      for (const items of derived) enrichedArtifacts.push(...items);
+      for (const items of slots) mediaContext.push(...items);
     }
     if (mediaContext.length) {
       const userText = isMediaPlaceholder(update.text) ? "" : update.text.trim();
