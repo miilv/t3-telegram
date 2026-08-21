@@ -55,6 +55,8 @@ const envSchema = z.object({
   DOCLING_START_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(600_000).default(120_000),
   DOCLING_CONVERT_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(600_000).default(180_000),
   DOCLING_IDLE_STOP_MINUTES: z.coerce.number().int().min(1).max(1_440).default(10),
+  DOCLING_OCR_PRESET: z.string().min(1).default("rapidocr"),
+  DOCLING_OCR_LANG: z.string().min(1).default("eslav"),
   OPENAI_API_KEY: z.string().min(1).optional(),
   OPENAI_TRANSCRIPTION_MODEL: z.string().min(1).default("gpt-4o-mini-transcribe"),
   GROQ_API_KEY: z.string().min(1).optional(),
@@ -185,6 +187,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
               startTimeoutMs: parsed.DOCLING_START_TIMEOUT_MS,
               convertTimeoutMs: parsed.DOCLING_CONVERT_TIMEOUT_MS,
               idleStopMinutes: parsed.DOCLING_IDLE_STOP_MINUTES,
+              ocrPreset: parsed.DOCLING_OCR_PRESET,
+              ocrLang: parsed.DOCLING_OCR_LANG,
             }
           : undefined,
       ocr: {

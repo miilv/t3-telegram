@@ -330,6 +330,8 @@ describe("MediaProcessor", () => {
           startTimeoutMs: 30_000,
           convertTimeoutMs: 30_000,
           idleStopMinutes: 10,
+          ocrPreset: "rapidocr",
+          ocrLang: "eslav",
         },
         ocr: {
           enabled: true,
@@ -346,7 +348,7 @@ describe("MediaProcessor", () => {
       async (url, init) => {
         requests.push(String(url));
         if (String(url).endsWith("/health")) return new Response("ok", { status: 200 });
-        expect(String(url)).toBe("http://127.0.0.1:5001/v1alpha/convert/file");
+        expect(String(url)).toBe("http://127.0.0.1:5001/v1/convert/file");
         const form = init?.body as FormData;
         expect((form.get("files") as File).name).toBe("report.docx");
         return new Response(

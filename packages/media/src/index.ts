@@ -25,6 +25,8 @@ export interface MediaProcessorConfig {
     startTimeoutMs: number;
     convertTimeoutMs: number;
     idleStopMinutes: number;
+    ocrPreset: string;
+    ocrLang: string;
   } | undefined;
   ocr?: {
     enabled: boolean;
@@ -540,7 +542,9 @@ export class MediaProcessor {
     form.append("to_formats", "json");
     form.append("table_mode", "accurate");
     form.append("image_export_mode", "placeholder");
-    const response = await this.fetchImpl(`${docling.endpoint}/v1alpha/convert/file`, {
+    form.append("ocr_preset", docling.ocrPreset);
+    form.append("ocr_lang", docling.ocrLang);
+    const response = await this.fetchImpl(`${docling.endpoint}/v1/convert/file`, {
       method: "POST",
       body: form,
       signal: AbortSignal.timeout(docling.convertTimeoutMs),
