@@ -2,6 +2,11 @@ import type { ApprovalRiskCategory } from "../../shared/src/index.js";
 
 export { classifyTaskComplexity, selectWorkerModel } from "./provider-selection.js";
 export type { TaskComplexity, WorkerModelSelection } from "./provider-selection.js";
+export {
+  fallbackParallelDelegationPlan,
+  parseDelegationPlan,
+  shouldPlanParallelDelegation,
+} from "./delegation-planning.js";
 
 export const OPERATOR_SYSTEM_PROMPT = `You are Operator, the user's always-available general-purpose AI coworker in Telegram.
 

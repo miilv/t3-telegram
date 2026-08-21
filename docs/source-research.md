@@ -90,6 +90,23 @@ instead of defining a second JSON-RPC dialect. Its deliberately narrow schema
 group keeps the private full T3 contracts out of this repository; unknown RPC
 payloads are structurally checked at the broker boundary.
 
+## Routing, handoff and fan-out source gate
+
+Before implementing cross-project transfer and multi-worker groups, the current
+T3 fork was reread again at `7107a98a225be85b58ddcd4de02c343af7d4707a`:
+
+- orchestration contracts expose normal project/thread creation, turn start,
+  interrupt, search, tail/artifact reads and thread event subscriptions;
+- no contract provides a safe provider-native thread rehome operation;
+- no contract provides a server-owned worker-group or synthesis primitive;
+- thread lifecycle and project membership remain authoritative T3 state.
+
+Consequently, a handoff creates a normal thread in the target T3 project and
+passes the spec's explicit `ThreadHandoff` packet. Fan-out creates 2–4 ordinary
+T3 threads and stores only the group coordination/synthesis state in the daemon.
+The daemon does not invent alternative thread lifecycle state or mutate T3's
+project ownership behind the server.
+
 ## Remaining source gates
 
 Before each media block, reread the corresponding donor implementation and the

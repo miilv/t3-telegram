@@ -1,5 +1,7 @@
-import { existsSync, realpathSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { execFileSync } from "node:child_process";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type {
   ArtifactRef,
   FocusState,
@@ -14,6 +16,8 @@ import type { OperatorStore } from "../../storage/src/index.js";
 const followUpPattern =
   /^(продолжай|готово\??|что там\??|а тесты\??|пусть исправит|сделай это|дальше|ещ[её]|также|добавь|continue|also|and also|status\??|done\??|what's up\??)/iu;
 const cancelPattern = /^(стоп|отмени|хватит|cancel|stop)\b/iu;
+const handoffPattern =
+  /(?:^|[^\p{L}\p{N}_])(перенеси|перенести|перемести|переведи\s+(?:работу|задачу)|move\s+(?:this|the\s+work|task)|transfer\s+(?:this|the\s+work|task)|handoff)(?=$|[^\p{L}\p{N}_])/iu;
 const sideQuestionPattern =
   /^(который час|сколько времени|столица|переведи|что значит|посчитай|what time|capital of|translate|calculate)\b/iu;
 
@@ -33,6 +37,16 @@ export class RoutingEngine {
     const text = input.text.trim();
     const lowered = text.toLocaleLowerCase();
 
+    const explicitProject = bestNamedProject(lowered, input.projects);
+    if (explicitProject) {
+      const thread = input.threadCandidates?.find(
+        (candidate) => candidate.thread.projectId === explicitProject.id && candidate.score >= 0.78,
+      );
+      return thread
+        ? decision({ type: "thread", threadId: thread.thread.id }, 0.93, ["explicit project name", ...thread.reasons])
+        : decision({ type: "project", projectId: explicitProject.id }, 0.92, ["explicit project name"]);
+    }
+
     if (input.replyThreadId) {
       return decision({ type: "thread", threadId: input.replyThreadId }, 0.99, ["Telegram reply mapping"]);
     }
@@ -49,16 +63,6 @@ export class RoutingEngine {
         0.94,
         ["multiple artifact provenance links"],
       );
-    }
-
-    const explicitProject = bestNamedProject(lowered, input.projects);
-    if (explicitProject) {
-      const thread = input.threadCandidates?.find(
-        (candidate) => candidate.thread.projectId === explicitProject.id && candidate.score >= 0.78,
-      );
-      return thread
-        ? decision({ type: "thread", threadId: thread.thread.id }, 0.93, ["explicit project name", ...thread.reasons])
-        : decision({ type: "project", projectId: explicitProject.id }, 0.92, ["explicit project name"]);
     }
 
     const pathProject = projectFromPath(text, input.projects);
@@ -179,6 +183,14 @@ export function isCancelIntent(text: string): boolean {
   return cancelPattern.test(text.trim());
 }
 
+export function isHandoffIntent(text: string): boolean {
+  return handoffPattern.test(text.trim());
+}
+
+export function resolveProjectReference(text: string, projects: Project[]): Project | undefined {
+  return bestNamedProject(text.toLocaleLowerCase(), projects) ?? projectFromPath(text, projects);
+}
+
 export function semanticProjectName(text: string): string {
   const cleaned = text
     .replace(/https?:\/\/\S+/g, "")
@@ -212,10 +224,23 @@ function bestNamedProject(lowered: string, projects: Project[]): Project | undef
 
 function projectFromPath(text: string, projects: Project[]): Project | undefined {
   for (const rawPath of extractPaths(text)) {
-    const candidate = existsSync(rawPath) ? realpathSync(rawPath) : resolve(rawPath);
+    const candidate = resolveUserPath(rawPath);
+    const candidateRoot = gitRoot(candidate);
+    const candidateRemote = candidateRoot ? gitRemote(candidateRoot) : undefined;
     const matches = projects
       .filter((project) => project.workspaceRoot)
-      .map((project) => ({ project, distance: pathDistance(candidate, project.workspaceRoot!) }))
+      .map((project) => {
+        const workspaceRoot = resolveUserPath(project.workspaceRoot!);
+        const workspaceGitRoot = gitRoot(workspaceRoot);
+        const sameGitRoot = Boolean(candidateRoot && workspaceGitRoot && candidateRoot === workspaceGitRoot);
+        const sameRemote = Boolean(
+          candidateRemote &&
+            workspaceGitRoot &&
+            normalizeGitRemote(candidateRemote) === normalizeGitRemote(gitRemote(workspaceGitRoot) ?? ""),
+        );
+        const distance = sameGitRoot || sameRemote ? 0 : pathDistance(candidate, workspaceRoot);
+        return { project, distance };
+      })
       .filter((entry) => entry.distance >= 0)
       .sort((a, b) => a.distance - b.distance);
     if (matches[0]) return matches[0].project;
@@ -224,16 +249,71 @@ function projectFromPath(text: string, projects: Project[]): Project | undefined
 }
 
 export function extractPaths(text: string): string[] {
-  const matches = text.match(/(?:^|[\s`"'])(\/?(?:[\w.@+~-]+\/)+[\w.@+~-]+)(?=$|[\s`"',:;])/gu) ?? [];
-  return matches
-    .map((match) => match.trim().replace(/^[`"']|[`"']$/g, ""))
-    .filter((path) => isAbsolute(path) || path.startsWith("./") || path.startsWith("../"));
+  const quoted = [...text.matchAll(/[`"']((?:~\/|\.{1,2}\/|\/)[^`"']+)[`"']/gu)].map(
+    (match) => match[1]!,
+  );
+  const unquoted = text.match(/(?:^|\s)((?:~\/|\.{1,2}\/|\/)[^\s`"',:;]+)/gu) ?? [];
+  return unique(
+    [...quoted, ...unquoted.map((match) => match.trim())]
+      .map((path) => path.replace(/[)\]}]+$/g, ""))
+      .filter((path) => isAbsolute(path) || path.startsWith("~/") || path.startsWith("./") || path.startsWith("../")),
+  );
 }
 
 function pathDistance(candidate: string, root: string): number {
-  const rootReal = existsSync(root) ? realpathSync(root) : resolve(root);
+  const rootReal = resolveUserPath(root);
   const rel = relative(rootReal, candidate);
   if (rel === "") return 0;
   if (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) return -1;
   return rel.split(sep).length;
+}
+
+function resolveUserPath(path: string): string {
+  const expanded = path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+  if (existsSync(expanded)) return realpathSync(expanded);
+  let ancestor = resolve(expanded);
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) return resolve(expanded);
+    ancestor = parent;
+  }
+  const realAncestor = realpathSync(ancestor);
+  return resolve(realAncestor, relative(ancestor, resolve(expanded)));
+}
+
+function gitRoot(path: string): string | undefined {
+  let cursor = path;
+  try {
+    if (existsSync(cursor) && statSync(cursor).isFile()) cursor = dirname(cursor);
+  } catch {
+    return undefined;
+  }
+  while (true) {
+    if (existsSync(join(cursor, ".git"))) return cursor;
+    const parent = dirname(cursor);
+    if (parent === cursor) return undefined;
+    cursor = parent;
+  }
+}
+
+function gitRemote(root: string): string | undefined {
+  try {
+    return execFileSync("git", ["-C", root, "config", "--get", "remote.origin.url"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_000,
+    }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeGitRemote(value: string): string {
+  return value
+    .trim()
+    .replace(/^git@([^:]+):/, "https://$1/")
+    .replace(/^ssh:\/\/git@/, "https://")
+    .replace(/\.git$/i, "")
+    .replace(/\/$/, "")
+    .toLocaleLowerCase();
 }

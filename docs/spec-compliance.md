@@ -31,15 +31,15 @@ branch, not an aspiration.
 | 5.7 | Artifact registry owns provenance, hashes, bindings, safe materialization and delivery. | PARTIAL |
 | 6 | Operator policy distinguishes direct work from delegated work and remains available during workers. | PARTIAL |
 | 7 | Existing/new/no-project decisions, sensible default workspace, and later affiliation correction. | PARTIAL |
-| 8 | Cross-project handoff packet and continuation thread without pretending provider-native rehome. | MISSING |
+| 8 | Cross-project handoff packet and continuation thread without pretending provider-native rehome. Unit/integration evidence covers packet shape and safe source-artifact materialization; delivery crash reconciliation remains incomplete. | PARTIAL |
 | 9 | Durable WorkThread metadata, lifecycle, summaries and bindings. | PARTIAL |
 | 10.1–10.2 | Messages may be unbound; focus is a ranked set and survives side questions. | PARTIAL |
 | 10.3 signals 1–4 | Explicit binding, reply, artifact and focus signals. | PARTIAL |
 | 10.3 signals 5–8 | Filesystem/git identity, entities, status/recency and semantic retrieval. | PARTIAL |
-| 10.3 signals 9–10 | LLM arbitration followed by a user clarification when ambiguity is material. | MISSING |
+| 10.3 signals 9–10 | LLM arbitration over a limited shortlist followed by a durable user clarification when ambiguity is material. | PARTIAL |
 | 10.4 | Confidence thresholds and no silent destructive misrouting. | PARTIAL |
 | 11 | Bidirectional Telegram-message mapping to turns, threads and artifacts. | PARTIAL |
-| 12 | Concurrent worker fan-out, independent progress, result aggregation and Operator synthesis. | MISSING |
+| 12 | Concurrent 2–4 worker fan-out, independent scopes, durable result aggregation, group control and one Operator synthesis. Real T3/Telegram evidence and synthesis-send crash reconciliation remain. | PARTIAL |
 | 13 | Event-driven background execution and complete normalized worker-event handling. | PARTIAL |
 | 13.3–14 | Do not leak raw worker stream; apply meaningful progress throttling/policy. | PARTIAL |
 | 15 | Operator context, durable source-of-truth memory, daily compaction and restart restoration. | PARTIAL |
@@ -59,7 +59,7 @@ branch, not an aspiration.
 | 35–36 | Thread reuse/search with metadata, FTS/semantic retrieval, recency and LLM reranking. | PARTIAL |
 | 37 | Human-friendly clarification only for material ambiguity. | PARTIAL |
 | 38 | Operator-to-worker prompt contract contains task, project, artifacts, constraints and result contract without privileged leakage. | PARTIAL |
-| 39 | Worker result is normalized to structured `WorkerResult` and synthesized by Operator. | MISSING |
+| 39 | Worker result is normalized to validated `WorkerResult`, with safe fallback, persisted group evidence and Operator synthesis. | PARTIAL |
 | 40–41 | Completion policy and rich status card with useful links/artifacts/state. | PARTIAL |
 | 42–43 | Cancel/interrupt plus provider-aware live input or queued follow-up while a turn runs. | PARTIAL |
 | 44–45 | Provider abstraction, capabilities, model/reasoning defaults, user overrides and Operator provider switching. | PARTIAL |
@@ -78,10 +78,10 @@ branch, not an aspiration.
 | 79 | Unit, integration and real E2E strategy with fixtures/fakes only where scope-appropriate. | PARTIAL |
 | 80 E2E-1 | Simple direct question without worker. | PARTIAL |
 | 80 E2E-2 | New project and worker. | PARTIAL |
-| 80 E2E-3 | Existing project selected by path/git identity. | MISSING |
+| 80 E2E-3 | Existing project selected by canonical path/git identity. Router tests exist; a real end-to-end T3 project exercise remains. | PARTIAL |
 | 80 E2E-4 | Focus survives a side question. | PARTIAL |
 | 80 E2E-5 | Reply routes to the correct work thread. | PARTIAL |
-| 80 E2E-6 | Three concurrent workers and a single synthesized answer. | MISSING |
+| 80 E2E-6 | Three concurrent workers and a single synthesized answer. Fake-boundary integration and restart/group-control tests pass; real T3/Telegram E2E remains. | PARTIAL |
 | 80 E2E-7 | Inbound file reaches the correct worker safely. | PARTIAL |
 | 80 E2E-8 | Worker artifact is sent back safely. | PARTIAL |
 | 80 E2E-9 | Voice is transcribed and original audio remains available. | MISSING |
@@ -91,7 +91,7 @@ branch, not an aspiration.
 | 81–84 | All MVP requirements plus Phase 2 and Phase 3 requested by the user are implemented; deferred lists are not treated as exclusions. | MISSING |
 | 85–87 | Maintainable repository structure; donor attribution; no bespoke Telegram protocol client; no UI/thread/project conflation. | PARTIAL |
 | 88 | Every MVP readiness criterion (18/18) has direct evidence. | MISSING |
-| 89 | Routing quality is measured against representative ambiguous cases. | MISSING |
+| 89 | Routing behavior has deterministic path/focus/handoff and daemon-level arbitration/clarification cases; the required representative quality corpus and percentage report remain. | PARTIAL |
 | 90 | Latency, reliability and maintainability requirements are measured and documented. | MISSING |
 | 91–92 | Named architecture risks and open questions have explicit decisions, mitigations and tests. | PARTIAL |
 | 93 | The complete target model works as one coherent system. | MISSING |
@@ -147,5 +147,17 @@ Before completion:
   current terminal event or startup recovery. The retry scheduler and a real
   multi-client crash exercise are still required before the relevant rows can
   be `PROVED`.
+- Canonical path/git-root/remote signals feed routing before lexical retrieval.
+  Operator arbitration receives only a bounded candidate shortlist; an
+  unresolved choice persists the original update and resumes it from the
+  owner's numbered/title reply after restart.
+- Cross-project transfer uses the exact `ThreadHandoff` contract and a new T3
+  thread because current T3 has no safe rehome operation. Registered source
+  artifacts are revalidated and materialized into the target workspace.
+- Parallel planning is validated to 2–4 non-duplicate worker scopes. Group
+  membership and normalized `WorkerResult` evidence are durable, synthesis is
+  atomically claimed after every member becomes terminal, `/status` aggregates
+  the group, and `/stop` cancels all active members. A Telegram-send/SQLite
+  commit crash window still prevents an exactly-once claim.
 - These checks prove only their slices; all remaining `PARTIAL`/`MISSING` rows
   still block completion.

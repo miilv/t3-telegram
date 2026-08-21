@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from "node:fs";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { OperatorDaemon } from "../apps/daemon/src/operator-daemon.js";
@@ -52,7 +53,7 @@ describe("OperatorDaemon product flow", () => {
 
     telegram.push(message(2, "исправь race condition в auth и прогони тесты"));
     await waitFor(() => broker.turns.length === 1);
-    await waitFor(() => telegram.sent.some((entry) => entry.text === "Worker завершил задачу; тесты прошли."));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу; тесты прошли")));
     expect(broker.projects).toHaveLength(1);
     expect(broker.threads).toHaveLength(1);
     const focusAfterWork = store.getFocus("42");
@@ -419,7 +420,331 @@ describe("OperatorDaemon product flow", () => {
     expect(store.getUserInput("input_local_1")?.messageId).toBeDefined();
     await daemon.stop();
   });
+
+  it("runs three independent T3 workers concurrently and delivers one synthesis", async () => {
+    const home = tempDirectory("daemon-worker-group-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(
+      message(
+        1,
+        "investigate production latency in parallel across backend, database, and git history",
+      ),
+    );
+    await waitFor(() => broker.turns.length === 3);
+    await waitFor(() =>
+      telegram.sent.some((entry) =>
+        entry.text.includes("Parallel synthesis: backend, database, and history evidence reconciled."),
+      ),
+    );
+
+    expect(broker.threads).toHaveLength(3);
+    expect(broker.turns.map((turn) => turn.text)).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("Assigned role: backend investigator"),
+        expect.stringContaining("Assigned role: database investigator"),
+        expect.stringContaining("Assigned role: history investigator"),
+      ]),
+    );
+    expect(store.listUndeliveredWorkerGroups()).toHaveLength(0);
+    expect(telegram.sent.filter((entry) => entry.text === "Worker завершил задачу; тесты прошли.")).toHaveLength(0);
+    expect(store.getReplyContext(7, 1)?.relatedThreadIds).toHaveLength(3);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("shows one grouped status card and stops every active worker in the group", async () => {
+    const home = tempDirectory("daemon-worker-group-control-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "investigate latency in parallel across backend, database, and history"));
+    await waitFor(() => broker.turns.length === 3);
+    telegram.push(message(2, "/status"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Работа")));
+    const status = telegram.sent.find((entry) => entry.text.startsWith("## Работа"))!.text;
+    expect(status).toContain("3 scopes");
+    expect(status).toContain("backend investigator — running");
+    expect(status).toContain("database investigator — running");
+    expect(status).toContain("history investigator — running");
+
+    telegram.push(message(3, "/stop"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Остановил группу")));
+    expect(broker.threads.every((thread) => thread.status === "cancelled")).toBe(true);
+    expect(store.listUndeliveredWorkerGroups()).toHaveLength(0);
+
+    broker.releaseTerminal();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("moves work across projects through a new thread and a structured handoff packet", async () => {
+    const home = tempDirectory("daemon-handoff-");
+    const sourceRoot = `${home}/source`;
+    const targetRoot = `${home}/target`;
+    mkdirSync(sourceRoot, { recursive: true });
+    mkdirSync(targetRoot, { recursive: true });
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const timestamp = nowIso();
+    const sourceProject: Project = {
+      id: "prj_source",
+      t3ProjectId: "prj_source",
+      name: "Source Project",
+      workspaceRoot: sourceRoot,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const targetProject: Project = {
+      id: "prj_target",
+      t3ProjectId: "prj_target",
+      name: "Target Project",
+      workspaceRoot: targetRoot,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const sourceThread: WorkThread = {
+      id: "th_source",
+      t3ThreadId: "th_source",
+      projectId: sourceProject.id,
+      provider: "claude",
+      model: "opus",
+      title: "Auth redesign",
+      shortSummary: "Refresh-token architecture is drafted.",
+      keywords: ["auth", "refresh"],
+      status: "completed",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      lastUserIntent: "redesign refresh-token authentication",
+      lastResultSummary: "Selected rotating refresh tokens.",
+      relatedArtifacts: [],
+    };
+    broker.projects.push(sourceProject, targetProject);
+    broker.threads.push(sourceThread);
+    store.upsertProject(sourceProject);
+    store.upsertProject(targetProject);
+    store.upsertThread(sourceThread);
+    store.saveTelegramMessage({
+      chatId: 7,
+      messageId: 50,
+      primaryProjectId: sourceProject.id,
+      primaryThreadId: sourceThread.id,
+      relatedThreadIds: [sourceThread.id],
+      artifactIds: [],
+      messageType: "worker_completed",
+      createdAt: timestamp,
+    });
+    store.linkMessageThread(7, 50, sourceThread.id);
+    store.setFocus("42", {
+      primary: {
+        projectId: targetProject.id,
+        topic: targetProject.name,
+        confidence: 0.99,
+        updatedAt: timestamp,
+      },
+      secondary: [],
+    });
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const sourceArtifactPath = `${sourceRoot}/handoff-notes.md`;
+    writeFileSync(sourceArtifactPath, "important handoff evidence", { mode: 0o600 });
+    await artifacts.initialize();
+    await artifacts.registerOutbound(sourceArtifactPath, [sourceRoot], {
+      projectId: sourceProject.id,
+      threadId: sourceThread.id,
+      mimeType: "text/markdown",
+    });
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push({
+      ...message(1, "перенеси эту работу в Target Project и продолжи"),
+      replyToMessageId: 50,
+    });
+    await waitFor(() => broker.turns.length === 1);
+    expect(broker.threads).toHaveLength(2);
+    expect(broker.threads[1]?.projectId).toBe(targetProject.id);
+    expect(broker.turns[0]?.text).toContain('"sourceThreadId": "th_source"');
+    expect(broker.turns[0]?.text).toContain('"targetProjectId": "prj_target"');
+    expect(broker.turns[0]?.artifacts).toHaveLength(1);
+    expect(broker.turns[0]?.artifacts?.[0]?.localPath).toContain(`${targetRoot}/.operator-inbox/`);
+    expect(store.getFocus("42").primary?.threadId).toBe(broker.threads[1]?.id);
+    expect(
+      telegram.sent.some((entry) => entry.text.includes("через новый T3 thread и handoff packet")),
+    ).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("uses Operator shortlist arbitration when one similar thread is materially identified", async () => {
+    const home = tempDirectory("daemon-route-arbitration-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    runtime.routingSelectionThreadId = "th_redesign";
+    const broker = new FakeBroker();
+    seedAmbiguousAuthThreads(store, broker);
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "continue the auth redesign work"));
+    await waitFor(() => broker.turns.length === 1);
+    expect(broker.turns[0]?.threadId).toBe("th_redesign");
+    expect(telegram.sent.some((entry) => entry.text.includes("Какой продолжить"))).toBe(false);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("persists a material routing clarification and resumes the original task from a numbered reply", async () => {
+    const home = tempDirectory("daemon-route-clarification-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    seedAmbiguousAuthThreads(store, broker);
+    const candidates = store.searchThreads("continue auth work");
+    const expectedThreadId = candidates[1]!.thread.id;
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "continue auth work"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Какой продолжить")));
+    const prompt = telegram.sent.find((entry) => entry.text.includes("Какой продолжить"))!;
+    telegram.push({ ...message(2, "2"), replyToMessageId: prompt.messageId });
+    await waitFor(() => broker.turns.length === 1);
+    expect(broker.turns[0]?.threadId).toBe(expectedThreadId);
+    expect(broker.turns[0]?.text).toContain("continue auth work");
+    expect(store.getReplyContext(7, 2)?.primaryThreadId).toBe(expectedThreadId);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("recovers and delivers one pending worker-group synthesis after restart", async () => {
+    const home = tempDirectory("daemon-group-recovery-");
+    const store = tempStore();
+    store.createWorkerGroup({
+      id: "group_recovery",
+      title: "Recovered investigation",
+      synthesisGoal: "Reconcile recovered evidence",
+      chatId: 7,
+      originMessageId: 55,
+    });
+    store.addWorkerGroupMember({
+      groupId: "group_recovery",
+      threadId: "thread_a",
+      role: "backend",
+      task: "Inspect backend",
+    });
+    store.addWorkerGroupMember({
+      groupId: "group_recovery",
+      threadId: "thread_b",
+      role: "database",
+      task: "Inspect database",
+    });
+    store.updateWorkerGroupMember("thread_a", "completed", {
+      summary: "Backend evidence",
+      status: "success",
+    });
+    store.updateWorkerGroupMember("thread_b", "failed", {
+      summary: "Database evidence unavailable",
+      status: "failed",
+    });
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+
+    await daemon.initialize();
+    expect(
+      telegram.sent.filter((entry) => entry.text.includes("Parallel synthesis: backend")).length,
+    ).toBe(1);
+    expect(store.listUndeliveredWorkerGroups()).toHaveLength(0);
+    await daemon.stop();
+  });
 });
+
+function seedAmbiguousAuthThreads(store: ReturnType<typeof tempStore>, broker: FakeBroker): void {
+  const timestamp = nowIso();
+  const project: Project = {
+    id: "prj_auth",
+    t3ProjectId: "prj_auth",
+    name: "Identity Platform",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const makeThread = (id: string, title: string): WorkThread => ({
+    id,
+    t3ThreadId: id,
+    projectId: project.id,
+    provider: "claude",
+    model: "opus",
+    title,
+    shortSummary: "auth work",
+    keywords: ["auth"],
+    status: "idle",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastActivityAt: timestamp,
+    relatedArtifacts: [],
+  });
+  const threads = [
+    makeThread("th_bug", "Production auth bug"),
+    makeThread("th_redesign", "Auth redesign"),
+  ];
+  broker.projects.push(project);
+  broker.threads.push(...threads);
+  store.upsertProject(project);
+  for (const thread of threads) store.upsertThread(thread);
+}
 
 function config(home: string): Config {
   return {
@@ -480,14 +805,38 @@ function callback(
 }
 
 class FakeRuntime implements OperatorRuntime {
+  routingSelectionThreadId?: string;
+
   async start(): Promise<{ id: string }> {
     return { id: "operator-session" };
   }
 
   async *sendTurn(input: { sessionId: string; prompt: string }): AsyncIterable<OperatorEvent> {
-    const text = input.prompt.includes("Normalize this completed")
-      ? "Worker завершил задачу; тесты прошли."
-      : "Париж.";
+    const text = input.prompt.includes("Arbitrate routing")
+      ? this.routingSelectionThreadId
+        ? JSON.stringify({
+            decision: "select",
+            threadId: this.routingSelectionThreadId,
+            confidence: 0.91,
+            reason: "The user named the redesign context.",
+          })
+        : JSON.stringify({ decision: "ask", confidence: 0.55, reason: "Material ambiguity." })
+      : input.prompt.includes("Normalize this completed")
+      ? JSON.stringify({ summary: "Worker завершил задачу; тесты прошли.", status: "success" })
+      : input.prompt.includes("Plan a parallel T3 worker delegation")
+        ? JSON.stringify({
+            mode: "parallel",
+            workers: [
+              { title: "Backend profiling", role: "backend investigator", task: "Profile backend latency." },
+              { title: "Database analysis", role: "database investigator", task: "Analyze database latency." },
+              { title: "Git history", role: "history investigator", task: "Inspect recent git history." },
+            ],
+            synthesisGoal: "Explain production latency with reconciled evidence.",
+            rationale: "Independent evidence streams.",
+          })
+        : input.prompt.includes("Synthesize this completed parallel")
+          ? "Parallel synthesis: backend, database, and history evidence reconciled."
+          : "Париж.";
     yield { type: "text_delta", text };
     yield { type: "result", text, sessionId: input.sessionId };
   }
@@ -607,6 +956,7 @@ class FakeBroker implements T3Broker {
     }
     yield { type: "started", threadId };
     await Promise.resolve();
+    if (this.terminalGate) await this.terminalGate;
     yield { type: "completed", threadId, result: "Fixed auth race. Tests pass." };
   }
   async getThreadTail(): Promise<Array<{ role: string; text: string }>> {

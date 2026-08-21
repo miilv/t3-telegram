@@ -156,6 +156,64 @@ CREATE TABLE IF NOT EXISTS background_jobs (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS worker_groups (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  synthesis_goal TEXT NOT NULL,
+  status TEXT NOT NULL,
+  synthesis_status TEXT NOT NULL,
+  telegram_chat_id INTEGER NOT NULL,
+  origin_message_id INTEGER NOT NULL,
+  message_thread_id INTEGER,
+  direct_messages_topic_id INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  delivered_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS worker_group_members (
+  group_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  task TEXT NOT NULL,
+  status TEXT NOT NULL,
+  result_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (group_id, thread_id),
+  FOREIGN KEY (group_id) REFERENCES worker_groups(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_group_members_thread
+  ON worker_group_members(thread_id);
+
+CREATE TABLE IF NOT EXISTS thread_handoffs (
+  id TEXT PRIMARY KEY,
+  source_project_id TEXT NOT NULL,
+  source_thread_id TEXT NOT NULL,
+  target_project_id TEXT NOT NULL,
+  target_thread_id TEXT,
+  packet_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS routing_clarifications (
+  id TEXT PRIMARY KEY,
+  telegram_chat_id INTEGER NOT NULL,
+  telegram_message_id INTEGER NOT NULL,
+  original_update_json TEXT NOT NULL,
+  artifact_ids_json TEXT NOT NULL,
+  candidate_thread_ids_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_routing_clarifications_message
+  ON routing_clarifications(telegram_chat_id, telegram_message_id, status);
+
 CREATE TABLE IF NOT EXISTS daemon_events (
   id TEXT PRIMARY KEY,
   event_type TEXT NOT NULL,

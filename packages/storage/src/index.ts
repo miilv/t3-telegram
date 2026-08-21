@@ -9,9 +9,11 @@ import type {
   Project,
   ReplyContext,
   TelegramMessageRecord,
+  ThreadHandoff,
   ThreadCandidate,
   ThreadStatus,
   UserInputQuestion,
+  WorkerResult,
   WorkThread,
 } from "../../shared/src/index.js";
 import { newId, nowIso } from "../../shared/src/index.js";
@@ -43,6 +45,39 @@ export interface BackgroundJob<T = unknown> {
   attempts: number;
   runAfter?: string;
   lastError?: string;
+}
+
+export interface WorkerGroupMemberRecord {
+  threadId: string;
+  role: string;
+  task: string;
+  status: string;
+  result?: WorkerResult;
+}
+
+export interface WorkerGroupRecord {
+  id: string;
+  title: string;
+  synthesisGoal: string;
+  status: string;
+  synthesisStatus: string;
+  chatId: number;
+  originMessageId: number;
+  messageThreadId?: number;
+  directMessagesTopicId?: number;
+  createdAt: string;
+  deliveredAt?: string;
+  members: WorkerGroupMemberRecord[];
+}
+
+export interface PendingRoutingClarification {
+  id: string;
+  chatId: number;
+  messageId: number;
+  originalUpdate: unknown;
+  artifactIds: string[];
+  candidateThreadIds: string[];
+  status: string;
 }
 
 function resolveMigrationPath(): string {
@@ -215,11 +250,25 @@ export class OperatorStore {
         ORDER BY rank ASC, t.last_activity_at DESC LIMIT ?
       `)
       .all(...(projectId ? [match, projectId, limit] : [match, limit])) as Row[];
-    return rows.map((row, index) => ({
-      thread: rowToThread(row),
-      score: Math.max(0.45, 0.86 - index * 0.06),
-      reasons: ["lexical thread summary match"],
-    }));
+    return rows.map((row, index) => {
+      const thread = rowToThread(row);
+      const activeBoost = ["queued", "running", "waiting_approval", "waiting_user"].includes(
+        thread.status,
+      )
+        ? 0.06
+        : 0;
+      const ageMs = Date.now() - Date.parse(thread.lastActivityAt);
+      const recencyBoost = Number.isFinite(ageMs) && ageMs <= 24 * 60 * 60 * 1_000 ? 0.04 : 0;
+      return {
+        thread,
+        score: Math.max(0.45, Math.min(0.96, 0.82 - index * 0.05 + activeBoost + recencyBoost)),
+        reasons: [
+          "lexical thread summary match",
+          ...(activeBoost ? ["active worker status"] : []),
+          ...(recencyBoost ? ["recent thread activity"] : []),
+        ],
+      };
+    });
   }
 
   updateThreadStatus(
@@ -234,6 +283,15 @@ export class OperatorStore {
         WHERE id=? OR t3_thread_id=?
       `)
       .run(status, fields.summary ?? null, fields.result ?? null, nowIso(), nowIso(), threadId, threadId);
+  }
+
+  updateThreadIntent(threadId: string, intent: string): void {
+    this.db
+      .prepare(`
+        UPDATE threads SET last_user_intent=?,last_activity_at=?,updated_at=?
+        WHERE id=? OR t3_thread_id=?
+      `)
+      .run(intent.slice(0, 12_000), nowIso(), nowIso(), threadId, threadId);
   }
 
   saveTelegramMessage(record: TelegramMessageRecord): boolean {
@@ -365,6 +423,14 @@ export class OperatorStore {
   getArtifact(id: string): Artifact | undefined {
     const row = this.db.prepare("SELECT * FROM artifacts WHERE id=?").get(id) as Row | undefined;
     return row ? rowToArtifact(row) : undefined;
+  }
+
+  listArtifactsForThread(threadId: string): Artifact[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM artifacts WHERE thread_id=? ORDER BY created_at DESC")
+        .all(threadId) as Row[]
+    ).map(rowToArtifact);
   }
 
   saveApproval(input: {
@@ -619,6 +685,243 @@ export class OperatorStore {
       );
   }
 
+  createWorkerGroup(input: {
+    id: string;
+    title: string;
+    synthesisGoal: string;
+    chatId: number;
+    originMessageId: number;
+    messageThreadId?: number;
+    directMessagesTopicId?: number;
+  }): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO worker_groups(
+          id,title,synthesis_goal,status,synthesis_status,telegram_chat_id,origin_message_id,
+          message_thread_id,direct_messages_topic_id,created_at,updated_at,delivered_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)
+      `)
+      .run(
+        input.id,
+        input.title,
+        input.synthesisGoal,
+        "running",
+        "pending",
+        input.chatId,
+        input.originMessageId,
+        input.messageThreadId ?? null,
+        input.directMessagesTopicId ?? null,
+        now,
+        now,
+      );
+  }
+
+  addWorkerGroupMember(input: {
+    groupId: string;
+    threadId: string;
+    role: string;
+    task: string;
+    status?: string;
+  }): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT OR REPLACE INTO worker_group_members(
+          group_id,thread_id,role,task,status,result_json,created_at,updated_at
+        ) VALUES (?,?,?,?,?,NULL,?,?)
+      `)
+      .run(input.groupId, input.threadId, input.role, input.task, input.status ?? "queued", now, now);
+  }
+
+  getWorkerGroupForThread(threadId: string): WorkerGroupRecord | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT g.* FROM worker_groups g
+        JOIN worker_group_members m ON m.group_id=g.id
+        WHERE m.thread_id=? ORDER BY g.created_at DESC LIMIT 1
+      `)
+      .get(threadId) as Row | undefined;
+    return row ? this.readWorkerGroup(row) : undefined;
+  }
+
+  updateWorkerGroupMember(
+    threadId: string,
+    status: string,
+    result?: WorkerResult,
+  ): void {
+    this.db
+      .prepare(`
+        UPDATE worker_group_members SET status=?,result_json=COALESCE(?,result_json),updated_at=?
+        WHERE thread_id=?
+      `)
+      .run(status, result ? JSON.stringify(result) : null, nowIso(), threadId);
+  }
+
+  claimWorkerGroupSynthesis(groupId: string): WorkerGroupRecord | undefined {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM worker_groups WHERE id=?").get(groupId) as
+        | Row
+        | undefined;
+      if (!row || row.delivered_at || !["pending", "failed"].includes(String(row.synthesis_status))) {
+        return undefined;
+      }
+      const members = this.workerGroupMembers(groupId);
+      if (
+        members.length < 2 ||
+        members.some((member) => !["completed", "failed", "cancelled"].includes(member.status))
+      ) {
+        return undefined;
+      }
+      const claimed = this.db
+        .prepare(`
+          UPDATE worker_groups SET synthesis_status='running',updated_at=?
+          WHERE id=? AND synthesis_status IN ('pending','failed') AND delivered_at IS NULL
+        `)
+        .run(nowIso(), groupId);
+      if (claimed.changes === 0) return undefined;
+      return { ...rowToWorkerGroup(row), synthesisStatus: "running", members };
+    });
+  }
+
+  listUndeliveredWorkerGroups(): WorkerGroupRecord[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM worker_groups WHERE delivered_at IS NULL ORDER BY created_at")
+        .all() as Row[]
+    ).map((row) => this.readWorkerGroup(row));
+  }
+
+  resetInterruptedWorkerGroupSyntheses(): number {
+    return Number(this.db
+      .prepare(`
+        UPDATE worker_groups SET synthesis_status='failed',updated_at=?
+        WHERE delivered_at IS NULL AND synthesis_status='running'
+      `)
+      .run(nowIso()).changes);
+  }
+
+  failWorkerGroupSynthesis(groupId: string): void {
+    this.db
+      .prepare("UPDATE worker_groups SET synthesis_status='failed',updated_at=? WHERE id=?")
+      .run(nowIso(), groupId);
+  }
+
+  completeWorkerGroup(groupId: string): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        UPDATE worker_groups SET status='completed',synthesis_status='completed',delivered_at=?,updated_at=?
+        WHERE id=?
+      `)
+      .run(now, now, groupId);
+  }
+
+  cancelWorkerGroup(groupId: string): void {
+    const now = nowIso();
+    this.transaction(() => {
+      this.db
+        .prepare(`
+          UPDATE worker_group_members SET status='cancelled',updated_at=?
+          WHERE group_id=? AND status NOT IN ('completed','failed','cancelled')
+        `)
+        .run(now, groupId);
+      this.db
+        .prepare(`
+          UPDATE worker_groups SET status='cancelled',synthesis_status='completed',delivered_at=?,updated_at=?
+          WHERE id=?
+        `)
+        .run(now, now, groupId);
+    });
+  }
+
+  saveThreadHandoff(input: {
+    id: string;
+    packet: ThreadHandoff;
+    targetThreadId?: string;
+    status: string;
+  }): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT OR REPLACE INTO thread_handoffs(
+          id,source_project_id,source_thread_id,target_project_id,target_thread_id,
+          packet_json,status,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+      `)
+      .run(
+        input.id,
+        input.packet.sourceProjectId,
+        input.packet.sourceThreadId,
+        input.packet.targetProjectId,
+        input.targetThreadId ?? null,
+        JSON.stringify(input.packet),
+        input.status,
+        now,
+        now,
+      );
+  }
+
+  saveRoutingClarification(input: {
+    id: string;
+    chatId: number;
+    messageId: number;
+    originalUpdate: unknown;
+    artifactIds: string[];
+    candidateThreadIds: string[];
+  }): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO routing_clarifications(
+          id,telegram_chat_id,telegram_message_id,original_update_json,artifact_ids_json,
+          candidate_thread_ids_json,status,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+      `)
+      .run(
+        input.id,
+        input.chatId,
+        input.messageId,
+        JSON.stringify(input.originalUpdate),
+        JSON.stringify(input.artifactIds),
+        JSON.stringify(input.candidateThreadIds),
+        "pending",
+        now,
+        now,
+      );
+  }
+
+  findPendingRoutingClarificationByMessage(
+    chatId: number,
+    messageId: number,
+  ): PendingRoutingClarification | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM routing_clarifications
+        WHERE telegram_chat_id=? AND telegram_message_id=? AND status='pending'
+        ORDER BY created_at DESC LIMIT 1
+      `)
+      .get(chatId, messageId) as Row | undefined;
+    return row ? rowToRoutingClarification(row) : undefined;
+  }
+
+  updateRoutingClarificationStatus(id: string, status: string): void {
+    this.db
+      .prepare("UPDATE routing_clarifications SET status=?,updated_at=? WHERE id=?")
+      .run(status, nowIso(), id);
+  }
+
+  resetInterruptedRoutingClarifications(): number {
+    return Number(
+      this.db
+        .prepare(`
+          UPDATE routing_clarifications SET status='pending',updated_at=?
+          WHERE status='dispatching'
+        `)
+        .run(nowIso()).changes,
+    );
+  }
+
   appendEvent(
     eventType: string,
     input: { correlationId?: string; projectId?: string; threadId?: string; payload?: unknown } = {},
@@ -669,6 +972,18 @@ export class OperatorStore {
         "INSERT INTO conversation_compactions(id,operator_session_id,reason,summary,created_at) VALUES (?,?,?,?,?)",
       )
       .run(newId("cmp"), sessionId, reason, summary ?? null, nowIso());
+  }
+
+  private readWorkerGroup(row: Row): WorkerGroupRecord {
+    return { ...rowToWorkerGroup(row), members: this.workerGroupMembers(String(row.id)) };
+  }
+
+  private workerGroupMembers(groupId: string): WorkerGroupMemberRecord[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM worker_group_members WHERE group_id=? ORDER BY created_at,thread_id")
+        .all(groupId) as Row[]
+    ).map(rowToWorkerGroupMember);
   }
 }
 
@@ -753,5 +1068,49 @@ function rowToBackgroundJob<T>(row: Row): BackgroundJob<T> {
     attempts: Number(row.attempts),
     ...(row.run_after ? { runAfter: String(row.run_after) } : {}),
     ...(row.last_error ? { lastError: String(row.last_error) } : {}),
+  };
+}
+
+function rowToWorkerGroup(row: Row): Omit<WorkerGroupRecord, "members"> {
+  return {
+    id: String(row.id),
+    title: String(row.title),
+    synthesisGoal: String(row.synthesis_goal),
+    status: String(row.status),
+    synthesisStatus: String(row.synthesis_status),
+    chatId: Number(row.telegram_chat_id),
+    originMessageId: Number(row.origin_message_id),
+    ...(row.message_thread_id !== null && row.message_thread_id !== undefined
+      ? { messageThreadId: Number(row.message_thread_id) }
+      : {}),
+    ...(row.direct_messages_topic_id !== null && row.direct_messages_topic_id !== undefined
+      ? { directMessagesTopicId: Number(row.direct_messages_topic_id) }
+      : {}),
+    createdAt: String(row.created_at),
+    ...(row.delivered_at ? { deliveredAt: String(row.delivered_at) } : {}),
+  };
+}
+
+function rowToWorkerGroupMember(row: Row): WorkerGroupMemberRecord {
+  return {
+    threadId: String(row.thread_id),
+    role: String(row.role),
+    task: String(row.task),
+    status: String(row.status),
+    ...(row.result_json
+      ? { result: JSON.parse(String(row.result_json)) as WorkerResult }
+      : {}),
+  };
+}
+
+function rowToRoutingClarification(row: Row): PendingRoutingClarification {
+  return {
+    id: String(row.id),
+    chatId: Number(row.telegram_chat_id),
+    messageId: Number(row.telegram_message_id),
+    originalUpdate: JSON.parse(String(row.original_update_json)) as unknown,
+    artifactIds: JSON.parse(String(row.artifact_ids_json)) as string[],
+    candidateThreadIds: JSON.parse(String(row.candidate_thread_ids_json)) as string[],
+    status: String(row.status),
   };
 }

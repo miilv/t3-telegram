@@ -144,6 +144,39 @@ export interface WorkerResult {
   needsUserInput?: boolean;
 }
 
+export interface NormalizedMessage {
+  role: string;
+  text: string;
+}
+
+export interface ThreadHandoff {
+  sourceProjectId: string;
+  sourceThreadId: string;
+  targetProjectId: string;
+  taskSummary: string;
+  currentState: string;
+  conclusions: string[];
+  decisions: string[];
+  unresolvedQuestions: string[];
+  importantFiles: ArtifactRef[];
+  changedFiles?: string[];
+  nextActions: string[];
+  sourceTranscriptTail?: NormalizedMessage[];
+}
+
+export interface DelegatedWorkerPlan {
+  title: string;
+  task: string;
+  role: string;
+}
+
+export interface DelegationPlan {
+  mode: "single" | "parallel";
+  workers: DelegatedWorkerPlan[];
+  synthesisGoal: string;
+  rationale: string;
+}
+
 export interface UserInputQuestionOption {
   label: string;
   description: string;

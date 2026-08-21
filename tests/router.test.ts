@@ -1,6 +1,7 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { RoutingEngine, shouldDelegate } from "../packages/router/src/index.js";
+import { extractPaths, isHandoffIntent, RoutingEngine, shouldDelegate } from "../packages/router/src/index.js";
 import { nowIso, type FocusState, type Project } from "../packages/shared/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
 
@@ -95,9 +96,62 @@ describe("RoutingEngine", () => {
     expect(result.confidence).toBeGreaterThan(0.95);
   });
 
+  it("matches a separate checkout by normalized git remote identity", () => {
+    const projectRoot = tempDirectory("acme-project-");
+    const checkoutRoot = tempDirectory("acme-checkout-");
+    for (const root of [projectRoot, checkoutRoot]) {
+      execFileSync("git", ["init", "-q", root]);
+      execFileSync("git", ["-C", root, "remote", "add", "origin", "git@github.com:acme/api.git"]);
+    }
+    const project: Project = {
+      id: "prj_acme",
+      t3ProjectId: "prj_acme",
+      name: "Acme API",
+      workspaceRoot: projectRoot,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    const result = new RoutingEngine().route({
+      text: `inspect ${checkoutRoot}/src/auth.ts`,
+      artifacts: [],
+      focus: emptyFocus,
+      projects: [project],
+    });
+    expect(result.binding).toEqual({ type: "project", projectId: "prj_acme" });
+  });
+
   it("delegates substantial work but not a simple fact", () => {
     expect(shouldDelegate("исправь race condition и прогони тесты", [], { type: "none" })).toBe(true);
     expect(shouldDelegate("столица Франции?", [], { type: "none" })).toBe(false);
+  });
+
+  it("recognizes cross-project handoff intent and quoted paths with spaces", () => {
+    expect(isHandoffIntent("перенеси эту работу в Acme API")).toBe(true);
+    expect(isHandoffIntent("move this work to the API project")).toBe(true);
+    expect(extractPaths('проверь "/tmp/Acme API/src/auth.ts"')).toEqual([
+      "/tmp/Acme API/src/auth.ts",
+    ]);
+  });
+
+  it("prefers an explicit project target over the replied thread binding", () => {
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "target",
+      t3ProjectId: "target",
+      name: "Target Project",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const router = new RoutingEngine();
+    expect(
+      router.route({
+        text: "move this work to Target Project",
+        replyThreadId: "source_thread",
+        artifacts: [],
+        focus: { secondary: [] },
+        projects: [project],
+      }).binding,
+    ).toEqual({ type: "project", projectId: "target" });
   });
 
   it("asks instead of choosing arbitrarily between close thread candidates", () => {

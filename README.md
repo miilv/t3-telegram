@@ -17,9 +17,10 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
   - server-advertised provider/model/reasoning catalog with per-turn switching;
   - explicit snapshot-polling compatibility mode for legacy/test servers.
 - SQLite/WAL source of truth for projects, threads, FTS search, focus, Telegram mappings, artifacts, approvals, structured input, background jobs, events, runtime state, and compactions.
-- Routing cascade for explicit project names, Telegram replies, artifact provenance, filesystem paths, active focus, lexical thread summaries, and confidence policy.
+- Routing cascade for explicit project names, Telegram replies, artifact provenance, quoted/relative/absolute filesystem paths, git roots/remotes, active focus, lexical thread summaries, status/recency, and confidence policy. A limited two-thread shortlist is arbitrated by Operator; material ambiguity becomes a durable clarification instead of a guessed mutation.
 - Focus survives unrelated factual questions.
-- Multiple T3 workers can run concurrently while Operator messages remain queued and responsive.
+- Cross-project work moves through a structured handoff packet into a new target-project T3 thread; registered source artifacts are safely copied into the target workspace.
+- Broad tasks can fan out to 2–4 independent T3 workers. Their structured results are persisted and reconciled into one Operator synthesis; `/status` and `/stop` treat the fan-out as one group.
 - Inbound Telegram documents/photos are hashed, stored with safe names, and materialized into the selected project.
 - Requested outbound worker documents/photos are resolved from T3 checkpoints, path-validated, and sent through Telegram.
 - Native rich draft/final methods are capability-detected, with HTML/edit/plain fallbacks, semantic message splitting, retry, and flood-control backoff.
@@ -27,7 +28,7 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 - Sequential structured T3 questions in Telegram, including single-select, multi-select, and custom text answers.
 - Provider-aware follow-ups: immediate live steering when supported, otherwise a durable queue dispatched after the current turn.
 - `/status`, `/projects`, `/work`, `/stop`, `/debug`.
-- Restart recovery for running workers and completions that arrived while the daemon was down.
+- Restart recovery for running workers, pending routing clarifications, interrupted group synthesis, and completions that arrived while the daemon was down.
 - Secret-redacted structured logs and worker/Operator capability isolation.
 
 ## Requirements
@@ -131,7 +132,7 @@ pnpm test
 pnpm build
 ```
 
-Tests cover routing/focus/path selection, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
+Tests cover routing/focus/path and git-aware selection, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
 
 ## Full-spec implementation status
 
