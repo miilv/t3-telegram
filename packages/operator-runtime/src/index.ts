@@ -16,6 +16,8 @@ export interface ClaudeCliRuntimeOptions {
   effort: "low" | "medium" | "high" | "xhigh" | "max";
   /** Absolute wall-clock cap per turn; a hung CLI must not stall daemon queues. */
   turnTimeoutMs?: number;
+  /** Owner opt-in: unrestricted built-in tools (Bash/Read/Write) on the host. */
+  fullAccess?: boolean;
 }
 
 export interface CodexCliRuntimeOptions {
@@ -360,8 +362,9 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       this.options.model,
       "--effort",
       this.options.effort,
-      "--permission-mode",
-      "dontAsk",
+      ...(this.options.fullAccess
+        ? ["--permission-mode", "bypassPermissions", "--allow-dangerously-skip-permissions"]
+        : ["--permission-mode", "dontAsk"]),
       // Prevent ambient user/project settings and slash-command skills from
       // acquiring privileges. Unlike --safe-mode, this still permits the one
       // explicit process-scoped MCP server supplied below.
@@ -369,7 +372,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       "",
       ...(input.allowBuiltInSlashCommands ? [] : ["--disable-slash-commands"]),
       "--tools",
-      "WebSearch,WebFetch",
+      this.options.fullAccess ? "default" : "WebSearch,WebFetch",
       "--strict-mcp-config",
       ...mcpArgs,
       ...(isNew

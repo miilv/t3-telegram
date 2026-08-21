@@ -28,6 +28,7 @@ async function main(): Promise<void> {
     model: config.operator.model,
     effort: config.operator.effort,
     turnTimeoutMs: config.operator.turnTimeoutMs,
+    fullAccess: config.operator.fullAccess,
   });
   const providers: Record<string, OperatorRuntime> = { claude: claudeRuntime };
   if (config.operator.codex) {

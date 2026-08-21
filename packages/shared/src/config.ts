@@ -18,6 +18,9 @@ const envSchema = z.object({
   OPERATOR_PROVIDER: z.enum(["claude", "codex"]).default("claude"),
   OPERATOR_MODEL: z.string().min(1).default("opus"),
   OPERATOR_EFFORT: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high"),
+  // Full host access for the Operator CLI (Bash/Read/Write, no permission
+  // prompts). Conscious opt-in: inbound content injection then reaches a shell.
+  OPERATOR_FULL_ACCESS: z.enum(["true", "false"]).default("false"),
   OPERATOR_CODEX_ENABLED: z.enum(["true", "false"]).default("false"),
   CODEX_BIN: z.string().min(1).default("codex"),
   CODEX_MODEL: z.string().min(1).default("gpt-5.4"),
@@ -147,6 +150,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       claudeBin: parsed.CLAUDE_BIN,
       model: parsed.OPERATOR_MODEL,
       effort: parsed.OPERATOR_EFFORT,
+      fullAccess: parsed.OPERATOR_FULL_ACCESS === "true",
       compactThresholdPercent: parsed.OPERATOR_COMPACT_THRESHOLD_PERCENT,
       turnTimeoutMs: parsed.OPERATOR_TURN_TIMEOUT_MS,
       home: operatorHome,

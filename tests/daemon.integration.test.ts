@@ -1809,6 +1809,7 @@ function config(home: string): Config {
       effort: "high",
       compactThresholdPercent: 80,
       turnTimeoutMs: 600_000,
+      fullAccess: false,
       home,
       runtimeDir: `${home}/runtime`,
       artifactDir: `${home}/artifacts`,
