@@ -1335,6 +1335,57 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("does not silently delegate small talk into a single lexical thread match", async () => {
+    const home = tempDirectory("daemon-route-single-lexical-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_checks",
+      t3ProjectId: "prj_checks",
+      name: "Checks",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const thread: WorkThread = {
+      id: "th_ipcheck",
+      t3ThreadId: "th_ipcheck",
+      projectId: project.id,
+      provider: "claude",
+      model: "opus",
+      title: "Проверка IP и пользователя",
+      shortSummary: "Проверка сервера",
+      keywords: ["проверка"],
+      status: "completed",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    broker.projects.push(project);
+    broker.threads.push(thread);
+    store.upsertProject(project);
+    store.upsertThread(thread);
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "Привет! Проверка после фиксов. Ответь одной короткой фразой."));
+    await waitFor(() => telegram.sent.length > 0 || telegram.visible.length > 0);
+    expect(broker.turns).toHaveLength(0);
+    expect(telegram.choicePrompts).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("resolves a routing clarification from an inline button press", async () => {
     const home = tempDirectory("daemon-route-button-");
     const store = tempStore();

@@ -634,20 +634,32 @@ export class OperatorDaemon {
       projects,
       threadCandidates: candidates,
     });
-    if (route.shouldAsk && route.binding.type === "multi_thread" && !route.binding.primaryThreadId) {
-      // Small talk and standalone questions must never reach a clarification
-      // prompt: if nothing about the message reads as delegable work, drop the
-      // speculative candidate binding and answer directly.
-      if (!shouldDelegate(update.text, enrichedArtifacts, { type: "none" })) {
-        route = {
-          binding: { type: "none" },
-          confidence: 0.6,
-          reasons: [...route.reasons, "not delegable work; direct answer"],
-          shouldAsk: false,
-        };
-      } else {
-        route = await this.arbitrateRouting(update.text, route);
-      }
+    // Bindings sourced only from lexical thread search are speculative. If the
+    // message itself does not read as delegable work, they must not trigger a
+    // clarification prompt (multi_thread) or a silent delegation into an old
+    // thread (single lexical match) — answer directly instead.
+    const lexicalOnlyBinding =
+      (route.binding.type === "thread" || route.binding.type === "multi_thread") &&
+      route.reasons.every(
+        (reason) =>
+          reason.startsWith("lexical thread summary match") ||
+          reason === "two materially similar thread candidates" ||
+          reason === "active worker status" ||
+          reason === "recent thread activity",
+      );
+    if (lexicalOnlyBinding && !shouldDelegate(update.text, enrichedArtifacts, { type: "none" })) {
+      route = {
+        binding: { type: "none" },
+        confidence: 0.6,
+        reasons: [...route.reasons, "not delegable work; direct answer"],
+        shouldAsk: false,
+      };
+    } else if (
+      route.shouldAsk &&
+      route.binding.type === "multi_thread" &&
+      !route.binding.primaryThreadId
+    ) {
+      route = await this.arbitrateRouting(update.text, route);
     }
     this.store.appendEvent("routing.selected", {
       correlationId: correlationForUpdate(update),
