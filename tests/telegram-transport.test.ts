@@ -1,6 +1,7 @@
 import pino from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  mergeForwardedBatch,
   mergeTelegramAlbum,
   normalizeTelegramUpdate,
   TelegramBotTransport,
@@ -396,3 +397,55 @@ function telegramResponse(body: unknown, status = 200): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+describe("forwarded batch merging", () => {
+  const base = {
+    type: "message" as const,
+    chatId: 7,
+    userId: 42,
+    date: 1,
+    text: "",
+    attachments: [],
+    messageIds: [] as number[],
+    edited: false,
+    chatType: "private" as const,
+  };
+  it("merges a burst of forwarded messages into one attributed update", () => {
+    const merged = mergeForwardedBatch([
+      {
+        ...base,
+        updateId: 2,
+        messageId: 12,
+        messageIds: [12],
+        text: "второе сообщение",
+        forwardOrigin: { type: "hidden_user", displayName: "Anon", date: 1 },
+      },
+      {
+        ...base,
+        updateId: 1,
+        messageId: 11,
+        messageIds: [11],
+        text: "первое сообщение",
+        forwardOrigin: { type: "user", userId: 5, username: "ivan", displayName: "Ivan Petrov", date: 1 },
+      },
+      {
+        ...base,
+        updateId: 3,
+        messageId: 13,
+        messageIds: [13],
+        text: "",
+        attachments: [{ type: "photo", fileId: "f1" }],
+        forwardOrigin: { type: "channel", chatId: -100, title: "Новости", messageId: 9, date: 1 },
+      },
+    ]);
+    expect(merged.messageIds).toEqual([11, 12, 13]);
+    expect(merged.messageId).toBe(13);
+    expect(merged.updateId).toBe(3);
+    expect(merged.text).toContain("[Переслано от Ivan Petrov (@ivan)]\nпервое сообщение");
+    expect(merged.text).toContain("[Переслано от Anon]\nвторое сообщение");
+    expect(merged.text).toContain("[Переслано от Новости]");
+    expect(merged.text.indexOf("первое")).toBeLessThan(merged.text.indexOf("второе"));
+    expect(merged.attachments).toHaveLength(1);
+  });
+});
+

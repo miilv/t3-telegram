@@ -35,6 +35,7 @@ const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
 const CAPTION_LIMIT = 1024;
 const ALBUM_WINDOW_MS = 650;
+const FORWARD_BATCH_WINDOW_MS = 1_200;
 const MAX_FLOOD_WAIT_SECONDS = 30;
 const MAX_SAFE_ATTEMPTS = 3;
 const PHOTO_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -152,6 +153,7 @@ export class TelegramBotTransport implements TelegramTransport {
   private readonly inbound = new AsyncInputQueue<TelegramInbound>();
   private readonly outboundQueue = new TelegramOutboundQueue();
   private readonly albums = new Map<string, AlbumBuffer>();
+  private readonly forwardBatches = new Map<string, AlbumBuffer>();
   private polling = false;
   private nextDraftId = Math.max(1, Date.now() % 2_000_000_000);
   private richDraftAvailable: boolean | undefined;
@@ -592,6 +594,24 @@ export class TelegramBotTransport implements TelegramTransport {
   private acceptUpdate(update: RawUpdate): void {
     const normalized = normalizeTelegramUpdate(update, this.accessPolicy);
     if (!normalized) return;
+    if (normalized.type === "message" && !normalized.mediaGroupId && normalized.forwardOrigin) {
+      // Forwarding several messages delivers a burst of independent updates.
+      // Buffer them per chat within a quiet window so the batch is routed and
+      // answered as one unit instead of N separate conversations.
+      const batchKey = `${normalized.chatId}:${normalized.userId}`;
+      const batch = this.forwardBatches.get(batchKey);
+      if (batch) {
+        clearTimeout(batch.timer);
+        batch.messages.push(normalized);
+        batch.timer = setTimeout(() => this.flushForwardBatch(batchKey), FORWARD_BATCH_WINDOW_MS);
+        return;
+      }
+      this.forwardBatches.set(batchKey, {
+        messages: [normalized],
+        timer: setTimeout(() => this.flushForwardBatch(batchKey), FORWARD_BATCH_WINDOW_MS),
+      });
+      return;
+    }
     if (normalized.type !== "message" || !normalized.mediaGroupId) {
       this.inbound.push(normalized);
       return;
@@ -608,6 +628,15 @@ export class TelegramBotTransport implements TelegramTransport {
       messages: [normalized],
       timer: setTimeout(() => this.flushAlbum(key), ALBUM_WINDOW_MS),
     });
+  }
+
+  private flushForwardBatch(key: string): void {
+    const batch = this.forwardBatches.get(key);
+    if (!batch) return;
+    this.forwardBatches.delete(key);
+    this.inbound.push(
+      batch.messages.length === 1 ? batch.messages[0]! : mergeForwardedBatch(batch.messages),
+    );
   }
 
   private flushAlbum(key: string): void {
@@ -882,6 +911,45 @@ function authorized(
   if (typeof access === "number") return userId === access && chatType === "private";
   if (!access.users[userId]) return false;
   return chatType === "private" || (access.allowGroups && (chatType === "group" || chatType === "supergroup"));
+}
+
+export function mergeForwardedBatch(messages: TelegramMessageInbound[]): TelegramMessageInbound {
+  if (!messages.length) throw new Error("Cannot merge an empty forwarded batch");
+  const ordered = [...messages].sort((left, right) => left.messageId - right.messageId);
+  const first = ordered[0]!;
+  const last = ordered.at(-1)!;
+  const blocks = ordered.map((message) => {
+    const origin = describeForwardOrigin(message.forwardOrigin);
+    const parts = [
+      origin ? `[Переслано от ${origin}]` : "[Переслано]",
+      message.text.trim(),
+      ...(message.attachments.length
+        ? [`(вложений: ${message.attachments.length})`]
+        : []),
+    ].filter(Boolean);
+    return parts.join("\n");
+  });
+  return {
+    ...first,
+    updateId: Math.max(...ordered.map((message) => message.updateId)),
+    messageId: last.messageId,
+    messageIds: ordered.map((message) => message.messageId),
+    text: blocks.join("\n\n"),
+    attachments: ordered.flatMap((message) => message.attachments),
+  };
+}
+
+function describeForwardOrigin(origin?: TelegramForwardOrigin): string | undefined {
+  if (!origin) return undefined;
+  switch (origin.type) {
+    case "user":
+      return origin.username ? `${origin.displayName} (@${origin.username})` : origin.displayName;
+    case "hidden_user":
+      return origin.displayName;
+    case "chat":
+    case "channel":
+      return origin.username ? `${origin.title} (@${origin.username})` : origin.title;
+  }
 }
 
 export function mergeTelegramAlbum(messages: TelegramMessageInbound[]): TelegramMessageInbound {

@@ -40,6 +40,15 @@ const envSchema = z.object({
   FFPROBE_BIN: z.string().min(1).default("ffprobe"),
   MEDIA_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(180_000).default(45_000),
   MEDIA_MAX_INPUT_BYTES: z.coerce.number().int().min(1_024).max(50 * 1024 * 1024).default(20 * 1024 * 1024),
+  OPENROUTER_API_KEY: z.string().min(1).optional(),
+  OPENROUTER_TRANSCRIPTION_MODEL: z.string().min(1).default("openai/whisper-large-v3-turbo"),
+  OCR_ENABLED: z.enum(["true", "false"]).default("true"),
+  TESSERACT_BIN: z.string().min(1).default("tesseract"),
+  PDFTOTEXT_BIN: z.string().min(1).default("pdftotext"),
+  PDFTOPPM_BIN: z.string().min(1).default("pdftoppm"),
+  OCR_LANGS: z.string().min(1).default("rus+eng"),
+  OCR_MAX_PDF_PAGES: z.coerce.number().int().min(1).max(50).default(8),
+  OCR_VISION_MODEL: z.string().min(1).default("google/gemini-2.5-flash-lite"),
   OPENAI_API_KEY: z.string().min(1).optional(),
   OPENAI_TRANSCRIPTION_MODEL: z.string().min(1).default("gpt-4o-mini-transcribe"),
   GROQ_API_KEY: z.string().min(1).optional(),
@@ -159,6 +168,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       ffprobeBin: parsed.FFPROBE_BIN,
       timeoutMs: parsed.MEDIA_TIMEOUT_MS,
       maxInputBytes: parsed.MEDIA_MAX_INPUT_BYTES,
+      openrouter: parsed.OPENROUTER_API_KEY
+        ? { apiKey: parsed.OPENROUTER_API_KEY, model: parsed.OPENROUTER_TRANSCRIPTION_MODEL }
+        : undefined,
+      ocr: {
+        enabled: parsed.OCR_ENABLED === "true",
+        tesseractBin: parsed.TESSERACT_BIN,
+        pdftotextBin: parsed.PDFTOTEXT_BIN,
+        pdftoppmBin: parsed.PDFTOPPM_BIN,
+        langs: parsed.OCR_LANGS,
+        maxPdfPages: parsed.OCR_MAX_PDF_PAGES,
+        ...(parsed.OPENROUTER_API_KEY
+          ? { vision: { apiKey: parsed.OPENROUTER_API_KEY, model: parsed.OCR_VISION_MODEL } }
+          : {}),
+      },
       openai: parsed.OPENAI_API_KEY
         ? { apiKey: parsed.OPENAI_API_KEY, model: parsed.OPENAI_TRANSCRIPTION_MODEL }
         : undefined,

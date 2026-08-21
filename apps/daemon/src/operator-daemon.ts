@@ -541,10 +541,35 @@ export class OperatorDaemon {
     if (this.media) {
       for (const [index, attachment] of update.attachments.entries()) {
         const original = ingested[index];
-        if (!original || !["voice", "audio", "video_note"].includes(attachment.type)) continue;
+        if (!original) continue;
+        if (["photo", "document"].includes(attachment.type)) {
+          const mime = original.mimeType ?? "";
+          if (mime.startsWith("image/") || mime === "application/pdf") {
+            const ocr = await this.media.ocrInbound(original);
+            if (ocr.artifact) enrichedArtifacts.push(ocr.artifact);
+            if (ocr.text) {
+              mediaContext.push(
+                `[OCR of ${original.filename ?? original.id} via ${ocr.provider}; full text saved as artifact ${ocr.artifact?.id}]\n${ocr.text.slice(0, 4_000)}`,
+              );
+            } else if (ocr.unavailable && ocr.unavailable !== "unsupported media type for OCR") {
+              mediaContext.push(
+                `[OCR unavailable for ${original.filename ?? original.id}; reason: ${ocr.unavailable}]`,
+              );
+            }
+          }
+          continue;
+        }
+        if (!["voice", "audio", "video_note", "video"].includes(attachment.type)) continue;
         const enrichment = await this.media.enrichInbound(attachment, original);
         enrichedArtifacts.push(...enrichment.artifacts);
-        const label = attachment.type === "video_note" ? "Video-note" : attachment.type === "voice" ? "Voice" : "Audio";
+        const label =
+          attachment.type === "video_note"
+            ? "Video-note"
+            : attachment.type === "video"
+              ? "Video"
+              : attachment.type === "voice"
+                ? "Voice"
+                : "Audio";
         if (enrichment.transcript) {
           mediaContext.push(
             `[${label} transcript; original artifact ${original.id}]\n${enrichment.transcript}`,

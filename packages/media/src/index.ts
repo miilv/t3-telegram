@@ -18,12 +18,29 @@ export interface MediaProcessorConfig {
   ffprobeBin: string;
   timeoutMs: number;
   maxInputBytes: number;
+  openrouter?: { apiKey: string; model: string } | undefined;
+  ocr?: {
+    enabled: boolean;
+    tesseractBin: string;
+    pdftotextBin: string;
+    pdftoppmBin: string;
+    langs: string;
+    maxPdfPages: number;
+    vision?: { apiKey: string; model: string } | undefined;
+  } | undefined;
   openai?: { apiKey: string; model: string } | undefined;
   groq?: { apiKey: string; model: string } | undefined;
   deepgram?: { apiKey: string; model: string } | undefined;
   whisper?: { binary: string; model?: string | undefined } | undefined;
   elevenlabs?: { apiKey: string; voiceId: string; model: string } | undefined;
   sayBin?: string | undefined;
+}
+
+export interface OcrResult {
+  text?: string;
+  artifact?: Artifact;
+  provider?: string;
+  unavailable?: string;
 }
 
 export interface InboundMediaEnrichment {
@@ -72,7 +89,12 @@ export class MediaProcessor {
     attachment: TelegramAttachment,
     original: Artifact,
   ): Promise<InboundMediaEnrichment> {
-    if (attachment.type !== "voice" && attachment.type !== "audio" && attachment.type !== "video_note") {
+    if (
+      attachment.type !== "voice" &&
+      attachment.type !== "audio" &&
+      attachment.type !== "video_note" &&
+      attachment.type !== "video"
+    ) {
       return { artifacts: [] };
     }
     const startedAt = Date.now();
@@ -87,7 +109,7 @@ export class MediaProcessor {
           transcriptionUnavailable: `media exceeds the configured ${this.config.maxInputBytes} byte transcription limit`,
         };
       }
-      if (attachment.type === "video_note") {
+      if (attachment.type === "video_note" || attachment.type === "video") {
         temporaryDirectory = await mkdtemp(join(tmpdir(), "t3-media-in-"));
         const extractedPath = join(temporaryDirectory, "video-note-audio.ogg");
         try {
@@ -367,11 +389,213 @@ export class MediaProcessor {
     return frames;
   }
 
+  /**
+   * Extract text from an inbound image or PDF and persist it as a Markdown
+   * sidecar artifact derived from the original. Local binaries (tesseract,
+   * poppler) are preferred; an OpenRouter vision model is the image fallback.
+   */
+  async ocrInbound(original: Artifact): Promise<OcrResult> {
+    const ocr = this.config.ocr;
+    if (!ocr?.enabled) return { unavailable: "OCR is disabled" };
+    const mime = original.mimeType ?? "";
+    const isImage = mime.startsWith("image/");
+    const isPdf = mime === "application/pdf" || (original.filename ?? original.localPath).toLowerCase().endsWith(".pdf");
+    if (!isImage && !isPdf) return { unavailable: "unsupported media type for OCR" };
+    if (original.sizeBytes > this.config.maxInputBytes) {
+      return { unavailable: `file exceeds the ${this.config.maxInputBytes} byte OCR limit` };
+    }
+    const startedAt = Date.now();
+    const deadline = startedAt + this.config.timeoutMs;
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "t3-ocr-"));
+    try {
+      let text: string | undefined;
+      let provider: string | undefined;
+      if (isPdf) {
+        const extracted = await this.pdfTextLayer(original, temporaryDirectory, deadline);
+        if (extracted !== undefined && extracted.trim().length >= 32) {
+          text = extracted;
+          provider = "pdftotext";
+        } else if (await this.binaryAvailable(ocr.pdftoppmBin) && (await this.binaryAvailable(ocr.tesseractBin))) {
+          text = await this.pdfRasterOcr(original, temporaryDirectory, deadline);
+          provider = "pdftoppm+tesseract";
+        } else if (extracted !== undefined) {
+          text = extracted;
+          provider = "pdftotext";
+        }
+      } else if (await this.binaryAvailable(ocr.tesseractBin)) {
+        const result = await runCommand(
+          ocr.tesseractBin,
+          [original.localPath, "stdout", "-l", ocr.langs],
+          remaining(deadline),
+        );
+        text = result.stdout;
+        provider = "tesseract";
+      } else if (ocr.vision) {
+        text = await this.visionOcr(original, ocr.vision, deadline);
+        provider = `vision:${ocr.vision.model}`;
+      }
+      const cleaned = text?.replace(/\r/g, "").replace(/[ \t]+$/gm, "").replace(/\n{4,}/g, "\n\n\n").trim();
+      if (!cleaned) {
+        this.store.appendEvent("media.ocr.unavailable", {
+          payload: { artifactId: original.id, durationMs: Date.now() - startedAt },
+        });
+        return { unavailable: provider ? "no recognizable text found" : "no OCR backend available" };
+      }
+      const bounded = cleaned.slice(0, MAX_TRANSCRIPT_CHARS);
+      const sourceName = original.filename ?? basename(original.localPath);
+      const markdown = [
+        `# OCR: ${sourceName}`,
+        "",
+        `> Source artifact: ${original.id} · engine: ${provider} · extracted ${new Date().toISOString()}`,
+        "",
+        bounded,
+        "",
+      ].join("\n");
+      const sidecarPath = join(temporaryDirectory, `${stem(sourceName)}.ocr.md`);
+      await writeFile(sidecarPath, markdown, "utf8");
+      const artifact = await this.artifacts.ingestDerivedFile({
+        path: sidecarPath,
+        filename: `${stem(sourceName)}.ocr.md`,
+        mimeType: "text/markdown",
+        derivedFromArtifactId: original.id,
+      });
+      this.store.appendEvent("media.ocr.completed", {
+        payload: {
+          artifactId: original.id,
+          sidecarArtifactId: artifact.id,
+          provider,
+          chars: bounded.length,
+          durationMs: Date.now() - startedAt,
+        },
+      });
+      return { text: bounded, artifact, ...(provider ? { provider } : {}) };
+    } catch (error) {
+      this.logger.warn({ artifactId: original.id, error: safeError(error) }, "OCR failed");
+      this.store.appendEvent("media.ocr.unavailable", {
+        payload: { artifactId: original.id, durationMs: Date.now() - startedAt },
+      });
+      return { unavailable: "OCR backend failed" };
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  private async pdfTextLayer(
+    original: Artifact,
+    directory: string,
+    deadline: number,
+  ): Promise<string | undefined> {
+    if (!(await this.binaryAvailable(this.config.ocr!.pdftotextBin))) return undefined;
+    const output = join(directory, "layer.txt");
+    try {
+      await runCommand(
+        this.config.ocr!.pdftotextBin,
+        ["-layout", "-l", String(this.config.ocr!.maxPdfPages), original.localPath, output],
+        remaining(deadline),
+      );
+    } catch {
+      return undefined;
+    }
+    return readFile(output, "utf8").catch(() => undefined);
+  }
+
+  private async pdfRasterOcr(original: Artifact, directory: string, deadline: number): Promise<string> {
+    const ocr = this.config.ocr!;
+    const prefix = join(directory, "page");
+    await runCommand(
+      ocr.pdftoppmBin,
+      ["-r", "200", "-l", String(ocr.maxPdfPages), "-png", original.localPath, prefix],
+      remaining(deadline),
+    );
+    const { readdir } = await import("node:fs/promises");
+    const pages = (await readdir(directory)).filter((name) => name.startsWith("page") && name.endsWith(".png")).sort();
+    const parts: string[] = [];
+    for (const page of pages) {
+      try {
+        const result = await runCommand(
+          ocr.tesseractBin,
+          [join(directory, page), "stdout", "-l", ocr.langs],
+          remaining(deadline),
+        );
+        if (result.stdout.trim()) parts.push(result.stdout.trim());
+      } catch {
+        // A single unreadable page must not sink the whole document.
+      }
+    }
+    return parts.join("\n\n---\n\n");
+  }
+
+  private async visionOcr(
+    original: Artifact,
+    vision: { apiKey: string; model: string },
+    deadline: number,
+  ): Promise<string> {
+    const bytes = await readFile(original.localPath);
+    if (bytes.byteLength > 8 * 1024 * 1024) throw new Error("image too large for vision OCR");
+    const dataUrl = `data:${original.mimeType ?? "image/jpeg"};base64,${Buffer.from(bytes).toString("base64")}`;
+    const response = await this.fetchImpl("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${vision.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: vision.model,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Perform OCR on this image. Return ONLY the extracted text as Markdown, preserving layout (headings, lists, tables) where evident. If the image contains no text, return an empty response.",
+              },
+              { type: "image_url", image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(remaining(deadline)),
+    });
+    if (!response.ok) throw httpFailure("vision OCR", response.status);
+    const payload = await readBoundedJson(response) as {
+      choices?: Array<{ message?: { content?: unknown } }>;
+    };
+    const content = payload.choices?.[0]?.message?.content;
+    if (typeof content !== "string") throw new Error("vision OCR response omitted content");
+    return content;
+  }
+
+  private readonly binaryCache = new Map<string, boolean>();
+
+  private async binaryAvailable(binary: string): Promise<boolean> {
+    const cached = this.binaryCache.get(binary);
+    if (cached !== undefined) return cached;
+    const available = await new Promise<boolean>((resolvePromise) => {
+      const probe = spawn(binary, ["--version"], { stdio: ["ignore", "ignore", "ignore"] });
+      probe.once("error", () => resolvePromise(false));
+      probe.once("exit", (code) => resolvePromise(code === 0 || code === 1));
+    });
+    this.binaryCache.set(binary, available);
+    return available;
+  }
+
   private async transcribe(
     artifact: Artifact,
     deadline: number,
   ): Promise<{ text: string; provider: string }> {
     const providers: Array<{ name: string; call: () => Promise<string> }> = [];
+    if (this.config.openrouter) {
+      providers.push({
+        name: "openrouter",
+        call: () => this.openAiCompatibleTranscription(
+          "https://openrouter.ai/api/v1/audio/transcriptions",
+          this.config.openrouter!.apiKey,
+          this.config.openrouter!.model,
+          artifact,
+          deadline,
+        ),
+      });
+    }
     if (this.config.openai) {
       providers.push({
         name: "openai",

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
@@ -216,7 +216,98 @@ describe("MediaProcessor", () => {
       store.close();
     },
   );
+
+  it("prefers OpenRouter when configured and falls through the provider chain", async () => {
+    const home = tempDirectory("media-openrouter-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const source = `${home}/voice.ogg`;
+    if (hasFfmpeg) generateVoice(source);
+    else writeFileSync(source, "fake-audio");
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(source),
+      filename: "voice.ogg",
+      mimeType: "audio/ogg",
+      telegramFileId: "voice_file",
+      chatId: 7,
+      messageId: 10,
+    });
+    const endpoints: string[] = [];
+    const processor = new MediaProcessor(
+      mediaConfig({
+        openrouter: { apiKey: "or-key", model: "openai/whisper-large-v3-turbo" },
+        openai: { apiKey: "oa-key", model: "gpt-4o-mini-transcribe" },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+      async (url, init) => {
+        endpoints.push(String(url));
+        if (endpoints.length === 1) {
+          expect(String(url)).toBe("https://openrouter.ai/api/v1/audio/transcriptions");
+          expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer or-key");
+          expect((init?.body as FormData).get("model")).toBe("openai/whisper-large-v3-turbo");
+          return new Response(JSON.stringify({ text: "привет из openrouter" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        throw new Error("no further providers should be tried");
+      },
+    );
+    const result = await processor.enrichInbound(voiceAttachment(), original);
+    expect(result.transcript).toBe("привет из openrouter");
+    expect(result.transcriptionProvider).toBe("openrouter");
+    store.close();
+  });
+
+  it("produces a Markdown OCR sidecar artifact for an inbound image", async () => {
+    const home = tempDirectory("media-ocr-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    // A fake tesseract keeps this test hermetic while exercising the real
+    // binary-detection, sidecar and derived-artifact paths.
+    const fakeBin = `${home}/tesseract`;
+    writeFileSync(fakeBin, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo tesseract 5; exit 0; fi\necho 'Distilled OCR text 42'\n");
+    chmodSync(fakeBin, 0o755);
+    const image = `${home}/scan.png`;
+    writeFileSync(image, "png-bytes");
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(image),
+      filename: "scan.png",
+      mimeType: "image/png",
+      telegramFileId: "photo_file",
+      chatId: 7,
+      messageId: 11,
+    });
+    const processor = new MediaProcessor(
+      mediaConfig({
+        ocr: {
+          enabled: true,
+          tesseractBin: fakeBin,
+          pdftotextBin: "pdftotext-missing",
+          pdftoppmBin: "pdftoppm-missing",
+          langs: "rus+eng",
+          maxPdfPages: 8,
+        },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+    );
+    const result = await processor.ocrInbound(original);
+    expect(result.text).toContain("Distilled OCR text 42");
+    expect(result.provider).toBe("tesseract");
+    expect(result.artifact?.filename).toBe("scan.ocr.md");
+    expect(result.artifact?.mimeType).toBe("text/markdown");
+    const sidecar = readFileSync(result.artifact!.localPath, "utf8");
+    expect(sidecar).toContain("# OCR: scan.png");
+    expect(sidecar).toContain("Distilled OCR text 42");
+    expect(artifacts.resolve(result.artifact!.id).derivedFromArtifactId).toBe(original.id);
+    store.close();
+  });
 });
+
 
 function mediaConfig(overrides: Partial<MediaProcessorConfig> = {}): MediaProcessorConfig {
   return {
