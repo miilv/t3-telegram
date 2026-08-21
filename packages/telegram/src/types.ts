@@ -76,6 +76,13 @@ export interface TelegramMessageInbound extends TelegramDestination {
   reply?: TelegramReplyContext;
   mediaGroupId?: string;
   forwardOrigin?: TelegramForwardOrigin;
+  /**
+   * The owner's own words in this envelope, excluding forwarded material.
+   * Routing and delegation decisions must read this, never the quoted bulk.
+   */
+  ownText?: string;
+  /** How many forwarded messages this envelope carries. */
+  forwardedCount?: number;
   text: string;
   attachments: TelegramAttachment[];
   /** Daemon-created proactive ingress; never passed through Telegram normalization. */
