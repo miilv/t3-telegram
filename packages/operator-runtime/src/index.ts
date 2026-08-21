@@ -617,7 +617,7 @@ function numeric(value: unknown): number {
 function sanitizedEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // Cap individual Bash tool commands: one runaway scan must not consume the
   // whole turn budget (the per-turn watchdog is the outer bound).
-  env = { ...env, BASH_DEFAULT_TIMEOUT_MS: env.BASH_DEFAULT_TIMEOUT_MS ?? "90000", BASH_MAX_TIMEOUT_MS: env.BASH_MAX_TIMEOUT_MS ?? "300000" };
+  env = { ...env, BASH_DEFAULT_TIMEOUT_MS: env.BASH_DEFAULT_TIMEOUT_MS ?? "300000", BASH_MAX_TIMEOUT_MS: env.BASH_MAX_TIMEOUT_MS ?? "300000" };
   const blocked = /^(TELEGRAM_BOT_TOKEN|T3_BEARER_TOKEN|OPENAI_API_KEY|GROQ_API_KEY|DEEPGRAM_API_KEY|ELEVENLABS_API_KEY|GOOGLE_WORKSPACE_ACCESS_TOKEN|T3_OPERATOR_MCP_CAPABILITY)$/;
   return Object.fromEntries(Object.entries(env).filter(([key]) => !blocked.test(key)));
 }
