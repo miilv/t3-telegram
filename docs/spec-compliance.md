@@ -66,15 +66,15 @@ branch, not an aspiration.
 | 46 | Complete Telegram-to-Operator input envelope including topic/reply/forward/media/reaction metadata. | PARTIAL |
 | 47–48 | All named T3, Telegram, memory, artifact and time/web tools are Zod-validated, audited and bounded to compact JSON; thread reads exclude raw transcripts. MCP discovery/call tests cover the complete list and representative mutation/security paths. | PROVED |
 | 49–50 | Required durable schema and append-only event log with correlation/idempotency fields. | PARTIAL |
-| 51–52 | Crash recovery and transactional/exactly-once effects across Telegram/T3 boundaries. | PARTIAL |
-| 53–55 | Separate ingress/operator/worker/outbound queues, bounded concurrency and interrupt policy. | PARTIAL |
+| 51–52 | Startup restores SQLite/session/subscriptions/interactions/jobs; inbound events and terminal effects have durable dedupe state. T3 retries reuse a transactionally deduplicated command ID; Telegram terminal replay edits the same anchor and advances completion only after delivery. Interrupted non-idempotent sends are quarantined. Storage and daemon crash/restart tests cover each boundary. | PROVED |
+| 53–55 | Short serialized ingress dispatch, one serialized Operator-input/runtime path, an 8-wide worker-event queue, per-chat/global Telegram delivery queues and serialized maintenance are independent. Approval callbacks proceed during a blocked Operator turn, later messages enqueue, and explicit cancel interrupts immediately. | PROVED |
 | 56–59 | Correct draft strategy, UTF-8/UTF-16 limits, flood control and per-capability/per-message fallback. | PARTIAL |
 | 60 | Operator-only time, web search/retrieval (MCP plus built-in WebSearch/WebFetch), calculator, safe file metadata and memory search are process-scoped and protocol-tested. | PROVED |
 | 61–64 | Coalescing minute scheduler, daily durable compaction gate, T3 reconciliation, note/artifact cleanup, structured thread summaries and post-compact state restoration. Long-term automation and context-size trigger remain. | PARTIAL |
 | 65–69 | `/status`, `/projects`, `/work`, `/focus`, `/stop`/`/cancel`, `/memory`, `/help` and redacted admin diagnostics exist; full debug metrics/capability detail remains. | PARTIAL |
 | 70–71 | Single-user authorization at every ingress/action and secrets never logged/persisted in plaintext artifacts. | PARTIAL |
-| 72–74 | Structured logs, metrics and cross-component tracing/correlation. | PARTIAL |
-| 75–78 | Classified errors; durable T3 retry and Telegram outbox; worker failure and recovery UX. | MISSING |
+| 72–74 | Secret-redacted structured logs use irreversible chat pseudonyms; all named latency/count/gauge metrics are instrumented and exposed in owner diagnostics. A root correlation ID is preserved across Telegram ingress, routing/artifact binding, T3 dispatch, worker events and durable Telegram delivery; integration tests assert the chain. | PROVED |
+| 75–78 | Errors are classified into safe codes/messages. T3 outage persists the accepted dispatch and retries its stable receipt-backed command ID; Telegram outage retains finals in an outbox with safe retry/ambiguity rules; provider failure invokes one Operator-controlled retry/new-thread/provider-switch/report decision without exposing raw errors. Crash and failure integration tests pass. | PROVED |
 | 79 | Unit, integration and real E2E strategy with fixtures/fakes only where scope-appropriate. | PARTIAL |
 | 80 E2E-1 | Simple direct question without worker. | PARTIAL |
 | 80 E2E-2 | New project and worker. | PARTIAL |
@@ -183,5 +183,21 @@ Before completion:
   `derived_from_artifact_id`; failures retain the original and produce explicit
   context rather than dropping the message. Media, daemon, artifact migration,
   and official-MCP-client tests prove sections 22–23 and E2E-9/10.
+- SQLite now stores durable T3 dispatch and Telegram outbox rows before the
+  external side effect. The pinned T3 reducer proves accepted `commandId`
+  replay is idempotent; Telegram replays only same-message edits/keyboard
+  cleanup after an interrupted request and quarantines an in-flight fresh send.
+  Direct Operator finals, worker starts/progress/terminal results, group
+  synthesis and requested artifacts use the outbox. Tests crash between claim
+  and delivery, restart twice, simulate T3 rejection/receipt retry, and exercise
+  a provider rate limit with a single safe recovery.
+- Ingress dispatch no longer waits for a long Operator turn. A dedicated test
+  holds the Operator runtime open while an approval callback reaches T3 and its
+  keyboard cleanup completes. The five named queues and their shutdown drains
+  are explicit in the daemon.
+- The diagnostics test proves hashed chat identity, session/context size,
+  Telegram capability state, component health, SQLite integrity/size/events,
+  subscriptions, pending queues, recent classified errors and the complete
+  metric snapshot without exposing the raw chat ID.
 - These checks prove only their slices; all remaining `PARTIAL`/`MISSING` rows
   still block completion.

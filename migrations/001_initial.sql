@@ -158,6 +158,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_user_inputs_message
 
 CREATE TABLE IF NOT EXISTS background_jobs (
   id TEXT PRIMARY KEY,
+  dedupe_key TEXT UNIQUE,
   kind TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -166,6 +167,23 @@ CREATE TABLE IF NOT EXISTS background_jobs (
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS telegram_outbox (
+  id TEXT PRIMARY KEY,
+  dedupe_key TEXT UNIQUE NOT NULL,
+  chat_id INTEGER NOT NULL,
+  operation TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  telegram_message_ids_json TEXT NOT NULL DEFAULT '[]',
+  last_error_code TEXT,
+  last_error_detail TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  delivered_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS worker_groups (
@@ -238,7 +256,9 @@ CREATE TABLE IF NOT EXISTS daemon_events (
 
 CREATE TABLE IF NOT EXISTS processed_events (
   dedupe_key TEXT PRIMARY KEY,
-  created_at TEXT NOT NULL
+  status TEXT NOT NULL DEFAULT 'completed',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS runtime_state (
@@ -253,6 +273,8 @@ CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity_at DESC
 CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON daemon_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_operator_notes_status ON operator_notes(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_telegram_outbox_delivery
+  ON telegram_outbox(status, next_attempt_at, created_at);
 
 DELETE FROM operator_note_search;
 INSERT INTO operator_note_search(id,category,content)

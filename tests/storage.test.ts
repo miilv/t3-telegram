@@ -111,6 +111,85 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("deduplicates, recovers, backs off, and completes durable Telegram outbox rows", () => {
+    const store = tempStore();
+    const first = store.enqueueTelegramOutbox({
+      dedupeKey: "thread:1:terminal",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "done", anchor: { threadId: "thread_1", messageTypes: ["worker_started"] } },
+    });
+    const duplicate = store.enqueueTelegramOutbox({
+      dedupeKey: "thread:1:terminal",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "must not replace" },
+    });
+    expect(duplicate.id).toBe(first.id);
+    expect(duplicate.payload).toEqual({
+      text: "done",
+      anchor: { threadId: "thread_1", messageTypes: ["worker_started"] },
+    });
+
+    const claimed = store.claimNextTelegramOutbox<{ text: string }>();
+    expect(claimed).toMatchObject({ id: first.id, status: "sending" });
+    expect(store.claimNextTelegramOutbox()).toBeUndefined();
+    expect(store.resetInterruptedTelegramOutbox()).toBe(1);
+    const recovered = store.claimNextTelegramOutbox<{ text: string }>();
+    expect(recovered?.id).toBe(first.id);
+    store.retryTelegramOutbox(first.id, "TELEGRAM_RATE_LIMIT", "server asked to wait", 60_000);
+    expect(store.claimNextTelegramOutbox()).toBeUndefined();
+    store.db.prepare("UPDATE telegram_outbox SET next_attempt_at=? WHERE id=?").run("2020-01-01", first.id);
+    expect(store.claimNextTelegramOutbox()?.id).toBe(first.id);
+    store.markTelegramOutboxDelivered(first.id, [100]);
+    expect(store.getTelegramOutbox(first.id)).toMatchObject({
+      status: "delivered",
+      telegramMessageIds: [100],
+      attempts: 1,
+    });
+
+    const ambiguous = store.enqueueTelegramOutbox({
+      dedupeKey: "message:2",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "maybe" },
+    });
+    expect(store.claimNextTelegramOutbox()?.id).toBe(ambiguous.id);
+    store.markTelegramOutboxFailed(
+      ambiguous.id,
+      "uncertain",
+      "TELEGRAM_AMBIGUOUS",
+      "network ended after upload",
+    );
+    expect(store.telegramOutboxCounts()).toMatchObject({ delivered: 1, uncertain: 1 });
+
+    const interruptedFresh = store.enqueueTelegramOutbox({
+      dedupeKey: "message:3",
+      chatId: 7,
+      operation: "document",
+      payload: { path: "/tmp/report.pdf" },
+    });
+    expect(store.claimNextTelegramOutbox()?.id).toBe(interruptedFresh.id);
+    expect(store.resetInterruptedTelegramOutbox()).toBe(1);
+    expect(store.getTelegramOutbox(interruptedFresh.id)).toMatchObject({
+      status: "uncertain",
+      lastErrorCode: "TELEGRAM_AMBIGUOUS",
+    });
+    expect(store.claimNextTelegramOutbox()).toBeUndefined();
+    store.close();
+  });
+
+  it("resumes interrupted inbound events but rejects completed duplicates", () => {
+    const store = tempStore();
+    expect(store.beginEvent("callback:1")).toBe(true);
+    expect(store.beginEvent("callback:1")).toBe(true);
+    store.completeEvent("callback:1");
+    expect(store.beginEvent("callback:1")).toBe(false);
+    expect(store.claimEvent("terminal:1")).toBe(true);
+    expect(store.claimEvent("terminal:1")).toBe(false);
+    store.close();
+  });
+
   it("atomically claims a terminal worker group for one synthesis", () => {
     const store = tempStore();
     store.createWorkerGroup({

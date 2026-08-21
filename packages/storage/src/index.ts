@@ -50,6 +50,25 @@ export interface BackgroundJob<T = unknown> {
   lastError?: string;
 }
 
+export type TelegramOutboxStatus = "pending" | "sending" | "delivered" | "uncertain" | "dead";
+
+export interface TelegramOutboxItem<T = unknown> {
+  id: string;
+  dedupeKey: string;
+  chatId: number;
+  operation: string;
+  payload: T;
+  status: TelegramOutboxStatus;
+  attempts: number;
+  nextAttemptAt?: string;
+  telegramMessageIds: number[];
+  lastErrorCode?: string;
+  lastErrorDetail?: string;
+  createdAt: string;
+  updatedAt: string;
+  deliveredAt?: string;
+}
+
 export interface WorkerGroupMemberRecord {
   threadId: string;
   role: string;
@@ -138,6 +157,19 @@ export class OperatorStore {
     const artifactColumns = this.db.prepare("PRAGMA table_info(artifacts)").all() as Row[];
     if (!artifactColumns.some((column) => column.name === "derived_from_artifact_id")) {
       this.db.exec("ALTER TABLE artifacts ADD COLUMN derived_from_artifact_id TEXT");
+    }
+    const backgroundJobColumns = this.db.prepare("PRAGMA table_info(background_jobs)").all() as Row[];
+    if (backgroundJobColumns.length && !backgroundJobColumns.some((column) => column.name === "dedupe_key")) {
+      this.db.exec("ALTER TABLE background_jobs ADD COLUMN dedupe_key TEXT");
+      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_background_jobs_dedupe ON background_jobs(dedupe_key)");
+    }
+    const processedEventColumns = this.db.prepare("PRAGMA table_info(processed_events)").all() as Row[];
+    if (processedEventColumns.length && !processedEventColumns.some((column) => column.name === "status")) {
+      this.db.exec("ALTER TABLE processed_events ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'");
+    }
+    if (processedEventColumns.length && !processedEventColumns.some((column) => column.name === "updated_at")) {
+      this.db.exec("ALTER TABLE processed_events ADD COLUMN updated_at TEXT");
+      this.db.prepare("UPDATE processed_events SET updated_at=created_at WHERE updated_at IS NULL").run();
     }
     this.db
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)")
@@ -855,17 +887,29 @@ export class OperatorStore {
     ).map(rowToPendingUserInput);
   }
 
-  enqueueBackgroundJob<T>(kind: string, payload: T, runAfter?: string): string {
-    const id = newId("job");
+  enqueueBackgroundJob<T>(kind: string, payload: T, runAfter?: string, input: { id?: string; dedupeKey?: string } = {}): string {
+    const id = input.id ?? newId("job");
     const now = nowIso();
     this.db
       .prepare(`
         INSERT INTO background_jobs(
-          id,kind,payload_json,status,run_after,attempts,last_error,created_at,updated_at
-        ) VALUES (?,?,?,?,?,0,NULL,?,?)
+          id,dedupe_key,kind,payload_json,status,run_after,attempts,last_error,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,0,NULL,?,?)
+        ON CONFLICT DO NOTHING
       `)
-      .run(id, kind, JSON.stringify(payload), "pending", runAfter ?? null, now, now);
+      .run(id, input.dedupeKey ?? null, kind, JSON.stringify(payload), "pending", runAfter ?? null, now, now);
     return id;
+  }
+
+  resetInterruptedBackgroundJobs(kind?: string): number {
+    const result = kind
+      ? this.db
+          .prepare("UPDATE background_jobs SET status='pending',updated_at=? WHERE status='running' AND kind=?")
+          .run(nowIso(), kind)
+      : this.db
+          .prepare("UPDATE background_jobs SET status='pending',updated_at=? WHERE status='running'")
+          .run(nowIso());
+    return Number(result.changes);
   }
 
   listBackgroundJobs<T>(kind: string, status = "pending"): BackgroundJob<T>[] {
@@ -874,6 +918,11 @@ export class OperatorStore {
         .prepare("SELECT * FROM background_jobs WHERE kind=? AND status=? ORDER BY created_at")
         .all(kind, status) as Row[]
     ).map((row) => rowToBackgroundJob<T>(row));
+  }
+
+  getBackgroundJob<T>(id: string): BackgroundJob<T> | undefined {
+    const row = this.db.prepare("SELECT * FROM background_jobs WHERE id=?").get(id) as Row | undefined;
+    return row ? rowToBackgroundJob<T>(row) : undefined;
   }
 
   claimBackgroundJob<T>(kind: string, predicate: (payload: T) => boolean): BackgroundJob<T> | undefined {
@@ -921,6 +970,232 @@ export class OperatorStore {
         nowIso(),
         id,
       );
+  }
+
+  enqueueTelegramOutbox<T>(input: {
+    dedupeKey: string;
+    chatId: number;
+    operation: string;
+    payload: T;
+  }): TelegramOutboxItem<T> {
+    const now = nowIso();
+    const id = newId("outbox");
+    this.db
+      .prepare(`
+        INSERT INTO telegram_outbox(
+          id,dedupe_key,chat_id,operation,payload_json,status,attempts,next_attempt_at,
+          telegram_message_ids_json,last_error_code,last_error_detail,created_at,updated_at,delivered_at
+        ) VALUES (?,?,?,?,?,'pending',0,NULL,'[]',NULL,NULL,?,?,NULL)
+        ON CONFLICT(dedupe_key) DO NOTHING
+      `)
+      .run(id, input.dedupeKey, input.chatId, input.operation, JSON.stringify(input.payload), now, now);
+    const row = this.db.prepare("SELECT * FROM telegram_outbox WHERE dedupe_key=?").get(input.dedupeKey) as Row;
+    return rowToTelegramOutbox<T>(row);
+  }
+
+  getTelegramOutbox<T>(idOrDedupeKey: string): TelegramOutboxItem<T> | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM telegram_outbox WHERE id=? OR dedupe_key=?")
+      .get(idOrDedupeKey, idOrDedupeKey) as Row | undefined;
+    return row ? rowToTelegramOutbox<T>(row) : undefined;
+  }
+
+  listTelegramOutbox<T>(statuses?: TelegramOutboxStatus[], limit = 100): TelegramOutboxItem<T>[] {
+    const boundedLimit = Math.max(1, Math.min(limit, 1_000));
+    if (!statuses?.length) {
+      return (this.db.prepare("SELECT * FROM telegram_outbox ORDER BY created_at LIMIT ?").all(boundedLimit) as Row[])
+        .map((row) => rowToTelegramOutbox<T>(row));
+    }
+    const placeholders = statuses.map(() => "?").join(",");
+    return (
+      this.db
+        .prepare(`SELECT * FROM telegram_outbox WHERE status IN (${placeholders}) ORDER BY created_at LIMIT ?`)
+        .all(...statuses, boundedLimit) as Row[]
+    ).map((row) => rowToTelegramOutbox<T>(row));
+  }
+
+  claimNextTelegramOutbox<T>(): TelegramOutboxItem<T> | undefined {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare(`
+          SELECT candidate.* FROM telegram_outbox candidate
+          WHERE candidate.status='pending'
+            AND (candidate.next_attempt_at IS NULL OR candidate.next_attempt_at<=?)
+            AND NOT EXISTS (
+              SELECT 1 FROM telegram_outbox earlier
+              WHERE earlier.chat_id=candidate.chat_id
+                AND earlier.status IN ('pending','sending')
+                AND earlier.created_at<candidate.created_at
+            )
+          ORDER BY candidate.created_at
+          LIMIT 1
+        `)
+        .get(nowIso()) as Row | undefined;
+      if (!row) return undefined;
+      const claimed = this.db
+        .prepare("UPDATE telegram_outbox SET status='sending',updated_at=? WHERE id=? AND status='pending'")
+        .run(nowIso(), String(row.id));
+      if (!claimed.changes) return undefined;
+      return { ...rowToTelegramOutbox<T>(row), status: "sending" };
+    });
+  }
+
+  markTelegramOutboxDelivered(id: string, messageIds: number[]): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        UPDATE telegram_outbox SET status='delivered',telegram_message_ids_json=?,
+          last_error_code=NULL,last_error_detail=NULL,updated_at=?,delivered_at=?
+        WHERE id=?
+      `)
+      .run(JSON.stringify(messageIds), now, now, id);
+  }
+
+  retryTelegramOutbox(id: string, errorCode: string, detail: string, retryAfterMs?: number): void {
+    const row = this.db.prepare("SELECT attempts FROM telegram_outbox WHERE id=?").get(id) as Row | undefined;
+    const attempts = Number(row?.attempts ?? 0) + 1;
+    const delayMs = Math.max(
+      retryAfterMs ?? 0,
+      Math.min(60_000, 1_000 * 2 ** Math.min(attempts - 1, 6)),
+    );
+    this.db
+      .prepare(`
+        UPDATE telegram_outbox SET status='pending',attempts=?,next_attempt_at=?,
+          last_error_code=?,last_error_detail=?,updated_at=? WHERE id=?
+      `)
+      .run(
+        attempts,
+        new Date(Date.now() + delayMs).toISOString(),
+        errorCode,
+        detail.slice(0, 1_000),
+        nowIso(),
+        id,
+      );
+  }
+
+  markTelegramOutboxFailed(
+    id: string,
+    status: Extract<TelegramOutboxStatus, "uncertain" | "dead">,
+    errorCode: string,
+    detail: string,
+  ): void {
+    this.db
+      .prepare(`
+        UPDATE telegram_outbox SET status=?,attempts=attempts+1,next_attempt_at=NULL,
+          last_error_code=?,last_error_detail=?,updated_at=? WHERE id=?
+      `)
+      .run(status, errorCode, detail.slice(0, 1_000), nowIso(), id);
+  }
+
+  resetInterruptedTelegramOutbox(): number {
+    return this.transaction(() => {
+      const rows = this.db
+        .prepare("SELECT id,operation,payload_json FROM telegram_outbox WHERE status='sending'")
+        .all() as Row[];
+      const now = nowIso();
+      for (const row of rows) {
+        let payload: Record<string, unknown> = {};
+        try {
+          payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+        } catch {
+          // Malformed payloads cannot be replayed safely.
+        }
+        const idempotent =
+          String(row.operation) === "clear_keyboard" ||
+          (String(row.operation) === "rich" &&
+            (typeof payload.editMessageId === "number" ||
+              (payload.anchor !== null && typeof payload.anchor === "object")));
+        this.db
+          .prepare(`
+            UPDATE telegram_outbox SET status=?,next_attempt_at=NULL,last_error_code=?,
+              last_error_detail=?,updated_at=? WHERE id=? AND status='sending'
+          `)
+          .run(
+            idempotent ? "pending" : "uncertain",
+            idempotent ? null : "TELEGRAM_AMBIGUOUS",
+            idempotent ? null : "Process stopped while a non-idempotent Telegram send was in flight.",
+            now,
+            String(row.id),
+          );
+      }
+      return rows.length;
+    });
+  }
+
+  telegramOutboxCounts(): Record<TelegramOutboxStatus, number> {
+    const result: Record<TelegramOutboxStatus, number> = {
+      pending: 0,
+      sending: 0,
+      delivered: 0,
+      uncertain: 0,
+      dead: 0,
+    };
+    for (const row of this.db.prepare("SELECT status,COUNT(*) AS count FROM telegram_outbox GROUP BY status").all() as Row[]) {
+      const status = String(row.status) as TelegramOutboxStatus;
+      if (status in result) result[status] = Number(row.count);
+    }
+    return result;
+  }
+
+  diagnostics(): { journalMode: string; integrity: string; sizeBytes: number; eventCount: number } {
+    const journal = this.db.prepare("PRAGMA journal_mode").get() as Row;
+    const integrity = this.db.prepare("PRAGMA quick_check").get() as Row;
+    const pageCount = this.db.prepare("PRAGMA page_count").get() as Row;
+    const pageSize = this.db.prepare("PRAGMA page_size").get() as Row;
+    const events = this.db.prepare("SELECT COUNT(*) AS count FROM daemon_events").get() as Row;
+    return {
+      journalMode: String(journal.journal_mode ?? "unknown"),
+      integrity: String(integrity.quick_check ?? "unknown"),
+      sizeBytes: Number(pageCount.page_count ?? 0) * Number(pageSize.page_size ?? 0),
+      eventCount: Number(events.count ?? 0),
+    };
+  }
+
+  listRecentOperationalErrors(limit = 5): Array<{
+    eventType: string;
+    correlationId?: string;
+    threadId?: string;
+    errorCode?: string;
+    createdAt: string;
+  }> {
+    const rows = this.db
+      .prepare(`
+        SELECT event_type,correlation_id,thread_id,payload_json,created_at
+        FROM daemon_events
+        WHERE event_type LIKE '%.failed' OR event_type LIKE '%.deferred'
+        ORDER BY created_at DESC LIMIT ?
+      `)
+      .all(Math.max(1, Math.min(limit, 20))) as Row[];
+    return rows.map((row) => {
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+      } catch {
+        // Legacy/malformed diagnostics are represented without their payload.
+      }
+      return {
+        eventType: String(row.event_type),
+        createdAt: String(row.created_at),
+        ...(row.correlation_id ? { correlationId: String(row.correlation_id) } : {}),
+        ...(row.thread_id ? { threadId: String(row.thread_id) } : {}),
+        ...(typeof payload.errorCode === "string" ? { errorCode: payload.errorCode } : {}),
+      };
+    });
+  }
+
+  findLatestTelegramMessageForThread(threadId: string, messageTypes: string[]): TelegramMessageRecord | undefined {
+    if (!messageTypes.length) return undefined;
+    const placeholders = messageTypes.map(() => "?").join(",");
+    const row = this.db
+      .prepare(`
+        SELECT message.* FROM telegram_messages message
+        JOIN message_thread_links link
+          ON link.chat_id=message.chat_id AND link.message_id=message.message_id
+        WHERE link.thread_id=? AND message.message_type IN (${placeholders})
+        ORDER BY message.created_at DESC, message.message_id DESC LIMIT 1
+      `)
+      .get(threadId, ...messageTypes) as Row | undefined;
+    return row ? rowToTelegramMessage(row) : undefined;
   }
 
   createWorkerGroup(input: {
@@ -1183,11 +1458,35 @@ export class OperatorStore {
   }
 
   claimEvent(dedupeKey: string): boolean {
+    const now = nowIso();
     return (
       this.db
-        .prepare("INSERT OR IGNORE INTO processed_events(dedupe_key,created_at) VALUES (?,?)")
-        .run(dedupeKey, nowIso()).changes > 0
+        .prepare("INSERT OR IGNORE INTO processed_events(dedupe_key,status,created_at,updated_at) VALUES (?,'completed',?,?)")
+        .run(dedupeKey, now, now).changes > 0
     );
+  }
+
+  beginEvent(dedupeKey: string): boolean {
+    return this.transaction(() => {
+      const existing = this.db.prepare("SELECT status FROM processed_events WHERE dedupe_key=?").get(dedupeKey) as
+        | Row
+        | undefined;
+      if (existing && String(existing.status) === "completed") return false;
+      const now = nowIso();
+      if (existing) {
+        this.db.prepare("UPDATE processed_events SET status='processing',updated_at=? WHERE dedupe_key=?")
+          .run(now, dedupeKey);
+      } else {
+        this.db.prepare("INSERT INTO processed_events(dedupe_key,status,created_at,updated_at) VALUES (?,'processing',?,?)")
+          .run(dedupeKey, now, now);
+      }
+      return true;
+    });
+  }
+
+  completeEvent(dedupeKey: string): void {
+    this.db.prepare("UPDATE processed_events SET status='completed',updated_at=? WHERE dedupe_key=?")
+      .run(nowIso(), dedupeKey);
   }
 
   setRuntimeState(key: string, value: string): void {
@@ -1358,6 +1657,39 @@ function rowToBackgroundJob<T>(row: Row): BackgroundJob<T> {
     attempts: Number(row.attempts),
     ...(row.run_after ? { runAfter: String(row.run_after) } : {}),
     ...(row.last_error ? { lastError: String(row.last_error) } : {}),
+  };
+}
+
+function rowToTelegramOutbox<T>(row: Row): TelegramOutboxItem<T> {
+  return {
+    id: String(row.id),
+    dedupeKey: String(row.dedupe_key),
+    chatId: Number(row.chat_id),
+    operation: String(row.operation),
+    payload: JSON.parse(String(row.payload_json)) as T,
+    status: String(row.status) as TelegramOutboxStatus,
+    attempts: Number(row.attempts),
+    telegramMessageIds: JSON.parse(String(row.telegram_message_ids_json ?? "[]")) as number[],
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    ...(row.next_attempt_at ? { nextAttemptAt: String(row.next_attempt_at) } : {}),
+    ...(row.last_error_code ? { lastErrorCode: String(row.last_error_code) } : {}),
+    ...(row.last_error_detail ? { lastErrorDetail: String(row.last_error_detail) } : {}),
+    ...(row.delivered_at ? { deliveredAt: String(row.delivered_at) } : {}),
+  };
+}
+
+function rowToTelegramMessage(row: Row): TelegramMessageRecord {
+  return {
+    chatId: Number(row.chat_id),
+    messageId: Number(row.message_id),
+    relatedThreadIds: JSON.parse(String(row.related_thread_ids_json ?? "[]")) as string[],
+    artifactIds: JSON.parse(String(row.artifact_ids_json ?? "[]")) as string[],
+    messageType: String(row.message_type),
+    createdAt: String(row.created_at),
+    ...(row.operator_turn_id ? { operatorTurnId: String(row.operator_turn_id) } : {}),
+    ...(row.primary_project_id ? { primaryProjectId: String(row.primary_project_id) } : {}),
+    ...(row.primary_thread_id ? { primaryThreadId: String(row.primary_thread_id) } : {}),
   };
 }
 

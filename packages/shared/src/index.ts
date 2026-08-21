@@ -360,6 +360,8 @@ export interface CreateThreadInput {
 export interface SendThreadTurnInput {
   threadId: string;
   text: string;
+  /** Stable across daemon retries so T3 can deduplicate an accepted command after restart. */
+  commandId?: string;
   artifacts?: ArtifactRef[];
   providerInstanceId?: string;
   model?: string;
@@ -369,12 +371,14 @@ export interface SendThreadTurnInput {
 export interface ApprovalDecision {
   threadId: string;
   approvalId: string;
+  commandId?: string;
   decision: "accept" | "acceptForSession" | "decline" | "cancel";
 }
 
 export interface UserInputDecision {
   threadId: string;
   requestId: string;
+  commandId?: string;
   answers: Record<string, string | string[]>;
 }
 

@@ -145,6 +145,11 @@ export interface TelegramHealth {
   healthy: boolean;
   username?: string;
   detail?: string;
+  capabilities?: {
+    richFinal: "available" | "unavailable" | "unknown";
+    richDraft: "available" | "unavailable" | "unknown";
+    plainDraft: "available" | "unavailable" | "unknown";
+  };
 }
 
 export interface TelegramTransport {
@@ -168,6 +173,12 @@ export interface TelegramTransport {
     approvalId: string,
     options?: TelegramSendOptions,
   ): Promise<SentMessage>;
+  editApproval(
+    chatId: number,
+    messageId: number,
+    text: string,
+    approvalId: string,
+  ): Promise<void>;
   sendUserInput(
     chatId: number,
     text: string,

@@ -27,6 +27,7 @@ import type {
 } from "../packages/shared/src/index.js";
 import { nowIso } from "../packages/shared/src/index.js";
 import { DailyScheduler } from "../packages/scheduler/src/index.js";
+import { OperatorStore } from "../packages/storage/src/index.js";
 import type {
   SentMessage,
   StreamDraft,
@@ -198,6 +199,74 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("handles an approval callback while a long Operator input is still running", async () => {
+    const home = tempDirectory("daemon-ingress-queue-");
+    const store = tempStore();
+    const runtime = new BlockingRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_live",
+      t3ApprovalId: "t3_approval_live",
+      threadId: "th_live",
+      payload: { summary: "Run tests", requestKind: "command", detail: "pnpm test" },
+      chatId: 7,
+      messageId: 777,
+    });
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => runtime.turnStarted);
+    telegram.push(callback(2, "cb_while_busy", 777, "approval:approval_live:accept"));
+    await waitFor(() => broker.approvalResponses.length === 1);
+
+    expect(runtime.turnReleased).toBe(false);
+    expect(broker.approvalResponses[0]?.commandId).toBe("callback:cb_while_busy");
+    runtime.releaseTurn();
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("keeps a completed direct answer in the durable outbox until its draft edit succeeds", async () => {
+    const home = tempDirectory("daemon-direct-outbox-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FlakyEditTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(
+      () => store.listTelegramOutbox(["pending"]).some((item) => item.dedupeKey.includes("telegram:operator:")),
+    );
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 3_000);
+
+    const direct = store
+      .listTelegramOutbox()
+      .find((item) => item.dedupeKey.includes("telegram:operator:"));
+    expect(direct).toMatchObject({ status: "delivered", attempts: 1 });
+    expect(telegram.sent.filter((entry) => entry.text === "Париж.")).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("answers directly, delegates durable work, completes in background, and preserves focus", async () => {
     const home = tempDirectory("daemon-home-");
     const store = tempStore();
@@ -221,6 +290,27 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу; тесты прошли")));
     expect(broker.projects).toHaveLength(1);
     expect(broker.threads).toHaveLength(1);
+    const traceRows = store.db
+      .prepare(`
+        SELECT event_type,correlation_id FROM daemon_events
+        WHERE event_type IN ('telegram.received','t3.dispatch.accepted','worker.completed','telegram.outbox.delivered')
+          AND correlation_id IS NOT NULL
+        ORDER BY created_at
+      `)
+      .all() as Array<{ event_type: string; correlation_id: string }>;
+    const workTrace = traceRows.find(
+      (row) => row.event_type === "t3.dispatch.accepted",
+    )?.correlation_id;
+    expect(workTrace).toMatch(/^tg:chat_[a-f0-9]{12}:2$/);
+    expect(
+      new Set(
+        traceRows
+          .filter((row) => row.correlation_id === workTrace)
+          .map((row) => row.event_type),
+      ),
+    ).toEqual(
+      new Set(["telegram.received", "t3.dispatch.accepted", "worker.completed", "telegram.outbox.delivered"]),
+    );
     const focusAfterWork = store.getFocus("42");
     expect(focusAfterWork.primary?.threadId).toBe(broker.threads[0]?.id);
 
@@ -285,11 +375,12 @@ describe("OperatorDaemon product flow", () => {
     telegram.push({ ...message(5, "Deploy after 22:00 UTC"), replyToMessageId: prompt.messageId });
 
     await waitFor(() => broker.userInputResponses.length === 1);
-    expect(broker.userInputResponses[0]).toEqual({
+    expect(broker.userInputResponses[0]).toMatchObject({
       threadId: "th_1",
       requestId: "t3_input_1",
       answers: { regions: ["EU", "US"], note: "Deploy after 22:00 UTC" },
     });
+    expect(broker.userInputResponses[0]?.commandId).toMatch(/^user-input:/);
     expect(telegram.keyboardClears).toContain(prompt.messageId);
     expect(store.listPendingUserInputs()).toHaveLength(0);
 
@@ -336,6 +427,7 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(message(1, "deploy and clean generated data"));
     await waitFor(() => broker.approvalResponses.length === 1 && telegram.approvals.length === 1);
     expect(broker.approvalResponses[0]).toMatchObject({ approvalId: "read_1", decision: "accept" });
+    expect(broker.approvalResponses[0]?.commandId).toBe("approval:auto:th_1:read_1");
     expect(telegram.approvals[0]?.text).toContain("Risk category: **destructive**");
     telegram.push(
       callback(
@@ -350,6 +442,7 @@ describe("OperatorDaemon product flow", () => {
       approvalId: "delete_1",
       decision: "decline",
     });
+    expect(broker.approvalResponses[1]?.commandId).toBe("callback:cb_deny_delete");
     expect(telegram.keyboardClears).toContain(telegram.approvals[0]!.messageId);
     expect(store.listPendingApprovals()).toHaveLength(0);
 
@@ -942,6 +1035,186 @@ describe("OperatorDaemon product flow", () => {
     expect(store.listUndeliveredWorkerGroups()).toHaveLength(0);
     await daemon.stop();
   });
+
+  it("replays an interrupted terminal outbox edit once and never duplicates it on a second restart", async () => {
+    const home = tempDirectory("daemon-outbox-restart-");
+    const databasePath = `${home}/operator.db`;
+    const timestamp = nowIso();
+    const seed = new OperatorStore(databasePath);
+    seed.migrate();
+    const project: Project = {
+      id: "prj_restart",
+      t3ProjectId: "prj_restart",
+      name: "Restart Project",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const thread: WorkThread = {
+      id: "th_restart",
+      t3ThreadId: "th_restart",
+      projectId: project.id,
+      title: "Restart-safe completion",
+      shortSummary: "",
+      keywords: ["restart"],
+      status: "completed",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    seed.upsertProject(project);
+    seed.upsertThread(thread);
+    seed.saveTelegramMessage({
+      chatId: 7,
+      messageId: 100,
+      primaryProjectId: project.id,
+      primaryThreadId: thread.id,
+      relatedThreadIds: [thread.id],
+      artifactIds: [],
+      messageType: "worker_started",
+      createdAt: timestamp,
+    });
+    seed.linkMessageThread(7, 100, thread.id, "primary");
+    seed.setRuntimeState(`thread_chat:${thread.id}`, "7");
+    seed.setRuntimeState(`thread_origin_message:${thread.id}`, "1");
+    seed.setRuntimeState(`thread_completion_delivered:${thread.id}`, "");
+    const outbox = seed.enqueueTelegramOutbox({
+      dedupeKey: `telegram:thread:${thread.id}:terminal`,
+      chatId: 7,
+      operation: "rich",
+      payload: {
+        text: "Restart-safe final result",
+        options: { replyToMessageId: 1 },
+        messageType: "worker_completed",
+        threadId: thread.id,
+        projectId: project.id,
+        anchor: { threadId: thread.id, messageTypes: ["worker_started"] },
+        completionThreadIds: [thread.id],
+      },
+    });
+    expect(seed.claimNextTelegramOutbox()?.id).toBe(outbox.id);
+    seed.close();
+
+    const telegram = new FakeTelegram();
+    const broker = new FakeBroker();
+    broker.projects.push(project);
+    broker.threads.push(thread);
+    const logger = pino({ enabled: false });
+    const startOnce = async () => {
+      const store = new OperatorStore(databasePath);
+      const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+      const runtime = new FakeRuntime();
+      let daemon: OperatorDaemon;
+      const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+      daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+      await daemon.initialize();
+      await daemon.stop();
+    };
+
+    await startOnce();
+    expect(telegram.sent.filter((entry) => entry.text === "Restart-safe final result")).toHaveLength(1);
+    await startOnce();
+    expect(telegram.sent.filter((entry) => entry.text === "Restart-safe final result")).toHaveLength(1);
+    const verify = new OperatorStore(databasePath);
+    verify.migrate();
+    expect(verify.getTelegramOutbox(outbox.id)?.status).toBe("delivered");
+    expect(verify.getRuntimeState(`thread_completion_delivered:${thread.id}`)).not.toBe("");
+    verify.close();
+  });
+
+  it("persists a T3 dispatch outage, retries with the same command id, and starts automatically", async () => {
+    const home = tempDirectory("daemon-t3-retry-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.dispatchFailures = 1;
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement durable refresh-token locking and run all tests"));
+    await waitFor(() => store.listBackgroundJobs("t3_dispatch").length === 1);
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("задача сохранена")));
+    const pending = store.listBackgroundJobs("t3_dispatch")[0]!;
+    expect(pending.status).toBe("pending");
+    store.db.prepare("UPDATE background_jobs SET run_after=? WHERE id=?").run("2020-01-01", pending.id);
+    await daemon.maintain("test T3 recovery");
+    await waitFor(() => broker.turns.length === 1);
+    expect(broker.turnAttempts).toHaveLength(2);
+    expect(broker.turnAttempts[0]?.commandId).toBe(broker.turnAttempts[1]?.commandId);
+    expect(store.getBackgroundJob(pending.id)?.status).toBe("completed");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("classifies provider rate limits, retries once, and never exposes the raw provider error", async () => {
+    const home = tempDirectory("daemon-provider-recovery-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      {
+        type: "failed",
+        threadId: "th_1",
+        error: "429 quota exceeded authorization=super-secret-provider-token",
+      },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement auth recovery and run tests"));
+    await waitFor(() => broker.turns.length === 2);
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("PROVIDER_RATE_LIMIT")));
+    expect(store.getRuntimeState("thread_failure_recovery_count:th_1")).toBe("1");
+    expect(telegram.sent.every((entry) => !entry.text.includes("super-secret-provider-token"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("reports owner diagnostics with capabilities, queues, SQLite health, metrics, and no raw chat id", async () => {
+    const home = tempDirectory("daemon-debug-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "/debug"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Operator debug")));
+    const diagnostic = telegram.sent.find((entry) => entry.text.startsWith("## Operator debug"))!.text;
+    expect(diagnostic).toContain("Operator session:");
+    expect(diagnostic).toContain("Restorable context:");
+    expect(diagnostic).toContain("SQLite: ok; wal");
+    expect(diagnostic).toContain("Outbox:");
+    expect(diagnostic).toContain("Metrics");
+    expect(diagnostic).toMatch(/Chat: `chat_[a-f0-9]{12}`/);
+    expect(diagnostic).not.toContain("Chat: `7`");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
 });
 
 function seedAmbiguousAuthThreads(store: ReturnType<typeof tempStore>, broker: FakeBroker): void {
@@ -1139,15 +1412,43 @@ class FakeRuntime implements OperatorRuntime {
   }
 }
 
+class BlockingRuntime extends FakeRuntime {
+  turnStarted = false;
+  turnReleased = false;
+  private release: (() => void) | undefined;
+  private readonly gate = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+
+  releaseTurn(): void {
+    this.turnReleased = true;
+    this.release?.();
+  }
+
+  override async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    this.prompts.push(input.prompt);
+    this.turnStarted = true;
+    await this.gate;
+    yield { type: "text_delta", text: "Париж." };
+    yield { type: "result", text: "Париж.", sessionId: input.sessionId };
+  }
+}
+
 class FakeBroker implements T3Broker {
   readonly projects: Project[] = [];
   readonly threads: WorkThread[] = [];
   readonly turns: SendThreadTurnInput[] = [];
+  readonly turnAttempts: SendThreadTurnInput[] = [];
   readonly userInputResponses: UserInputDecision[] = [];
   readonly approvalResponses: ApprovalDecision[] = [];
   readonly threadInputs: CreateThreadInput[] = [];
   providers: ProviderDescriptor[] = [];
   workerEvents: WorkerEvent[] | undefined;
+  dispatchFailures = 0;
   private terminalGate: Promise<void> | undefined;
   private releaseTerminalGate: (() => void) | undefined;
 
@@ -1221,10 +1522,15 @@ class FakeBroker implements T3Broker {
     return thread;
   }
   async sendTurn(input: SendThreadTurnInput): Promise<TurnHandle> {
+    this.turnAttempts.push(input);
+    if (this.dispatchFailures > 0) {
+      this.dispatchFailures -= 1;
+      throw new Error("T3 connection unavailable");
+    }
     this.turns.push(input);
     const thread = await this.getThread(input.threadId);
     thread.status = "running";
-    return { threadId: input.threadId, commandId: "cmd_1" };
+    return { threadId: input.threadId, commandId: input.commandId ?? "cmd_1" };
   }
   async interruptThread(threadId: string): Promise<void> {
     (await this.getThread(threadId)).status = "cancelled";
@@ -1373,6 +1679,14 @@ class FakeTelegram implements TelegramTransport {
     this.approvals.push({ messageId, text, approvalId });
     return { chatId: 7, messageId };
   }
+  async editApproval(
+    _chatId: number,
+    messageId: number,
+    text: string,
+    approvalId: string,
+  ): Promise<void> {
+    this.approvals.push({ messageId, text, approvalId });
+  }
   async sendUserInput(
     _chatId: number,
     _text: string,
@@ -1387,16 +1701,23 @@ class FakeTelegram implements TelegramTransport {
     _chatId: number,
     messageId: number,
     _text: string,
-    _inputId: string,
+    inputId: string,
     questionIndex: number,
   ): Promise<void> {
+    if (!this.userInputs.some((entry) => entry.messageId === messageId)) {
+      this.userInputs.push({ messageId, inputId, questionIndex });
+    }
     this.userInputEdits.push({ messageId, questionIndex });
   }
   async clearInlineKeyboard(_chatId: number, messageId: number): Promise<void> {
     this.keyboardClears.push(messageId);
   }
   async answerCallback(): Promise<void> {}
-  async editRich(): Promise<void> {}
+  async editRich(_chatId: number, messageId: number, text: string): Promise<void> {
+    // Keep a call history: real Telegram replaces the message in place, while
+    // tests need to assert both the durable start frame and terminal edit.
+    this.sent.push({ messageId, text });
+  }
   async downloadFile(): Promise<Uint8Array> {
     return new Uint8Array();
   }
@@ -1404,6 +1725,18 @@ class FakeTelegram implements TelegramTransport {
   async sendChatAction(): Promise<void> {}
   async health(): Promise<{ healthy: boolean; username: string }> {
     return { healthy: true, username: "operator_test_bot" };
+  }
+}
+
+class FlakyEditTelegram extends FakeTelegram {
+  private failures = 1;
+
+  override async editRich(chatId: number, messageId: number, text: string): Promise<void> {
+    if (this.failures > 0) {
+      this.failures -= 1;
+      throw new Error("connection reset after request write");
+    }
+    await super.editRich(chatId, messageId, text);
   }
 }
 

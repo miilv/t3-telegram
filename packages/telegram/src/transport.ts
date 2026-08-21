@@ -2,6 +2,7 @@ import { realpath, stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Logger } from "pino";
+import { metrics } from "../../observability/src/index.js";
 import { AsyncInputQueue, delay, TelegramOutboundQueue } from "./queues.js";
 import {
   markdownToTelegramHtml,
@@ -34,6 +35,7 @@ const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
 const CAPTION_LIMIT = 1024;
 const ALBUM_WINDOW_MS = 650;
 const MAX_FLOOD_WAIT_SECONDS = 30;
+const MAX_SAFE_ATTEMPTS = 3;
 const PHOTO_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const ALLOWED_REACTIONS = new Set([
   "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩",
@@ -238,6 +240,8 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   async updateDraft(draft: StreamDraft, text: string): Promise<void> {
+    const startedAt = Date.now();
+    try {
     const preview = truncateRichPreview(text);
     draft.text = preview;
     if (draft.mode === "rich-draft") {
@@ -271,6 +275,9 @@ export class TelegramBotTransport implements TelegramTransport {
         link_preview_options: { is_disabled: true },
       }),
     );
+    } finally {
+      metrics.observe("telegram_draft_update_latency_ms", Date.now() - startedAt);
+    }
   }
 
   async finalizeDraft(draft: StreamDraft, text: string): Promise<SentMessage[]> {
@@ -399,18 +406,29 @@ export class TelegramBotTransport implements TelegramTransport {
         ...messageOptions(options),
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: "Allow once", callback_data: `approval:${approvalId}:accept` },
-              { text: "Allow session", callback_data: `approval:${approvalId}:acceptForSession` },
-            ],
-            [{ text: "Deny", callback_data: `approval:${approvalId}:decline` }],
-          ],
-        },
+        reply_markup: approvalKeyboard(approvalId),
       }),
     );
     return sentMessage(chatId, message.message_id, options);
+  }
+
+  async editApproval(
+    chatId: number,
+    messageId: number,
+    text: string,
+    approvalId: string,
+  ): Promise<void> {
+    try {
+      await this.outbound(chatId, () =>
+        this.bot.api.editMessageText(chatId, messageId, markdownToTelegramHtml(text), {
+          parse_mode: "HTML",
+          link_preview_options: { is_disabled: true },
+          reply_markup: approvalKeyboard(approvalId),
+        }),
+      );
+    } catch (error) {
+      if (!isMessageNotModified(error)) throw error;
+    }
   }
 
   async sendUserInput(
@@ -459,11 +477,15 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   async clearInlineKeyboard(chatId: number, messageId: number): Promise<void> {
-    await this.outbound(chatId, () =>
-      this.bot.api.editMessageReplyMarkup(chatId, messageId, {
-        reply_markup: { inline_keyboard: [] },
-      }),
-    );
+    try {
+      await this.outbound(chatId, () =>
+        this.bot.api.editMessageReplyMarkup(chatId, messageId, {
+          reply_markup: { inline_keyboard: [] },
+        }),
+      );
+    } catch (error) {
+      if (!isMessageNotModified(error)) throw error;
+    }
   }
 
   async answerCallback(callbackId: string, text?: string): Promise<void> {
@@ -496,7 +518,15 @@ export class TelegramBotTransport implements TelegramTransport {
   async health(): Promise<TelegramHealth> {
     try {
       const me = await this.bot.api.getMe();
-      return { healthy: true, ...(me.username ? { username: me.username } : {}) };
+      return {
+        healthy: true,
+        ...(me.username ? { username: me.username } : {}),
+        capabilities: {
+          richFinal: capabilityState(this.richFinalAvailable),
+          richDraft: capabilityState(this.richDraftAvailable),
+          plainDraft: capabilityState(this.draftAvailable),
+        },
+      };
     } catch (error) {
       return { healthy: false, detail: errorMessage(error) };
     }
@@ -568,6 +598,7 @@ export class TelegramBotTransport implements TelegramTransport {
       } catch (error) {
         const failure = classifyRichFailure(error);
         if (failure === "fatal") throw error;
+        metrics.increment("rich_fallback_total", { reason: failure });
         if (failure === "capability") this.richFinalAvailable = false;
       }
     }
@@ -617,8 +648,12 @@ export class TelegramBotTransport implements TelegramTransport {
         this.richFinalAvailable = true;
         return [sentMessage(chatId, messageId, options)];
       } catch (error) {
+        if (isMessageNotModified(error)) {
+          return [sentMessage(chatId, messageId, options)];
+        }
         const failure = classifyRichFailure(error);
         if (failure === "fatal") throw error;
+        metrics.increment("rich_fallback_total", { reason: failure });
         if (failure === "capability") this.richFinalAvailable = false;
       }
     }
@@ -631,7 +666,9 @@ export class TelegramBotTransport implements TelegramTransport {
         }),
       );
     } catch (error) {
+      if (isMessageNotModified(error)) return [sentMessage(chatId, messageId, options)];
       if (!isFormattingError(error)) throw error;
+      metrics.increment("rich_fallback_total", { reason: "formatting" });
       await this.outbound(chatId, () =>
         this.bot.api.editMessageText(chatId, messageId, chunks[0] ?? "…", {
           link_preview_options: { is_disabled: true },
@@ -701,15 +738,30 @@ export class TelegramBotTransport implements TelegramTransport {
 
   private outbound<T>(chatId: number, effect: () => Promise<T>): Promise<T> {
     return this.outboundQueue.run(chatId, async () => {
-      try {
-        return await effect();
-      } catch (error) {
-        const retryAfter = telegramRetryAfter(error);
-        if (retryAfter === undefined || retryAfter > MAX_FLOOD_WAIT_SECONDS) throw error;
-        this.logger.warn({ chatId, retryAfter }, "Telegram flood wait; retrying once");
-        await delay(retryAfter * 1000);
-        return effect();
+      for (let attempt = 0; attempt < MAX_SAFE_ATTEMPTS; attempt += 1) {
+        const startedAt = Date.now();
+        try {
+          const result = await effect();
+          metrics.observe("telegram_update_latency_ms", Date.now() - startedAt, { direction: "outbound_api" });
+          return result;
+        } catch (error) {
+          const disposition = classifyTelegramDeliveryError(error);
+          metrics.increment("telegram_errors_total", { code: disposition.code });
+          const canRetryInline =
+            disposition.retryable &&
+            !disposition.ambiguous &&
+            attempt + 1 < MAX_SAFE_ATTEMPTS &&
+            (disposition.retryAfterMs ?? 0) <= MAX_FLOOD_WAIT_SECONDS * 1_000;
+          if (!canRetryInline) throw error;
+          const waitMs = Math.max(disposition.retryAfterMs ?? 0, 500 * 2 ** attempt);
+          this.logger.warn(
+            { chatId, errorCode: disposition.code, attempt: attempt + 1, waitMs },
+            "Telegram request rejected before delivery; retrying with backoff",
+          );
+          await delay(waitMs);
+        }
       }
+      throw new Error("Telegram retry loop exhausted");
     });
   }
 
@@ -1150,6 +1202,59 @@ function telegramRetryAfter(error: unknown): number | undefined {
   if (!(error instanceof GrammyError) || error.error_code !== 429) return undefined;
   const parameters = error.parameters as { retry_after?: number } | undefined;
   return parameters?.retry_after;
+}
+
+function approvalKeyboard(approvalId: string) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Allow once", callback_data: `approval:${approvalId}:accept` },
+        { text: "Allow session", callback_data: `approval:${approvalId}:acceptForSession` },
+      ],
+      [{ text: "Deny", callback_data: `approval:${approvalId}:decline` }],
+    ],
+  };
+}
+
+export interface TelegramDeliveryError {
+  code: "TELEGRAM_RATE_LIMIT" | "TELEGRAM_SERVER" | "TELEGRAM_FORBIDDEN" | "TELEGRAM_BAD_REQUEST" | "TELEGRAM_AMBIGUOUS";
+  retryable: boolean;
+  ambiguous: boolean;
+  retryAfterMs?: number;
+}
+
+/** Classifies whether replay is safe. Http/network failures are always ambiguous. */
+export function classifyTelegramDeliveryError(error: unknown): TelegramDeliveryError {
+  if (error instanceof HttpError) {
+    return { code: "TELEGRAM_AMBIGUOUS", retryable: true, ambiguous: true };
+  }
+  if (error instanceof GrammyError) {
+    const retryAfter = telegramRetryAfter(error);
+    if (error.error_code === 429) {
+      return {
+        code: "TELEGRAM_RATE_LIMIT",
+        retryable: true,
+        ambiguous: false,
+        ...(retryAfter !== undefined ? { retryAfterMs: retryAfter * 1_000 } : {}),
+      };
+    }
+    if (error.error_code >= 500) {
+      return { code: "TELEGRAM_SERVER", retryable: true, ambiguous: false };
+    }
+    if (error.error_code === 401 || error.error_code === 403) {
+      return { code: "TELEGRAM_FORBIDDEN", retryable: false, ambiguous: false };
+    }
+    return { code: "TELEGRAM_BAD_REQUEST", retryable: false, ambiguous: false };
+  }
+  return { code: "TELEGRAM_AMBIGUOUS", retryable: true, ambiguous: true };
+}
+
+function isMessageNotModified(error: unknown): boolean {
+  return error instanceof GrammyError && error.error_code === 400 && error.description.toLowerCase().includes("message is not modified");
+}
+
+function capabilityState(value: boolean | undefined): "available" | "unavailable" | "unknown" {
+  return value === true ? "available" : value === false ? "unavailable" : "unknown";
 }
 
 function sanitizeFilename(value: string): string {

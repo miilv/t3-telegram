@@ -54,6 +54,14 @@ export class DraftWriter {
     return this.transport.finalizeDraft(this.draft, this.buffer || fallbackText);
   }
 
+  /** Stop preview updates so a caller can deliver the final through a durable outbox. */
+  async closePreview(): Promise<void> {
+    if (this.closed) return;
+    this.flush();
+    this.closed = true;
+    await this.chain;
+  }
+
   get text(): string {
     return this.buffer;
   }

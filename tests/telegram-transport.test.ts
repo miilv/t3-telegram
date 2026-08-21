@@ -10,6 +10,7 @@ import type { TelegramMessageInbound } from "../packages/telegram/src/index.js";
 const logger = pino({ level: "silent" });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -149,6 +150,52 @@ describe("grammY Telegram transport", () => {
       ((calls[1]?.body.reply_markup as { inline_keyboard: unknown[][] }).inline_keyboard[0] as unknown[])[0],
     ).toEqual({ text: "✓ EU", callback_data: "ui:input_123:0:o0" });
     expect(calls[2]?.body).toMatchObject({ reply_markup: { inline_keyboard: [] } });
+  });
+
+  it("treats an idempotent no-op edit as delivered", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push(parseApiCall(input, init));
+        return telegramResponse(
+          { ok: false, error_code: 400, description: "Bad Request: message is not modified" },
+          400,
+        );
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    await expect(transport.editRich(7, 100, "already final")).resolves.toBeUndefined();
+    expect(calls.map((call) => call.method)).toEqual(["editMessageText"]);
+  });
+
+  it("honors retry_after and retries only server-confirmed rejection", async () => {
+    vi.useFakeTimers();
+    const calls: ApiCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        if (calls.length === 1) {
+          return telegramResponse(
+            {
+              ok: false,
+              error_code: 429,
+              description: "Too Many Requests: retry later",
+              parameters: { retry_after: 0 },
+            },
+            429,
+          );
+        }
+        return telegramResponse(messageResult(105));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const delivery = transport.sendRich(7, "retry safely");
+    await vi.runAllTimersAsync();
+    await expect(delivery).resolves.toEqual([{ chatId: 7, messageId: 105 }]);
+    expect(calls.map((call) => call.method)).toEqual(["sendRichMessage", "sendRichMessage"]);
   });
 });
 

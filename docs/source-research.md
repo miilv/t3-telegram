@@ -193,3 +193,39 @@ The implementation therefore uses no shell command strings, preserves every
 original before enrichment, stores source-linked derivatives, never logs raw
 transcript/provider bodies, and exposes image bytes only through the
 process-scoped, type/size-bounded Operator capability.
+
+## Recovery, retry and delivery source gate
+
+Before implementing sections 51–55 and 72–78, the pinned donor revisions were
+reread at their failure boundaries:
+
+- Supercharged's `server.ts` replays recent SQLite-persisted messages that were
+  accepted but never answered, while `supervisor.ts` restarts failed work with
+  bounded 1–30 second exponential backoff.
+- Pavel's `telegram_utils.py` treats placeholders as cosmetic and never lets a
+  placeholder failure discard the real answer. Its sender separates formatting
+  rejection, explicit `RetryAfter`, and ambiguous transport failure.
+- Mark-Life's `src/telegram.ts` keeps rich drafts best-effort and debounced while
+  preserving a separate persistent final with rich-to-plain fallback.
+- Hermes' Telegram adapter retries only confirmed rate limits/capability
+  failures. A timeout may mean Telegram accepted the request, so it never sends
+  a second legacy message after an ambiguous failure; no-op edits are success.
+
+The current T3 fork was also reread at
+`7107a98a225be85b58ddcd4de02c343af7d4707a`:
+
+- `OrchestrationEngine.processEnvelope` looks up the command receipt before
+  deciding or appending events. An already accepted `commandId` returns its
+  recorded result sequence without executing the command again.
+- The accepted receipt is written in the same SQL transaction as the command's
+  orchestration events.
+- `OrchestrationCommandReceiptRepository` keys receipts by `commandId` and
+  rejects reuse against another aggregate.
+
+Consequently, every durable T3 dispatch retains one command ID across retries.
+Telegram retries a fresh send only after a server-confirmed pre-delivery
+rejection; ambiguous fresh sends are quarantined as `uncertain`. Durable edits
+and keyboard cleanup may be replayed because they target the same message.
+Worker terminal delivery uses the recorded start/status message as its edit
+anchor, and its local completion marker advances only after that outbox row is
+delivered.

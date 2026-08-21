@@ -6,8 +6,11 @@
 - `/focus` — current and recent work contexts; `/focus clear` resets them explicitly.
 - `/memory` — active durable notes and the latest compaction. Subcommands: `remember [category:] text`, `search query`, `forget note_id`, and `compact`.
 - `/stop` — interrupts the focused worker; when focus is a fan-out group, it interrupts every active member and suppresses a later duplicate synthesis.
-- `/debug` — connectivity for Telegram, Claude CLI, T3, and subscription count.
+- `/debug` — hashed owner identity, Operator session/context size, Telegram/T3/Claude health, Telegram capability states, subscriptions, SQLite integrity/size/event count, durable queue counts, recent classified errors, and metrics.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
+- Set `OBSERVABILITY_HASH_SALT` to a random secret so the irreversible chat
+  pseudonym remains stable across restarts. Without it, a process-random salt
+  intentionally changes the pseudonym on every launch.
 
 ## Operator MCP isolation
 
@@ -58,9 +61,15 @@ SQLite uses WAL mode. On startup the daemon:
 4. restores unsent approval and structured-question prompts;
 5. reconciles T3 thread state;
 6. restores monitors for running/waiting workers and dispatches due queued follow-ups for idle threads;
-7. resets a clarification interrupted while dispatching so the owner's reply can be retried;
-8. resumes all-terminal fan-out groups whose synthesis was pending or interrupted;
-9. delivers an undelivered completion for an Operator-owned thread.
+7. replays interrupted idempotent Telegram edits/keyboard cleanup and resumes
+   pending outbox work; an interrupted fresh send is marked `uncertain` rather
+   than duplicated;
+8. retries accepted T3 tasks with the original command ID, which T3 deduplicates
+   through its transactional command receipt;
+9. refreshes pending approval/question keyboards and resets an interrupted
+   clarification so the owner's response can be retried;
+10. resumes all-terminal fan-out groups whose synthesis was pending or interrupted;
+11. delivers an undelivered completion for an Operator-owned thread.
 
 ## Memory and maintenance
 
@@ -74,7 +83,21 @@ Telegram updates are deduplicated by `(chat_id, message_id)`. Approval callbacks
 
 Routing clarifications store the original normalized update, candidate thread IDs, and artifact IDs. Reply with the displayed number, the exact thread ID, or an unambiguous title; invalid replies leave the clarification pending. Fan-out members are ordinary T3 threads and remain independently inspectable, but Telegram receives only the group start, meaningful throttled progress, and one final synthesis.
 
-Current recovery boundary: SQLite atomically claims synthesis work, but Telegram does not expose an idempotency key for sends. A process death after Telegram accepts the synthesis and before the local delivery marker commits can still duplicate that message; the compliance ledger therefore keeps exactly-once delivery `PARTIAL` until the durable outbound outbox/reconciliation block is complete.
+Worker starts, progress, terminal results, group syntheses, requested artifacts,
+interaction cleanup, and direct Operator finals use the durable outbound queue.
+Terminal results edit a recorded status anchor, so restart replay is idempotent
+and the completion marker is committed only after delivery. Telegram exposes no
+idempotency key for a brand-new send: if the process dies while such a request
+is in flight, the row is deliberately quarantined as `uncertain` for owner
+inspection instead of risking a duplicate.
+
+T3 dispatch is persisted before the RPC call. A connection failure leaves it
+pending with exponential backoff and the user sees a safe saved-task notice.
+The command ID is stable across attempts; current T3 stores the command receipt
+in the same transaction as orchestration events and returns the receipt on a
+replay. Provider failures are classified without raw provider text, and the
+Operator chooses one bounded recovery action: retry once, start a recovery
+thread, switch to an advertised provider, or report.
 
 ## Running under launchd
 

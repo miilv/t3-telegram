@@ -19,6 +19,7 @@ import type {
   WorkerEvent,
 } from "../../shared/src/index.js";
 import { newId, nowIso } from "../../shared/src/index.js";
+import { metrics } from "../../observability/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 import { EffectT3RpcClient, type T3LiveClient } from "./rpc.js";
 
@@ -268,8 +269,8 @@ export class HttpT3Broker implements T3Broker {
   }
 
   async sendTurn(input: SendThreadTurnInput): Promise<TurnHandle> {
-    const commandId = newId("cmd");
-    const messageId = newId("msg");
+    const commandId = input.commandId ?? newId("cmd");
+    const messageId = `${commandId}:message`;
     const attachments = await Promise.all(
       (input.artifacts ?? [])
         .filter((artifact) => artifact.mimeType?.startsWith("image/") && artifact.sizeBytes <= 10 * 1024 * 1024)
@@ -464,7 +465,7 @@ export class HttpT3Broker implements T3Broker {
   async respondApproval(input: ApprovalDecision): Promise<void> {
     await this.dispatch({
       type: "thread.approval.respond",
-      commandId: newId("cmd"),
+      commandId: input.commandId ?? newId("cmd"),
       threadId: input.threadId,
       requestId: input.approvalId,
       decision: input.decision,
@@ -475,7 +476,7 @@ export class HttpT3Broker implements T3Broker {
   async respondUserInput(input: UserInputDecision): Promise<void> {
     await this.dispatch({
       type: "thread.user-input.respond",
-      commandId: newId("cmd"),
+      commandId: input.commandId ?? newId("cmd"),
       threadId: input.threadId,
       requestId: input.requestId,
       answers: input.answers,
@@ -513,19 +514,28 @@ export class HttpT3Broker implements T3Broker {
   }
 
   private async request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${this.options.baseUrl}${path}`, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        ...(this.options.bearerToken ? { authorization: `Bearer ${this.options.bearerToken}` } : {}),
-        ...init.headers,
-      },
-    });
-    if (!response.ok) {
-      const body = (await response.text()).slice(0, 1000);
-      throw new Error(`T3 ${response.status} ${response.statusText}: ${body}`);
+    const startedAt = Date.now();
+    const operation = init.method === "POST" ? "dispatch" : path.includes("threads/") ? "thread_snapshot" : "shell";
+    try {
+      const response = await fetch(`${this.options.baseUrl}${path}`, {
+        ...init,
+        headers: {
+          "content-type": "application/json",
+          ...(this.options.bearerToken ? { authorization: `Bearer ${this.options.bearerToken}` } : {}),
+          ...init.headers,
+        },
+      });
+      if (!response.ok) {
+        const body = (await response.text()).slice(0, 1000);
+        throw new Error(`T3 ${response.status} ${response.statusText}: ${body}`);
+      }
+      return (await response.json()) as T;
+    } catch (error) {
+      metrics.increment("provider_errors_total", { subsystem: "t3" });
+      throw error;
+    } finally {
+      metrics.observe("t3_rpc_latency_ms", Date.now() - startedAt, { operation });
     }
-    return (await response.json()) as T;
   }
 
   private synchronize(snapshot: T3ShellSnapshot): void {
