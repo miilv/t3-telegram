@@ -13,7 +13,9 @@ commit `.env`; it is ignored by Git.
    similar thread titles for the ambiguity exercise.
 4. Prepare a harmless document/photo, short voice note, short video note, and a
    worker task that creates a small text artifact.
-5. Run `pnpm check`, then `pnpm start` with `.env` loaded.
+5. Run `pnpm check` and `pnpm e2e:preflight`. Preflight prints only health,
+   bot username and whether the owner ID is configured; it never prints tokens.
+6. Start the production bundle with `.env` loaded.
 
 ## Evidence capture
 

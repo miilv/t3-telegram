@@ -35,6 +35,10 @@ turns; terminal worker delivery uses one anchored, idempotent outbox effect.
 - Local Claude CLI contract: `2.1.237`.
 - Real FFmpeg/ffprobe codec and media-conversion tests run in the normal suite.
 - `pnpm check` is the release gate: typecheck, all tests, and production bundle.
+- `docs/mvp-readiness.md` maps all 18 readiness criteria to exact source/test
+  boundaries; `tests/readiness.test.ts` prevents missing or duplicate rows.
+- `pnpm e2e:preflight` safely checks configured Telegram/T3 health without
+  printing credentials before the manual 12-scenario acceptance run.
 
 Real Telegram, Google Workspace, and authenticated T3 smoke tests require
 deployment credentials and are intentionally not simulated by this report.

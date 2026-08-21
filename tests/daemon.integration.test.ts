@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { OperatorDaemon } from "../apps/daemon/src/operator-daemon.js";
@@ -512,6 +512,181 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length === 2);
     expect(store.getFocus("42")).toEqual(focusAfterWork);
     expect(broker.turns).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("selects an existing project from a nested canonical path at the daemon boundary", async () => {
+    const home = tempDirectory("daemon-existing-path-");
+    const workspaceRoot = `${home}/acme-api`;
+    mkdirSync(`${workspaceRoot}/src/auth`, { recursive: true });
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_existing_path",
+      t3ProjectId: "prj_existing_path",
+      name: "Acme API",
+      workspaceRoot,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    broker.projects.push(project);
+    store.upsertProject(project);
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, `fix the auth race in ${workspaceRoot}/src/auth/refresh.ts and run tests`));
+    await waitFor(() => broker.turns.length === 1);
+    expect(broker.projects).toHaveLength(1);
+    expect(broker.threadInputs[0]?.projectId).toBe(project.id);
+    expect(store.getFocus("42").primary?.projectId).toBe(project.id);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("continues the exact mapped thread from a Telegram reply at the daemon boundary", async () => {
+    const home = tempDirectory("daemon-reply-routing-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_reply",
+      t3ProjectId: "prj_reply",
+      name: "Reply Project",
+      workspaceRoot: `${home}/reply-project`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    mkdirSync(project.workspaceRoot!, { recursive: true });
+    const thread: WorkThread = {
+      id: "th_reply_exact",
+      t3ThreadId: "th_reply_exact",
+      projectId: project.id,
+      title: "Mapped work",
+      shortSummary: "Existing mapped task",
+      keywords: ["mapped"],
+      status: "idle",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    broker.projects.push(project);
+    broker.threads.push(thread);
+    store.upsertProject(project);
+    store.upsertThread(thread);
+    store.saveTelegramMessage({
+      chatId: 7,
+      messageId: 777,
+      primaryProjectId: project.id,
+      primaryThreadId: thread.id,
+      relatedThreadIds: [thread.id],
+      artifactIds: [],
+      messageType: "worker_completed",
+      createdAt: timestamp,
+    });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push({ ...message(1, "продолжай и добавь regression test"), replyToMessageId: 777 });
+    await waitFor(() => broker.turns.length === 1);
+    expect(broker.turns[0]?.threadId).toBe(thread.id);
+    expect(broker.threadInputs).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("materializes an inbound Telegram document into the delegated worker workspace", async () => {
+    const home = tempDirectory("daemon-document-in-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(documentMessage(1, "analyze this specification and implement its requirements"));
+    await waitFor(() => broker.turns.length === 1);
+    const materialized = broker.turns[0]?.artifacts?.[0];
+    expect(materialized?.filename).toBe("requirements.txt");
+    expect(materialized?.localPath).toContain("/.operator-inbox/");
+    expect(existsSync(materialized!.localPath)).toBe(true);
+    const mapping = store.db
+      .prepare("SELECT artifact_ids_json FROM telegram_messages WHERE chat_id=? AND message_id=?")
+      .get(7, 1) as { artifact_ids_json: string };
+    expect(JSON.parse(mapping.artifact_ids_json)).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("returns a requested worker artifact through one validated Telegram document send", async () => {
+    const home = tempDirectory("daemon-document-out-");
+    const workspaceRoot = `${home}/acme-files`;
+    mkdirSync(workspaceRoot, { recursive: true });
+    const outputPath = `${workspaceRoot}/result.patch`;
+    writeFileSync(outputPath, "diff --git a/a b/a\n", { mode: 0o600 });
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.outputArtifacts = [{
+      id: "t3-output-patch",
+      filename: "result.patch",
+      localPath: outputPath,
+      sizeBytes: 21,
+      sha256: "t3-checkpoint",
+      projectId: "prj_files",
+    }];
+    const project: Project = {
+      id: "prj_files",
+      t3ProjectId: "prj_files",
+      name: "Acme Files",
+      workspaceRoot,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    broker.projects.push(project);
+    store.upsertProject(project);
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "build a patch in Acme Files and send the document"));
+    await waitFor(() => telegram.sentDocuments.length === 1);
+    expect(telegram.sentDocuments[0]).toMatchObject({ path: realpathSync(outputPath), caption: "result.patch" });
+    expect(store.listTelegramOutbox().filter((item) => item.operation === "document")).toHaveLength(1);
 
     telegram.finish();
     await run;
@@ -1616,6 +1791,18 @@ function videoNoteMessage(messageId: number): Extract<TelegramInbound, { type: "
   };
 }
 
+function documentMessage(messageId: number, text: string): Extract<TelegramInbound, { type: "message" }> {
+  return {
+    ...message(messageId, text),
+    attachments: [{
+      type: "document",
+      fileId: `document_${messageId}`,
+      filename: "requirements.txt",
+      mimeType: "text/plain",
+    }],
+  };
+}
+
 function callback(
   updateId: number,
   callbackId: string,
@@ -1783,6 +1970,7 @@ class FakeBroker implements T3Broker {
   readonly threadInputs: CreateThreadInput[] = [];
   providers: ProviderDescriptor[] = [];
   workerEvents: WorkerEvent[] | undefined;
+  outputArtifacts: ArtifactRef[] = [];
   dispatchFailures = 0;
   private terminalGate: Promise<void> | undefined;
   private releaseTerminalGate: (() => void) | undefined;
@@ -1892,7 +2080,7 @@ class FakeBroker implements T3Broker {
     return [];
   }
   async getThreadArtifacts(): Promise<ArtifactRef[]> {
-    return [];
+    return this.outputArtifacts;
   }
   async respondApproval(input: ApprovalDecision): Promise<void> {
     this.approvalResponses.push(input);
@@ -1954,6 +2142,7 @@ class FakeTelegram implements TelegramTransport {
   readonly userInputEdits: Array<{ messageId: number; questionIndex: number }> = [];
   readonly keyboardClears: number[] = [];
   readonly approvals: Array<{ messageId: number; text: string; approvalId: string }> = [];
+  readonly sentDocuments: Array<{ path: string; caption?: string }> = [];
   private readonly queue = new AsyncInputQueue<TelegramInbound>();
   private nextMessageId = 100;
 
@@ -1982,7 +2171,8 @@ class FakeTelegram implements TelegramTransport {
     this.sent.push({ messageId: draft.messageId!, text, at: Date.now() });
     return [{ chatId: draft.chatId, messageId: draft.messageId! }];
   }
-  async sendDocument(): Promise<SentMessage> {
+  async sendDocument(_chatId: number, path: string, caption?: string): Promise<SentMessage> {
+    this.sentDocuments.push({ path, ...(caption ? { caption } : {}) });
     return { chatId: 7, messageId: this.nextMessageId++ };
   }
   async sendPhoto(): Promise<SentMessage> {

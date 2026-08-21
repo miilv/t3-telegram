@@ -90,7 +90,7 @@ branch, not an aspiration.
 | 80 E2E-12 | Crash/restart subscription and exactly-once completion pass integration; real test-bot/T3 run is not yet available. | UNVERIFIED |
 | 81–84 | MVP plus Phase 2/3 are implemented: media/rich/hybrid memory/handoff/fan-out, teams/RBAC/groups, connectors/automations/dashboard/policy and optimized provider routing. Evidence: full 111-test suite. | PROVED |
 | 85–87 | Repository is modular; donor/source decisions are attributed; grammY/Effect RPC are used; Operator, Telegram UI and T3 project/thread state remain separate. | PROVED |
-| 88 | All 18 MVP readiness paths pass component/integration gates, but the required real test-bot/T3 acceptance run remains. | UNVERIFIED |
+| 88 | All 18 MVP readiness paths pass component/integration gates and are mapped in `mvp-readiness.md`; the required real test-bot/T3 acceptance run remains. | UNVERIFIED |
 | 89 | Checked-in 80-scenario corpus reports 100% for reply, project/path and focus gates and 100% clarification/focus preservation. Evidence: `routing-quality.test.ts`, `verification-report.md`. | PROVED |
 | 90 | Latency budgets, required metrics, restart/dedupe/idempotency and typed modular boundaries are measured/tested/documented. Evidence: daemon latency/recovery tests and verification report. | PROVED |
 | 91–92 | Every named risk/open question has a source-checked decision, isolation/fallback mitigation and regression evidence. Evidence: source research plus broker/runtime/router/transport tests. | PROVED |
@@ -213,6 +213,9 @@ Before completion:
   removal, argv-safe MCP bearer injection and secret-stripped environments. A
   daemon test proves compact + bounded snapshot restoration during `/operator
   switch` and durable provider/session persistence.
+- The 18-row MVP matrix is guarded by `readiness.test.ts`; new daemon-boundary
+  cases prove canonical-path project selection, mapped Telegram replies,
+  inbound document materialization and requested outbound document delivery.
 - The 80-scenario routing corpus passes every section 89 target at 100%. The
   daemon latency gate enforces direct first-visible under three seconds and
   worker acknowledgement under two seconds at the local provider boundary;

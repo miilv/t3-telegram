@@ -15,6 +15,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "e2e:preflight": "node --env-file=.env --import tsx scripts/e2e-preflight.ts",
     "check": "pnpm typecheck && pnpm test && pnpm build"
   },
   "dependencies": {
