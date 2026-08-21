@@ -170,7 +170,11 @@ export class TelegramBotTransport implements TelegramTransport {
       client: {
         apiRoot: apiBase,
         timeoutSeconds: Math.max(30, pollTimeoutSeconds + 15),
-        fetch: fetchImpl,
+        // grammY constructs polyfilled AbortSignals that undici's fetch
+        // brand-checks and rejects, failing every API call. Re-issue them as
+        // native signals before delegating.
+        fetch: ((input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+          this.fetchImpl(input, normalizeFetchInit(init))) as typeof fetch,
       },
     });
     this.bot.on("message", (ctx) => this.acceptUpdate(ctx.update as unknown as RawUpdate));
@@ -562,14 +566,21 @@ export class TelegramBotTransport implements TelegramTransport {
             this.logger.info({ username: me.username }, "Telegram polling started");
           },
         });
-        return;
+        if (signal?.aborted) return;
+        // bot.start() resolved without an abort: restart rather than go deaf.
+        attempt += 1;
+        this.logger.warn({ attempt }, "Telegram polling stopped unexpectedly; restarting");
+        await delay(Math.min(15_000, Math.max(1_000, attempt * 1_000)), signal);
       } catch (error) {
         if (signal?.aborted || isAbortError(error)) return;
         attempt += 1;
         const isConflict = error instanceof GrammyError && error.error_code === 409;
         if (isConflict && attempt >= 8) {
-          this.logger.error({ err: error }, "Telegram polling conflict persisted; another poller owns the bot token");
-          return;
+          // Another poller (often our own predecessor during restart overlap)
+          // owns the token. Never give up permanently — keep probing slowly.
+          this.logger.error({ err: error, attempt }, "Telegram polling conflict persists; retrying in 30s");
+          await delay(30_000, signal);
+          continue;
         }
         const waitMs = Math.min(15_000, Math.max(1_000, attempt * 1_000));
         this.logger.warn({ err: error, attempt, waitMs }, "Telegram polling failed; retrying");
@@ -1131,6 +1142,16 @@ function userInputKeyboard(
     inline_keyboard.push([{ text: "Submit selected", callback_data: callback("s") }]);
   }
   return { inline_keyboard };
+}
+
+function normalizeFetchInit(init?: RequestInit): RequestInit | undefined {
+  const signal = init?.signal;
+  if (!signal || signal instanceof AbortSignal) return init;
+  const controller = new AbortController();
+  const foreign = signal as unknown as AbortSignal;
+  if (foreign.aborted) controller.abort(foreign.reason);
+  else foreign.addEventListener("abort", () => controller.abort(foreign.reason), { once: true });
+  return { ...init, signal: controller.signal };
 }
 
 function truncateButtonLabel(value: string): string {
