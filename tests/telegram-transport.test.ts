@@ -490,4 +490,29 @@ describe("inbound batch merging", () => {
     }
     expect(new Set(payloads).size).toBe(3);
   });
+
+  it("opens a table block even when the model omits the blank line", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    // Telegram's rich parser glues rows onto the paragraph above unless the
+    // table starts its own block, and then renders raw pipes.
+    await transport.sendRich(
+      7,
+      "**Активные:**\n| Проект | Тредов |\n|---|---|\n| me | 7 |\nИтого 1 проект.",
+    );
+    const markdown = (calls.at(-1)?.body?.rich_message as { markdown: string }).markdown;
+    expect(markdown).toContain("**Активные:**\n\n| Проект | Тредов |");
+    expect(markdown).toContain("| me | 7 |\n\nИтого 1 проект.");
+  });
+
+  it("leaves pipe-looking lines inside fenced code untouched", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const source = "Вывод:\n```\n| a | b |\n| c | d |\n```\nконец";
+    await transport.sendRich(7, source);
+    const markdown = (calls.at(-1)?.body?.rich_message as { markdown: string }).markdown;
+    expect(markdown).toBe(source);
+  });
 });

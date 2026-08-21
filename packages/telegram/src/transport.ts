@@ -1358,7 +1358,45 @@ function normalizeRichMarkdown(text: string): string {
   // Rich markdown is GFM-compatible; it must not be escaped as MarkdownV2.
   // CJK draft corruption observed by Hermes is avoided by keeping the original
   // Unicode text and never injecting zero-width formatting characters.
-  return text.replaceAll("\u0000", "");
+  return isolateBlockStarts(text.replaceAll("\u0000", ""));
+}
+
+const TABLE_ROW = /^\s{0,3}\|.*\|\s*$/;
+
+/**
+ * GFM (and Telegram's rich parser) only opens a table when its first row starts
+ * a fresh block. Models routinely write the table directly under a heading or
+ * a bold lead-in, and the rows then glue onto that paragraph and render as raw
+ * pipes. Insert the missing blank lines so the block is recognised.
+ */
+function isolateBlockStarts(text: string): string {
+  const lines = text.split("\n");
+  const output: string[] = [];
+  let inFence = false;
+  for (const line of lines) {
+    if (/^\s{0,3}(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      output.push(line);
+      continue;
+    }
+    if (inFence) {
+      output.push(line);
+      continue;
+    }
+    const previous = output.at(-1);
+    const isRow = TABLE_ROW.test(line);
+    const previousIsRow = previous !== undefined && TABLE_ROW.test(previous);
+    // Opening row directly under text: separate it from that paragraph.
+    if (isRow && !previousIsRow && previous !== undefined && previous.trim() !== "") {
+      output.push("");
+    }
+    // Text directly under the last row: close the table before it.
+    if (!isRow && previousIsRow && line.trim() !== "") {
+      output.push("");
+    }
+    output.push(line);
+  }
+  return output.join("\n");
 }
 
 function classifyRichFailure(error: unknown): RichFailure {
