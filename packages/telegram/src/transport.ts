@@ -451,6 +451,24 @@ export class TelegramBotTransport implements TelegramTransport {
     return sentMessage(chatId, message.message_id, options);
   }
 
+  async sendChoices(
+    chatId: number,
+    text: string,
+    choiceId: string,
+    labels: string[],
+    options: TelegramSendOptions = {},
+  ): Promise<SentMessage> {
+    const message = await this.outbound(chatId, () =>
+      this.bot.api.sendMessage(chatId, markdownToTelegramHtml(text), {
+        ...messageOptions(options),
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        reply_markup: choiceKeyboard(choiceId, labels),
+      }),
+    );
+    return sentMessage(chatId, message.message_id, options);
+  }
+
   async editUserInput(
     chatId: number,
     messageId: number,
@@ -1216,6 +1234,14 @@ function telegramRetryAfter(error: unknown): number | undefined {
   if (!(error instanceof GrammyError) || error.error_code !== 429) return undefined;
   const parameters = error.parameters as { retry_after?: number } | undefined;
   return parameters?.retry_after;
+}
+
+function choiceKeyboard(choiceId: string, labels: string[]) {
+  return {
+    inline_keyboard: labels.map((label, index) => [
+      { text: truncateButtonLabel(label), callback_data: `route:${choiceId}:${index}` },
+    ]),
+  };
 }
 
 function approvalKeyboard(approvalId: string) {

@@ -1304,11 +1304,17 @@ export class OperatorStore {
       .run(nowIso(), id);
   }
 
-  retryBackgroundJob(id: string, error: string): void {
+  retryBackgroundJob(id: string, error: string, maxAttempts = 8): boolean {
     const row = this.db.prepare("SELECT attempts FROM background_jobs WHERE id=?").get(id) as
       | Row
       | undefined;
     const attempts = Number(row?.attempts ?? 0) + 1;
+    if (attempts >= maxAttempts) {
+      this.db
+        .prepare("UPDATE background_jobs SET status='failed',attempts=?,last_error=?,updated_at=? WHERE id=?")
+        .run(attempts, error.slice(0, 1000), nowIso(), id);
+      return true;
+    }
     const delayMs = Math.min(60_000, 1_000 * 2 ** Math.min(attempts - 1, 6));
     this.db
       .prepare(`
@@ -1322,6 +1328,7 @@ export class OperatorStore {
         nowIso(),
         id,
       );
+    return false;
   }
 
   enqueueTelegramOutbox<T>(input: {
@@ -1566,6 +1573,7 @@ export class OperatorStore {
           id,title,synthesis_goal,status,synthesis_status,telegram_chat_id,origin_message_id,
           message_thread_id,direct_messages_topic_id,created_at,updated_at,delivered_at
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)
+        ON CONFLICT(id) DO NOTHING
       `)
       .run(
         input.id,
@@ -1768,6 +1776,19 @@ export class OperatorStore {
       `)
       .get(chatId, messageId) as Row | undefined;
     return row ? rowToRoutingClarification(row) : undefined;
+  }
+
+  getRoutingClarification(id: string): PendingRoutingClarification | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM routing_clarifications WHERE id=? AND status='pending'")
+      .get(id) as Row | undefined;
+    return row ? rowToRoutingClarification(row) : undefined;
+  }
+
+  repointRoutingClarificationMessage(id: string, messageId: number): void {
+    this.db
+      .prepare("UPDATE routing_clarifications SET telegram_message_id=?,updated_at=? WHERE id=?")
+      .run(messageId, nowIso(), id);
   }
 
   updateRoutingClarificationStatus(id: string, status: string): void {

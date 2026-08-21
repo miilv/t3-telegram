@@ -207,6 +207,13 @@ export interface TelegramTransport {
     choices: TelegramUserInputChoice[],
     multiSelect: boolean,
   ): Promise<void>;
+  sendChoices(
+    chatId: number,
+    text: string,
+    choiceId: string,
+    labels: string[],
+    options?: TelegramSendOptions,
+  ): Promise<SentMessage>;
   editRich(chatId: number, messageId: number, text: string, options?: TelegramDestination): Promise<void>;
   clearInlineKeyboard(chatId: number, messageId: number): Promise<void>;
   answerCallback(callbackId: string, text?: string): Promise<void>;

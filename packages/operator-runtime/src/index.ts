@@ -14,6 +14,8 @@ export interface ClaudeCliRuntimeOptions {
   cwd: string;
   model: string;
   effort: "low" | "medium" | "high" | "xhigh" | "max";
+  /** Absolute wall-clock cap per turn; a hung CLI must not stall daemon queues. */
+  turnTimeoutMs?: number;
 }
 
 export interface CodexCliRuntimeOptions {
@@ -351,6 +353,8 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       "-p",
       "--output-format",
       "stream-json",
+      // The CLI rejects --print with stream-json output unless --verbose is set.
+      "--verbose",
       "--include-partial-messages",
       "--model",
       this.options.model,
@@ -381,6 +385,14 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     this.currentSessionId = input.sessionId;
     child.stdin.end(input.prompt);
 
+    let timedOut = false;
+    const timeoutMs = this.options.turnTimeoutMs ?? 600_000;
+    const watchdog = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    watchdog.unref();
+
     let stderr = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
@@ -399,13 +411,18 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
         if (event) queue.push(event);
       }
     });
-    child.once("error", (error) => queue.fail(error));
+    child.once("error", (error) => {
+      clearTimeout(watchdog);
+      queue.fail(error);
+    });
     child.once("close", (code) => {
+      clearTimeout(watchdog);
       if (buffer.trim()) {
         const event = parseClaudeEvent(buffer);
         if (event) queue.push(event);
       }
-      if (code === 0) queue.end();
+      if (timedOut) queue.fail(new Error(`Claude CLI turn timed out after ${timeoutMs}ms and was killed`));
+      else if (code === 0) queue.end();
       else queue.fail(new Error(`Claude CLI exited ${code}: ${stderr.slice(-1200)}`));
     });
 
@@ -417,6 +434,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       this.newSessions.delete(input.sessionId);
       this.systemPrompts.delete(input.sessionId);
     } finally {
+      clearTimeout(watchdog);
       this.active = undefined;
       if (mcpConfigPath) await unlink(mcpConfigPath).catch(() => undefined);
     }

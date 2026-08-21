@@ -183,8 +183,12 @@ function splitPlainText(text: string, limit: number): string[] {
     const window = remaining.slice(0, limit + 1);
     const newline = window.lastIndexOf("\n");
     const space = window.lastIndexOf(" ");
-    const splitAt = Math.max(newline, space, 1);
-    chunks.push(remaining.slice(0, splitAt).trim());
+    // Without whitespace in the window (base64, long URLs) fall back to a hard
+    // cut at the limit instead of degenerating to one-character chunks.
+    let splitAt = Math.max(newline, space);
+    if (splitAt < 1) splitAt = limit;
+    const chunk = remaining.slice(0, splitAt).trim();
+    if (chunk) chunks.push(chunk);
     remaining = remaining.slice(splitAt).trimStart();
   }
   if (remaining) chunks.push(remaining);

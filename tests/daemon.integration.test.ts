@@ -1310,6 +1310,40 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("resolves a routing clarification from an inline button press", async () => {
+    const home = tempDirectory("daemon-route-button-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    seedAmbiguousAuthThreads(store, broker);
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "continue auth work"));
+    await waitFor(() => telegram.choicePrompts.length === 1);
+    const prompt = telegram.choicePrompts[0]!;
+    const clarification = store.findPendingRoutingClarificationByMessage(7, prompt.messageId);
+    expect(clarification).toBeDefined();
+    expect(prompt.choiceId).toBe(clarification!.id);
+    const expectedThreadId = clarification!.candidateThreadIds[1]!;
+
+    telegram.push(callback(99, "cb_route_1", prompt.messageId, `route:${prompt.choiceId}:1`));
+    await waitFor(() => broker.turns.length === 1);
+    expect(broker.turns[0]?.threadId).toBe(expectedThreadId);
+    expect(broker.turns[0]?.text).toContain("continue auth work");
+    expect(store.getRoutingClarification(clarification!.id)).toBeUndefined();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("uses Operator shortlist arbitration when one similar thread is materially identified", async () => {
     const home = tempDirectory("daemon-route-arbitration-");
     const store = tempStore();
@@ -1696,6 +1730,7 @@ function config(home: string): Config {
       model: "opus",
       effort: "high",
       compactThresholdPercent: 80,
+      turnTimeoutMs: 600_000,
       home,
       runtimeDir: `${home}/runtime`,
       artifactDir: `${home}/artifacts`,
@@ -2215,6 +2250,20 @@ class FakeTelegram implements TelegramTransport {
     approvalId: string,
   ): Promise<void> {
     this.approvals.push({ messageId, text, approvalId });
+  }
+  readonly choicePrompts: Array<{ messageId: number; choiceId: string; labels: string[] }> = [];
+  async sendChoices(
+    _chatId: number,
+    text: string,
+    choiceId: string,
+    labels: string[],
+  ): Promise<SentMessage> {
+    const messageId = this.nextMessageId++;
+    const at = Date.now();
+    this.visible.push({ kind: "message", at });
+    this.sent.push({ messageId, text, at });
+    this.choicePrompts.push({ messageId, choiceId, labels });
+    return { chatId: 7, messageId };
   }
   async sendUserInput(
     _chatId: number,

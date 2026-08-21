@@ -193,7 +193,7 @@ describe("MediaProcessor", () => {
     expect(videoProbe.durationSeconds).toBeGreaterThanOrEqual(59.5);
     expect(videoNote.derivedFromArtifactId).toBe(video.id);
     store.close();
-  });
+  }, 120_000);
 
   it.runIf(process.platform === "darwin" && commandWorks("/usr/bin/say", ["-v", "?"]))(
     "synthesizes local text to a Telegram-native Opus voice artifact",

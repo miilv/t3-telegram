@@ -5,6 +5,8 @@ export default defineConfig({
   format: ["esm"],
   platform: "node",
   target: "node24",
+  // tsup v8 strips the `node:` prefix by default, which breaks `node:sqlite`.
+  removeNodeProtocol: false,
   outDir: "dist",
   sourcemap: true,
   clean: true,

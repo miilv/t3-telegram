@@ -330,7 +330,7 @@ export class OperatorDaemon {
       `thread_direct_topic:${thread.id}`,
       String(input.context.directMessagesTopicId ?? ""),
     );
-    this.store.setRuntimeState(`thread_completion_delivered:${thread.id}`, "");
+    this.resetThreadTerminalDelivery(thread.id);
     this.store.setRuntimeState(
       `thread_correlation_id:${thread.id}`,
       `tg:${hashChatId(input.context.chatId)}:${input.context.originMessageId}`,
@@ -650,13 +650,18 @@ export class OperatorDaemon {
       const choices = route.binding.threadIds
         .map((threadId) => this.store.getThread(threadId))
         .filter((thread): thread is WorkThread => Boolean(thread));
-      const sent = await this.telegram.sendRich(
-        update.chatId,
-        `Тут два похожих рабочих контекста:\n\n${choices
-          .map((thread, index) => `${index + 1}. **${escapeMarkdownText(thread.title)}**`)
-          .join("\n")}\n\nКакой продолжить?`,
-        replyOptions(update),
-      );
+      const clarificationId = newId("route");
+      const sent = [
+        await this.telegram.sendChoices(
+          update.chatId,
+          `Тут два похожих рабочих контекста:\n\n${choices
+            .map((thread, index) => `${index + 1}. **${escapeMarkdownText(thread.title)}**`)
+            .join("\n")}\n\nКакой продолжить?`,
+          clarificationId,
+          choices.map((thread, index) => `${index + 1}. ${thread.title}`),
+          replyOptions(update),
+        ),
+      ];
       for (const message of sent) {
         this.store.saveTelegramMessage({
           chatId: message.chatId,
@@ -673,7 +678,7 @@ export class OperatorDaemon {
       const promptMessage = sent[0];
       if (promptMessage) {
         this.store.saveRoutingClarification({
-          id: newId("route"),
+          id: clarificationId,
           chatId: promptMessage.chatId,
           messageId: promptMessage.messageId,
           originalUpdate: { ...update, attachments: [] },
@@ -891,13 +896,24 @@ export class OperatorDaemon {
       const choices = clarification.candidateThreadIds
         .map((threadId) => this.store.getThread(threadId))
         .filter((thread): thread is WorkThread => Boolean(thread));
-      await this.telegram.sendRich(
+      const reprompt = await this.telegram.sendChoices(
         update.chatId,
-        `Не смог сопоставить ответ. Ответьте номером или названием:\n\n${choices
+        `Не смог сопоставить ответ. Выберите кнопкой или ответьте номером/названием:\n\n${choices
           .map((thread, index) => `${index + 1}. **${escapeMarkdownText(thread.title)}**`)
           .join("\n")}`,
+        clarification.id,
+        choices.map((thread, index) => `${index + 1}. ${thread.title}`),
         replyOptions(update),
       );
+      this.store.saveTelegramMessage({
+        chatId: reprompt.chatId,
+        messageId: reprompt.messageId,
+        relatedThreadIds: clarification.candidateThreadIds,
+        artifactIds: [],
+        messageType: "routing_clarification",
+        createdAt: nowIso(),
+      });
+      this.store.repointRoutingClarificationMessage(clarification.id, reprompt.messageId);
       return;
     }
     if (!isStoredTelegramMessage(clarification.originalUpdate)) {
@@ -909,6 +925,19 @@ export class OperatorDaemon {
       );
       return;
     }
+    await this.dispatchClarifiedThread(clarification, selectedThreadId, update);
+  }
+
+  private async dispatchClarifiedThread(
+    clarification: PendingRoutingClarification,
+    selectedThreadId: string,
+    answer?: Extract<TelegramInbound, { type: "message" }>,
+  ): Promise<void> {
+    if (!isStoredTelegramMessage(clarification.originalUpdate)) {
+      this.store.updateRoutingClarificationStatus(clarification.id, "invalid");
+      return;
+    }
+    const update = answer ?? clarification.originalUpdate;
     this.store.updateRoutingClarificationStatus(clarification.id, "dispatching");
     try {
       const projects = await this.broker.listProjects().catch(() => this.store.listProjects());
@@ -1559,7 +1588,7 @@ export class OperatorDaemon {
       project.id,
       thread.id,
     );
-    this.store.setRuntimeState(`thread_completion_delivered:${thread.id}`, "");
+    this.resetThreadTerminalDelivery(thread.id);
     for (const messageId of update.messageIds) {
       this.store.updateTelegramMessageBinding(update.chatId, messageId, {
         primaryProjectId: project.id,
@@ -1792,8 +1821,16 @@ export class OperatorDaemon {
       });
     } catch (error) {
       const detail = safeExcerpt(error instanceof Error ? error.message : String(error), 1_000);
-      this.store.retryBackgroundJob(job.id, detail);
-      this.logger.warn({ err: error, threadId, jobId: job.id }, "Queued worker follow-up dispatch failed");
+      const gaveUp = this.store.retryBackgroundJob(job.id, detail);
+      if (gaveUp) {
+        this.enqueueTelegramOutbox(`telegram:${job.id}:gave_up`, job.payload.chatId, "rich", {
+          text: `Не удалось отправить отложенное уточнение в **${escapeMarkdownText(this.store.getThread(threadId)?.title ?? threadId)}** после нескольких попыток.`,
+          options: job.payload.destination,
+          threadId,
+          messageType: "followup_failed",
+        });
+      }
+      this.logger.warn({ err: error, threadId, jobId: job.id, gaveUp }, "Queued worker follow-up dispatch failed");
       return undefined;
     }
     this.store.completeBackgroundJob(job.id);
@@ -1807,7 +1844,7 @@ export class OperatorDaemon {
       `thread_direct_topic:${threadId}`,
       String(job.payload.destination.directMessagesTopicId ?? ""),
     );
-    this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, "");
+    this.resetThreadTerminalDelivery(threadId);
     this.store.appendEvent("thread.followup.dispatched", {
       threadId,
       payload: { jobId: job.id, attempts: job.attempts },
@@ -2201,6 +2238,20 @@ export class OperatorDaemon {
     );
   }
 
+  // A per-thread delivery epoch distinguishes terminal events of successive
+  // turns on a reused thread. The outbox dedupe key includes it so retries of
+  // one terminal event stay idempotent while the next turn delivers again.
+  private resetThreadTerminalDelivery(threadId: string): void {
+    this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, "");
+    const epoch = Number(this.store.getRuntimeState(`thread_terminal_epoch:${threadId}`) ?? "0");
+    this.store.setRuntimeState(`thread_terminal_epoch:${threadId}`, String(epoch + 1));
+  }
+
+  private threadTerminalOutboxKey(threadId: string): string {
+    const epoch = this.store.getRuntimeState(`thread_terminal_epoch:${threadId}`) ?? "0";
+    return `telegram:thread:${threadId}:terminal:${epoch}`;
+  }
+
   private async deliverCompletion(
     chatId: number,
     event: Extract<WorkerEvent, { type: "completed" }>,
@@ -2227,7 +2278,7 @@ export class OperatorDaemon {
       return;
     }
     const rendered = renderWorkerResult(result);
-    this.enqueueTelegramOutbox(`telegram:thread:${event.threadId}:terminal`, chatId, "rich", {
+    this.enqueueTelegramOutbox(this.threadTerminalOutboxKey(event.threadId), chatId, "rich", {
       text: rendered,
       options: {
         ...destination,
@@ -2341,7 +2392,7 @@ export class OperatorDaemon {
         if (value !== undefined) this.store.setRuntimeState(`thread_${key}:${targetThread.id}`, value);
       }
       this.store.setRuntimeState(`thread_user_intent:${targetThread.id}`, this.store.getRuntimeState(`thread_user_intent:${threadId}`) ?? "");
-      this.store.setRuntimeState(`thread_completion_delivered:${targetThread.id}`, "");
+      this.resetThreadTerminalDelivery(targetThread.id);
       this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, nowIso());
       this.store.updateThreadStatus(threadId, "failed", { result: `Recovery continued in ${targetThread.id}` });
       const originMessageId = Number(this.store.getRuntimeState(`thread_origin_message:${threadId}`));
@@ -2441,7 +2492,7 @@ export class OperatorDaemon {
       await this.attemptWorkerGroupSynthesis(group.id);
       return false;
     }
-    this.enqueueTelegramOutbox(`telegram:thread:${threadId}:terminal`, chatId, "rich", {
+    this.enqueueTelegramOutbox(this.threadTerminalOutboxKey(threadId), chatId, "rich", {
       text: `Работа **${escapeMarkdownText(this.store.getThread(threadId)?.title ?? threadId)}** завершилась ошибкой. ${escapeMarkdownText(classified.safeMessage)} Код: \`${classified.code}\`.`,
       options: destination,
       threadId,
@@ -2475,7 +2526,7 @@ export class OperatorDaemon {
       await this.attemptWorkerGroupSynthesis(group.id);
       return;
     }
-    this.enqueueTelegramOutbox(`telegram:thread:${threadId}:terminal`, chatId, "rich", {
+    this.enqueueTelegramOutbox(this.threadTerminalOutboxKey(threadId), chatId, "rich", {
       text: `Работа **${escapeMarkdownText(this.store.getThread(threadId)?.title ?? threadId)}** остановлена.`,
       options: destination,
       threadId,
@@ -2579,6 +2630,33 @@ export class OperatorDaemon {
         userInputMatch[3]!,
       );
       this.store.completeEvent(eventKey);
+      return;
+    }
+    const routeMatch = /^route:([^:]+):(\d+)$/.exec(update.data);
+    if (routeMatch) {
+      const clarification = this.store.getRoutingClarification(routeMatch[1]!);
+      if (!clarification || clarification.chatId !== update.chatId) {
+        await this.telegram.answerCallback(update.callbackId, "Этот выбор уже неактуален");
+        this.store.completeEvent(eventKey);
+        return;
+      }
+      const selectedThreadId = clarification.candidateThreadIds[Number(routeMatch[2])];
+      if (!selectedThreadId) {
+        await this.telegram.answerCallback(update.callbackId, "Этот выбор уже неактуален");
+        this.store.completeEvent(eventKey);
+        return;
+      }
+      await this.telegram.answerCallback(
+        update.callbackId,
+        this.store.getThread(selectedThreadId)?.title ?? "Продолжаю",
+      );
+      this.enqueueKeyboardCleanup(update.chatId, clarification.messageId, selectedThreadId, eventKey);
+      try {
+        await this.dispatchClarifiedThread(clarification, selectedThreadId);
+      } finally {
+        this.store.completeEvent(eventKey);
+        await this.flushTelegramOutbox();
+      }
       return;
     }
     const match = /^approval:([^:]+):(accept|acceptForSession|decline|cancel)$/.exec(update.data);
@@ -3538,9 +3616,12 @@ export class OperatorDaemon {
       const recoverable = all.filter((thread) => {
         const hasChat = Boolean(this.store.getRuntimeState(`thread_chat:${thread.id}`));
         const active = ["queued", "running", "waiting_approval", "waiting_user"].includes(thread.status);
-        const undeliveredCompletion =
-          thread.status === "completed" && !this.store.getRuntimeState(`thread_completion_delivered:${thread.id}`);
-        return hasChat && (active || undeliveredCompletion);
+        // Terminal states reached while the daemon was down must still be
+        // delivered; the broker re-emits the terminal event on subscribe.
+        const undeliveredTerminal =
+          ["completed", "failed", "cancelled"].includes(thread.status) &&
+          !this.store.getRuntimeState(`thread_completion_delivered:${thread.id}`);
+        return hasChat && (active || undeliveredTerminal);
       });
       for (const thread of recoverable) {
         const chatId = Number(this.store.getRuntimeState(`thread_chat:${thread.id}`));
@@ -3750,11 +3831,20 @@ export class OperatorDaemon {
         if (job.payload.update.automationRunId) this.store.completeAutomationRunByJob(job.id);
       } catch (error) {
         const classified = classifyOperationalError(error);
-        this.store.retryBackgroundJob(job.id, classified.code);
+        const gaveUp = this.store.retryBackgroundJob(job.id, classified.code);
         this.store.appendEvent("telegram.ingress.deferred", {
           correlationId: correlationForUpdate(job.payload.update),
-          payload: { jobId: job.id, errorCode: classified.code },
+          payload: { jobId: job.id, errorCode: classified.code, gaveUp },
         });
+        if (gaveUp) {
+          this.enqueueTelegramOutbox(`telegram:job:${job.id}:gave_up`, job.payload.update.chatId, "rich", {
+            text: `Не удалось обработать сообщение после нескольких попыток. ${classified.safeMessage}`,
+            options: { replyToMessageId: job.payload.update.messageId },
+            messageType: "ingress_failed",
+            correlationId: correlationForUpdate(job.payload.update),
+          });
+          continue;
+        }
         throw error;
       }
     }
@@ -4058,7 +4148,18 @@ export class OperatorDaemon {
       return true;
     } catch (error) {
       const classified = classifyOperationalError(error, "t3");
-      this.store.retryBackgroundJob(job.id, classified.code);
+      const gaveUp = this.store.retryBackgroundJob(job.id, classified.code);
+      if (gaveUp) {
+        this.enqueueTelegramOutbox(`telegram:${payload.commandId}:gave_up`, payload.chatId, "rich", {
+          text: `Не удалось запустить работу в T3 после нескольких попыток. ${classified.safeMessage}`,
+          options: { ...payload.destination, replyToMessageId: payload.originMessageId },
+          messageType: "t3_dispatch_failed",
+          projectId: payload.projectId,
+          threadId: payload.threadId,
+          correlationId: payload.correlationId,
+        });
+        return false;
+      }
       if (!payload.suppressDeferredNotification) {
         this.enqueueTelegramOutbox(`telegram:${payload.commandId}:deferred`, payload.chatId, "rich", {
           text: classified.safeMessage,
@@ -4275,7 +4376,7 @@ export class OperatorDaemon {
       `thread_direct_topic:${threadId}`,
       String(update.directMessagesTopicId ?? ""),
     );
-    this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, "");
+    this.resetThreadTerminalDelivery(threadId);
     this.store.setRuntimeState(`thread_correlation_id:${threadId}`, correlationForUpdate(update));
   }
 

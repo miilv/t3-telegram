@@ -39,4 +39,13 @@ describe("Telegram rich rendering", () => {
     expect(chunks.some((chunk) => chunk.includes("![chart](attachment://chart.png)"))).toBe(true);
     expect(chunks.every((chunk) => chunk.length <= 180)).toBe(true);
   });
+
+  it("splits whitespace-free payloads at the limit instead of one-character chunks", () => {
+    const blob = "A".repeat(9000);
+    const chunks = splitRichText(blob, 3800);
+    expect(chunks.length).toBe(3);
+    expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(3800);
+    expect(chunks.join("")).toBe(blob);
+    expect(chunks.every((chunk) => chunk.length > 0)).toBe(true);
+  });
 });

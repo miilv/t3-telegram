@@ -216,6 +216,31 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("caps background job retries and marks the job failed", () => {
+    const store = tempStore();
+    const jobId = store.enqueueBackgroundJob("thread_followup", { threadId: "thread_1" });
+    for (let attempt = 1; attempt < 8; attempt += 1) {
+      expect(store.retryBackgroundJob(jobId, "boom")).toBe(false);
+    }
+    expect(store.retryBackgroundJob(jobId, "boom")).toBe(true);
+    expect(store.listBackgroundJobs("thread_followup", "failed")).toHaveLength(1);
+    store.close();
+  });
+
+  it("createWorkerGroup is idempotent on crash replay", () => {
+    const store = tempStore();
+    const input = {
+      id: "group_replay",
+      title: "Replay",
+      synthesisGoal: "Goal",
+      chatId: 7,
+      originMessageId: 11,
+    };
+    store.createWorkerGroup(input);
+    expect(() => store.createWorkerGroup(input)).not.toThrow();
+    store.close();
+  });
+
   it("atomically claims a terminal worker group for one synthesis", () => {
     const store = tempStore();
     store.createWorkerGroup({
