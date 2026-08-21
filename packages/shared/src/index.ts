@@ -38,6 +38,36 @@ export interface WorkThread {
   relatedArtifacts: string[];
 }
 
+export interface ThreadSummary {
+  threadId: string;
+  purpose: string;
+  currentState: string;
+  importantDecisions: string[];
+  files: string[];
+  openIssues: string[];
+  nextActions: string[];
+  updatedAt: string;
+}
+
+export interface OperatorNote {
+  id: string;
+  category: string;
+  content: string;
+  status: "active" | "obsolete";
+  source: "manual" | "maintenance" | "system";
+  createdAt: string;
+  updatedAt: string;
+  expiresAt?: string;
+}
+
+export interface ConversationCompaction {
+  id: string;
+  operatorSessionId?: string;
+  reason: string;
+  summary?: string;
+  createdAt: string;
+}
+
 export type WorkBinding =
   | { type: "none" }
   | { type: "project"; projectId: string }

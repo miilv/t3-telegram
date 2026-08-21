@@ -27,12 +27,12 @@ branch, not an aspiration.
 | 5.3 | Cross-project T3 broker uses official server/RPC contracts for projects, threads, turns, events, approvals, artifacts and provider capabilities. | PARTIAL |
 | 5.4 | Production Telegram transport: Bot API 10.x RichMessage, full media, replies, topics, reactions, retry/flood control and fallback. | PARTIAL |
 | 5.5 | Routing engine implements the complete deterministic/semantic/LLM cascade and ambiguity policy. | PARTIAL |
-| 5.6 | Minimal memory plus structured summaries, durable notes, compaction and maintenance. | PARTIAL |
-| 5.7 | Artifact registry owns provenance, hashes, bindings, safe materialization and delivery. | PARTIAL |
+| 5.6 | Structured thread summaries, secret-redacted searchable/deduplicated durable notes, explicit focus and bounded compaction restoration are implemented; provider context-threshold telemetry and real-runtime recovery evidence remain. | PARTIAL |
+| 5.7 | Artifact registry owns provenance, hashes, bindings, safe materialization/delivery, retention and root-contained cleanup. | PARTIAL |
 | 6 | Operator policy distinguishes direct work from delegated work and remains available during workers. | PARTIAL |
 | 7 | Existing/new/no-project decisions, sensible default workspace, and later affiliation correction. | PARTIAL |
 | 8 | Cross-project handoff packet and continuation thread without pretending provider-native rehome. Unit/integration evidence covers packet shape and safe source-artifact materialization; delivery crash reconciliation remains incomplete. | PARTIAL |
-| 9 | Durable WorkThread metadata, lifecycle, summaries and bindings. | PARTIAL |
+| 9 | Durable WorkThread metadata, lifecycle, structured purpose/state/decision/file/open-loop/next-action summaries and bindings. | PARTIAL |
 | 10.1–10.2 | Messages may be unbound; focus is a ranked set and survives side questions. | PARTIAL |
 | 10.3 signals 1–4 | Explicit binding, reply, artifact and focus signals. | PARTIAL |
 | 10.3 signals 5–8 | Filesystem/git identity, entities, status/recency and semantic retrieval. | PARTIAL |
@@ -42,7 +42,7 @@ branch, not an aspiration.
 | 12 | Concurrent 2–4 worker fan-out, independent scopes, durable result aggregation, group control and one Operator synthesis. Real T3/Telegram evidence and synthesis-send crash reconciliation remain. | PARTIAL |
 | 13 | Event-driven background execution and complete normalized worker-event handling. | PARTIAL |
 | 13.3–14 | Do not leak raw worker stream; apply meaningful progress throttling/policy. | PARTIAL |
-| 15 | Operator context, durable source-of-truth memory, daily compaction and restart restoration. | PARTIAL |
+| 15 | Operator context excludes full T3 history; SQLite summaries/notes/focus are authoritative, daily compaction is restart-safe, and bounded state is restored afterward. Real Claude context-threshold/runtime evidence remains. | PARTIAL |
 | 16 | Native RichMessage draft-to-final lifecycle, rich formatting, phase changes, debouncing and safe fallback. | PARTIAL |
 | 17 | Inbound text, photo, document/arbitrary file, audio, voice, video, video note, GIF, sticker, media group, forwarded message and reply. | PARTIAL |
 | 18–19 | Safe Telegram file ingestion and explicit artifact transfer/materialization into a worker workspace. | PARTIAL |
@@ -70,8 +70,8 @@ branch, not an aspiration.
 | 53–55 | Separate ingress/operator/worker/outbound queues, bounded concurrency and interrupt policy. | PARTIAL |
 | 56–59 | Correct draft strategy, UTF-8/UTF-16 limits, flood control and per-capability/per-message fallback. | PARTIAL |
 | 60 | General web/time tools available only to Operator under policy. | PARTIAL |
-| 61–64 | Durable scheduled follow-ups/status/cleanup/maintenance; memory/thread summaries and safe compaction. | PARTIAL |
-| 65–69 | `/status`, `/projects`, `/work`, `/focus`, `/cancel`, `/memory`, help and redacted admin diagnostics. | PARTIAL |
+| 61–64 | Coalescing minute scheduler, daily durable compaction gate, T3 reconciliation, note/artifact cleanup, structured thread summaries and post-compact state restoration. Long-term automation and context-size trigger remain. | PARTIAL |
+| 65–69 | `/status`, `/projects`, `/work`, `/focus`, `/stop`/`/cancel`, `/memory`, `/help` and redacted admin diagnostics exist; full debug metrics/capability detail remains. | PARTIAL |
 | 70–71 | Single-user authorization at every ingress/action and secrets never logged/persisted in plaintext artifacts. | PARTIAL |
 | 72–74 | Structured logs, metrics and cross-component tracing/correlation. | PARTIAL |
 | 75–78 | Classified errors; durable T3 retry and Telegram outbox; worker failure and recovery UX. | MISSING |
@@ -159,5 +159,12 @@ Before completion:
   atomically claimed after every member becomes terminal, `/status` aggregates
   the group, and `/stop` cancels all active members. A Telegram-send/SQLite
   commit crash window still prevents an exactly-once claim.
+- Structured thread memory is updated on delegation/completion/failure and
+  consumed by handoff. Durable Operator notes are FTS-searchable, deduplicated,
+  expirable and secret-redacted, with natural-language and `/memory` UX.
+  Maintenance is coalesced, uses a durable 24-hour gate that survives restart,
+  safely cleans only registry-owned expired files, and restores a bounded
+  authoritative snapshot after Operator context compaction. Storage migration,
+  scheduler, cleanup and daemon integration tests cover this slice.
 - These checks prove only their slices; all remaining `PARTIAL`/`MISSING` rows
   still block completion.

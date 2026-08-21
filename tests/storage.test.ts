@@ -1,6 +1,9 @@
+import { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { nowIso } from "../packages/shared/src/index.js";
-import { tempStore } from "./helpers.js";
+import { OperatorStore } from "../packages/storage/src/index.js";
+import { tempDirectory, tempStore } from "./helpers.js";
 
 describe("OperatorStore", () => {
   it("persists message mappings idempotently and restores reply context", () => {
@@ -165,6 +168,94 @@ describe("OperatorStore", () => {
     store.updateRoutingClarificationStatus("route_1", "dispatching");
     expect(store.resetInterruptedRoutingClarifications()).toBe(1);
     expect(store.findPendingRoutingClarificationByMessage(7, 99)?.status).toBe("pending");
+    store.close();
+  });
+
+  it("persists structured thread memory and searchable, expiring Operator notes", () => {
+    const store = tempStore();
+    const timestamp = nowIso();
+    store.upsertProject({
+      id: "project_memory",
+      t3ProjectId: "project_memory",
+      name: "Memory Project",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    store.upsertThread({
+      id: "thread_memory",
+      t3ThreadId: "thread_memory",
+      projectId: "project_memory",
+      title: "Refresh token work",
+      shortSummary: "",
+      keywords: ["auth"],
+      status: "completed",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    });
+    store.upsertThreadSummary({
+      threadId: "thread_memory",
+      purpose: "Fix refresh token concurrency",
+      currentState: "Regression tests pass",
+      importantDecisions: ["Use single-flight refresh"],
+      files: ["src/auth.ts"],
+      openIssues: [],
+      nextActions: ["Deploy canary"],
+    });
+    expect(store.getThreadSummary("thread_memory")).toMatchObject({
+      currentState: "Regression tests pass",
+      importantDecisions: ["Use single-flight refresh"],
+    });
+    expect(store.searchThreads("single flight refresh")[0]?.thread.id).toBe("thread_memory");
+
+    const expired = store.rememberOperatorNote({
+      category: "preference",
+      content: "Always run authentication regression tests",
+      source: "manual",
+      expiresAt: "2020-01-01T00:00:00.000Z",
+    });
+    const duplicate = store.rememberOperatorNote({
+      category: "preference",
+      content: "Always run authentication regression tests",
+      source: "manual",
+      expiresAt: "2020-01-01T00:00:00.000Z",
+    });
+    expect(duplicate.id).toBe(expired.id);
+    expect(store.searchOperatorNotes("authentication regression")[0]?.id).toBe(expired.id);
+    expect(store.expireOperatorNotes("2021-01-01T00:00:00.000Z")).toBe(1);
+    expect(store.searchOperatorNotes("authentication regression")).toHaveLength(0);
+    expect(store.getOperatorNote(expired.id)?.status).toBe("obsolete");
+    const redacted = store.rememberOperatorNote({
+      content: "authorization=sensitive-value-that-must-not-persist",
+    });
+    expect(redacted.content).toBe("authorization=[REDACTED]");
+    store.close();
+  });
+
+  it("upgrades and indexes notes created by the pre-memory schema", () => {
+    const path = join(tempDirectory("legacy-memory-store-"), "operator.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE operator_notes (
+        id TEXT PRIMARY KEY,
+        category TEXT,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO operator_notes(id,category,content,created_at,updated_at)
+      VALUES ('legacy_note','preference','Preserve legacy memory','2020-01-01','2020-01-01');
+    `);
+    legacy.close();
+
+    const store = new OperatorStore(path);
+    store.migrate();
+    expect(store.getOperatorNote("legacy_note")).toMatchObject({
+      status: "active",
+      source: "manual",
+    });
+    expect(store.searchOperatorNotes("legacy memory")[0]?.id).toBe("legacy_note");
     store.close();
   });
 });

@@ -38,7 +38,7 @@ async function main(): Promise<void> {
     logger,
   );
   let daemon: OperatorDaemon;
-  const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+  const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
   daemon = new OperatorDaemon(config, store, runtime, broker, telegram, artifacts, scheduler, logger);
 
   const shutdown = async (signal: string) => {

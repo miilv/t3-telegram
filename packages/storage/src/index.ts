@@ -5,12 +5,15 @@ import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
 import type {
   Artifact,
+  ConversationCompaction,
   FocusState,
+  OperatorNote,
   Project,
   ReplyContext,
   TelegramMessageRecord,
   ThreadHandoff,
   ThreadCandidate,
+  ThreadSummary,
   ThreadStatus,
   UserInputQuestion,
   WorkerResult,
@@ -109,6 +112,23 @@ export class OperatorStore {
   }
 
   migrate(): void {
+    const operatorNotesExists = Boolean(
+      this.db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_notes'")
+        .get(),
+    );
+    if (operatorNotesExists) {
+      const noteColumns = this.db.prepare("PRAGMA table_info(operator_notes)").all() as Row[];
+      if (!noteColumns.some((column) => column.name === "status")) {
+        this.db.exec("ALTER TABLE operator_notes ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+      }
+      if (!noteColumns.some((column) => column.name === "source")) {
+        this.db.exec("ALTER TABLE operator_notes ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'");
+      }
+      if (!noteColumns.some((column) => column.name === "expires_at")) {
+        this.db.exec("ALTER TABLE operator_notes ADD COLUMN expires_at TEXT");
+      }
+    }
     const sql = readFileSync(resolveMigrationPath(), "utf8");
     this.db.exec(sql);
     const threadColumns = this.db.prepare("PRAGMA table_info(threads)").all() as Row[];
@@ -294,6 +314,76 @@ export class OperatorStore {
       .run(intent.slice(0, 12_000), nowIso(), nowIso(), threadId, threadId);
   }
 
+  upsertThreadSummary(
+    input: Omit<ThreadSummary, "updatedAt">,
+  ): ThreadSummary {
+    const thread = this.getThread(input.threadId);
+    if (!thread) throw new Error(`Cannot summarize unknown thread: ${input.threadId}`);
+    const updatedAt = nowIso();
+    const summary: ThreadSummary = {
+      threadId: input.threadId,
+      purpose: redactStoredText(input.purpose).trim().slice(0, 4_000),
+      currentState: redactStoredText(input.currentState).trim().slice(0, 4_000),
+      importantDecisions: boundedStrings(input.importantDecisions),
+      files: boundedStrings(input.files),
+      openIssues: boundedStrings(input.openIssues),
+      nextActions: boundedStrings(input.nextActions),
+      updatedAt,
+    };
+    this.transaction(() => {
+      this.db
+        .prepare(`
+          INSERT INTO thread_summaries(
+            thread_id,purpose,current_state,important_decisions,files_json,
+            open_issues_json,next_actions_json,updated_at
+          ) VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(thread_id) DO UPDATE SET
+            purpose=excluded.purpose,current_state=excluded.current_state,
+            important_decisions=excluded.important_decisions,files_json=excluded.files_json,
+            open_issues_json=excluded.open_issues_json,next_actions_json=excluded.next_actions_json,
+            updated_at=excluded.updated_at
+        `)
+        .run(
+          summary.threadId,
+          summary.purpose,
+          summary.currentState,
+          JSON.stringify(summary.importantDecisions),
+          JSON.stringify(summary.files),
+          JSON.stringify(summary.openIssues),
+          JSON.stringify(summary.nextActions),
+          summary.updatedAt,
+        );
+      this.db
+        .prepare("UPDATE threads SET short_summary=?,updated_at=? WHERE id=?")
+        .run(summary.currentState, updatedAt, summary.threadId);
+      this.db.prepare("DELETE FROM thread_search WHERE id=?").run(summary.threadId);
+      this.db
+        .prepare("INSERT INTO thread_search(id,title,summary,keywords) VALUES (?,?,?,?)")
+        .run(
+          summary.threadId,
+          thread.title,
+          `${summary.purpose}\n${summary.currentState}\n${summary.importantDecisions.join("\n")}\n${summary.openIssues.join("\n")}`,
+          thread.keywords.join(" "),
+        );
+    });
+    return summary;
+  }
+
+  getThreadSummary(threadId: string): ThreadSummary | undefined {
+    const row = this.db.prepare("SELECT * FROM thread_summaries WHERE thread_id=?").get(threadId) as
+      | Row
+      | undefined;
+    return row ? rowToThreadSummary(row) : undefined;
+  }
+
+  listThreadSummaries(limit = 50): ThreadSummary[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM thread_summaries ORDER BY updated_at DESC LIMIT ?")
+        .all(Math.max(1, Math.min(limit, 200))) as Row[]
+    ).map(rowToThreadSummary);
+  }
+
   saveTelegramMessage(record: TelegramMessageRecord): boolean {
     const result = this.db
       .prepare(`
@@ -394,6 +484,111 @@ export class OperatorStore {
       .run(ownerId, JSON.stringify(focus), nowIso());
   }
 
+  rememberOperatorNote(input: {
+    id?: string;
+    category?: string;
+    content: string;
+    source?: OperatorNote["source"];
+    expiresAt?: string;
+  }): OperatorNote {
+    const content = redactStoredText(input.content).trim().slice(0, 8_000);
+    if (!content) throw new Error("Operator note cannot be empty");
+    const category = (input.category?.trim() || "general").slice(0, 80);
+    const existing = this.db
+      .prepare(`
+        SELECT * FROM operator_notes
+        WHERE status='active' AND lower(category)=lower(?) AND lower(content)=lower(?)
+        ORDER BY updated_at DESC LIMIT 1
+      `)
+      .get(category, content) as Row | undefined;
+    const now = nowIso();
+    const id = existing ? String(existing.id) : input.id ?? newId("note");
+    const createdAt = existing ? String(existing.created_at) : now;
+    const source = input.source ?? (existing ? rowToOperatorNote(existing).source : "manual");
+    this.transaction(() => {
+      this.db
+        .prepare(`
+          INSERT INTO operator_notes(
+            id,category,content,status,source,expires_at,created_at,updated_at
+          ) VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(id) DO UPDATE SET
+            category=excluded.category,content=excluded.content,status='active',
+            source=excluded.source,expires_at=excluded.expires_at,updated_at=excluded.updated_at
+        `)
+        .run(id, category, content, "active", source, input.expiresAt ?? null, createdAt, now);
+      this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
+      this.db
+        .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
+        .run(id, category, content);
+    });
+    return this.getOperatorNote(id)!;
+  }
+
+  getOperatorNote(id: string): OperatorNote | undefined {
+    const row = this.db.prepare("SELECT * FROM operator_notes WHERE id=?").get(id) as Row | undefined;
+    return row ? rowToOperatorNote(row) : undefined;
+  }
+
+  listOperatorNotes(input: { status?: OperatorNote["status"]; limit?: number } = {}): OperatorNote[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
+    const rows = input.status
+      ? this.db
+          .prepare("SELECT * FROM operator_notes WHERE status=? ORDER BY updated_at DESC LIMIT ?")
+          .all(input.status, limit)
+      : this.db.prepare("SELECT * FROM operator_notes ORDER BY updated_at DESC LIMIT ?").all(limit);
+    return (rows as Row[]).map(rowToOperatorNote);
+  }
+
+  searchOperatorNotes(query: string, limit = 8): OperatorNote[] {
+    const terms = query
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .match(/[\p{L}\p{N}_-]{2,}/gu)
+      ?.slice(0, 10);
+    if (!terms?.length) return [];
+    const match = terms.map((term) => `"${term.replaceAll('"', '""')}"*`).join(" OR ");
+    return (
+      this.db
+        .prepare(`
+          SELECT n.* FROM operator_note_search s
+          JOIN operator_notes n ON n.id=s.id
+          WHERE operator_note_search MATCH ? AND n.status='active'
+          ORDER BY bm25(operator_note_search),n.updated_at DESC LIMIT ?
+        `)
+        .all(match, Math.max(1, Math.min(limit, 50))) as Row[]
+    ).map(rowToOperatorNote);
+  }
+
+  markOperatorNoteObsolete(id: string): boolean {
+    return this.transaction(() => {
+      const result = this.db
+        .prepare("UPDATE operator_notes SET status='obsolete',updated_at=? WHERE id=? AND status='active'")
+        .run(nowIso(), id);
+      if (result.changes > 0) this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
+      return result.changes > 0;
+    });
+  }
+
+  expireOperatorNotes(at = nowIso()): number {
+    return this.transaction(() => {
+      const rows = this.db
+        .prepare(`
+          SELECT id FROM operator_notes
+          WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?
+        `)
+        .all(at) as Row[];
+      if (!rows.length) return 0;
+      const ids = rows.map((row) => String(row.id));
+      for (const id of ids) {
+        this.db
+          .prepare("UPDATE operator_notes SET status='obsolete',updated_at=? WHERE id=?")
+          .run(at, id);
+        this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
+      }
+      return ids.length;
+    });
+  }
+
   saveArtifact(artifact: Artifact): void {
     this.db
       .prepare(`
@@ -431,6 +626,36 @@ export class OperatorStore {
         .prepare("SELECT * FROM artifacts WHERE thread_id=? ORDER BY created_at DESC")
         .all(threadId) as Row[]
     ).map(rowToArtifact);
+  }
+
+  listExpiredArtifacts(at = nowIso(), limit = 100): Artifact[] {
+    return (
+      this.db
+        .prepare(`
+          SELECT a.* FROM artifacts a
+          LEFT JOIN threads t ON t.id=a.thread_id
+          WHERE a.expires_at IS NOT NULL AND a.expires_at<=?
+            AND (t.id IS NULL OR t.status IN ('idle','completed','failed','cancelled'))
+          ORDER BY a.expires_at LIMIT ?
+        `)
+        .all(at, Math.max(1, Math.min(limit, 1_000))) as Row[]
+    ).map(rowToArtifact);
+  }
+
+  deleteArtifactRecord(id: string): boolean {
+    return this.db.prepare("DELETE FROM artifacts WHERE id=?").run(id).changes > 0;
+  }
+
+  bindArtifacts(artifactIds: string[], projectId: string, threadId?: string): void {
+    const uniqueIds = [...new Set(artifactIds)];
+    for (const id of uniqueIds) {
+      this.db
+        .prepare(`
+          UPDATE artifacts SET project_id=COALESCE(project_id,?),thread_id=COALESCE(thread_id,?)
+          WHERE id=?
+        `)
+        .run(projectId, threadId ?? null, id);
+    }
   }
 
   saveApproval(input: {
@@ -974,6 +1199,14 @@ export class OperatorStore {
       .run(newId("cmp"), sessionId, reason, summary ?? null, nowIso());
   }
 
+  listCompactions(limit = 20): ConversationCompaction[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM conversation_compactions ORDER BY created_at DESC LIMIT ?")
+        .all(Math.max(1, Math.min(limit, 100))) as Row[]
+    ).map(rowToConversationCompaction);
+  }
+
   private readWorkerGroup(row: Row): WorkerGroupRecord {
     return { ...rowToWorkerGroup(row), members: this.workerGroupMembers(String(row.id)) };
   }
@@ -1016,6 +1249,47 @@ function rowToThread(row: Row): WorkThread {
     ...(row.last_user_intent ? { lastUserIntent: String(row.last_user_intent) } : {}),
     ...(row.last_result_summary ? { lastResultSummary: String(row.last_result_summary) } : {}),
     relatedArtifacts: JSON.parse(String(row.related_artifacts_json ?? "[]")) as string[],
+  };
+}
+
+function rowToThreadSummary(row: Row): ThreadSummary {
+  return {
+    threadId: String(row.thread_id),
+    purpose: String(row.purpose ?? ""),
+    currentState: String(row.current_state ?? ""),
+    importantDecisions: parseStringArray(row.important_decisions),
+    files: parseStringArray(row.files_json),
+    openIssues: parseStringArray(row.open_issues_json),
+    nextActions: parseStringArray(row.next_actions_json),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function rowToOperatorNote(row: Row): OperatorNote {
+  const status = String(row.status ?? "active");
+  const source = String(row.source ?? "manual");
+  return {
+    id: String(row.id),
+    category: String(row.category ?? "general"),
+    content: String(row.content),
+    status: status === "obsolete" ? "obsolete" : "active",
+    source:
+      source === "maintenance" || source === "system" ? source : "manual",
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    ...(row.expires_at ? { expiresAt: String(row.expires_at) } : {}),
+  };
+}
+
+function rowToConversationCompaction(row: Row): ConversationCompaction {
+  return {
+    id: String(row.id),
+    ...(row.operator_session_id
+      ? { operatorSessionId: String(row.operator_session_id) }
+      : {}),
+    reason: String(row.reason),
+    ...(row.summary ? { summary: String(row.summary) } : {}),
+    createdAt: String(row.created_at),
   };
 }
 
@@ -1113,4 +1387,38 @@ function rowToRoutingClarification(row: Row): PendingRoutingClarification {
     candidateThreadIds: JSON.parse(String(row.candidate_thread_ids_json)) as string[],
     status: String(row.status),
   };
+}
+
+function boundedStrings(values: string[], limit = 50): string[] {
+  return [
+    ...new Set(
+      values
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => redactStoredText(value).trim().slice(0, 2_000))
+        .filter(Boolean),
+    ),
+  ].slice(0, limit);
+}
+
+function redactStoredText(value: string): string {
+  return value
+    .replace(
+      /-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi,
+      "[REDACTED PRIVATE KEY]",
+    )
+    .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(/(token|secret|password|authorization)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .replace(/\b(?:sk|ghp|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{12,}\b/g, "[REDACTED TOKEN]");
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (typeof value !== "string" || !value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [value];
+  } catch {
+    return [value];
+  }
 }

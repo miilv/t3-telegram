@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ArtifactRegistry, sanitizeFilename } from "../packages/artifacts/src/index.js";
@@ -42,5 +42,37 @@ describe("ArtifactRegistry", () => {
 
   it("normalizes traversal-heavy filenames", () => {
     expect(sanitizeFilename("../../foo bar.ts")).toBe("foo-bar.ts");
+  });
+
+  it("removes only expired files managed by the artifact registry", async () => {
+    const store = tempStore();
+    const root = tempDirectory("artifact-cleanup-");
+    const registry = new ArtifactRegistry(root, store);
+    await registry.initialize();
+    const artifact = await registry.ingestTelegram({
+      bytes: new TextEncoder().encode("temporary"),
+      filename: "temporary.txt",
+      telegramFileId: "file_expired",
+      chatId: 1,
+      messageId: 3,
+    });
+    store.db
+      .prepare("UPDATE artifacts SET expires_at=? WHERE id=?")
+      .run("2020-01-01T00:00:00.000Z", artifact.id);
+    expect(await registry.cleanupExpired("2021-01-01T00:00:00.000Z")).toBe(1);
+    expect(existsSync(artifact.localPath)).toBe(false);
+    expect(store.getArtifact(artifact.id)).toBeUndefined();
+
+    const externalRoot = tempDirectory("artifact-external-");
+    const externalPath = join(externalRoot, "worker-report.txt");
+    writeFileSync(externalPath, "keep the worker-owned file");
+    const external = await registry.registerOutbound(externalPath, [externalRoot]);
+    store.db
+      .prepare("UPDATE artifacts SET expires_at=? WHERE id=?")
+      .run("2020-01-01T00:00:00.000Z", external.id);
+    expect(await registry.cleanupExpired("2021-01-01T00:00:00.000Z")).toBe(1);
+    expect(existsSync(externalPath)).toBe(true);
+    expect(store.getArtifact(external.id)).toBeUndefined();
+    store.close();
   });
 });

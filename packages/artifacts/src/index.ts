@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { copyFile, mkdir, realpath, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import type { Artifact, ArtifactRef } from "../../shared/src/index.js";
 import { newId, nowIso } from "../../shared/src/index.js";
@@ -8,6 +8,7 @@ import type { OperatorStore } from "../../storage/src/index.js";
 
 const MAX_INBOUND_BYTES = 50 * 1024 * 1024;
 const MAX_OUTBOUND_BYTES = 50 * 1024 * 1024;
+const INBOUND_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const secretPattern = /(^|[._-])(env|secret|token|credential|id_rsa|id_ed25519)([._-]|$)/i;
 
 export class ArtifactRegistry {
@@ -47,6 +48,7 @@ export class ArtifactRegistry {
       telegramChatId: input.chatId,
       telegramMessageId: input.messageId,
       createdAt: nowIso(),
+      expiresAt: new Date(Date.now() + INBOUND_RETENTION_MS).toISOString(),
     };
     this.store.saveArtifact(artifact);
     this.store.appendEvent("artifact.received", { payload: { artifactId: id, sizeBytes: artifact.sizeBytes } });
@@ -111,6 +113,28 @@ export class ArtifactRegistry {
     };
     this.store.saveArtifact(artifact);
     return artifact;
+  }
+
+  async cleanupExpired(at = nowIso()): Promise<number> {
+    const rootReal = await realpath(this.root);
+    let removed = 0;
+    for (const artifact of this.store.listExpiredArtifacts(at)) {
+      try {
+        const resolvedPath = await realpath(artifact.localPath).catch(() => undefined);
+        if (resolvedPath && isInside(rootReal, resolvedPath)) {
+          const artifactDirectory = dirname(resolvedPath);
+          if (dirname(artifactDirectory) === rootReal) {
+            await rm(artifactDirectory, { recursive: true, force: true });
+          } else {
+            await rm(resolvedPath, { force: true });
+          }
+        }
+        if (this.store.deleteArtifactRecord(artifact.id)) removed += 1;
+      } catch {
+        // Keep the record so a later maintenance pass can retry safely.
+      }
+    }
+    return removed;
   }
 }
 

@@ -107,6 +107,24 @@ T3 threads and stores only the group coordination/synthesis state in the daemon.
 The daemon does not invent alternative thread lifecycle state or mutate T3's
 project ownership behind the server.
 
+## Memory and maintenance source gate
+
+Before implementing structured memory, the current T3 fork was reread at
+`7107a98a225be85b58ddcd4de02c343af7d4707a`:
+
+- `OrchestrationThreadShell` is navigation/lifecycle state and does not expose
+  an authoritative semantic work summary;
+- `OrchestrationThreadDetailSnapshot` supports bounded recent-turn windows and
+  explicitly avoids requiring full-history hydration;
+- `orchestration.searchThreads` returns bounded 240-character message snippets;
+- T3 remains authoritative for messages, activities, checkpoints, session and
+  latest-turn lifecycle.
+
+The daemon therefore stores normalized compact summaries and references, never
+a second copy of full T3 history. Completion results update the summary, handoff
+consumes it, and compaction restoration uses a bounded SQLite/T3-derived state
+snapshot. This preserves the spec's source-of-truth boundary.
+
 ## Remaining source gates
 
 Before each media block, reread the corresponding donor implementation and the

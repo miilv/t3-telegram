@@ -16,7 +16,7 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
     progress and authoritative session completion;
   - server-advertised provider/model/reasoning catalog with per-turn switching;
   - explicit snapshot-polling compatibility mode for legacy/test servers.
-- SQLite/WAL source of truth for projects, threads, FTS search, focus, Telegram mappings, artifacts, approvals, structured input, background jobs, events, runtime state, and compactions.
+- SQLite/WAL source of truth for projects, structured thread summaries, searchable/deduplicated Operator notes, FTS search, focus, Telegram mappings, artifacts, approvals, structured input, background jobs, events, runtime state, and compactions.
 - Routing cascade for explicit project names, Telegram replies, artifact provenance, quoted/relative/absolute filesystem paths, git roots/remotes, active focus, lexical thread summaries, status/recency, and confidence policy. A limited two-thread shortlist is arbitrated by Operator; material ambiguity becomes a durable clarification instead of a guessed mutation.
 - Focus survives unrelated factual questions.
 - Cross-project work moves through a structured handoff packet into a new target-project T3 thread; registered source artifacts are safely copied into the target workspace.
@@ -27,7 +27,8 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 - Telegram approval buttons (`Allow once`, `Allow session`, `Deny`) backed by an explicit eight-category risk policy.
 - Sequential structured T3 questions in Telegram, including single-select, multi-select, and custom text answers.
 - Provider-aware follow-ups: immediate live steering when supported, otherwise a durable queue dispatched after the current turn.
-- `/status`, `/projects`, `/work`, `/stop`, `/debug`.
+- Natural-language durable remember/recall plus `/status`, `/projects`, `/work`, `/focus`, `/memory`, `/stop`/`/cancel`, `/help`, and `/debug`.
+- Minute maintenance ticks coalesce safely and enforce daily context compaction, bounded authoritative context restoration, T3 worker reconciliation, note expiry, and managed artifact retention cleanup.
 - Restart recovery for running workers, pending routing clarifications, interrupted group synthesis, and completions that arrived while the daemon was down.
 - Secret-redacted structured logs and worker/Operator capability isolation.
 
@@ -132,7 +133,7 @@ pnpm test
 pnpm build
 ```
 
-Tests cover routing/focus/path and git-aware selection, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
+Tests cover routing/focus/path and git-aware selection, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, structured memory/search/migration/compaction restoration, maintenance scheduling and retention cleanup, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
 
 ## Full-spec implementation status
 

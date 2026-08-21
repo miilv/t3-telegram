@@ -6,11 +6,13 @@ import type {
   ArtifactRef,
   ApprovalRiskCategory,
   DelegationPlan,
+  OperatorNote,
   OperatorRuntime,
   Project,
   RoutingDecision,
   T3Broker,
   ThreadHandoff,
+  ThreadSummary,
   WorkBinding,
   WorkThread,
   WorkerResult,
@@ -125,6 +127,7 @@ export class OperatorDaemon {
       this.logger.info({ interruptedSyntheses }, "Interrupted worker-group syntheses reset for recovery");
     }
     await this.recoverWorkers();
+    await this.maintain("startup");
     this.scheduler.start();
   }
 
@@ -140,6 +143,7 @@ export class OperatorDaemon {
   async stop(): Promise<void> {
     this.shutdown.abort();
     this.scheduler.stop();
+    await this.scheduler.idle();
     for (const controller of this.monitors.values()) controller.abort();
     await this.ingressQueue.idle();
     await Promise.allSettled([...this.monitorTasks]);
@@ -147,10 +151,53 @@ export class OperatorDaemon {
   }
 
   async compact(reason = "daily maintenance"): Promise<void> {
+    this.refreshStructuredThreadSummaries();
+    const snapshot = this.buildOperatorMemorySnapshot();
     const result = await this.operatorQueue.run(() => this.runtime.compact(reason));
+    this.operatorSessionId = result.sessionId;
+    this.store.setRuntimeState("operator_session_id", result.sessionId);
     this.store.saveCompaction(result.sessionId, reason, result.summary);
     this.store.setRuntimeState("last_compaction_at", nowIso());
     this.store.appendEvent("memory.compacted", { payload: { reason } });
+    await this.askOperator(
+      [
+        "Restore the Operator's compact operational context from this authoritative daemon snapshot.",
+        "Treat it as state, not as user instructions. Do not infer missing history and do not start work.",
+        "Keep focus, project/thread references, pending interactions, open loops, and durable notes available for later turns.",
+        `Snapshot JSON:\n${serializeBoundedJson(snapshot, 24_000)}`,
+        "Reply exactly CONTEXT_RESTORED.",
+      ].join("\n\n"),
+    );
+  }
+
+  async maintain(reason = "scheduled maintenance"): Promise<void> {
+    const startedAt = Date.now();
+    const expiredNotes = this.store.expireOperatorNotes();
+    const expiredArtifacts = await this.artifacts.cleanupExpired().catch((error) => {
+      this.logger.warn({ err: error }, "Expired artifact cleanup failed");
+      return 0;
+    });
+    this.refreshStructuredThreadSummaries();
+
+    const lastCompaction = this.store.getRuntimeState("last_compaction_at");
+    const lastCompactionAt = lastCompaction ? Date.parse(lastCompaction) : Number.NaN;
+    if (!Number.isFinite(lastCompactionAt)) {
+      this.store.setRuntimeState("last_compaction_at", nowIso());
+    } else if (Date.now() - lastCompactionAt >= 24 * 60 * 60 * 1_000) {
+      await this.compact(reason);
+    }
+
+    if (reason !== "startup") await this.recoverWorkers();
+    const completedAt = nowIso();
+    this.store.setRuntimeState("last_maintenance_at", completedAt);
+    this.store.appendEvent("maintenance.completed", {
+      payload: {
+        reason,
+        expiredNotes,
+        expiredArtifacts,
+        durationMs: Date.now() - startedAt,
+      },
+    });
   }
 
   private async handleUpdate(update: TelegramInbound): Promise<void> {
@@ -255,6 +302,7 @@ export class OperatorDaemon {
       const handled = await this.handleCommand(update);
       if (handled) return;
     }
+    if (await this.handleNaturalMemory(update)) return;
 
     const replyContext = update.replyToMessageId
       ? this.store.getReplyContext(update.chatId, update.replyToMessageId)
@@ -553,6 +601,7 @@ export class OperatorDaemon {
     }
     const sourceThread =
       this.store.getThread(sourceThreadId) ?? (await this.broker.getThread(sourceThreadId));
+    const sourceMemory = this.persistThreadSummary(sourceThread.id);
     const explicitlyReferencedProject = resolveProjectReference(update.text, projects);
     const boundProject = explicitlyReferencedProject
       ? undefined
@@ -601,18 +650,24 @@ export class OperatorDaemon {
       sourceProjectId: sourceProject.id,
       sourceThreadId: sourceThread.id,
       targetProjectId: targetProject.id,
-      taskSummary: sourceThread.lastUserIntent ?? sourceThread.title,
-      currentState: sourceThread.shortSummary || `Source thread status: ${sourceThread.status}`,
+      taskSummary: sourceMemory?.purpose ?? sourceThread.lastUserIntent ?? sourceThread.title,
+      currentState:
+        sourceMemory?.currentState ||
+        sourceThread.shortSummary ||
+        `Source thread status: ${sourceThread.status}`,
       conclusions: sourceThread.lastResultSummary ? [sourceThread.lastResultSummary] : [],
-      decisions: [],
-      unresolvedQuestions: ["waiting_approval", "waiting_user"].includes(sourceThread.status)
-        ? [`Source thread stopped while it was ${sourceThread.status}. Re-evaluate the pending interaction.`]
-        : [],
+      decisions: sourceMemory?.importantDecisions ?? [],
+      unresolvedQuestions: [
+        ...(sourceMemory?.openIssues ?? []),
+        ...(["waiting_approval", "waiting_user"].includes(sourceThread.status)
+          ? [`Source thread stopped while it was ${sourceThread.status}. Re-evaluate the pending interaction.`]
+          : []),
+      ],
       importantFiles,
       ...(handoffArtifacts.changedFiles.length
         ? { changedFiles: handoffArtifacts.changedFiles }
         : {}),
-      nextActions: [update.text],
+      nextActions: [...(sourceMemory?.nextActions ?? []), update.text],
       ...(transcript.length
         ? {
             sourceTranscriptTail: transcript.map((message) => ({
@@ -657,6 +712,11 @@ export class OperatorDaemon {
       artifacts: importantFiles,
     });
     this.store.updateThreadIntent(targetThread.id, update.text);
+    this.store.bindArtifacts(
+      inboundArtifacts.map((artifact) => artifact.id),
+      targetProject.id,
+      targetThread.id,
+    );
     this.store.appendEvent("thread.handoff.dispatched", {
       projectId: targetProject.id,
       threadId: targetThread.id,
@@ -916,9 +976,19 @@ export class OperatorDaemon {
       replyOptions(update),
     );
     this.recordGroupOutgoing(sent, project.id, threadIds, "worker_group_started");
+    this.store.bindArtifacts(
+      inboundArtifacts.map((artifact) => artifact.id),
+      project.id,
+      running[0]?.id ?? threadIds[0],
+    );
     this.bindInboundToThreads(update, project.id, threadIds, running[0]?.id ?? threadIds[0]);
     for (const thread of running) {
       this.store.updateThreadIntent(thread.id, update.text);
+      const member = created.find((entry) => entry.thread.id === thread.id);
+      this.persistThreadSummary(thread.id, {
+        currentState: `Running independent scope: ${member?.worker.task ?? update.text}`,
+        nextAction: member?.worker.task ?? update.text,
+      });
       this.rememberThreadDestination(thread.id, update);
       this.monitorThread(thread.id, update.chatId, update.messageId, destinationFromUpdate(update));
     }
@@ -1135,7 +1205,20 @@ export class OperatorDaemon {
     }
     this.store.setRuntimeState(`thread_user_intent:${thread.id}`, update.text);
     this.store.updateThreadIntent(thread.id, update.text);
+    this.store.bindArtifacts(
+      inboundArtifacts.map((artifact) => artifact.id),
+      project.id,
+      thread.id,
+    );
     this.store.setRuntimeState(`thread_completion_delivered:${thread.id}`, "");
+    this.persistThreadSummary(thread.id, {
+      currentState: queueFollowUp
+        ? "A substantial follow-up is queued until the current T3 turn becomes terminal."
+        : activeFollowUp
+          ? "A substantial follow-up was steered into the active T3 turn."
+          : "Delegated to T3 and awaiting a worker result.",
+      nextAction: update.text,
+    });
 
     for (const messageId of update.messageIds) {
       this.store.updateTelegramMessageBinding(update.chatId, messageId, {
@@ -1588,9 +1671,14 @@ export class OperatorDaemon {
   ): Promise<void> {
     if (this.store.getRuntimeState(`thread_completion_delivered:${event.threadId}`)) return;
     const thread = this.store.getThread(event.threadId);
-    const result = await this.normalizeWorkerResult(thread?.title ?? event.threadId, event.result);
+    const normalized = await this.normalizeWorkerResult(thread?.title ?? event.threadId, event.result);
+    const result = normalized.result;
     const group = this.store.getWorkerGroupForThread(event.threadId);
     this.store.updateThreadStatus(event.threadId, "completed", { result: result.summary });
+    this.persistThreadSummary(event.threadId, {
+      result,
+      importantDecisions: normalized.importantDecisions,
+    });
     this.store.appendEvent("thread.completed", {
       threadId: event.threadId,
       payload: { normalizedStatus: result.status, workerGroupId: group?.id },
@@ -1610,22 +1698,28 @@ export class OperatorDaemon {
     this.store.setRuntimeState(`thread_completion_delivered:${event.threadId}`, nowIso());
   }
 
-  private async normalizeWorkerResult(title: string, raw: string): Promise<WorkerResult> {
+  private async normalizeWorkerResult(
+    title: string,
+    raw: string,
+  ): Promise<{ result: WorkerResult; importantDecisions: string[] }> {
     const fallback = fallbackWorkerResult(raw);
     try {
       const response = await this.askOperator(
         [
           "Normalize this completed T3 worker result as structured data.",
           `Work title: ${title}`,
-          "Return ONLY JSON with: summary, status (success|partial|blocked|failed), changedFiles (string[]), tests ({name,status,details?}[]), unresolved (string[]), suggestedNextActions (string[]), needsUserInput (boolean).",
+          "Return ONLY JSON with: summary, status (success|partial|blocked|failed), changedFiles (string[]), tests ({name,status,details?}[]), unresolved (string[]), suggestedNextActions (string[]), needsUserInput (boolean), importantDecisions (string[]).",
           "Use only evidence in the worker result. Omit empty optional fields. Never include raw thinking or tool chatter.",
           `Worker result:\n${safeExcerpt(raw, 18_000)}`,
         ].join("\n\n"),
       );
-      return parseWorkerResult(response) ?? fallback;
+      return {
+        result: parseWorkerResult(response) ?? fallback,
+        importantDecisions: parseWorkerImportantDecisions(response),
+      };
     } catch (error) {
       this.logger.warn({ err: error, title }, "Worker result normalization failed; using safe fallback");
-      return fallback;
+      return { result: fallback, importantDecisions: [] };
     }
   }
 
@@ -1643,6 +1737,7 @@ export class OperatorDaemon {
     };
     const group = this.store.getWorkerGroupForThread(threadId);
     this.store.updateThreadStatus(threadId, "failed", { result: result.summary });
+    this.persistThreadSummary(threadId, { result });
     this.store.appendEvent("thread.failed", { threadId, payload: { workerGroupId: group?.id } });
     if (group && !group.deliveredAt) {
       this.store.updateWorkerGroupMember(threadId, "failed", result);
@@ -1669,6 +1764,7 @@ export class OperatorDaemon {
     };
     const group = this.store.getWorkerGroupForThread(threadId);
     this.store.updateThreadStatus(threadId, "cancelled", { result: result.summary });
+    this.persistThreadSummary(threadId, { result });
     if (group && !group.deliveredAt) {
       this.store.updateWorkerGroupMember(threadId, "cancelled", result);
       await this.attemptWorkerGroupSynthesis(group.id);
@@ -1834,8 +1930,122 @@ export class OperatorDaemon {
     );
   }
 
+  private persistThreadSummary(
+    threadId: string,
+    input: {
+      result?: WorkerResult;
+      currentState?: string;
+      nextAction?: string;
+      importantDecisions?: string[];
+    } = {},
+  ): ThreadSummary | undefined {
+    const thread = this.store.getThread(threadId);
+    if (!thread) return undefined;
+    const previous = this.store.getThreadSummary(threadId);
+    const artifactFiles = this.store
+      .listArtifactsForThread(threadId)
+      .map((artifact) => artifact.filename ?? artifact.localPath);
+    const result = input.result;
+    const currentState =
+      input.currentState ||
+      result?.summary ||
+      thread.lastResultSummary ||
+      thread.shortSummary ||
+      `Thread status: ${thread.status}`;
+    return this.store.upsertThreadSummary({
+      threadId,
+      purpose: previous?.purpose || thread.lastUserIntent || thread.title,
+      currentState,
+      importantDecisions: [
+        ...(previous?.importantDecisions ?? []),
+        ...(input.importantDecisions ?? []),
+      ],
+      files: [
+        ...(previous?.files ?? []),
+        ...(result?.changedFiles ?? []),
+        ...artifactFiles,
+      ],
+      openIssues: result
+        ? [
+            ...(result.unresolved ?? []),
+            ...(result.needsUserInput ? ["Worker result requires owner input."] : []),
+          ]
+        : previous?.openIssues ?? [],
+      nextActions: result
+        ? result.suggestedNextActions ?? []
+        : [...(previous?.nextActions ?? []), ...(input.nextAction ? [input.nextAction] : [])],
+    });
+  }
+
+  private refreshStructuredThreadSummaries(): void {
+    for (const thread of this.store.listThreads().slice(0, 200)) {
+      const summary = this.store.getThreadSummary(thread.id);
+      if (summary && Date.parse(summary.updatedAt) >= Date.parse(thread.lastActivityAt)) continue;
+      this.persistThreadSummary(thread.id);
+    }
+  }
+
+  private buildOperatorMemorySnapshot(): Record<string, unknown> {
+    const ownerId = String(this.config.telegram.allowedUserId);
+    const threads = this.store.listThreads();
+    const focus = this.store.getFocus(ownerId);
+    return {
+      capturedAt: nowIso(),
+      focus: {
+        ...(focus.primary
+          ? {
+              primary: {
+                ...focus.primary,
+                topic: safeExcerpt(focus.primary.topic, 500),
+              },
+            }
+          : {}),
+        secondary: focus.secondary.map((item) => ({
+          ...item,
+          topic: safeExcerpt(item.topic, 500),
+        })),
+      },
+      projects: this.store.listProjects().slice(0, 50).map((project) => ({
+        id: project.id,
+        name: safeExcerpt(project.name, 300),
+        ...(project.summary ? { summary: safeExcerpt(project.summary, 1_000) } : {}),
+      })),
+      activeThreads: threads
+        .filter((thread) =>
+          ["queued", "running", "waiting_approval", "waiting_user"].includes(thread.status),
+        )
+        .slice(0, 50)
+        .map(compactThreadState),
+      recentThreadSummaries: this.store.listThreadSummaries(50).map(compactThreadSummary),
+      durableNotes: this.store.listOperatorNotes({ status: "active", limit: 50 }).map(compactNote),
+      pendingApprovals: this.store.listPendingApprovals().map((approval) => ({
+        id: approval.id,
+        threadId: approval.threadId,
+      })),
+      pendingUserInputs: this.store.listPendingUserInputs().map((pending) => ({
+        id: pending.id,
+        threadId: pending.threadId,
+        currentQuestion: pending.currentQuestion,
+        questionCount: pending.questions.length,
+      })),
+      openWorkerGroups: this.store.listUndeliveredWorkerGroups().map((group) => ({
+        id: group.id,
+        title: group.title,
+        synthesisStatus: group.synthesisStatus,
+        members: group.members.map((member) => ({
+          threadId: member.threadId,
+          role: member.role,
+          status: member.status,
+        })),
+      })),
+    };
+  }
+
   private async handleCommand(update: Extract<TelegramInbound, { type: "message" }>): Promise<boolean> {
-    const command = update.text.split(/\s+/, 1)[0]!.toLocaleLowerCase();
+    const command = update.text
+      .split(/\s+/, 1)[0]!
+      .split("@", 1)[0]!
+      .toLocaleLowerCase();
     if (command === "/status") {
       try {
         await this.broker.listThreads();
@@ -1849,6 +2059,10 @@ export class OperatorDaemon {
       const approvals = this.store.listPendingApprovals();
       const userInputs = this.store.listPendingUserInputs();
       const groups = this.store.listUndeliveredWorkerGroups();
+      const recentCompletions = this.store
+        .listThreads()
+        .filter((thread) => ["completed", "failed", "cancelled"].includes(thread.status))
+        .slice(0, 5);
       const groupedThreadIds = new Set(
         groups.flatMap((group) => group.members.map((member) => member.threadId)),
       );
@@ -1871,6 +2085,16 @@ export class OperatorDaemon {
       }
       if (approvals.length) lines.push("", `Ожидают разрешения: ${approvals.length}`);
       if (userInputs.length) lines.push("", `Ожидают ответа: ${userInputs.length}`);
+      if (recentCompletions.length) {
+        lines.push(
+          "",
+          "**Недавние завершения**",
+          ...recentCompletions.map(
+            (thread) =>
+              `- ${thread.status === "completed" ? "✓" : thread.status === "failed" ? "✗" : "○"} ${escapeMarkdownText(thread.title)} — ${escapeMarkdownText(thread.status)}`,
+          ),
+        );
+      }
       if (focus.primary) lines.push("", `Текущий фокус: ${focus.primary.topic}`);
       await this.telegram.sendRich(update.chatId, lines.join("\n"), replyOptions(update));
       return true;
@@ -1895,8 +2119,68 @@ export class OperatorDaemon {
       );
       return true;
     }
-    if (command === "/stop") {
+    if (command === "/focus") {
+      const action = update.text.trim().split(/\s+/).slice(1).join(" ").toLocaleLowerCase();
+      if (action === "clear" || action === "reset" || action === "очистить") {
+        this.store.setFocus(String(update.userId), { secondary: [] });
+        await this.telegram.sendRich(update.chatId, "Рабочий фокус очищен.", replyOptions(update));
+        return true;
+      }
+      const focus = this.store.getFocus(String(update.userId));
+      if (!focus.primary) {
+        await this.telegram.sendRich(update.chatId, "Текущего рабочего фокуса нет.", replyOptions(update));
+        return true;
+      }
+      const primaryProject = this.store.getProject(focus.primary.projectId);
+      const primaryThread = focus.primary.threadId
+        ? this.store.getThread(focus.primary.threadId)
+        : undefined;
+      const lines = [
+        "## Фокус",
+        "",
+        `**${escapeMarkdownText(primaryProject?.name ?? focus.primary.projectId)}**${primaryThread ? ` — ${escapeMarkdownText(primaryThread.title)}` : ""}`,
+        escapeMarkdownText(focus.primary.topic),
+      ];
+      if (focus.secondary.length) {
+        lines.push(
+          "",
+          "**Недавние контексты**",
+          ...focus.secondary.map((item) => {
+            const project = this.store.getProject(item.projectId);
+            const thread = item.threadId ? this.store.getThread(item.threadId) : undefined;
+            return `- ${escapeMarkdownText(project?.name ?? item.projectId)}${thread ? ` — ${escapeMarkdownText(thread.title)}` : ""}`;
+          }),
+        );
+      }
+      await this.telegram.sendRich(update.chatId, lines.join("\n"), replyOptions(update));
+      return true;
+    }
+    if (command === "/memory") {
+      await this.handleMemoryCommand(update);
+      return true;
+    }
+    if (command === "/stop" || command === "/cancel") {
       await this.cancelBoundWork(update, { type: "none" }, this.store.getFocus(String(update.userId)).primary?.threadId);
+      return true;
+    }
+    if (command === "/help" || command === "/start") {
+      await this.telegram.sendRich(
+        update.chatId,
+        [
+          "## Operator",
+          "",
+          "Пишите обычным языком: короткие вопросы я отвечу сам, существенную работу передам persistent T3 workers.",
+          "",
+          "- `/status` — активная и недавняя работа",
+          "- `/projects` — проекты",
+          "- `/work` — work threads",
+          "- `/focus` — текущий контекст; `/focus clear` — очистить",
+          "- `/memory` — durable notes; `remember`, `search`, `forget`, `compact`",
+          "- `/stop` или `/cancel` — остановить focused work",
+          "- `/debug` — owner-only runtime diagnostics",
+        ].join("\n"),
+        replyOptions(update),
+      );
       return true;
     }
     if (command === "/debug") {
@@ -1913,6 +2197,122 @@ export class OperatorDaemon {
       return true;
     }
     return false;
+  }
+
+  private async handleMemoryCommand(
+    update: Extract<TelegramInbound, { type: "message" }>,
+  ): Promise<void> {
+    const input = update.text.replace(/^\/memory(?:@\w+)?\s*/iu, "").trim();
+    const [action = "", ...rest] = input.split(/\s+/);
+    const detail = rest.join(" ").trim();
+    if (["remember", "запомни"].includes(action.toLocaleLowerCase())) {
+      if (!detail) {
+        await this.telegram.sendRich(
+          update.chatId,
+          "Использование: `/memory remember [category:] текст`",
+          replyOptions(update),
+        );
+        return;
+      }
+      const categoryMatch = /^([\p{L}\p{N}_-]{2,40}):\s*(.+)$/u.exec(detail);
+      const note = this.store.rememberOperatorNote({
+        category: categoryMatch?.[1] ?? "user",
+        content: categoryMatch?.[2] ?? detail,
+        source: "manual",
+      });
+      this.store.appendEvent("memory.note.remembered", { payload: { noteId: note.id } });
+      await this.telegram.sendRich(
+        update.chatId,
+        `Запомнил durable note **${escapeMarkdownText(note.id)}** в категории **${escapeMarkdownText(note.category)}**.`,
+        replyOptions(update),
+      );
+      return;
+    }
+    if (["forget", "delete", "забудь"].includes(action.toLocaleLowerCase())) {
+      const removed = detail ? this.store.markOperatorNoteObsolete(detail) : false;
+      await this.telegram.sendRich(
+        update.chatId,
+        removed ? `Пометил **${escapeMarkdownText(detail)}** как obsolete.` : "Активная note с таким ID не найдена.",
+        replyOptions(update),
+      );
+      return;
+    }
+    if (["search", "find", "найди"].includes(action.toLocaleLowerCase())) {
+      const notes = detail ? this.store.searchOperatorNotes(detail, 10) : [];
+      await this.telegram.sendRich(
+        update.chatId,
+        notes.length
+          ? `## Memory search\n\n${notes.map(renderOperatorNote).join("\n")}`
+          : "Совпадающих active notes нет.",
+        replyOptions(update),
+      );
+      return;
+    }
+    if (["compact", "сжать"].includes(action.toLocaleLowerCase())) {
+      await this.compact("manual /memory compact");
+      await this.telegram.sendRich(
+        update.chatId,
+        "Operator context compacted; authoritative focus, summaries, open loops and durable notes restored.",
+        replyOptions(update),
+      );
+      return;
+    }
+    const notes = this.store.listOperatorNotes({ status: "active", limit: 12 });
+    const compaction = this.store.listCompactions(1)[0];
+    await this.telegram.sendRich(
+      update.chatId,
+      [
+        "## Durable memory",
+        "",
+        ...(notes.length ? notes.map(renderOperatorNote) : ["Active notes нет."]),
+        "",
+        compaction
+          ? `Последний compact: ${escapeMarkdownText(compaction.createdAt)} — ${escapeMarkdownText(compaction.reason)}`
+          : "Compaction history пока пуста.",
+      ].join("\n"),
+      replyOptions(update),
+    );
+  }
+
+  private async handleNaturalMemory(
+    update: Extract<TelegramInbound, { type: "message" }>,
+  ): Promise<boolean> {
+    const intent = parseNaturalMemoryIntent(update.text);
+    if (!intent) return false;
+    if (intent.action === "remember") {
+      const note = this.store.rememberOperatorNote({
+        category: "user",
+        content: intent.content,
+        source: "manual",
+      });
+      this.store.appendEvent("memory.note.remembered", { payload: { noteId: note.id } });
+      await this.telegram.sendRich(
+        update.chatId,
+        `Запомнил: ${escapeMarkdownText(note.content)}`,
+        replyOptions(update),
+      );
+      return true;
+    }
+    if (intent.action === "forget") {
+      const removed = this.store.markOperatorNoteObsolete(intent.id);
+      await this.telegram.sendRich(
+        update.chatId,
+        removed ? "Забыл эту durable note." : "Активная note с таким ID не найдена.",
+        replyOptions(update),
+      );
+      return true;
+    }
+    const notes = intent.query
+      ? this.store.searchOperatorNotes(intent.query, 10)
+      : this.store.listOperatorNotes({ status: "active", limit: 10 });
+    await this.telegram.sendRich(
+      update.chatId,
+      notes.length
+        ? `Вот durable notes:\n\n${notes.map(renderOperatorNote).join("\n")}`
+        : "Подходящих durable notes нет.",
+      replyOptions(update),
+    );
+    return true;
   }
 
   private async recoverWorkers(): Promise<void> {
@@ -2303,6 +2703,34 @@ function buildUserInputAnswers(
   return answers;
 }
 
+function parseNaturalMemoryIntent(
+  text: string,
+):
+  | { action: "remember"; content: string }
+  | { action: "forget"; id: string }
+  | { action: "recall"; query?: string }
+  | undefined {
+  const normalized = text.normalize("NFKC").trim();
+  const remember = /^(?:пожалуйста[,\s]+)?(?:запомни|remember)(?:[,\s]+(?:что|that))?[,\s]+([\s\S]+)$/iu.exec(
+    normalized,
+  );
+  if (remember?.[1]?.trim()) {
+    return { action: "remember", content: remember[1].trim().slice(0, 8_000) };
+  }
+  const forget = /^(?:забудь|forget)(?:\s+(?:note|заметку))?\s+(note_[\w-]+)$/iu.exec(normalized);
+  if (forget?.[1]) return { action: "forget", id: forget[1] };
+  const recall = /^(?:что\s+ты\s+помнишь|what\s+do\s+you\s+remember)(?:\s+(?:про|об?|about)\s+(.+))?[?.!]*$/iu.exec(
+    normalized,
+  );
+  if (recall) {
+    return {
+      action: "recall",
+      ...(recall[1]?.trim() ? { query: recall[1].trim().replace(/[?.!]+$/g, "") } : {}),
+    };
+  }
+  return undefined;
+}
+
 function escapeMarkdownText(value: string): string {
   return value.replace(/[\\`*_[\]{}()#+\-.!|>~]/g, "\\$&");
 }
@@ -2578,6 +3006,23 @@ function parseWorkerResult(value: string): WorkerResult | undefined {
   };
 }
 
+function parseWorkerImportantDecisions(value: string): string[] {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/iu.exec(value)?.[1];
+  const candidate = fenced ?? value.slice(value.indexOf("{"), value.lastIndexOf("}") + 1);
+  if (!candidate) return [];
+  try {
+    const parsed: unknown = JSON.parse(candidate);
+    return isRecord(parsed) && Array.isArray(parsed.importantDecisions)
+      ? parsed.importantDecisions
+          .filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+          .map((item) => safeExcerpt(item.trim(), 1_000))
+          .slice(0, 30)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function fallbackWorkerResult(result: string): WorkerResult {
   return {
     summary: safeExcerpt(result, 3_000) || "Worker completed without a textual result.",
@@ -2613,6 +3058,45 @@ function renderWorkerResult(result: WorkerResult): string {
   return lines.join("\n");
 }
 
+function compactThreadState(thread: WorkThread): Record<string, unknown> {
+  return {
+    id: thread.id,
+    projectId: thread.projectId,
+    title: safeExcerpt(thread.title, 300),
+    status: thread.status,
+    summary: safeExcerpt(thread.shortSummary, 1_000),
+    lastActivityAt: thread.lastActivityAt,
+  };
+}
+
+function compactThreadSummary(summary: ThreadSummary): Record<string, unknown> {
+  const strings = (values: string[]) => values.map((value) => safeExcerpt(value, 1_000));
+  return {
+    threadId: summary.threadId,
+    purpose: safeExcerpt(summary.purpose, 1_000),
+    currentState: safeExcerpt(summary.currentState, 2_000),
+    importantDecisions: strings(summary.importantDecisions),
+    files: strings(summary.files),
+    openIssues: strings(summary.openIssues),
+    nextActions: strings(summary.nextActions),
+    updatedAt: summary.updatedAt,
+  };
+}
+
+function compactNote(note: OperatorNote): Record<string, unknown> {
+  return {
+    id: note.id,
+    category: note.category,
+    content: safeExcerpt(note.content, 2_000),
+    updatedAt: note.updatedAt,
+    ...(note.expiresAt ? { expiresAt: note.expiresAt } : {}),
+  };
+}
+
+function renderOperatorNote(note: OperatorNote): string {
+  return `- **${escapeMarkdownText(note.category)}** · ${escapeMarkdownText(note.id)} — ${escapeMarkdownText(safeExcerpt(note.content, 700))}`;
+}
+
 function fallbackGroupSynthesis(group: WorkerGroupRecord): string {
   return [
     `## ${escapeMarkdownText(group.title)}`,
@@ -2632,6 +3116,52 @@ function safeExcerpt(value: string, limit: number): string {
     .replace(/(token|secret|password|authorization)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
     .replace(/\b(?:sk|ghp|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{12,}\b/g, "[REDACTED TOKEN]")
     .slice(0, limit);
+}
+
+function serializeBoundedJson(value: unknown, limit: number): string {
+  const full = JSON.stringify(value);
+  if (full.length <= limit) return full;
+  for (const [arrayLimit, stringLimit] of [
+    [20, 1_000],
+    [10, 500],
+    [5, 240],
+  ] as const) {
+    const compact = JSON.stringify(compactJsonValue(value, arrayLimit, stringLimit, 0));
+    if (compact.length <= limit) return compact;
+  }
+  let prefixLength = Math.max(0, limit - 256);
+  let fallback = "";
+  do {
+    fallback = JSON.stringify({
+      truncated: true,
+      snapshotPrefix: full.slice(0, prefixLength),
+    });
+    prefixLength = Math.max(0, prefixLength - Math.max(32, fallback.length - limit));
+  } while (fallback.length > limit && prefixLength > 0);
+  return fallback;
+}
+
+function compactJsonValue(
+  value: unknown,
+  arrayLimit: number,
+  stringLimit: number,
+  depth: number,
+): unknown {
+  if (typeof value === "string") return value.slice(0, stringLimit);
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, arrayLimit)
+      .map((item) => compactJsonValue(item, arrayLimit, stringLimit, depth + 1));
+  }
+  if (isRecord(value) && depth < 8) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        compactJsonValue(item, arrayLimit, stringLimit, depth + 1),
+      ]),
+    );
+  }
+  return value;
 }
 
 function elapsedLabel(startedAt: string, currentTime = Date.now()): string {

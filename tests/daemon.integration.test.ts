@@ -421,6 +421,73 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("maintains structured thread memory, durable notes, focus commands, and daily compaction restoration", async () => {
+    const home = tempDirectory("daemon-memory-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement refresh-token locking and run regression tests"));
+    await waitFor(() => store.getThreadSummary("th_1")?.currentState.includes("тесты прошли") === true);
+    expect(store.getThreadSummary("th_1")).toMatchObject({
+      purpose: "implement refresh-token locking and run regression tests",
+      importantDecisions: ["Use single-flight refresh locking."],
+      openIssues: [],
+    });
+
+    telegram.push(message(2, "/memory remember preference: Always run auth regression tests"));
+    await waitFor(() => store.searchOperatorNotes("auth regression").length === 1);
+    telegram.push(message(3, "/memory search auth regression"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Memory search")));
+    expect(telegram.sent.some((entry) => entry.text.includes("Always run auth regression tests"))).toBe(true);
+
+    telegram.push(message(4, "/focus"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Фокус")));
+    expect(telegram.sent.some((entry) => entry.text.includes("Refresh-token"))).toBe(true);
+
+    telegram.push(message(5, "запомни, что production deploy идёт после 22:00 UTC"));
+    await waitFor(() => store.searchOperatorNotes("production deploy").length === 1);
+    telegram.push(message(6, "что ты помнишь про production deploy?"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Вот durable notes")));
+    expect(broker.turns).toHaveLength(1);
+
+    for (let index = 0; index < 15; index += 1) {
+      store.rememberOperatorNote({
+        category: "large-test",
+        content: `bounded snapshot ${index} ${"x".repeat(7_000)}`,
+        source: "system",
+      });
+    }
+
+    store.setRuntimeState("last_compaction_at", "2020-01-01T00:00:00.000Z");
+    await daemon.maintain("test daily maintenance");
+    expect(runtime.compactReasons).toContain("test daily maintenance");
+    expect(store.listCompactions(1)[0]?.reason).toBe("test daily maintenance");
+    expect(
+      runtime.prompts.some((prompt) =>
+        prompt.includes("Restore the Operator's compact operational context"),
+      ),
+    ).toBe(true);
+    const restorePrompt = runtime.prompts.findLast((prompt) =>
+      prompt.includes("Restore the Operator's compact operational context"),
+    )!;
+    const snapshotJson = /Snapshot JSON:\n([\s\S]+)\n\nReply exactly/u.exec(restorePrompt)?.[1];
+    expect(snapshotJson?.length).toBeLessThanOrEqual(24_000);
+    expect(() => JSON.parse(snapshotJson!)).not.toThrow();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("runs three independent T3 workers concurrently and delivers one synthesis", async () => {
     const home = tempDirectory("daemon-worker-group-");
     const store = tempStore();
@@ -806,12 +873,15 @@ function callback(
 
 class FakeRuntime implements OperatorRuntime {
   routingSelectionThreadId?: string;
+  readonly prompts: string[] = [];
+  readonly compactReasons: string[] = [];
 
   async start(): Promise<{ id: string }> {
     return { id: "operator-session" };
   }
 
   async *sendTurn(input: { sessionId: string; prompt: string }): AsyncIterable<OperatorEvent> {
+    this.prompts.push(input.prompt);
     const text = input.prompt.includes("Arbitrate routing")
       ? this.routingSelectionThreadId
         ? JSON.stringify({
@@ -822,7 +892,11 @@ class FakeRuntime implements OperatorRuntime {
           })
         : JSON.stringify({ decision: "ask", confidence: 0.55, reason: "Material ambiguity." })
       : input.prompt.includes("Normalize this completed")
-      ? JSON.stringify({ summary: "Worker завершил задачу; тесты прошли.", status: "success" })
+      ? JSON.stringify({
+          summary: "Worker завершил задачу; тесты прошли.",
+          status: "success",
+          importantDecisions: ["Use single-flight refresh locking."],
+        })
       : input.prompt.includes("Plan a parallel T3 worker delegation")
         ? JSON.stringify({
             mode: "parallel",
@@ -842,7 +916,8 @@ class FakeRuntime implements OperatorRuntime {
   }
 
   async interrupt(): Promise<void> {}
-  async compact(): Promise<{ sessionId: string; summary: string }> {
+  async compact(reason = "scheduled daily compaction"): Promise<{ sessionId: string; summary: string }> {
+    this.compactReasons.push(reason);
     return { sessionId: "operator-session", summary: "compact" };
   }
   async resume(): Promise<void> {}

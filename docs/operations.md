@@ -3,6 +3,8 @@
 ## Health and status
 
 - `/status` — active workers, one aggregate card per fan-out group, pending approvals, pending structured questions, and current focus.
+- `/focus` — current and recent work contexts; `/focus clear` resets them explicitly.
+- `/memory` — active durable notes and the latest compaction. Subcommands: `remember [category:] text`, `search query`, `forget note_id`, and `compact`.
 - `/stop` — interrupts the focused worker; when focus is a fan-out group, it interrupts every active member and suppresses a later duplicate synthesis.
 - `/debug` — connectivity for Telegram, Claude CLI, T3, and subscription count.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
@@ -20,6 +22,14 @@ SQLite uses WAL mode. On startup the daemon:
 7. resets a clarification interrupted while dispatching so the owner's reply can be retried;
 8. resumes all-terminal fan-out groups whose synthesis was pending or interrupted;
 9. delivers an undelivered completion for an Operator-owned thread.
+
+## Memory and maintenance
+
+The daemon runs a coalescing maintenance tick every minute. The tick does not compact every minute: SQLite's `last_compaction_at` is the durable gate, and compaction runs when it is at least 24 hours old. Restart at any hour therefore cannot skip the daily job. Maintenance also reconciles T3 worker subscriptions, refreshes stale structured thread summaries, expires notes, and removes only expired files physically contained in the managed artifact root.
+
+Thread memory stores purpose, current state, important decisions, files, open issues, and next actions. Worker completion normalization updates it; handoff packets consume it. Full T3 transcripts and tool histories remain in T3. After Claude context compaction, the daemon injects a bounded, secret-redacted snapshot containing focus, project/thread references, active work, pending interactions, open loops, and active notes.
+
+Natural-language forms such as “запомни, что …” / “remember that …” and “что ты помнишь про …?” / “what do you remember about …?” use the same durable note store. Duplicate notes are merged, expiring notes become obsolete, and note/thread-summary text is redacted before persistence.
 
 Telegram updates are deduplicated by `(chat_id, message_id)`. Approval callbacks, structured-input callbacks, and T3 interaction events have separate durable dedupe keys. Resolved interactions have their inline keyboards cleared even when they were resolved from another T3 client.
 

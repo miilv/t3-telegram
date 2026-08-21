@@ -101,10 +101,20 @@ CREATE TABLE IF NOT EXISTS focus_state (
 
 CREATE TABLE IF NOT EXISTS operator_notes (
   id TEXT PRIMARY KEY,
-  category TEXT,
+  category TEXT NOT NULL DEFAULT 'general',
   content TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  source TEXT NOT NULL DEFAULT 'manual',
+  expires_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS operator_note_search USING fts5(
+  id UNINDEXED,
+  category,
+  content,
+  tokenize = 'unicode61'
 );
 
 CREATE TABLE IF NOT EXISTS conversation_compactions (
@@ -240,3 +250,8 @@ CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
 CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity_at DESC);
 CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON daemon_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_notes_status ON operator_notes(status, updated_at DESC);
+
+DELETE FROM operator_note_search;
+INSERT INTO operator_note_search(id,category,content)
+  SELECT id,category,content FROM operator_notes WHERE status='active';
