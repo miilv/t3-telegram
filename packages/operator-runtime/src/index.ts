@@ -556,6 +556,14 @@ function parseClaudeEvent(line: string): OperatorEvent | undefined {
       const text = stream.delta.text;
       if (typeof text === "string") return { type: "text_delta", text };
     }
+    if (
+      stream.type === "content_block_start" &&
+      isRecord(stream.content_block) &&
+      stream.content_block.type === "tool_use"
+    ) {
+      const tool = typeof stream.content_block.name === "string" ? stream.content_block.name : "tool";
+      return { type: "tool_started", tool };
+    }
   }
   if (event.type === "result") {
     const text = typeof event.result === "string" ? event.result : "";

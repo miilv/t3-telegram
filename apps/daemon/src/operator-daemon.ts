@@ -4314,6 +4314,8 @@ export class OperatorDaemon {
   ): Promise<string> {
     return this.operatorRuntimeQueue.run(async () => {
       let streamed = "";
+      let segment = "";
+      let sawTool = false;
       let result = "";
       try {
         for await (const event of this.runtime.sendTurn({
@@ -4323,7 +4325,12 @@ export class OperatorDaemon {
         })) {
           if (event.type === "text_delta") {
             streamed += event.text;
+            segment += event.text;
             onDelta?.(event.text);
+          } else if (event.type === "tool_started") {
+            // Text before a tool call is live commentary, not the answer.
+            sawTool = true;
+            segment = "";
           } else if (event.type === "result") {
             result = event.text;
             this.recordOperatorUsage(event.usage);
@@ -4333,6 +4340,7 @@ export class OperatorDaemon {
             }
           }
         }
+        if (sawTool && segment.trim()) return segment;
         return streamed || result;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -4347,10 +4355,17 @@ export class OperatorDaemon {
           })) {
             if (event.type === "text_delta") {
               streamed += event.text;
+              segment += event.text;
               onDelta?.(event.text);
-            } else if (event.type === "result") result = event.text;
-            if (event.type === "result") this.recordOperatorUsage(event.usage);
+            } else if (event.type === "tool_started") {
+              sawTool = true;
+              segment = "";
+            } else if (event.type === "result") {
+              result = event.text;
+              this.recordOperatorUsage(event.usage);
+            }
           }
+          if (sawTool && segment.trim()) return segment;
           return streamed || result;
         }
         throw error;

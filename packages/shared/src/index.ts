@@ -352,6 +352,7 @@ export type WorkerEvent =
 export type OperatorEvent =
   | { type: "session"; sessionId: string }
   | { type: "text_delta"; text: string }
+  | { type: "tool_started"; tool: string }
   | { type: "message"; text: string }
   | {
       type: "result";
