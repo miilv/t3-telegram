@@ -6,12 +6,15 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 
 - Authorized private Telegram chat with idempotent long polling.
 - Persistent Claude CLI Operator runtime with resume/compact and a restricted tool surface (`WebSearch`, `WebFetch` only).
-- Current T3 Code HTTP orchestration adapter:
+- Current T3 Code orchestration adapter:
   - project list/create/rename;
-  - thread list/search/create/reuse;
+  - thread list/create/reuse plus server-side full-text RPC search;
   - turn dispatch, interrupt, approval responses;
   - thread detail/tail/artifact discovery;
-  - asynchronous progress/completion subscription through version-tolerant snapshot polling.
+  - native Effect RPC/WebSocket event subscriptions with ticket authentication,
+    sequence resume/deduplication, streamed assistant assembly, approvals,
+    progress and authoritative session completion;
+  - explicit snapshot-polling compatibility mode for legacy/test servers.
 - SQLite/WAL source of truth for projects, threads, FTS search, focus, Telegram mappings, artifacts, approvals, events, runtime state, and compactions.
 - Routing cascade for explicit project names, Telegram replies, artifact provenance, filesystem paths, active focus, lexical thread summaries, and confidence policy.
 - Focus survives unrelated factual questions.
@@ -109,7 +112,7 @@ Operator daemon ── SQLite / artifact registry / routing / scheduler
       │                         └── Claude CLI Operator session
       │                              (conversation + web only)
       ▼
-T3 Code HTTP orchestration
+T3 Code orchestration (HTTP snapshots/commands + Effect RPC/WebSocket events)
       ├── Project A / persistent thread(s)
       ├── Project B / persistent thread(s)
       └── Project C / persistent thread(s)
@@ -125,8 +128,13 @@ pnpm test
 pnpm build
 ```
 
-Tests cover routing/focus/path selection, FTS thread reuse, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, Claude CLI streaming and secret isolation, and the current T3 HTTP command/snapshot shapes.
+Tests cover routing/focus/path selection, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, Claude CLI streaming and secret isolation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
 
-## Deliberate MVP boundaries
+## Full-spec implementation status
 
-The specification’s Phase 2/3 items remain outside this implementation: voice/video-note transcription and generation, semantic embeddings, forum-topic modeling, multi-user/team roles, provider migration, advanced scheduling, and a policy-editor UI. Native rich Telegram methods vary by Bot API deployment, so the transport always retains edit/HTML/plain fallbacks.
+This feature branch is implementing the complete technical specification,
+including its Phase 2/3 requirements. The conservative, evidence-based status
+for every requirement is maintained in [`docs/spec-compliance.md`](docs/spec-compliance.md);
+items there are not considered complete until they have direct test or runtime
+evidence. Native rich Telegram methods vary by Bot API deployment, so the
+transport retains edit/HTML/plain fallbacks.

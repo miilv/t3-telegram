@@ -2,7 +2,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import pino from "pino";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { HttpT3Broker } from "../packages/t3-broker/src/index.js";
+import {
+  HttpT3Broker,
+  resolveT3WebSocketUrl,
+  type T3LiveClient,
+  type T3ShellSubscriptionInput,
+  type T3ThreadSubscriptionInput,
+} from "../packages/t3-broker/src/index.js";
 import { tempStore } from "./helpers.js";
 import type { OperatorStore } from "../packages/storage/src/index.js";
 
@@ -30,6 +36,7 @@ describe("HttpT3Broker", () => {
         model: "claude-opus-4-1",
         runtimeMode: "approval-required",
         pollIntervalMs: 5,
+        liveClient: false,
       },
       store,
       pino({ enabled: false }),
@@ -55,7 +62,7 @@ describe("HttpT3Broker", () => {
     expect(fixture.authorizationHeaders).toEqual(["Bearer test-token", "Bearer test-token", "Bearer test-token"]);
   });
 
-  it("turns snapshot polling into a completion subscription", async () => {
+  it("keeps snapshot polling as an explicit legacy-server fallback", async () => {
     const broker = new HttpT3Broker(
       {
         baseUrl: fixture.url,
@@ -63,6 +70,7 @@ describe("HttpT3Broker", () => {
         model: "claude-opus-4-1",
         runtimeMode: "approval-required",
         pollIntervalMs: 5,
+        liveClient: false,
       },
       store,
       pino({ enabled: false }),
@@ -81,11 +89,203 @@ describe("HttpT3Broker", () => {
       result: "Fixed race; tests pass.",
     });
   });
+
+  it("projects real T3 thread stream deltas and session completion without polling", async () => {
+    const liveClient = new FakeLiveClient();
+    const broker = new HttpT3Broker(
+      {
+        baseUrl: fixture.url,
+        providerInstanceId: "claude",
+        model: "claude-opus-4-1",
+        runtimeMode: "approval-required",
+        pollIntervalMs: 5,
+        liveClient,
+      },
+      store,
+      pino({ enabled: false }),
+    );
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: "/tmp/acme" });
+    const thread = await broker.createThread({ projectId: project.id, title: "Auth" });
+    await broker.sendTurn({ threadId: thread.id, text: "Fix auth" });
+    liveClient.threadItems = [
+      t3Event(3, "thread.activity-appended", {
+        activity: {
+          id: "activity_stale",
+          kind: "tool.progress",
+          summary: "Stale replay",
+          payload: {},
+        },
+      }),
+      t3Event(4, "thread.activity-appended", {
+        activity: {
+          id: "activity_plan",
+          kind: "turn.plan.updated",
+          summary: "Reproducing the race",
+          payload: {},
+        },
+      }),
+      t3Event(5, "thread.message-sent", {
+        messageId: "msg_result",
+        role: "assistant",
+        text: "Fixed ",
+        streaming: true,
+      }),
+      t3Event(6, "thread.message-sent", {
+        messageId: "msg_result",
+        role: "assistant",
+        text: "race; tests pass.",
+        streaming: true,
+      }),
+      t3Event(7, "thread.message-sent", {
+        messageId: "msg_result",
+        role: "assistant",
+        text: "",
+        streaming: false,
+      }),
+      t3Event(8, "thread.session-set", {
+        session: { status: "ready", activeTurnId: null, lastError: null },
+      }),
+    ];
+
+    const events = [];
+    for await (const event of broker.subscribeThread(thread.id)) events.push(event);
+
+    expect(liveClient.threadInputs).toEqual([
+      {
+        threadId: thread.id,
+        afterSequence: 3,
+        requestCompletionMarker: true,
+        turnLimit: 25,
+      },
+    ]);
+    expect(events).toContainEqual({
+      type: "progress",
+      threadId: thread.id,
+      summary: "Reproducing the race",
+    });
+    expect(events).not.toContainEqual({
+      type: "progress",
+      threadId: thread.id,
+      summary: "Stale replay",
+    });
+    expect(events.at(-1)).toEqual({
+      type: "completed",
+      threadId: thread.id,
+      result: "Fixed race; tests pass.",
+    });
+    expect(fixture.threadReadCount).toBe(1);
+  });
+
+  it("uses T3 RPC full-text matches and exposes approval requests", async () => {
+    const liveClient = new FakeLiveClient();
+    const broker = new HttpT3Broker(
+      {
+        baseUrl: fixture.url,
+        providerInstanceId: "claude",
+        model: "claude-opus-4-1",
+        runtimeMode: "approval-required",
+        pollIntervalMs: 5,
+        liveClient,
+      },
+      store,
+      pino({ enabled: false }),
+    );
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: "/tmp/acme" });
+    const thread = await broker.createThread({ projectId: project.id, title: "Auth" });
+    liveClient.searchResult = {
+      matches: [
+        {
+          threadId: thread.id,
+          projectId: project.id,
+          source: "assistant",
+          snippet: "Refresh-token mutex fixed here",
+          messageCreatedAt: new Date().toISOString(),
+        },
+      ],
+    };
+    const candidates = await broker.searchThreads({ query: "refresh mutex" });
+    expect(candidates[0]?.thread.id).toBe(thread.id);
+    expect(candidates[0]?.reasons[0]).toContain("Refresh-token mutex fixed here");
+
+    await broker.sendTurn({ threadId: thread.id, text: "Deploy" });
+    liveClient.threadItems = [
+      t3Event(4, "thread.activity-appended", {
+        activity: {
+          id: "activity_approval",
+          kind: "approval.requested",
+          summary: "Allow production deployment?",
+          payload: { requestId: "approval_1", requestKind: "tool", requestType: "deploy" },
+        },
+      }),
+      t3Event(5, "thread.session-set", {
+        session: { status: "interrupted", activeTurnId: null, lastError: null },
+      }),
+    ];
+    const events = [];
+    for await (const event of broker.subscribeThread(thread.id)) events.push(event);
+    expect(events).toContainEqual({
+      type: "approval_required",
+      threadId: thread.id,
+      approvalId: "approval_1",
+      summary: "Allow production deployment?",
+    });
+  });
+
+  it("requests a bearer-authenticated T3 WebSocket ticket without leaking the token into the URL", async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const socketUrl = await resolveT3WebSocketUrl({
+      baseUrl: "https://t3.example.test/base",
+      bearerToken: "secret-token",
+      fetchImpl: async (url, init) => {
+        requests.push({ url: String(url), ...(init ? { init } : {}) });
+        return new Response(JSON.stringify({ ticket: "one-time-ticket" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe("https://t3.example.test/api/auth/websocket-ticket");
+    expect(requests[0]?.init?.method).toBe("POST");
+    expect(requests[0]?.init?.headers).toEqual({ authorization: "Bearer secret-token" });
+    expect(socketUrl).toBe("wss://t3.example.test/ws?wsTicket=one-time-ticket");
+    expect(socketUrl).not.toContain("secret-token");
+  });
 });
+
+class FakeLiveClient implements T3LiveClient {
+  threadItems: unknown[] = [];
+  threadInputs: T3ThreadSubscriptionInput[] = [];
+  shellInputs: T3ShellSubscriptionInput[] = [];
+  searchResult: unknown = { matches: [] };
+
+  async *subscribeThread(input: T3ThreadSubscriptionInput): AsyncIterable<unknown> {
+    this.threadInputs.push(input);
+    yield* this.threadItems;
+  }
+
+  async *subscribeShell(input: T3ShellSubscriptionInput): AsyncIterable<unknown> {
+    this.shellInputs.push(input);
+  }
+
+  async searchThreads(): Promise<unknown> {
+    return this.searchResult;
+  }
+
+  async getServerConfig(): Promise<unknown> {
+    return { environment: { capabilities: {} } };
+  }
+}
+
+function t3Event(sequence: number, type: string, payload: Record<string, unknown>): unknown {
+  return { kind: "event", event: { sequence, type, payload } };
+}
 
 class T3Fixture {
   readonly commands: Array<Record<string, unknown>> = [];
   readonly authorizationHeaders: Array<string | undefined> = [];
+  threadReadCount = 0;
   private projects: Array<Record<string, unknown>> = [];
   private threads: Array<Record<string, unknown>> = [];
   private sequence = 0;
@@ -147,13 +347,18 @@ class T3Fixture {
     }
     const threadMatch = /^\/api\/orchestration\/threads\/([^?]+)/.exec(request.url ?? "");
     if (threadMatch) {
+      this.threadReadCount += 1;
       const thread = this.threads.find((candidate) => candidate.id === decodeURIComponent(threadMatch[1]!));
       if (!thread) {
         response.statusCode = 404;
         json(response, { error: "not found" });
         return;
       }
-      json(response, { snapshotSequence: this.sequence, thread });
+      json(response, {
+        snapshotSequence: this.sequence,
+        page: { threadSequence: this.sequence },
+        thread,
+      });
       return;
     }
     response.statusCode = 404;

@@ -24,7 +24,7 @@ branch, not an aspiration.
 | 4 | Target architecture boundaries and event flow. Evidence: package-level contracts plus integration tests covering the whole flow. | PARTIAL |
 | 5.1 | Agent daemon owns polling/webhook loop, dispatch, queues, recovery, scheduler and health. | PARTIAL |
 | 5.2 | Persistent abstract Operator runtime, resumable/compactable and isolated from worker capabilities. | PARTIAL |
-| 5.3 | Cross-project T3 broker uses official server/RPC contracts for projects, threads, turns, events, approvals, artifacts and provider capabilities. | MISSING |
+| 5.3 | Cross-project T3 broker uses official server/RPC contracts for projects, threads, turns, events, approvals, artifacts and provider capabilities. | PARTIAL |
 | 5.4 | Production Telegram transport: Bot API 10.x RichMessage, full media, replies, topics, reactions, retry/flood control and fallback. | PARTIAL |
 | 5.5 | Routing engine implements the complete deterministic/semantic/LLM cascade and ambiguity policy. | PARTIAL |
 | 5.6 | Minimal memory plus structured summaries, durable notes, compaction and maintenance. | PARTIAL |
@@ -124,6 +124,14 @@ Before completion:
 - `tests/telegram-transport.test.ts` proves the exact RichMessage payload shape,
   draft-to-final sequence, parser fallback, no fallback after ambiguous network
   failure, media metadata, reactions, topic events and album merge.
-- Current check: 23 tests pass, typecheck passes and the production bundle
-  builds. These checks prove only this slice; all remaining `PARTIAL`/`MISSING`
-  rows still block completion.
+- `packages/t3-broker/src/rpc.ts` uses T3's own Effect RPC JSON/WebSocket
+  protocol, bearer ticket exchange and thread/shell sequence resume. The broker
+  projects message deltas, activity events and authoritative session state,
+  uses the RPC full-text search method, and probes both HTTP and RPC health.
+- `tests/t3-broker.integration.test.ts` proves HTTP command shapes, explicit
+  legacy polling, thread-scoped resume/deduplication, assistant delta assembly,
+  plan/approval projection, server-side search and ticket redaction. A live T3
+  server exercise is still required before the complete broker row can be
+  `PROVED`.
+- These checks prove only their slices; all remaining `PARTIAL`/`MISSING` rows
+  still block completion.

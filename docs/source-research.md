@@ -48,10 +48,34 @@ references used for the first audit and Telegram transport block.
    request; image-specific failures fall back to documents.
 10. Polling catches handler errors and restarts with bounded exponential backoff.
 
+## T3 broker source gate
+
+Before the RPC broker implementation, the current T3 fork was reread at
+`7107a98a225be85b58ddcd4de02c343af7d4707a`:
+
+- `packages/contracts/src/rpc.ts` and `orchestration.ts` supplied the exact
+  `orchestration.searchThreads`, `orchestration.subscribeShell` and
+  `orchestration.subscribeThread` method names, input fields, stream-item
+  unions and sequence-resume semantics.
+- `packages/contracts/src/environmentHttp.ts` supplied the snapshot and
+  dispatch HTTP routes used to establish a thread-scoped resume watermark.
+- `packages/client-runtime/src/rpc/session.ts` and `protocol.ts` established
+  Effect RPC JSON serialization over WebSocket, scoped client lifetime and the
+  bearer-token-to-one-time-ticket handshake.
+- `packages/client-runtime/src/state/threadReducer.ts` established that
+  streaming `thread.message-sent` payloads are deltas, non-streaming messages
+  finalize message state, and `thread.session-set` is the authoritative turn
+  boundary.
+- Provider ingestion source established the normalized approval, user-input,
+  plan, task, tool-progress and runtime-error activity kinds.
+
+The local client therefore uses the same `effect@4.0.0-beta.103` protocol
+instead of defining a second JSON-RPC dialect. Its deliberately narrow schema
+group keeps the private full T3 contracts out of this repository; unknown RPC
+payloads are structurally checked at the broker boundary.
+
 ## Remaining source gates
 
-Before the T3 broker block, reread the current fork's complete relevant RPC,
-orchestration and reducer contracts and capture the exact method/event mapping.
 Before each media block, reread the corresponding donor implementation and the
 current Telegram method/type declarations. These notes are not a substitute for
 that per-block source gate.

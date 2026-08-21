@@ -16,6 +16,15 @@ import type {
 } from "../../shared/src/index.js";
 import { newId, nowIso } from "../../shared/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
+import { EffectT3RpcClient, type T3LiveClient } from "./rpc.js";
+
+export { EffectT3RpcClient, resolveT3WebSocketUrl } from "./rpc.js";
+export type {
+  EffectT3RpcClientOptions,
+  T3LiveClient,
+  T3ShellSubscriptionInput,
+  T3ThreadSubscriptionInput,
+} from "./rpc.js";
 
 interface T3ProjectWire {
   id: string;
@@ -78,6 +87,7 @@ interface T3ShellSnapshot {
 
 interface T3ThreadSnapshot {
   snapshotSequence: number;
+  page?: { threadSequence?: number };
   thread: T3ThreadWire;
 }
 
@@ -88,14 +98,30 @@ export interface HttpT3BrokerOptions {
   model: string;
   runtimeMode: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
   pollIntervalMs: number;
+  /** `false` is reserved for tests/legacy servers that intentionally lack T3's WebSocket RPC. */
+  liveClient?: T3LiveClient | false;
 }
 
 export class HttpT3Broker implements T3Broker {
+  private readonly liveClient: T3LiveClient | undefined;
+
   constructor(
     private readonly options: HttpT3BrokerOptions,
     private readonly store: OperatorStore,
     private readonly logger: Logger,
-  ) {}
+  ) {
+    this.liveClient =
+      options.liveClient === false
+        ? undefined
+        : (options.liveClient ??
+          new EffectT3RpcClient(
+            {
+              baseUrl: options.baseUrl,
+              ...(options.bearerToken ? { bearerToken: options.bearerToken } : {}),
+            },
+            logger,
+          ));
+  }
 
   async listProjects(): Promise<Project[]> {
     const snapshot = await this.shellSnapshot();
@@ -158,7 +184,29 @@ export class HttpT3Broker implements T3Broker {
 
   async searchThreads(input: { query: string; projectId?: string; limit?: number }): Promise<ThreadCandidate[]> {
     await this.listThreads(input.projectId ? { projectId: input.projectId } : {});
-    return this.store.searchThreads(input.query, input.projectId, input.limit ?? 8);
+    const limit = Math.min(50, Math.max(1, input.limit ?? 8));
+    if (!this.liveClient || input.query.trim().length < 2) {
+      return this.store.searchThreads(input.query, input.projectId, limit);
+    }
+    try {
+      const result = await this.liveClient.searchThreads({ query: input.query.trim(), limit });
+      const matches = parseThreadSearchMatches(result);
+      const candidates: ThreadCandidate[] = [];
+      for (const [index, match] of matches.entries()) {
+        if (input.projectId && match.projectId !== input.projectId) continue;
+        const thread = this.store.getThread(match.threadId);
+        if (!thread) continue;
+        candidates.push({
+          thread,
+          score: Math.max(0.1, 1 - index / Math.max(matches.length, 1)),
+          reasons: [`T3 ${match.source} message: ${match.snippet}`],
+        });
+      }
+      return candidates.slice(0, limit);
+    } catch (error) {
+      this.logger.warn({ err: error }, "T3 thread search RPC failed; using the local metadata index");
+      return this.store.searchThreads(input.query, input.projectId, limit);
+    }
   }
 
   async getThread(threadId: string): Promise<WorkThread> {
@@ -251,6 +299,43 @@ export class HttpT3Broker implements T3Broker {
   }
 
   async *subscribeThread(threadId: string, signal?: AbortSignal): AsyncIterable<WorkerEvent> {
+    if (!this.liveClient) {
+      yield* this.subscribeThreadByPolling(threadId, signal);
+      return;
+    }
+
+    const initial = await this.threadSnapshot(threadId);
+    const projection = new ThreadSubscriptionProjection(
+      threadId,
+      this.store,
+      initial.page?.threadSequence,
+    );
+    for (const event of projection.applySnapshot(initial.thread)) {
+      yield event;
+      if (isTerminalWorkerEvent(event)) return;
+    }
+
+    const afterSequence = initial.page?.threadSequence;
+    for await (const item of this.liveClient.subscribeThread(
+      {
+        threadId,
+        ...(afterSequence !== undefined ? { afterSequence } : {}),
+        requestCompletionMarker: true,
+        turnLimit: 25,
+      },
+      signal,
+    )) {
+      for (const event of projection.applyStreamItem(item)) {
+        yield event;
+        if (isTerminalWorkerEvent(event)) return;
+      }
+    }
+  }
+
+  private async *subscribeThreadByPolling(
+    threadId: string,
+    signal?: AbortSignal,
+  ): AsyncIterable<WorkerEvent> {
     let lastState = "";
     let lastMessage = "";
     const seenActivities = new Set<string>();
@@ -354,7 +439,10 @@ export class HttpT3Broker implements T3Broker {
 
   async health(): Promise<{ healthy: boolean; detail?: string }> {
     try {
-      await this.shellSnapshot();
+      await Promise.all([
+        this.shellSnapshot(),
+        ...(this.liveClient ? [this.liveClient.getServerConfig()] : []),
+      ]);
       return { healthy: true };
     } catch (error) {
       return { healthy: false, detail: error instanceof Error ? error.message : String(error) };
@@ -440,6 +528,250 @@ function statusFromWire(thread: T3ThreadWire): ThreadStatus {
 
 function lastAssistantMessage(thread: T3ThreadWire) {
   return [...(thread.messages ?? [])].reverse().find((message) => message.role === "assistant" && !message.streaming);
+}
+
+interface T3ThreadSearchMatch {
+  threadId: string;
+  projectId: string;
+  source: "user" | "assistant";
+  snippet: string;
+}
+
+function parseThreadSearchMatches(value: unknown): T3ThreadSearchMatch[] {
+  if (!isRecord(value) || !Array.isArray(value.matches)) {
+    throw new Error("T3 thread search RPC returned an invalid result");
+  }
+  return value.matches.flatMap((candidate) => {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.threadId !== "string" ||
+      typeof candidate.projectId !== "string" ||
+      (candidate.source !== "user" && candidate.source !== "assistant") ||
+      typeof candidate.snippet !== "string"
+    ) {
+      return [];
+    }
+    return [
+      {
+        threadId: candidate.threadId,
+        projectId: candidate.projectId,
+        source: candidate.source,
+        snippet: candidate.snippet,
+      },
+    ];
+  });
+}
+
+class ThreadSubscriptionProjection {
+  private readonly assistantMessages = new Map<string, string>();
+  private readonly seenActivities = new Set<string>();
+  private lastCompletedAssistant = "";
+  private lastProgress = "";
+  private lastSequence = -1;
+  private startedEmitted = false;
+  private turnObserved = false;
+
+  constructor(
+    private readonly threadId: string,
+    private readonly store: OperatorStore,
+    initialSequence?: number,
+  ) {
+    this.lastSequence = initialSequence ?? -1;
+  }
+
+  applySnapshot(thread: T3ThreadWire): WorkerEvent[] {
+    this.store.upsertThread(mapThread(thread));
+    this.assistantMessages.clear();
+    for (const message of thread.messages ?? []) {
+      if (message.role !== "assistant") continue;
+      this.assistantMessages.set(message.id, message.text);
+      if (!message.streaming) this.lastCompletedAssistant = message.text;
+    }
+
+    const events: WorkerEvent[] = [];
+    const state = statusFromWire(thread);
+    if (state === "running" || state === "queued") {
+      this.turnObserved = true;
+      this.pushStarted(events);
+    }
+    if (thread.planProgress?.step) this.pushProgress(events, thread.planProgress.step);
+    for (const activity of thread.activities ?? []) {
+      events.push(...this.applyActivity(activity));
+    }
+    const terminal = this.terminalForState(state, thread.session?.lastError ?? undefined);
+    if (terminal) events.push(terminal);
+    return events;
+  }
+
+  applyStreamItem(item: unknown): WorkerEvent[] {
+    if (!isRecord(item)) return [];
+    if (item.kind === "snapshot" && isRecord(item.snapshot) && isRecord(item.snapshot.thread)) {
+      if (isRecord(item.snapshot.page) && typeof item.snapshot.page.threadSequence === "number") {
+        this.lastSequence = Math.max(this.lastSequence, item.snapshot.page.threadSequence);
+      }
+      return this.applySnapshot(parseThreadWire(item.snapshot.thread));
+    }
+    if (item.kind !== "event" || !isRecord(item.event)) return [];
+    const event = item.event;
+    if (typeof event.sequence === "number") {
+      if (event.sequence <= this.lastSequence) return [];
+      this.lastSequence = event.sequence;
+    }
+    if (typeof event.type !== "string" || !isRecord(event.payload)) return [];
+    const payload = event.payload;
+    const events: WorkerEvent[] = [];
+
+    switch (event.type) {
+      case "thread.turn-start-requested":
+        this.turnObserved = true;
+        this.store.updateThreadStatus(this.threadId, "queued");
+        this.pushStarted(events);
+        break;
+      case "thread.message-sent":
+        this.applyMessage(payload);
+        break;
+      case "thread.session-set": {
+        if (!isRecord(payload.session) || typeof payload.session.status !== "string") break;
+        const session = payload.session;
+        const status = session.status;
+        if (status === "starting" || status === "running") {
+          this.turnObserved = true;
+          this.store.updateThreadStatus(this.threadId, status === "starting" ? "queued" : "running");
+          this.pushStarted(events);
+          break;
+        }
+        if (status === "error") {
+          const error = typeof session.lastError === "string" ? session.lastError : "T3 worker failed";
+          this.store.updateThreadStatus(this.threadId, "failed", { result: error });
+          events.push({ type: "failed", threadId: this.threadId, error });
+          break;
+        }
+        if (status === "interrupted" || status === "stopped") {
+          this.store.updateThreadStatus(this.threadId, "cancelled");
+          events.push({ type: "cancelled", threadId: this.threadId });
+          break;
+        }
+        if ((status === "ready" || status === "idle") && this.turnObserved) {
+          const result = this.lastCompletedAssistant || "Worker completed.";
+          this.store.updateThreadStatus(this.threadId, "completed", { result });
+          events.push({ type: "completed", threadId: this.threadId, result });
+        }
+        break;
+      }
+      case "thread.activity-appended":
+        if (isRecord(payload.activity)) events.push(...this.applyActivity(payload.activity));
+        break;
+      case "thread.turn-diff-completed": {
+        if (Array.isArray(payload.files) && payload.files.length > 0) {
+          this.pushProgress(
+            events,
+            `Checkpoint ready: ${payload.files.length} changed ${payload.files.length === 1 ? "file" : "files"}.`,
+          );
+        }
+        break;
+      }
+    }
+    return events;
+  }
+
+  private applyMessage(payload: Record<string, unknown>): void {
+    if (payload.role !== "assistant" || typeof payload.messageId !== "string") return;
+    const incoming = typeof payload.text === "string" ? payload.text : "";
+    const existing = this.assistantMessages.get(payload.messageId) ?? "";
+    const streaming = payload.streaming === true;
+    const text = streaming ? `${existing}${incoming}` : incoming || existing;
+    this.assistantMessages.set(payload.messageId, text);
+    if (!streaming) this.lastCompletedAssistant = text;
+  }
+
+  private applyActivity(activity: Record<string, unknown>): WorkerEvent[] {
+    const id = typeof activity.id === "string" ? activity.id : undefined;
+    if (id && this.seenActivities.has(id)) return [];
+    if (id) this.seenActivities.add(id);
+    const kind = typeof activity.kind === "string" ? activity.kind : "";
+    const summary = typeof activity.summary === "string" ? activity.summary : "";
+    const payload = isRecord(activity.payload) ? activity.payload : {};
+
+    if (kind === "approval.requested") {
+      const approvalId = String(payload.requestId ?? id ?? "");
+      if (!approvalId) return [];
+      this.store.updateThreadStatus(this.threadId, "waiting_approval");
+      return [
+        {
+          type: "approval_required",
+          threadId: this.threadId,
+          approvalId,
+          summary: summary || "T3 requires approval.",
+        },
+      ];
+    }
+    if (kind === "user-input.requested") {
+      this.store.updateThreadStatus(this.threadId, "waiting_user");
+      const events: WorkerEvent[] = [];
+      this.pushProgress(events, summary || "T3 is waiting for user input.");
+      return events;
+    }
+    if (
+      summary &&
+      (kind === "turn.plan.updated" ||
+        kind.startsWith("task.") ||
+        kind === "tool.progress" ||
+        kind === "runtime.warning")
+    ) {
+      const events: WorkerEvent[] = [];
+      this.pushProgress(events, summary);
+      return events;
+    }
+    return [];
+  }
+
+  private terminalForState(state: ThreadStatus, error?: string): WorkerEvent | undefined {
+    if (state === "completed") {
+      const result = this.lastCompletedAssistant || "Worker completed.";
+      this.store.updateThreadStatus(this.threadId, "completed", { result });
+      return { type: "completed", threadId: this.threadId, result };
+    }
+    if (state === "failed") {
+      const detail = error || "T3 worker failed";
+      this.store.updateThreadStatus(this.threadId, "failed", { result: detail });
+      return { type: "failed", threadId: this.threadId, error: detail };
+    }
+    if (state === "cancelled") return { type: "cancelled", threadId: this.threadId };
+    return undefined;
+  }
+
+  private pushStarted(events: WorkerEvent[]): void {
+    if (this.startedEmitted) return;
+    this.startedEmitted = true;
+    events.push({ type: "started", threadId: this.threadId });
+  }
+
+  private pushProgress(events: WorkerEvent[], summary: string): void {
+    if (!summary || summary === this.lastProgress) return;
+    this.lastProgress = summary;
+    events.push({ type: "progress", threadId: this.threadId, summary });
+  }
+}
+
+function isTerminalWorkerEvent(event: WorkerEvent): boolean {
+  return event.type === "completed" || event.type === "failed" || event.type === "cancelled";
+}
+
+function parseThreadWire(value: unknown): T3ThreadWire {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.projectId !== "string" ||
+    typeof value.title !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string" ||
+    (value.messages !== undefined && !Array.isArray(value.messages)) ||
+    (value.activities !== undefined && !Array.isArray(value.activities)) ||
+    (value.checkpoints !== undefined && !Array.isArray(value.checkpoints))
+  ) {
+    throw new Error("T3 thread subscription returned an invalid snapshot");
+  }
+  return value as unknown as T3ThreadWire;
 }
 
 function keywords(value: string): string[] {
