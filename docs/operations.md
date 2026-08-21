@@ -27,6 +27,27 @@ target only a same-turn sent message. Paths supplied to media/file tools are
 accepted only after project-root, realpath/symlink, secret-name, size and hash
 validation. Tool audit events store tool name and duration, not arguments.
 
+## Voice and video notes
+
+Inbound voice/audio and video notes are retained as original, hashed artifacts
+before media processing starts. Configured STT adapters are attempted in order:
+OpenAI, Groq, Deepgram, then local Whisper. Provider responses, credentials, and
+transcript text are not written to logs or audit payloads. A provider timeout,
+size rejection, or total failure adds an explicit unavailable marker to the
+Operator envelope and leaves the original usable.
+
+Video notes additionally produce a registry-managed OGG/Opus audio derivative
+and 3–6 evenly spaced JPEG keyframes. Their source artifact ID is persisted;
+the direct Operator can inspect a keyframe only through the size/type-bounded
+`artifacts.view_image` capability. Worker delegation receives the same
+registered originals and derivatives through normal artifact materialization.
+
+`telegram.send_voice` accepts either text for TTS or an existing artifact/path.
+Every result is normalized to mono OGG/Opus before `sendVoice`.
+`telegram.send_video_note` always crops/scales to 640×640, encodes H.264/AAC
+MPEG-4, caps duration at 60 seconds, probes the result, registers it, and only
+then calls `sendVideoNote`. Telegram's 50 MiB upload ceiling is enforced.
+
 ## Restart behavior
 
 SQLite uses WAL mode. On startup the daemon:

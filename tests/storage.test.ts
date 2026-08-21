@@ -258,4 +258,34 @@ describe("OperatorStore", () => {
     expect(store.searchOperatorNotes("legacy memory")[0]?.id).toBe("legacy_note");
     store.close();
   });
+
+  it("adds derived-media provenance to an existing artifact database", () => {
+    const path = join(tempDirectory("legacy-artifact-store-"), "operator.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE artifacts (
+        id TEXT PRIMARY KEY,
+        local_path TEXT NOT NULL,
+        filename TEXT,
+        mime_type TEXT,
+        size_bytes INTEGER NOT NULL,
+        sha256 TEXT,
+        source TEXT NOT NULL,
+        project_id TEXT,
+        thread_id TEXT,
+        telegram_file_id TEXT,
+        telegram_chat_id INTEGER,
+        telegram_message_id INTEGER,
+        created_at TEXT NOT NULL,
+        expires_at TEXT
+      );
+    `);
+    legacy.close();
+
+    const store = new OperatorStore(path);
+    store.migrate();
+    const columns = store.db.prepare("PRAGMA table_info(artifacts)").all() as Array<{ name: string }>;
+    expect(columns.some((column) => column.name === "derived_from_artifact_id")).toBe(true);
+    store.close();
+  });
 });

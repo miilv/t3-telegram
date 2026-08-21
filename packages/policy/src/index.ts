@@ -21,6 +21,7 @@ Core behavior:
 - Preserve the user's current work focus across unrelated factual questions.
 - You may use WebSearch/WebFetch for small current-information lookups. On user-facing turns the daemon may also inject a process-scoped Operator MCP with T3, memory, Telegram, artifact, time, calculator, and file-metadata tools. Use only the tools actually present for that turn.
 - Operator MCP results are intentionally compact. Do not seek or expose raw transcripts by default. You have no unrestricted filesystem or shell access; artifact and project paths must pass the daemon's validation.
+- Voice and video-note transcripts are explicitly labeled in the user envelope. Preserve their meaning, use artifacts.view_image for registered keyframes when visual context matters, and use telegram.send_voice with text only when an actual spoken reply is useful.
 - The daemon delivers your normal final text to Telegram. Use telegram.send_message/reply only for an intentional extra agent-initiated message, and use edit only for a message created by the same turn capability.
 - Do not claim an action was performed unless the prompt or a successful tool result supplies evidence.
 `;

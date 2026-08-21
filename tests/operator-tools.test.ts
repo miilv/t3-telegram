@@ -4,6 +4,7 @@ import { join } from "node:path";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
+import type { MediaProcessor } from "../packages/media/src/index.js";
 import {
   OPERATOR_MCP_TOOL_NAMES,
   OperatorToolServer,
@@ -28,6 +29,25 @@ describe("OperatorToolServer", () => {
     const store = tempStore();
     const artifacts = new ArtifactRegistry(`${tempDirectory("operator-tools-")}/artifacts`, store);
     await artifacts.initialize();
+    const imageArtifact = await artifacts.ingestTelegram({
+      bytes: Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=",
+        "base64",
+      ),
+      filename: "keyframe.png",
+      mimeType: "image/png",
+      telegramFileId: "image_file",
+      chatId: 777,
+      messageId: 91,
+    });
+    const voiceArtifact = await artifacts.ingestTelegram({
+      bytes: Buffer.from("fake normalized media"),
+      filename: "voice.ogg",
+      mimeType: "audio/ogg",
+      telegramFileId: "voice_file",
+      chatId: 777,
+      messageId: 91,
+    });
     const project = projectFixture();
     const thread = threadFixture(project.id);
     const workerReport = join(project.workspaceRoot!, "report.txt");
@@ -71,11 +91,17 @@ describe("OperatorToolServer", () => {
       health: async () => ({ healthy: true }),
     } as unknown as T3Broker;
     const telegram = new ToolTelegram();
+    const media = {
+      synthesizeVoice: async () => voiceArtifact,
+      normalizeVoice: async () => voiceArtifact,
+      normalizeVideoNote: async () => voiceArtifact,
+    } as unknown as MediaProcessor;
     const server = new OperatorToolServer({
       broker,
       store,
       telegram: telegram as unknown as TelegramTransport,
       artifacts,
+      media,
       logger: pino({ enabled: false }),
       onThreadStarted: (input) => {
         started.push(input);
@@ -107,6 +133,15 @@ describe("OperatorToolServer", () => {
       expect(listed.tools.map((tool) => tool.name).sort()).toEqual([...OPERATOR_MCP_TOOL_NAMES].sort());
       expect(lease.access.allowedTools).toContain("mcp__operator__t3_send_turn");
 
+      const viewed = await client.callTool({
+        name: "artifacts.view_image",
+        arguments: { artifactId: imageArtifact.id },
+      });
+      expect(viewed.isError).not.toBe(true);
+      expect(viewed.content.some((item) =>
+        typeof item === "object" && item !== null && (item as { type?: unknown }).type === "image"
+      )).toBe(true);
+
       expect(await callJson(client, "utility.calculator", { expression: "2 + 3 * (4 ^ 2)" })).toEqual({
         expression: "2 + 3 * (4 ^ 2)",
         result: 50,
@@ -136,6 +171,10 @@ describe("OperatorToolServer", () => {
       expect(telegram.documents).toHaveLength(1);
       expect(telegram.documents[0]?.chatId).toBe(777);
       expect(telegram.documents[0]?.path).toMatch(/\/report\.txt$/);
+      await callJson(client, "telegram.send_voice", { text: "Read this aloud" });
+      await callJson(client, "telegram.send_video_note", { artifactId: voiceArtifact.id });
+      expect(telegram.voices[0]?.path).toBe(voiceArtifact.localPath);
+      expect(telegram.videoNotes[0]?.path).toBe(voiceArtifact.localPath);
       await callJson(client, "t3.send_turn", { threadId: thread.id, text: "Continue implementation" });
       expect(turns).toEqual([{ threadId: thread.id, text: "Continue implementation" }]);
       expect(started).toHaveLength(1);
@@ -236,6 +275,8 @@ class ToolTelegram {
   readonly edits: Array<{ chatId: number; messageId: number; text: string }> = [];
   readonly reactions: Array<{ chatId: number; messageId: number; emoji: string }> = [];
   readonly documents: Array<{ chatId: number; path: string }> = [];
+  readonly voices: Array<{ chatId: number; path: string }> = [];
+  readonly videoNotes: Array<{ chatId: number; path: string }> = [];
   private nextMessageId = 1_000;
 
   async sendRich(chatId: number, text: string, options: TelegramSendOptions = {}): Promise<SentMessage[]> {
@@ -255,6 +296,16 @@ class ToolTelegram {
     this.documents.push({ chatId, path });
     return { chatId, messageId: this.nextMessageId++ };
   }
+
+  async sendVoice(chatId: number, path: string): Promise<SentMessage> {
+    this.voices.push({ chatId, path });
+    return { chatId, messageId: this.nextMessageId++ };
+  }
+
+  async sendVideoNote(chatId: number, path: string): Promise<SentMessage> {
+    this.videoNotes.push({ chatId, path });
+    return { chatId, messageId: this.nextMessageId++ };
+  }
 }
 
 function destinationOnly(options: TelegramSendOptions): TelegramDestination {
@@ -268,6 +319,6 @@ function destinationOnly(options: TelegramSendOptions): TelegramDestination {
 // this tool server; the production constructor receives the full transport.
 const _telegramShapeCheck: Pick<
   TelegramTransport,
-  "sendRich" | "editRich" | "react" | "sendDocument"
+  "sendRich" | "editRich" | "react" | "sendDocument" | "sendVoice" | "sendVideoNote"
 > = new ToolTelegram();
 void _telegramShapeCheck;

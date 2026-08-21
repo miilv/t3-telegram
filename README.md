@@ -23,8 +23,9 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 - Focus survives unrelated factual questions.
 - Cross-project work moves through a structured handoff packet into a new target-project T3 thread; registered source artifacts are safely copied into the target workspace.
 - Broad tasks can fan out to 2–4 independent T3 workers. Their structured results are persisted and reconciled into one Operator synthesis; `/status` and `/stop` treat the fan-out as one group.
-- Inbound Telegram documents/photos are hashed, stored with safe names, and materialized into the selected project.
+- Every named inbound Telegram media kind is normalized and stored with safe names. Voice is transcribed through configured cloud/local STT while retaining its original artifact; video notes also yield a derived audio artifact and durable keyframes.
 - Requested outbound worker documents/photos are resolved from T3 checkpoints, path-validated, and sent through Telegram.
+- Agent-initiated spoken replies are synthesized and normalized to Telegram-native OGG/Opus. Arbitrary source video is cropped/scaled and transcoded to a square H.264/AAC video note capped at 60 seconds.
 - Native rich draft/final methods are capability-detected, with HTML/edit/plain fallbacks, semantic message splitting, retry, and flood-control backoff.
 - Telegram approval buttons (`Allow once`, `Allow session`, `Deny`) backed by an explicit eight-category risk policy.
 - Sequential structured T3 questions in Telegram, including single-select, multi-select, and custom text answers.
@@ -40,6 +41,7 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 - T3 Code running locally or remotely.
 - Claude Code CLI installed and authenticated.
 - A Telegram bot token from BotFather and the numeric Telegram user ID of the single owner.
+- `ffmpeg` and `ffprobe` with Opus, H.264, and AAC support.
 
 T3 Code itself may require a newer Node release than this daemon. Follow the requirements of the T3 version you run.
 
@@ -59,6 +61,21 @@ T3_BASE_URL=http://127.0.0.1:3773
 ```
 
 For a locally trusted T3 environment, `T3_BEARER_TOKEN` may be unnecessary. For a paired/remote environment, provide an access token with `orchestration:read orchestration:operate` scopes.
+
+For voice transcription, configure at least one STT adapter. OpenAI, Groq,
+Deepgram, and a local Whisper CLI are supported and tried in that order. With
+no adapter, the original is still retained and the Operator receives an
+explicit transcription-unavailable marker:
+
+```dotenv
+OPENAI_API_KEY=...
+# or GROQ_API_KEY / DEEPGRAM_API_KEY
+# or WHISPER_BIN=/absolute/path/to/whisper-cli
+#    WHISPER_MODEL=/absolute/path/to/ggml-model.bin
+```
+
+Outbound TTS uses ElevenLabs when configured and otherwise uses macOS `say`
+(or an explicit `SAY_BIN`), followed by FFmpeg OGG/Opus normalization.
 
 The provider instance and model are fallbacks and must match the configured T3 runtime. At runtime the daemon reads T3's provider catalog, applies the spec's task-complexity defaults, and honors explicit model/reasoning requests:
 
@@ -141,7 +158,7 @@ pnpm test
 pnpm build
 ```
 
-Tests cover routing/focus/path and git-aware selection, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, structured memory/search/migration/compaction restoration, maintenance scheduling and retention cleanup, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, process-scoped MCP discovery/calls/revocation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
+Tests cover routing/focus/path and git-aware selection, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, structured memory/search/migration/compaction restoration, maintenance scheduling and retention cleanup, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization/provenance, real FFmpeg voice and video-note conversion, STT fallback behavior, local TTS, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, process-scoped MCP discovery/calls/revocation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
 
 ## Full-spec implementation status
 

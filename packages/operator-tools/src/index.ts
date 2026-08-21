@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import {
@@ -11,7 +11,9 @@ import {
 import type { Logger } from "pino";
 import { z } from "zod";
 import type { ArtifactRegistry } from "../../artifacts/src/index.js";
+import type { MediaProcessor } from "../../media/src/index.js";
 import type {
+  Artifact,
   ArtifactRef,
   OperatorToolAccess,
   Project,
@@ -29,6 +31,7 @@ import type {
 const CAPABILITY_TTL_MS = 2 * 60 * 60 * 1_000;
 const MAX_TOOL_RESULT_CHARS = 16_000;
 const MAX_SEARCH_RESULTS = 10;
+const MAX_MCP_IMAGE_BYTES = 5 * 1024 * 1024;
 
 export const OPERATOR_MCP_TOOL_NAMES = [
   "t3.list_projects",
@@ -57,6 +60,7 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "telegram.send_video_note",
   "telegram.react",
   "artifacts.resolve",
+  "artifacts.view_image",
   "artifacts.materialize_for_thread",
   "utility.time",
   "utility.web_search",
@@ -87,6 +91,7 @@ export interface OperatorToolServerOptions {
   store: OperatorStore;
   telegram: TelegramTransport;
   artifacts: ArtifactRegistry;
+  media?: MediaProcessor;
   logger: Logger;
   onThreadStarted?: (input: ToolStartedThread) => void | Promise<void>;
   fetchImpl?: typeof fetch;
@@ -99,10 +104,18 @@ interface TurnCapability {
   sentMessageIds: Set<number>;
 }
 
-interface TextToolResult {
+interface ToolResult {
   resultType: "complete";
-  content: [{ type: "text"; text: string }];
+  content: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; data: string; mimeType: string }
+  >;
   isError?: true;
+}
+
+interface ImageToolPayload {
+  image: { data: string; mimeType: string };
+  metadata: Record<string, unknown>;
 }
 
 type DynamicToolRegistrar = (
@@ -117,7 +130,7 @@ type DynamicToolRegistrar = (
       openWorldHint: boolean;
     };
   },
-  callback: (input: Record<string, unknown>) => Promise<TextToolResult>,
+  callback: (input: Record<string, unknown>) => Promise<ToolResult>,
 ) => unknown;
 
 interface RegisteredToolInput<T extends z.ZodType<Record<string, unknown>>> {
@@ -537,6 +550,25 @@ export class OperatorToolServer {
       handler: ({ artifactId }) => compactArtifact(this.options.artifacts.resolve(artifactId), true),
     });
     this.addTool(server, token, {
+      name: "artifacts.view_image",
+      description: "View a registered JPEG, PNG, GIF, or WebP artifact, including a video-note keyframe.",
+      schema: z.object({ artifactId: z.string().min(1) }),
+      readOnly: true,
+      handler: async ({ artifactId }) => {
+        const artifact = this.options.artifacts.resolve(artifactId);
+        const mimeType = artifact.mimeType ?? "";
+        if (!["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mimeType)) {
+          throw new Error("artifact is not a supported image");
+        }
+        if (artifact.sizeBytes > MAX_MCP_IMAGE_BYTES) throw new Error("image exceeds the 5 MiB viewing limit");
+        const bytes = await readFile(artifact.localPath);
+        return {
+          image: { data: bytes.toString("base64"), mimeType },
+          metadata: compactArtifact(artifact),
+        } satisfies ImageToolPayload;
+      },
+    });
+    this.addTool(server, token, {
       name: "artifacts.materialize_for_thread",
       description: "Copy a registered artifact into a T3 thread's project-local .operator-inbox.",
       schema: z.object({ artifactId: z.string().min(1), threadId: z.string().min(1) }),
@@ -650,7 +682,7 @@ export class OperatorToolServer {
       },
     });
 
-    for (const kind of ["document", "photo", "audio", "voice", "video", "video_note"] as const) {
+    for (const kind of ["document", "photo", "audio", "video"] as const) {
       this.addTool(server, token, {
         name: `telegram.send_${kind}`,
         description: `Send a validated ${kind.replace("_", " ")} to the current Telegram chat/topic.`,
@@ -670,13 +702,62 @@ export class OperatorToolServer {
           if (kind === "document") sent = await this.options.telegram.sendDocument(capability.context.chatId, artifact.localPath, caption, options);
           else if (kind === "photo") sent = await this.options.telegram.sendPhoto(capability.context.chatId, artifact.localPath, caption, options);
           else if (kind === "audio") sent = await this.options.telegram.sendAudio(capability.context.chatId, artifact.localPath, caption, options);
-          else if (kind === "voice") sent = await this.options.telegram.sendVoice(capability.context.chatId, artifact.localPath, caption, options);
           else if (kind === "video") sent = await this.options.telegram.sendVideo(capability.context.chatId, artifact.localPath, caption, options);
-          else sent = await this.options.telegram.sendVideoNote(capability.context.chatId, artifact.localPath, options);
-          return this.recordSent([sent], capability, `operator_tool_${kind}`);
+          else throw new Error("unsupported Telegram media kind");
+          return this.recordSent([sent], capability, `operator_tool_${kind}`, [artifact.id]);
         },
       });
     }
+    this.addTool(server, token, {
+      name: "telegram.send_voice",
+      description: "Synthesize text or normalize registered audio to Telegram OGG/Opus, then send it as a voice note.",
+      schema: z.object({
+        text: z.string().trim().min(1).max(10_000).optional(),
+        artifactId: z.string().min(1).optional(),
+        path: z.string().min(1).max(4_096).optional(),
+        projectId: z.string().min(1).optional(),
+        caption: z.string().max(1_024).optional(),
+      }).refine(
+        (input) => Number(Boolean(input.text)) + Number(Boolean(input.artifactId || (input.path && input.projectId))) === 1,
+        { message: "provide text, artifactId, or both path and projectId" },
+      ),
+      handler: async (input, capability) => {
+        if (!this.options.media) throw new Error("media processor is unavailable");
+        const voice = input.text
+          ? await this.options.media.synthesizeVoice(input.text)
+          : await this.options.media.normalizeVoice(await this.resolveOutboundArtifact(input));
+        const sent = await this.options.telegram.sendVoice(
+          capability.context.chatId,
+          voice.localPath,
+          input.caption ?? "",
+          destination(capability.context),
+        );
+        return this.recordSent([sent], capability, "operator_tool_voice", [voice.id]);
+      },
+    });
+    this.addTool(server, token, {
+      name: "telegram.send_video_note",
+      description: "Normalize a registered video to square H.264/AAC MPEG-4 (maximum 60 seconds), then send it as a video note.",
+      schema: z.object({
+        artifactId: z.string().min(1).optional(),
+        path: z.string().min(1).max(4_096).optional(),
+        projectId: z.string().min(1).optional(),
+      }).refine((input) => Boolean(input.artifactId || (input.path && input.projectId)), {
+        message: "provide artifactId, or both path and projectId",
+      }),
+      handler: async (input, capability) => {
+        if (!this.options.media) throw new Error("media processor is unavailable");
+        const videoNote = await this.options.media.normalizeVideoNote(
+          await this.resolveOutboundArtifact(input),
+        );
+        const sent = await this.options.telegram.sendVideoNote(
+          capability.context.chatId,
+          videoNote.localPath,
+          destination(capability.context),
+        );
+        return this.recordSent([sent], capability, "operator_tool_video_note", [videoNote.id]);
+      },
+    });
     this.addTool(server, token, {
       name: "telegram.react",
       description: "React to the triggering message or a message sent by this turn capability.",
@@ -698,7 +779,7 @@ export class OperatorToolServer {
     token: string,
     spec: RegisteredToolInput<T>,
   ): void {
-    const callback = async (input: Record<string, unknown>): Promise<TextToolResult> => {
+    const callback = async (input: Record<string, unknown>): Promise<ToolResult> => {
       const startedAt = Date.now();
       try {
         const capability = this.requireCapability(token);
@@ -741,7 +822,7 @@ export class OperatorToolServer {
     artifactId?: string | undefined;
     path?: string | undefined;
     projectId?: string | undefined;
-  }): Promise<ArtifactRef> {
+  }): Promise<Artifact> {
     if (input.artifactId) return this.options.artifacts.resolve(input.artifactId);
     if (!input.path || !input.projectId) throw new Error("provide artifactId, or both path and projectId");
     const project = await this.options.broker.getProject(input.projectId);
@@ -756,6 +837,7 @@ export class OperatorToolServer {
     messages: SentMessage[],
     capability: TurnCapability,
     messageType: string,
+    artifactIds: string[] = [],
   ): { sent: Array<{ chatId: number; messageId: number }> } {
     for (const message of messages) {
       capability.sentMessageIds.add(message.messageId);
@@ -764,7 +846,7 @@ export class OperatorToolServer {
         messageId: message.messageId,
         operatorTurnId: capability.context.operatorTurnId,
         relatedThreadIds: [],
-        artifactIds: [],
+        artifactIds,
         messageType,
         createdAt: nowIso(),
       });
@@ -862,21 +944,44 @@ function compactArtifact(artifact: ArtifactRef, includePath = false): Record<str
     sizeBytes: artifact.sizeBytes,
     ...(artifact.projectId ? { projectId: artifact.projectId } : {}),
     ...(artifact.threadId ? { threadId: artifact.threadId } : {}),
+    ...(artifact.derivedFromArtifactId
+      ? { derivedFromArtifactId: artifact.derivedFromArtifactId }
+      : {}),
     ...(includePath ? { localPath: artifact.localPath } : {}),
   };
 }
 
-function compactResult(value: unknown): TextToolResult {
+function compactResult(value: unknown): ToolResult {
+  if (isImageToolPayload(value)) {
+    return {
+      resultType: "complete",
+      content: [
+        { type: "text", text: boundedJson(value.metadata) },
+        { type: "image", data: value.image.data, mimeType: value.image.mimeType },
+      ],
+    };
+  }
   return { resultType: "complete", content: [{ type: "text", text: boundedJson(value) }] };
 }
 
-function toolError(error: unknown): TextToolResult {
+function toolError(error: unknown): ToolResult {
   const message = error instanceof Error ? error.message : String(error);
   return {
     resultType: "complete",
     content: [{ type: "text", text: boundedJson({ error: message.slice(0, 2_000) }) }],
     isError: true,
   };
+}
+
+function isImageToolPayload(value: unknown): value is ImageToolPayload {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<ImageToolPayload>;
+  return Boolean(
+    candidate.image &&
+      typeof candidate.image.data === "string" &&
+      typeof candidate.image.mimeType === "string" &&
+      candidate.metadata,
+  );
 }
 
 function boundedJson(value: unknown): string {

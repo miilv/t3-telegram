@@ -20,6 +20,22 @@ const envSchema = z.object({
   TELEGRAM_POLL_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(50).default(30),
   T3_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(30_000).default(1500),
   APPROVAL_AUTO_ALLOW: z.string().default("safe-read"),
+  FFMPEG_BIN: z.string().min(1).default("ffmpeg"),
+  FFPROBE_BIN: z.string().min(1).default("ffprobe"),
+  MEDIA_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(180_000).default(45_000),
+  MEDIA_MAX_INPUT_BYTES: z.coerce.number().int().min(1_024).max(50 * 1024 * 1024).default(20 * 1024 * 1024),
+  OPENAI_API_KEY: z.string().min(1).optional(),
+  OPENAI_TRANSCRIPTION_MODEL: z.string().min(1).default("gpt-4o-mini-transcribe"),
+  GROQ_API_KEY: z.string().min(1).optional(),
+  GROQ_TRANSCRIPTION_MODEL: z.string().min(1).default("whisper-large-v3-turbo"),
+  DEEPGRAM_API_KEY: z.string().min(1).optional(),
+  DEEPGRAM_TRANSCRIPTION_MODEL: z.string().min(1).default("nova-3"),
+  WHISPER_BIN: z.string().min(1).optional(),
+  WHISPER_MODEL: z.string().min(1).optional(),
+  ELEVENLABS_API_KEY: z.string().min(1).optional(),
+  ELEVENLABS_VOICE_ID: z.string().min(1).default("21m00Tcm4TlvDq8ikWAM"),
+  ELEVENLABS_MODEL: z.string().min(1).default("eleven_multilingual_v2"),
+  SAY_BIN: z.string().min(1).optional(),
 });
 
 const approvalRiskCategory = z.enum([
@@ -72,6 +88,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       databasePath: resolve(operatorHome, "operator.db"),
     },
     approval: { autoAllow: approvalAutoAllow },
+    media: {
+      ffmpegBin: parsed.FFMPEG_BIN,
+      ffprobeBin: parsed.FFPROBE_BIN,
+      timeoutMs: parsed.MEDIA_TIMEOUT_MS,
+      maxInputBytes: parsed.MEDIA_MAX_INPUT_BYTES,
+      openai: parsed.OPENAI_API_KEY
+        ? { apiKey: parsed.OPENAI_API_KEY, model: parsed.OPENAI_TRANSCRIPTION_MODEL }
+        : undefined,
+      groq: parsed.GROQ_API_KEY
+        ? { apiKey: parsed.GROQ_API_KEY, model: parsed.GROQ_TRANSCRIPTION_MODEL }
+        : undefined,
+      deepgram: parsed.DEEPGRAM_API_KEY
+        ? { apiKey: parsed.DEEPGRAM_API_KEY, model: parsed.DEEPGRAM_TRANSCRIPTION_MODEL }
+        : undefined,
+      whisper: parsed.WHISPER_BIN
+        ? { binary: parsed.WHISPER_BIN, model: parsed.WHISPER_MODEL }
+        : undefined,
+      elevenlabs: parsed.ELEVENLABS_API_KEY
+        ? {
+            apiKey: parsed.ELEVENLABS_API_KEY,
+            voiceId: parsed.ELEVENLABS_VOICE_ID,
+            model: parsed.ELEVENLABS_MODEL,
+          }
+        : undefined,
+      sayBin: parsed.SAY_BIN,
+    },
     logLevel: parsed.LOG_LEVEL,
   } as const;
 }

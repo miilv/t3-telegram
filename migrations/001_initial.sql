@@ -84,13 +84,15 @@ CREATE TABLE IF NOT EXISTS artifacts (
   size_bytes INTEGER NOT NULL,
   sha256 TEXT,
   source TEXT NOT NULL,
+  derived_from_artifact_id TEXT,
   project_id TEXT,
   thread_id TEXT,
   telegram_file_id TEXT,
   telegram_chat_id INTEGER,
   telegram_message_id INTEGER,
   created_at TEXT NOT NULL,
-  expires_at TEXT
+  expires_at TEXT,
+  FOREIGN KEY (derived_from_artifact_id) REFERENCES artifacts(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS focus_state (

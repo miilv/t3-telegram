@@ -99,6 +99,8 @@ export interface ArtifactRef {
   sha256?: string;
   projectId?: string;
   threadId?: string;
+  /** Source artifact for media extracted, transcoded, or otherwise derived by the daemon. */
+  derivedFromArtifactId?: string;
 }
 
 export interface Artifact extends ArtifactRef {

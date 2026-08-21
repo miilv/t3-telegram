@@ -164,8 +164,32 @@ A live Claude CLI smoke run proved Streamable HTTP discovery, header delivery,
 Claude's permission-name normalization (`t3.send_turn` becomes
 `mcp__operator__t3_send_turn`), which is now covered by regression tests.
 
-## Remaining source gates
+## Voice and video-note source gate
 
-Before each media block, reread the corresponding donor implementation and the
-current Telegram method/type declarations. These notes are not a substitute for
-that per-block source gate.
+Before implementing sections 22–23, the pinned donor sources above were reread
+at their media boundaries:
+
+- Supercharged's `server.ts` supplied the bounded OpenAI/Groq/Deepgram/local
+  Whisper fallback chain, safe argument-array command execution, audio cache,
+  FFmpeg WAV normalization, direct OGG/Opus TTS, and evenly sampled frames.
+- Pavel's `core/services/transcriber.py` and `core/services/content.py`
+  supplied explicit total timeouts, input-size guards, one transient retry and
+  the invariant that recognition failure must not discard the original.
+- Hermes' Telegram adapter supplied duration probing and native voice/audio
+  format fallback behavior.
+- The current official [Telegram Bot API](https://core.telegram.org/bots/api)
+  establishes OGG/Opus voice, 50 MiB bot upload limits, and rounded square
+  MPEG-4 video notes up to 60 seconds. The installed grammY types were checked
+  again for the exact `sendVoice`/`sendVideoNote` calls.
+- Official [OpenAI transcription API documentation](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)
+  establishes multipart `file` plus `model`, extension-bearing filenames,
+  supported formats, JSON response shape, and current transcription model IDs.
+- Official [FFmpeg](https://ffmpeg.org/ffmpeg-filters.html) and
+  [ffprobe](https://ffmpeg.org/ffprobe.html) documentation supplied the
+  crop/scale and machine-readable probing contracts. The target machine's
+  FFmpeg 7.1.1 build was verified to include `libopus`, `libx264`, and AAC.
+
+The implementation therefore uses no shell command strings, preserves every
+original before enrichment, stores source-linked derivatives, never logs raw
+transcript/provider bodies, and exposes image bytes only through the
+process-scoped, type/size-bounded Operator capability.

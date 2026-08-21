@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { copyFile, mkdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import type { Artifact, ArtifactRef } from "../../shared/src/index.js";
 import { newId, nowIso } from "../../shared/src/index.js";
@@ -84,6 +84,9 @@ export class ArtifactRegistry {
       ...(artifact.sha256 ? { sha256: artifact.sha256 } : {}),
       ...(artifact.projectId ? { projectId: artifact.projectId } : {}),
       ...(artifact.threadId ? { threadId: artifact.threadId } : {}),
+      ...(artifact.derivedFromArtifactId
+        ? { derivedFromArtifactId: artifact.derivedFromArtifactId }
+        : {}),
     };
   }
 
@@ -112,6 +115,91 @@ export class ArtifactRegistry {
       createdAt: nowIso(),
     };
     this.store.saveArtifact(artifact);
+    return artifact;
+  }
+
+  async ingestDerivedFile(input: {
+    path: string;
+    filename: string;
+    mimeType: string;
+    derivedFromArtifactId: string;
+    expiresAt?: string;
+  }): Promise<Artifact> {
+    const parent = this.resolve(input.derivedFromArtifactId);
+    const metadata = await stat(input.path);
+    if (!metadata.isFile()) throw new Error("Derived artifact must be a regular file");
+    if (metadata.size > MAX_OUTBOUND_BYTES) throw new Error("Derived artifact exceeds 50 MiB limit");
+    const id = newId("art");
+    const safeName = sanitizeFilename(input.filename);
+    const directory = join(this.root, id);
+    const localPath = join(directory, safeName);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await copyFile(input.path, localPath);
+    await chmod(localPath, 0o600);
+    const artifact: Artifact = {
+      id,
+      localPath,
+      filename: safeName,
+      mimeType: input.mimeType,
+      sizeBytes: metadata.size,
+      sha256: await hashFile(localPath),
+      source: "operator_generated",
+      derivedFromArtifactId: parent.id,
+      ...(parent.projectId ? { projectId: parent.projectId } : {}),
+      ...(parent.threadId ? { threadId: parent.threadId } : {}),
+      createdAt: nowIso(),
+      ...(input.expiresAt ?? parent.expiresAt
+        ? { expiresAt: input.expiresAt ?? parent.expiresAt }
+        : {}),
+    };
+    this.store.saveArtifact(artifact);
+    this.store.appendEvent("artifact.derived", {
+      payload: {
+        artifactId: artifact.id,
+        derivedFromArtifactId: parent.id,
+        mimeType: artifact.mimeType,
+        sizeBytes: artifact.sizeBytes,
+      },
+    });
+    return artifact;
+  }
+
+  async ingestGeneratedFile(input: {
+    path: string;
+    filename: string;
+    mimeType: string;
+    expiresAt?: string;
+  }): Promise<Artifact> {
+    const metadata = await stat(input.path);
+    if (!metadata.isFile()) throw new Error("Generated artifact must be a regular file");
+    if (metadata.size > MAX_OUTBOUND_BYTES) throw new Error("Generated artifact exceeds 50 MiB limit");
+    const id = newId("art");
+    const safeName = sanitizeFilename(input.filename);
+    const directory = join(this.root, id);
+    const localPath = join(directory, safeName);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await copyFile(input.path, localPath);
+    await chmod(localPath, 0o600);
+    const artifact: Artifact = {
+      id,
+      localPath,
+      filename: safeName,
+      mimeType: input.mimeType,
+      sizeBytes: metadata.size,
+      sha256: await hashFile(localPath),
+      source: "operator_generated",
+      createdAt: nowIso(),
+      expiresAt:
+        input.expiresAt ?? new Date(Date.now() + INBOUND_RETENTION_MS).toISOString(),
+    };
+    this.store.saveArtifact(artifact);
+    this.store.appendEvent("artifact.generated", {
+      payload: {
+        artifactId: artifact.id,
+        mimeType: artifact.mimeType,
+        sizeBytes: artifact.sizeBytes,
+      },
+    });
     return artifact;
   }
 

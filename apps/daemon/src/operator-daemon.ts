@@ -38,6 +38,7 @@ import {
 import type { ArtifactRegistry } from "../../../packages/artifacts/src/index.js";
 import type {
   SentMessage,
+  TelegramAttachment,
   TelegramDestination,
   TelegramInbound,
   TelegramSendOptions,
@@ -57,6 +58,7 @@ import type {
   OperatorToolServer,
   ToolStartedThread,
 } from "../../../packages/operator-tools/src/index.js";
+import type { MediaProcessor } from "../../../packages/media/src/index.js";
 
 interface QueuedThreadFollowup {
   threadId: string;
@@ -89,6 +91,7 @@ export class OperatorDaemon {
     private readonly scheduler: DailyScheduler,
     private readonly logger: Logger,
     private readonly operatorTools?: OperatorToolServer,
+    private readonly media?: MediaProcessor,
   ) {
     this.router = new RoutingEngine(store);
   }
@@ -315,17 +318,51 @@ export class OperatorDaemon {
         const bytes = await this.telegram.downloadFile(attachment.fileId);
         return this.artifacts.ingestTelegram({
           bytes,
-          ...(attachment.filename ? { filename: attachment.filename } : {}),
-          ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
+          filename:
+            attachment.filename ?? inferredAttachmentFilename(attachment, update.messageId),
+          mimeType: attachment.mimeType ?? inferredAttachmentMimeType(attachment),
           telegramFileId: attachment.fileId,
           chatId: update.chatId,
           messageId: update.messageId,
         });
       }),
     );
+    const enrichedArtifacts = [...ingested];
+    const mediaContext: string[] = [];
+    if (this.media) {
+      for (const [index, attachment] of update.attachments.entries()) {
+        const original = ingested[index];
+        if (!original || !["voice", "audio", "video_note"].includes(attachment.type)) continue;
+        const enrichment = await this.media.enrichInbound(attachment, original);
+        enrichedArtifacts.push(...enrichment.artifacts);
+        const label = attachment.type === "video_note" ? "Video-note" : attachment.type === "voice" ? "Voice" : "Audio";
+        if (enrichment.transcript) {
+          mediaContext.push(
+            `[${label} transcript; original artifact ${original.id}]\n${enrichment.transcript}`,
+          );
+        } else {
+          mediaContext.push(
+            `[${label} transcription unavailable; original artifact ${original.id}; reason: ${enrichment.transcriptionUnavailable ?? "unknown"}]`,
+          );
+        }
+        const keyframes = enrichment.artifacts.filter((artifact) => artifact.mimeType === "image/jpeg");
+        if (keyframes.length) {
+          mediaContext.push(
+            `[${label} keyframes: ${keyframes.map((artifact) => artifact.id).join(", ")}]`,
+          );
+        }
+      }
+    }
+    if (mediaContext.length) {
+      const userText = isMediaPlaceholder(update.text) ? "" : update.text.trim();
+      update = {
+        ...update,
+        text: [userText, ...mediaContext].filter(Boolean).join("\n\n"),
+      };
+    }
     for (const messageId of update.messageIds) {
       this.store.updateTelegramMessageBinding(update.chatId, messageId, {
-        artifactIds: ingested.map((artifact) => artifact.id),
+        artifactIds: enrichedArtifacts.map((artifact) => artifact.id),
       });
     }
 
@@ -370,7 +407,7 @@ export class OperatorDaemon {
     let route = this.router.route({
       text: update.text,
       ...(replyContext?.primaryThreadId ? { replyThreadId: replyContext.primaryThreadId } : {}),
-      artifacts: ingested,
+      artifacts: enrichedArtifacts,
       focus,
       projects,
       threadCandidates: candidates,
@@ -418,7 +455,7 @@ export class OperatorDaemon {
           chatId: promptMessage.chatId,
           messageId: promptMessage.messageId,
           originalUpdate: { ...update, attachments: [] },
-          artifactIds: ingested.map((artifact) => artifact.id),
+          artifactIds: enrichedArtifacts.map((artifact) => artifact.id),
           candidateThreadIds: route.binding.threadIds,
         });
       }
@@ -433,7 +470,7 @@ export class OperatorDaemon {
     if (isHandoffIntent(update.text)) {
       const handled = await this.handleHandoffRequest(
         update,
-        ingested,
+        enrichedArtifacts,
         route.binding,
         focus,
         projects,
@@ -442,19 +479,24 @@ export class OperatorDaemon {
       if (handled) return;
     }
 
-    if (shouldDelegate(update.text, ingested, route.binding)) {
+    const delegationArtifacts = update.attachments.some(
+      (attachment) => attachment.type !== "voice" && attachment.type !== "video_note",
+    )
+      ? enrichedArtifacts
+      : [];
+    if (shouldDelegate(update.text, delegationArtifacts, route.binding)) {
       if (shouldPlanParallelDelegation(update.text)) {
         const plan = await this.planParallelDelegation(update.text);
         if (plan.mode === "parallel" && plan.workers.length >= 2) {
-          await this.delegateParallel(update, ingested, route.binding, projects, route.confidence, plan);
+          await this.delegateParallel(update, enrichedArtifacts, route.binding, projects, route.confidence, plan);
           return;
         }
       }
-      await this.delegate(update, ingested, route.binding, projects, route.confidence);
+      await this.delegate(update, enrichedArtifacts, route.binding, projects, route.confidence);
       return;
     }
 
-    await this.answerDirect(update, focus, ingested);
+    await this.answerDirect(update, focus, enrichedArtifacts);
   }
 
   private async answerDirect(
@@ -483,7 +525,7 @@ export class OperatorDaemon {
       "Answer the user's Telegram message directly. This is a quick task and no T3 worker was created.",
       `User message: ${update.text || "(attachment only)"}`,
       artifacts.length
-        ? `Attachments available only as metadata: ${artifacts.map((a) => `${a.filename ?? a.id} (${a.mimeType ?? "unknown"})`).join(", ")}`
+        ? `Registered attachments (use artifact tools by id when needed): ${artifacts.map((a) => `${a.id}: ${a.filename ?? "unnamed"} (${a.mimeType ?? "unknown"})`).join(", ")}`
         : "No attachments.",
       focus.primary
         ? `Current durable work focus (do not change it for this side question): ${focus.primary.topic}`
@@ -3273,6 +3315,40 @@ function inferMimeType(filename: string): string {
     return "text/plain";
   }
   return "application/octet-stream";
+}
+
+function inferredAttachmentFilename(
+  attachment: TelegramAttachment,
+  messageId: number,
+): string {
+  const extension = (() => {
+    const mimeType = attachment.mimeType?.split(";")[0]?.toLocaleLowerCase();
+    if (mimeType === "audio/ogg") return ".ogg";
+    if (mimeType === "audio/mpeg") return ".mp3";
+    if (mimeType === "audio/mp4" || mimeType === "audio/x-m4a") return ".m4a";
+    if (mimeType === "video/webm") return ".webm";
+    if (mimeType === "image/webp") return ".webp";
+    if (mimeType === "application/x-tgsticker") return ".tgs";
+    if (attachment.type === "voice") return ".ogg";
+    if (attachment.type === "video_note" || attachment.type === "video") return ".mp4";
+    if (attachment.type === "animation") return ".mp4";
+    return "";
+  })();
+  return `${attachment.type.replaceAll("_", "-")}-${messageId}${extension}`;
+}
+
+function inferredAttachmentMimeType(attachment: TelegramAttachment): string {
+  if (attachment.type === "voice") return "audio/ogg";
+  if (attachment.type === "video_note" || attachment.type === "video") return "video/mp4";
+  if (attachment.type === "animation") return "video/mp4";
+  if (attachment.type === "sticker" && attachment.isVideo) return "video/webm";
+  if (attachment.type === "sticker" && attachment.isAnimated) return "application/x-tgsticker";
+  if (attachment.type === "sticker") return "image/webp";
+  return "application/octet-stream";
+}
+
+function isMediaPlaceholder(text: string): boolean {
+  return /^\((?:voice|audio|video note)\)$/i.test(text.trim());
 }
 
 class SerialQueue {

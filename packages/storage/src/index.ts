@@ -135,6 +135,10 @@ export class OperatorStore {
     if (!threadColumns.some((column) => column.name === "model")) {
       this.db.exec("ALTER TABLE threads ADD COLUMN model TEXT");
     }
+    const artifactColumns = this.db.prepare("PRAGMA table_info(artifacts)").all() as Row[];
+    if (!artifactColumns.some((column) => column.name === "derived_from_artifact_id")) {
+      this.db.exec("ALTER TABLE artifacts ADD COLUMN derived_from_artifact_id TEXT");
+    }
     this.db
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)")
       .run(nowIso());
@@ -592,10 +596,18 @@ export class OperatorStore {
   saveArtifact(artifact: Artifact): void {
     this.db
       .prepare(`
-        INSERT OR REPLACE INTO artifacts(
-          id,local_path,filename,mime_type,size_bytes,sha256,source,project_id,thread_id,
-          telegram_file_id,telegram_chat_id,telegram_message_id,created_at,expires_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO artifacts(
+          id,local_path,filename,mime_type,size_bytes,sha256,source,derived_from_artifact_id,
+          project_id,thread_id,telegram_file_id,telegram_chat_id,telegram_message_id,created_at,expires_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+          local_path=excluded.local_path,filename=excluded.filename,mime_type=excluded.mime_type,
+          size_bytes=excluded.size_bytes,sha256=excluded.sha256,source=excluded.source,
+          derived_from_artifact_id=excluded.derived_from_artifact_id,
+          project_id=excluded.project_id,thread_id=excluded.thread_id,
+          telegram_file_id=excluded.telegram_file_id,telegram_chat_id=excluded.telegram_chat_id,
+          telegram_message_id=excluded.telegram_message_id,created_at=excluded.created_at,
+          expires_at=excluded.expires_at
       `)
       .run(
         artifact.id,
@@ -605,6 +617,7 @@ export class OperatorStore {
         artifact.sizeBytes,
         artifact.sha256 ?? null,
         artifact.source,
+        artifact.derivedFromArtifactId ?? null,
         artifact.projectId ?? null,
         artifact.threadId ?? null,
         artifact.telegramFileId ?? null,
@@ -636,7 +649,7 @@ export class OperatorStore {
           LEFT JOIN threads t ON t.id=a.thread_id
           WHERE a.expires_at IS NOT NULL AND a.expires_at<=?
             AND (t.id IS NULL OR t.status IN ('idle','completed','failed','cancelled'))
-          ORDER BY a.expires_at LIMIT ?
+          ORDER BY (a.derived_from_artifact_id IS NULL),a.expires_at LIMIT ?
         `)
         .all(at, Math.max(1, Math.min(limit, 1_000))) as Row[]
     ).map(rowToArtifact);
@@ -1299,6 +1312,9 @@ function rowToArtifact(row: Row): Artifact {
     localPath: String(row.local_path),
     sizeBytes: Number(row.size_bytes),
     source: String(row.source) as Artifact["source"],
+    ...(row.derived_from_artifact_id
+      ? { derivedFromArtifactId: String(row.derived_from_artifact_id) }
+      : {}),
     ...(row.filename ? { filename: String(row.filename) } : {}),
     ...(row.mime_type ? { mimeType: String(row.mime_type) } : {}),
     ...(row.sha256 ? { sha256: String(row.sha256) } : {}),

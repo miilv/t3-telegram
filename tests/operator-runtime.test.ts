@@ -15,7 +15,7 @@ let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
-  if (process.env.TELEGRAM_BOT_TOKEN || process.env.T3_BEARER_TOKEN) process.exit(9);
+  if (process.env.TELEGRAM_BOT_TOKEN || process.env.T3_BEARER_TOKEN || process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY || process.env.DEEPGRAM_API_KEY || process.env.ELEVENLABS_API_KEY) process.exit(9);
   const sessionIndex = process.argv.indexOf("--session-id");
   const session = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : "resumed";
   console.log(JSON.stringify({ type: "system", session_id: session }));
@@ -27,10 +27,16 @@ process.stdin.on("end", () => {
       { mode: 0o700 },
     );
     chmodSync(binary, 0o700);
-    const previousTelegram = process.env.TELEGRAM_BOT_TOKEN;
-    const previousT3 = process.env.T3_BEARER_TOKEN;
-    process.env.TELEGRAM_BOT_TOKEN = "must-not-leak";
-    process.env.T3_BEARER_TOKEN = "must-not-leak";
+    const secretKeys = [
+      "TELEGRAM_BOT_TOKEN",
+      "T3_BEARER_TOKEN",
+      "OPENAI_API_KEY",
+      "GROQ_API_KEY",
+      "DEEPGRAM_API_KEY",
+      "ELEVENLABS_API_KEY",
+    ] as const;
+    const previous = Object.fromEntries(secretKeys.map((key) => [key, process.env[key]]));
+    for (const key of secretKeys) process.env[key] = "must-not-leak";
     try {
       const runtime = new ClaudeCliOperatorRuntime({
         binary,
@@ -48,10 +54,10 @@ process.stdin.on("end", () => {
       expect(streamed).toBe("Hello world");
       expect(result).toBe("Hello world");
     } finally {
-      if (previousTelegram === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
-      else process.env.TELEGRAM_BOT_TOKEN = previousTelegram;
-      if (previousT3 === undefined) delete process.env.T3_BEARER_TOKEN;
-      else process.env.T3_BEARER_TOKEN = previousT3;
+      for (const key of secretKeys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
     }
   });
 

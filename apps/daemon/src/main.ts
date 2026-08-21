@@ -7,6 +7,7 @@ import { OperatorStore } from "../../../packages/storage/src/index.js";
 import { HttpT3Broker } from "../../../packages/t3-broker/src/index.js";
 import { TelegramBotTransport } from "../../../packages/telegram/src/index.js";
 import { OperatorToolServer } from "../../../packages/operator-tools/src/index.js";
+import { MediaProcessor } from "../../../packages/media/src/index.js";
 import { OperatorDaemon } from "./operator-daemon.js";
 
 async function main(): Promise<void> {
@@ -38,12 +39,14 @@ async function main(): Promise<void> {
     config.telegram.pollTimeoutSeconds,
     logger,
   );
+  const media = new MediaProcessor(config.media, artifacts, store, logger);
   let daemon: OperatorDaemon;
   const operatorTools = new OperatorToolServer({
     broker,
     store,
     telegram,
     artifacts,
+    media,
     logger,
     onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
   });
@@ -58,6 +61,7 @@ async function main(): Promise<void> {
     scheduler,
     logger,
     operatorTools,
+    media,
   );
 
   const shutdown = async (signal: string) => {

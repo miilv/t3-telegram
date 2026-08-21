@@ -223,7 +223,7 @@ function parseClaudeEvent(line: string): OperatorEvent | undefined {
 }
 
 function sanitizedEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const blocked = /^(TELEGRAM_BOT_TOKEN|T3_BEARER_TOKEN)$/;
+  const blocked = /^(TELEGRAM_BOT_TOKEN|T3_BEARER_TOKEN|OPENAI_API_KEY|GROQ_API_KEY|DEEPGRAM_API_KEY|ELEVENLABS_API_KEY)$/;
   return Object.fromEntries(Object.entries(env).filter(([key]) => !blocked.test(key)));
 }
 

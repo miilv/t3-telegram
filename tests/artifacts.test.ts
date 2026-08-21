@@ -44,6 +44,39 @@ describe("ArtifactRegistry", () => {
     expect(sanitizeFilename("../../foo bar.ts")).toBe("foo-bar.ts");
   });
 
+  it("copies derived media into managed storage and persists its source provenance", async () => {
+    const store = tempStore();
+    const root = tempDirectory("artifact-derived-");
+    const registry = new ArtifactRegistry(root, store);
+    await registry.initialize();
+    const original = await registry.ingestTelegram({
+      bytes: new TextEncoder().encode("original media"),
+      filename: "voice.ogg",
+      mimeType: "audio/ogg",
+      telegramFileId: "voice_1",
+      chatId: 1,
+      messageId: 4,
+    });
+    const work = tempDirectory("artifact-derived-work-");
+    const derivedPath = join(work, "transcoded.ogg");
+    writeFileSync(derivedPath, "derived media", { mode: 0o600 });
+
+    const derived = await registry.ingestDerivedFile({
+      path: derivedPath,
+      filename: "../../transcoded voice.ogg",
+      mimeType: "audio/ogg",
+      derivedFromArtifactId: original.id,
+    });
+
+    expect(derived.localPath).toContain(`${root}/${derived.id}/`);
+    expect(derived.filename).toBe("transcoded-voice.ogg");
+    expect(derived.derivedFromArtifactId).toBe(original.id);
+    expect(derived.expiresAt).toBe(original.expiresAt);
+    expect(store.getArtifact(derived.id)?.derivedFromArtifactId).toBe(original.id);
+    expect(existsSync(derived.localPath)).toBe(true);
+    store.close();
+  });
+
   it("removes only expired files managed by the artifact registry", async () => {
     const store = tempStore();
     const root = tempDirectory("artifact-cleanup-");

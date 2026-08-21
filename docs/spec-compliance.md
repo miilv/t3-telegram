@@ -47,8 +47,8 @@ branch, not an aspiration.
 | 17 | Inbound text, photo, document/arbitrary file, audio, voice, video, video note, GIF, sticker, media group, forwarded message and reply. | PARTIAL |
 | 18–19 | Safe Telegram file ingestion and explicit artifact transfer/materialization into a worker workspace. | PARTIAL |
 | 20–21 | Agent-initiated document/image/gallery and appropriate Telegram-native outbound media. | PARTIAL |
-| 22 | Preserve inbound voice, STT, include transcript and original artifact, plus outbound TTS voice with fallback. | MISSING |
-| 23 | Video-note download, audio extraction/STT, keyframes/vision and outbound square video-note transcoding. | MISSING |
+| 22 | Preserve inbound voice, bounded multi-provider/local STT, include transcript and original artifact, plus outbound TTS normalized to OGG/Opus. Evidence: real-FFmpeg media tests, provider/degradation tests, daemon routing test and MCP send test. | PROVED |
+| 23 | Video-note download, durable source-linked audio extraction/STT, 3–6 keyframes viewable through bounded MCP image content, and probed square H.264/AAC outbound transcoding capped at 60 seconds. Evidence: real-FFmpeg media tests, daemon reasoning-envelope test and MCP image/send tests. | PROVED |
 | 24 | Replies use `reply_parameters`; reply context participates in routing and output. | PARTIAL |
 | 25 | Forum topics are preserved as Telegram context but never assumed to map 1:1 to T3 threads. | PARTIAL |
 | 26 | Inbound/outbound reactions with allowlist and durable event context. | PARTIAL |
@@ -84,8 +84,8 @@ branch, not an aspiration.
 | 80 E2E-6 | Three concurrent workers and a single synthesized answer. Fake-boundary integration and restart/group-control tests pass; real T3/Telegram E2E remains. | PARTIAL |
 | 80 E2E-7 | Inbound file reaches the correct worker safely. | PARTIAL |
 | 80 E2E-8 | Worker artifact is sent back safely. | PARTIAL |
-| 80 E2E-9 | Voice is transcribed and original audio remains available. | MISSING |
-| 80 E2E-10 | Video note yields transcript/keyframes and reaches reasoning. | MISSING |
+| 80 E2E-9 | Voice is transcribed, routes from transcript semantics, and the original audio remains registered and reaches direct/delegated work. Fake-boundary daemon E2E plus real provider-form/FFmpeg tests pass. | PROVED |
+| 80 E2E-10 | Video note yields source-linked transcript/audio/keyframes and their IDs reach direct Operator reasoning; bounded MCP vision and real FFmpeg extraction are tested. | PROVED |
 | 80 E2E-11 | Dangerous action pauses, renders approval, resumes once. | PARTIAL |
 | 80 E2E-12 | Restart recovers active work and delivers completion exactly once. | PARTIAL |
 | 81–84 | All MVP requirements plus Phase 2 and Phase 3 requested by the user are implemented; deferred lists are not treated as exclusions. | MISSING |
@@ -176,5 +176,12 @@ Before completion:
   message-scope denial, and prove revocation. Runtime and daemon tests prove
   strict process injection and lease lifecycle. A live Claude CLI 2.1.237 run
   called an HTTP MCP tool successfully with no permission denials.
+- `packages/media/src/index.ts` implements bounded OpenAI/Groq/Deepgram/local
+  Whisper transcription, local/cloud TTS, FFmpeg extraction/keyframes, Opus
+  voice normalization and probed square H.264/AAC video-note normalization.
+  Original media is registered before processing and every derivative persists
+  `derived_from_artifact_id`; failures retain the original and produce explicit
+  context rather than dropping the message. Media, daemon, artifact migration,
+  and official-MCP-client tests prove sections 22–23 and E2E-9/10.
 - These checks prove only their slices; all remaining `PARTIAL`/`MISSING` rows
   still block completion.

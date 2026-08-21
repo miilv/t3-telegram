@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { OperatorDaemon } from "../apps/daemon/src/operator-daemon.js";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
 import { OperatorToolServer } from "../packages/operator-tools/src/index.js";
+import type { MediaProcessor } from "../packages/media/src/index.js";
 import type { Config } from "../packages/shared/src/config.js";
 import type {
   ApprovalDecision,
@@ -35,6 +36,125 @@ import type {
 import { tempDirectory, tempStore } from "./helpers.js";
 
 describe("OperatorDaemon product flow", () => {
+  it("routes voice by its transcript while preserving the original artifact", async () => {
+    const home = tempDirectory("daemon-voice-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const media = {
+      enrichInbound: async (_attachment: unknown, original: { telegramMessageId?: number }) => ({
+        transcript:
+          original.telegramMessageId === 1
+            ? "который час в Токио?"
+            : "реализуй проверку refresh token и прогони тесты",
+        artifacts: [],
+        transcriptionProvider: "openai",
+      }),
+    } as unknown as MediaProcessor;
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(
+      config(home),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      undefined,
+      media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(voiceMessage(1));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    expect(broker.turns).toHaveLength(0);
+    expect(runtime.prompts.at(-1)).toContain("который час в Токио?");
+    expect(runtime.prompts.at(-1)).toMatch(/art_[^:]+: voice-1\.ogg \(audio\/ogg\)/);
+    const firstRecord = store.db
+      .prepare("SELECT artifact_ids_json FROM telegram_messages WHERE chat_id=7 AND message_id=1")
+      .get() as { artifact_ids_json: string };
+    const firstArtifactIds = JSON.parse(firstRecord.artifact_ids_json) as string[];
+    expect(firstArtifactIds).toHaveLength(1);
+    expect(artifacts.resolve(firstArtifactIds[0]!).source).toBe("telegram_upload");
+
+    telegram.push(voiceMessage(2));
+    await waitFor(() => broker.turns.length === 1);
+    expect(broker.turns[0]?.text).toContain("реализуй проверку refresh token");
+    expect(broker.turns[0]?.artifacts).toHaveLength(1);
+    expect(broker.turns[0]?.artifacts?.[0]?.filename).toBe("voice-2.ogg");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("delivers a video-note transcript and registered keyframes to direct reasoning", async () => {
+    const home = tempDirectory("daemon-video-note-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const keyframeSource = `${home}/keyframe.jpg`;
+    writeFileSync(keyframeSource, Buffer.from([0xff, 0xd8, 0xff, 0xd9]), { mode: 0o600 });
+    const media = {
+      enrichInbound: async (_attachment: unknown, original: { id: string }) => {
+        const keyframe = await artifacts.ingestDerivedFile({
+          path: keyframeSource,
+          filename: "video-note-keyframe-1.jpg",
+          mimeType: "image/jpeg",
+          derivedFromArtifactId: original.id,
+        });
+        return {
+          transcript: "что изображено на экране?",
+          artifacts: [keyframe],
+          transcriptionProvider: "openai",
+        };
+      },
+    } as unknown as MediaProcessor;
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(
+      config(home),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      undefined,
+      media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(videoNoteMessage(1));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    expect(broker.turns).toHaveLength(0);
+    const prompt = runtime.prompts.at(-1)!;
+    expect(prompt).toContain("что изображено на экране?");
+    expect(prompt).toContain("Video-note keyframes: art_");
+    expect(prompt).toContain("video-note-keyframe-1.jpg (image/jpeg)");
+    const record = store.db
+      .prepare("SELECT artifact_ids_json FROM telegram_messages WHERE chat_id=7 AND message_id=1")
+      .get() as { artifact_ids_json: string };
+    const artifactIds = JSON.parse(record.artifact_ids_json) as string[];
+    expect(artifactIds).toHaveLength(2);
+    expect(artifacts.resolve(artifactIds[1]!).derivedFromArtifactId).toBe(artifactIds[0]);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("issues privileged MCP access only for the user-facing direct turn", async () => {
     const home = tempDirectory("daemon-tools-");
     const store = tempStore();
@@ -879,6 +999,18 @@ function config(home: string): Config {
       databasePath: `${home}/operator.db`,
     },
     approval: { autoAllow: ["safe-read"] },
+    media: {
+      ffmpegBin: "ffmpeg",
+      ffprobeBin: "ffprobe",
+      timeoutMs: 45_000,
+      maxInputBytes: 20 * 1024 * 1024,
+      openai: undefined,
+      groq: undefined,
+      deepgram: undefined,
+      whisper: undefined,
+      elevenlabs: undefined,
+      sayBin: undefined,
+    },
     logLevel: "info",
   };
 }
@@ -896,6 +1028,36 @@ function message(messageId: number, text: string): Extract<TelegramInbound, { ty
     date: Math.floor(Date.now() / 1000),
     text,
     attachments: [],
+  };
+}
+
+function voiceMessage(messageId: number): Extract<TelegramInbound, { type: "message" }> {
+  return {
+    ...message(messageId, "(voice)"),
+    attachments: [
+      {
+        type: "voice",
+        fileId: `voice_${messageId}`,
+        mimeType: "audio/ogg",
+        durationSeconds: 3,
+      },
+    ],
+  };
+}
+
+function videoNoteMessage(messageId: number): Extract<TelegramInbound, { type: "message" }> {
+  return {
+    ...message(messageId, "(video note)"),
+    attachments: [
+      {
+        type: "video_note",
+        fileId: `video_note_${messageId}`,
+        mimeType: "video/mp4",
+        durationSeconds: 3,
+        width: 640,
+        height: 640,
+      },
+    ],
   };
 }
 
