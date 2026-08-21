@@ -78,6 +78,7 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "telegram.react",
   "artifacts.resolve",
   "artifacts.view_image",
+  "artifacts.read_text",
   "artifacts.materialize_for_thread",
   "utility.time",
   "utility.web_search",
@@ -819,6 +820,37 @@ export class OperatorToolServer {
           image: { data: bytes.toString("base64"), mimeType },
           metadata: compactArtifact(artifact),
         } satisfies ImageToolPayload;
+      },
+    });
+    this.addTool(server, token, {
+      name: "artifacts.read_text",
+      description:
+        "Read a registered text artifact (Markdown/JSON/plain text, e.g. an OCR sidecar or transcript). Returns up to 64k characters per call; use offset to page.",
+      schema: z.object({
+        artifactId: z.string().min(1),
+        offset: z.number().int().min(0).default(0),
+      }),
+      readOnly: true,
+      handler: async ({ artifactId, offset }, capability) => {
+        const artifact = this.options.artifacts.resolve(artifactId);
+        this.requireArtifactAccess(capability, artifact);
+        const mimeType = artifact.mimeType ?? "";
+        const name = (artifact.filename ?? artifact.localPath).toLowerCase();
+        const isText =
+          mimeType.startsWith("text/") ||
+          ["application/json", "application/xml", "application/x-ndjson"].includes(mimeType) ||
+          /\.(md|txt|json|csv|xml|log|html?)$/.test(name);
+        if (!isText) throw new Error("artifact is not a readable text format; use artifacts.view_image for images");
+        if (artifact.sizeBytes > 20 * 1024 * 1024) throw new Error("artifact exceeds the 20 MiB text reading limit");
+        const content = await readFile(artifact.localPath, "utf8");
+        const window = content.slice(offset, offset + 64_000);
+        return {
+          metadata: compactArtifact(artifact),
+          totalChars: content.length,
+          offset,
+          content: window,
+          truncated: offset + window.length < content.length,
+        };
       },
     });
     this.addTool(server, token, {

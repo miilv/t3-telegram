@@ -41,6 +41,14 @@ describe("OperatorToolServer", () => {
       chatId: 777,
       messageId: 91,
     });
+    const textArtifact = await artifacts.ingestTelegram({
+      bytes: Buffer.from("# OCR: план\n\n| Этап | Срок |\n| --- | --- |\n| Docling | 21 августа |\n", "utf8"),
+      filename: "план.ocr.md",
+      mimeType: "text/markdown",
+      telegramFileId: "sidecar_file",
+      chatId: 777,
+      messageId: 91,
+    });
     const voiceArtifact = await artifacts.ingestTelegram({
       bytes: Buffer.from("fake normalized media"),
       filename: "voice.ogg",
@@ -132,7 +140,7 @@ describe("OperatorToolServer", () => {
       teamRole: "owner",
       originMessageId: 91,
       allowedMessageIds: [91, 92],
-      allowedArtifactIds: [imageArtifact.id],
+      allowedArtifactIds: [imageArtifact.id, textArtifact.id],
       operatorTurnId: "opturn_1",
       messageThreadId: 12,
     });
@@ -155,6 +163,13 @@ describe("OperatorToolServer", () => {
       expect(viewed.content.some((item) =>
         typeof item === "object" && item !== null && (item as { type?: unknown }).type === "image"
       )).toBe(true);
+
+      const readText = await callJson(client, "artifacts.read_text", { artifactId: textArtifact.id });
+      expect(readText).toMatchObject({ offset: 0, truncated: false });
+      expect((readText as { content: string }).content).toContain("| Docling | 21 августа |");
+      await expect(
+        callJson(client, "artifacts.read_text", { artifactId: imageArtifact.id }),
+      ).rejects.toThrow(/not a readable text format/);
 
       expect(await callJson(client, "utility.calculator", { expression: "2 + 3 * (4 ^ 2)" })).toEqual({
         expression: "2 + 3 * (4 ^ 2)",
