@@ -675,6 +675,14 @@ export class OperatorDaemon {
     // message itself does not read as delegable work, they must not trigger a
     // clarification prompt (multi_thread) or a silent delegation into an old
     // thread (single lexical match) — answer directly instead.
+    const delegationArtifacts = update.attachments.some(
+      (attachment, index) =>
+        attachment.type !== "voice" &&
+        attachment.type !== "video_note" &&
+        !contextCovered.has(index),
+    )
+      ? enrichedArtifacts
+      : [];
     const lexicalOnlyBinding =
       (route.binding.type === "thread" || route.binding.type === "multi_thread") &&
       route.reasons.every(
@@ -684,7 +692,7 @@ export class OperatorDaemon {
           reason === "active worker status" ||
           reason === "recent thread activity",
       );
-    if (lexicalOnlyBinding && !shouldDelegate(update.text, enrichedArtifacts, { type: "none" })) {
+    if (lexicalOnlyBinding && !shouldDelegate(update.text, delegationArtifacts, { type: "none" })) {
       route = {
         binding: { type: "none" },
         confidence: 0.6,
@@ -767,14 +775,6 @@ export class OperatorDaemon {
       if (handled) return;
     }
 
-    const delegationArtifacts = update.attachments.some(
-      (attachment, index) =>
-        attachment.type !== "voice" &&
-        attachment.type !== "video_note" &&
-        !contextCovered.has(index),
-    )
-      ? enrichedArtifacts
-      : [];
     if (shouldDelegate(update.text, delegationArtifacts, route.binding)) {
       if (shouldPlanParallelDelegation(update.text)) {
         const plan = await this.planParallelDelegation(update);

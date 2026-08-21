@@ -1380,6 +1380,8 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() => telegram.sent.length > 0 || telegram.visible.length > 0);
     expect(broker.turns).toHaveLength(0);
     expect(telegram.choicePrompts).toHaveLength(0);
+    // A follow-up mentioning the freshly created thread's words must also stay
+    // direct when its only artifact evidence is context-covered.
 
     telegram.finish();
     await run;
