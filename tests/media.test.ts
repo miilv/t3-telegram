@@ -306,8 +306,72 @@ describe("MediaProcessor", () => {
     expect(artifacts.resolve(result.artifact!.id).derivedFromArtifactId).toBe(original.id);
     store.close();
   });
-});
 
+  it("converts documents through Docling and stores md + json sidecars", async () => {
+    const home = tempDirectory("media-docling-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const source = `${home}/report.docx`;
+    writeFileSync(source, "docx-bytes");
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(source),
+      filename: "report.docx",
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      telegramFileId: "doc_file",
+      chatId: 7,
+      messageId: 12,
+    });
+    const requests: string[] = [];
+    const processor = new MediaProcessor(
+      mediaConfig({
+        docling: {
+          endpoint: "http://127.0.0.1:5001",
+          container: "t3-docling",
+          startTimeoutMs: 30_000,
+          convertTimeoutMs: 30_000,
+          idleStopMinutes: 10,
+        },
+        ocr: {
+          enabled: true,
+          tesseractBin: "tesseract-missing",
+          pdftotextBin: "pdftotext-missing",
+          pdftoppmBin: "pdftoppm-missing",
+          langs: "rus+eng",
+          maxPdfPages: 8,
+        },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+      async (url, init) => {
+        requests.push(String(url));
+        if (String(url).endsWith("/health")) return new Response("ok", { status: 200 });
+        expect(String(url)).toBe("http://127.0.0.1:5001/v1alpha/convert/file");
+        const form = init?.body as FormData;
+        expect((form.get("files") as File).name).toBe("report.docx");
+        return new Response(
+          JSON.stringify({
+            status: "success",
+            document: {
+              md_content: "# Отчёт\n\n| Кв | Выручка |\n| --- | --- |\n| Q1 | 100 |",
+              json_content: { schema_name: "DoclingDocument", tables: [{ rows: 2 }] },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+    const result = await processor.ocrInbound(original);
+    expect(result.provider).toBe("docling");
+    expect(result.text).toContain("| Q1 | 100 |");
+    expect(result.artifact?.filename).toBe("report.ocr.md");
+    const rows = store.db
+      .prepare("SELECT filename FROM artifacts WHERE derived_from_artifact_id=? ORDER BY filename")
+      .all(original.id) as Array<{ filename: string }>;
+    expect(rows.map((row) => row.filename)).toEqual(["report.docling.json", "report.ocr.md"]);
+    store.close();
+  });
+});
 
 function mediaConfig(overrides: Partial<MediaProcessorConfig> = {}): MediaProcessorConfig {
   return {

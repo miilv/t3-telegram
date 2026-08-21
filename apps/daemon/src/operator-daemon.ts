@@ -80,6 +80,7 @@ import type {
   OperatorToolServer,
   ToolStartedThread,
 } from "../../../packages/operator-tools/src/index.js";
+import { isOfficeDocument } from "../../../packages/media/src/index.js";
 import type { MediaProcessor } from "../../../packages/media/src/index.js";
 import type { DashboardServer } from "../../../packages/dashboard/src/index.js";
 
@@ -547,7 +548,13 @@ export class OperatorDaemon {
         if (!original) continue;
         if (["photo", "document"].includes(attachment.type)) {
           const mime = original.mimeType ?? "";
-          if (mime.startsWith("image/") || mime === "application/pdf") {
+          const lowerName = (original.filename ?? "").toLowerCase();
+          if (
+            mime.startsWith("image/") ||
+            mime === "application/pdf" ||
+            lowerName.endsWith(".pdf") ||
+            isOfficeDocument(mime, lowerName)
+          ) {
             const ocr = await this.media.ocrInbound(original);
             if (ocr.artifact) enrichedArtifacts.push(ocr.artifact);
             if (ocr.text) {

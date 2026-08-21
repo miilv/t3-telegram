@@ -19,6 +19,13 @@ export interface MediaProcessorConfig {
   timeoutMs: number;
   maxInputBytes: number;
   openrouter?: { apiKey: string; model: string } | undefined;
+  docling?: {
+    endpoint: string;
+    container: string;
+    startTimeoutMs: number;
+    convertTimeoutMs: number;
+    idleStopMinutes: number;
+  } | undefined;
   ocr?: {
     enabled: boolean;
     tesseractBin: string;
@@ -398,9 +405,11 @@ export class MediaProcessor {
     const ocr = this.config.ocr;
     if (!ocr?.enabled) return { unavailable: "OCR is disabled" };
     const mime = original.mimeType ?? "";
+    const name = (original.filename ?? original.localPath).toLowerCase();
     const isImage = mime.startsWith("image/");
-    const isPdf = mime === "application/pdf" || (original.filename ?? original.localPath).toLowerCase().endsWith(".pdf");
-    if (!isImage && !isPdf) return { unavailable: "unsupported media type for OCR" };
+    const isPdf = mime === "application/pdf" || name.endsWith(".pdf");
+    const isOffice = isOfficeDocument(mime, name);
+    if (!isImage && !isPdf && !isOffice) return { unavailable: "unsupported media type for OCR" };
     if (original.sizeBytes > this.config.maxInputBytes) {
       return { unavailable: `file exceeds the ${this.config.maxInputBytes} byte OCR limit` };
     }
@@ -410,7 +419,24 @@ export class MediaProcessor {
     try {
       let text: string | undefined;
       let provider: string | undefined;
-      if (isPdf) {
+      let structuredJson: string | undefined;
+      if (this.config.docling) {
+        try {
+          const converted = await this.doclingConvert(original);
+          text = converted.markdown;
+          structuredJson = converted.json;
+          provider = "docling";
+        } catch (error) {
+          this.logger.warn(
+            { artifactId: original.id, error: safeError(error) },
+            "Docling conversion failed; falling back to local OCR",
+          );
+        }
+      }
+      if (text === undefined && isOffice) {
+        return { unavailable: "office document conversion requires Docling" };
+      }
+      if (text === undefined && isPdf) {
         const extracted = await this.pdfTextLayer(original, temporaryDirectory, deadline);
         if (extracted !== undefined && extracted.trim().length >= 32) {
           text = extracted;
@@ -422,7 +448,7 @@ export class MediaProcessor {
           text = extracted;
           provider = "pdftotext";
         }
-      } else if (await this.binaryAvailable(ocr.tesseractBin)) {
+      } else if (text === undefined && (await this.binaryAvailable(ocr.tesseractBin))) {
         const result = await runCommand(
           ocr.tesseractBin,
           [original.localPath, "stdout", "-l", ocr.langs],
@@ -430,7 +456,7 @@ export class MediaProcessor {
         );
         text = result.stdout;
         provider = "tesseract";
-      } else if (ocr.vision) {
+      } else if (text === undefined && isImage && ocr.vision) {
         text = await this.visionOcr(original, ocr.vision, deadline);
         provider = `vision:${ocr.vision.model}`;
       }
@@ -459,6 +485,16 @@ export class MediaProcessor {
         mimeType: "text/markdown",
         derivedFromArtifactId: original.id,
       });
+      if (structuredJson) {
+        const jsonPath = join(temporaryDirectory, `${stem(sourceName)}.docling.json`);
+        await writeFile(jsonPath, structuredJson, "utf8");
+        await this.artifacts.ingestDerivedFile({
+          path: jsonPath,
+          filename: `${stem(sourceName)}.docling.json`,
+          mimeType: "application/json",
+          derivedFromArtifactId: original.id,
+        });
+      }
       this.store.appendEvent("media.ocr.completed", {
         payload: {
           artifactId: original.id,
@@ -478,6 +514,93 @@ export class MediaProcessor {
     } finally {
       await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
+  }
+
+  private doclingLastUsedAt = 0;
+  private doclingIdleTimer: NodeJS.Timeout | undefined;
+
+  /**
+   * Convert a document through the on-demand Docling container. The container
+   * is started only when a document arrives and stopped again after an idle
+   * window, so the parser costs no memory while the chat is quiet.
+   */
+  private async doclingConvert(original: Artifact): Promise<{ markdown: string; json?: string }> {
+    const docling = this.config.docling!;
+    await this.ensureDoclingRunning();
+    this.doclingLastUsedAt = Date.now();
+    this.scheduleDoclingIdleStop();
+    const bytes = await readFile(original.localPath);
+    const form = new FormData();
+    form.append(
+      "files",
+      new Blob([bytes], { type: original.mimeType ?? "application/octet-stream" }),
+      extensionBearingFilename(original),
+    );
+    form.append("to_formats", "md");
+    form.append("to_formats", "json");
+    form.append("table_mode", "accurate");
+    form.append("image_export_mode", "placeholder");
+    const response = await this.fetchImpl(`${docling.endpoint}/v1alpha/convert/file`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(docling.convertTimeoutMs),
+    });
+    if (!response.ok) throw httpFailure("docling", response.status);
+    const payload = (await response.json()) as {
+      document?: { md_content?: unknown; json_content?: unknown };
+      status?: unknown;
+    };
+    const markdown = payload.document?.md_content;
+    if (typeof markdown !== "string" || !markdown.trim()) {
+      throw new Error(`docling returned no markdown (status ${String(payload.status)})`);
+    }
+    this.doclingLastUsedAt = Date.now();
+    return {
+      markdown,
+      ...(payload.document?.json_content !== undefined
+        ? { json: JSON.stringify(payload.document.json_content) }
+        : {}),
+    };
+  }
+
+  private async ensureDoclingRunning(): Promise<void> {
+    const docling = this.config.docling!;
+    const deadline = Date.now() + docling.startTimeoutMs;
+    if (await this.doclingHealthy()) return;
+    await runCommand("docker", ["start", docling.container], 30_000);
+    while (Date.now() < deadline) {
+      if (await this.doclingHealthy()) return;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_500));
+    }
+    throw new Error("docling container did not become healthy in time");
+  }
+
+  private async doclingHealthy(): Promise<boolean> {
+    try {
+      const response = await this.fetchImpl(`${this.config.docling!.endpoint}/health`, {
+        signal: AbortSignal.timeout(3_000),
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  private scheduleDoclingIdleStop(): void {
+    const docling = this.config.docling!;
+    if (this.doclingIdleTimer) clearTimeout(this.doclingIdleTimer);
+    const idleMs = docling.idleStopMinutes * 60_000;
+    this.doclingIdleTimer = setTimeout(() => {
+      const idleFor = Date.now() - this.doclingLastUsedAt;
+      if (idleFor < idleMs - 1_000) {
+        this.scheduleDoclingIdleStop();
+        return;
+      }
+      runCommand("docker", ["stop", docling.container], 60_000).catch((error) => {
+        this.logger.warn({ error: safeError(error) }, "Docling idle stop failed");
+      });
+    }, idleMs);
+    this.doclingIdleTimer.unref();
   }
 
   private async pdfTextLayer(
@@ -876,6 +999,24 @@ function appendBounded(current: string, chunk: string): string {
 function finiteNumber(value: unknown): number | undefined {
   const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
   return Number.isFinite(number) ? number : undefined;
+}
+
+export function isOfficeDocument(mime: string, name: string): boolean {
+  if (
+    [
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "application/msword",
+      "application/vnd.ms-excel",
+      "application/vnd.ms-powerpoint",
+      "text/csv",
+      "text/html",
+    ].includes(mime)
+  ) {
+    return true;
+  }
+  return /\.(docx?|xlsx?|pptx?|csv|html?)$/.test(name);
 }
 
 function stem(filename: string): string {

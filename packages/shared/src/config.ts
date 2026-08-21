@@ -48,7 +48,13 @@ const envSchema = z.object({
   PDFTOPPM_BIN: z.string().min(1).default("pdftoppm"),
   OCR_LANGS: z.string().min(1).default("rus+eng"),
   OCR_MAX_PDF_PAGES: z.coerce.number().int().min(1).max(50).default(8),
-  OCR_VISION_MODEL: z.string().min(1).default("google/gemini-2.5-flash-lite"),
+  OCR_VISION_MODEL: z.string().min(1).default("qwen/qwen3.7-flash"),
+  DOCLING_ENABLED: z.enum(["true", "false"]).default("false"),
+  DOCLING_ENDPOINT: z.string().url().default("http://127.0.0.1:5001"),
+  DOCLING_CONTAINER: z.string().min(1).default("t3-docling"),
+  DOCLING_START_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(600_000).default(120_000),
+  DOCLING_CONVERT_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(600_000).default(180_000),
+  DOCLING_IDLE_STOP_MINUTES: z.coerce.number().int().min(1).max(1_440).default(10),
   OPENAI_API_KEY: z.string().min(1).optional(),
   OPENAI_TRANSCRIPTION_MODEL: z.string().min(1).default("gpt-4o-mini-transcribe"),
   GROQ_API_KEY: z.string().min(1).optional(),
@@ -171,6 +177,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       openrouter: parsed.OPENROUTER_API_KEY
         ? { apiKey: parsed.OPENROUTER_API_KEY, model: parsed.OPENROUTER_TRANSCRIPTION_MODEL }
         : undefined,
+      docling:
+        parsed.DOCLING_ENABLED === "true"
+          ? {
+              endpoint: parsed.DOCLING_ENDPOINT.replace(/\/$/, ""),
+              container: parsed.DOCLING_CONTAINER,
+              startTimeoutMs: parsed.DOCLING_START_TIMEOUT_MS,
+              convertTimeoutMs: parsed.DOCLING_CONVERT_TIMEOUT_MS,
+              idleStopMinutes: parsed.DOCLING_IDLE_STOP_MINUTES,
+            }
+          : undefined,
       ocr: {
         enabled: parsed.OCR_ENABLED === "true",
         tesseractBin: parsed.TESSERACT_BIN,

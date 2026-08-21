@@ -1829,6 +1829,7 @@ function config(home: string): Config {
       timeoutMs: 45_000,
       maxInputBytes: 20 * 1024 * 1024,
       openrouter: undefined,
+      docling: undefined,
       ocr: {
         enabled: false,
         tesseractBin: "tesseract",
