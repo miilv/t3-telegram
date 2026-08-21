@@ -17,6 +17,29 @@ describe("media configuration", () => {
       openai: undefined,
       whisper: undefined,
     });
+    expect(config.telegram).toMatchObject({
+      allowedUserId: 42,
+      users: { 42: "owner" },
+      allowGroups: false,
+    });
+  });
+
+  it("parses explicit team roles and group authorization without replacing the owner", () => {
+    const config = loadConfig({
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      TELEGRAM_ALLOWED_USERS: "7:admin,9:member,11:viewer,42:member",
+      TELEGRAM_ALLOW_GROUPS: "true",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+    });
+
+    expect(config.telegram.users).toEqual({
+      7: "admin",
+      9: "member",
+      11: "viewer",
+      42: "owner",
+    });
+    expect(config.telegram.allowGroups).toBe(true);
   });
 
   it("enables only explicitly configured STT/TTS adapters", () => {

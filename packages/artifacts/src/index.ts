@@ -37,6 +37,12 @@ export class ArtifactRegistry {
     messageId: number;
   }): Promise<Artifact> {
     if (input.bytes.byteLength > MAX_INBOUND_BYTES) throw new Error("Attachment exceeds 50 MiB limit");
+    const existing = this.store.findTelegramArtifact(
+      input.chatId,
+      input.messageId,
+      input.telegramFileId,
+    );
+    if (existing) return existing;
     const id = newId("art");
     const safeName = sanitizeFilename(input.filename ?? `telegram-${input.messageId}`);
     const directory = join(this.root, id);
@@ -126,11 +132,13 @@ export class ArtifactRegistry {
     expiresAt?: string;
   }): Promise<Artifact> {
     const parent = this.resolve(input.derivedFromArtifactId);
+    const safeName = sanitizeFilename(input.filename);
+    const existing = this.store.findDerivedArtifact(parent.id, safeName, input.mimeType);
+    if (existing) return existing;
     const metadata = await stat(input.path);
     if (!metadata.isFile()) throw new Error("Derived artifact must be a regular file");
     if (metadata.size > MAX_OUTBOUND_BYTES) throw new Error("Derived artifact exceeds 50 MiB limit");
     const id = newId("art");
-    const safeName = sanitizeFilename(input.filename);
     const directory = join(this.root, id);
     const localPath = join(directory, safeName);
     await mkdir(directory, { recursive: true, mode: 0o700 });

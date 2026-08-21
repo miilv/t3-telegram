@@ -42,11 +42,18 @@ describe("HttpT3Broker", () => {
       pino({ enabled: false }),
     );
     const project = await broker.createProject({
+      projectId: "prj_stable",
+      commandId: "cmd_project_stable",
       name: "Acme API",
       workspaceRoot: "/tmp/acme",
       createWorkspaceRootIfMissing: true,
     });
-    const thread = await broker.createThread({ projectId: project.id, title: "Auth refresh race" });
+    const thread = await broker.createThread({
+      threadId: "th_stable",
+      commandId: "cmd_thread_stable",
+      projectId: project.id,
+      title: "Auth refresh race",
+    });
     const turn = await broker.sendTurn({
       threadId: thread.id,
       text: "Reproduce and fix it",
@@ -56,6 +63,8 @@ describe("HttpT3Broker", () => {
     });
 
     expect(turn.threadId).toBe(thread.id);
+    expect(project.id).toBe("prj_stable");
+    expect(thread.id).toBe("th_stable");
     expect(fixture.commands.map((command) => command.type)).toEqual([
       "project.create",
       "thread.create",
@@ -65,6 +74,10 @@ describe("HttpT3Broker", () => {
       instanceId: "claude",
       model: "claude-opus-4-1",
     });
+    expect(fixture.commands.slice(0, 2).map((command) => command.commandId)).toEqual([
+      "cmd_project_stable",
+      "cmd_thread_stable",
+    ]);
     expect(fixture.commands[2]?.modelSelection).toEqual({
       instanceId: "codex_work",
       model: "gpt-5.6-sol",

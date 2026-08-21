@@ -7,6 +7,7 @@ import type {
   ArtifactRef,
   ApprovalRiskCategory,
   DelegationPlan,
+  OperatorEvent,
   OperatorNote,
   OperatorRuntime,
   OperatorToolAccess,
@@ -17,6 +18,7 @@ import type {
   TelegramMessageRecord,
   ThreadHandoff,
   ThreadSummary,
+  TeamRole,
   WorkBinding,
   WorkThread,
   WorkerResult,
@@ -81,6 +83,11 @@ interface QueuedThreadFollowup {
   model?: string;
   modelOptions?: Array<{ id: string; value: string | boolean }>;
   correlationId?: string;
+}
+
+interface DurableTelegramIngress {
+  update: Extract<TelegramInbound, { type: "message" }>;
+  processExisting: boolean;
 }
 
 interface DurableT3Dispatch {
@@ -155,6 +162,12 @@ export class OperatorDaemon {
 
   async initialize(): Promise<void> {
     this.store.migrate();
+    for (const [userId, role] of Object.entries(this.config.telegram.users)) {
+      const configuredRole = Number(userId) === this.config.telegram.allowedUserId ? "owner" : role;
+      if (!this.store.getTeamMember(userId) || configuredRole === "owner") {
+        this.store.upsertTeamMember(userId, configuredRole);
+      }
+    }
     const interruptedOutbox = this.store.resetInterruptedTelegramOutbox();
     const interruptedDispatches = this.store.resetInterruptedBackgroundJobs();
     await this.artifacts.initialize();
@@ -174,7 +187,12 @@ export class OperatorDaemon {
       this.broker.health(),
       this.runtime.health(),
     ]);
-    if (!telegramHealth.healthy) throw new Error(`Telegram unavailable: ${telegramHealth.detail}`);
+    if (!telegramHealth.healthy) {
+      this.logger.warn(
+        { errorCode: "TELEGRAM_UNAVAILABLE" },
+        "Telegram unavailable at startup; polling and durable delivery will keep retrying",
+      );
+    }
     if (!runtimeHealth.healthy) throw new Error(`Claude Operator unavailable: ${runtimeHealth.detail}`);
     if (!t3Health.healthy) {
       this.logger.warn({ detail: t3Health.detail }, "T3 unavailable; direct Operator mode remains available");
@@ -191,6 +209,7 @@ export class OperatorDaemon {
     );
     await this.flushTelegramOutbox();
     await this.drainT3Dispatches();
+    await this.operatorInputQueue.run(() => this.drainTelegramIngress());
     await this.recoverPendingInteractions();
     const interruptedClarifications = this.store.resetInterruptedRoutingClarifications();
     if (interruptedClarifications) {
@@ -216,8 +235,20 @@ export class OperatorDaemon {
       void this.ingressQueue
         .run(async () => {
           if (update.type === "message") {
+            const jobId = telegramIngressJobId(update);
+            this.store.enqueueBackgroundJob<DurableTelegramIngress>(
+              "telegram_ingress",
+              {
+                update,
+                processExisting: !update.messageIds.some((messageId) =>
+                  this.store.hasTelegramMessage(update.chatId, messageId),
+                ),
+              },
+              undefined,
+              { id: jobId, dedupeKey: jobId },
+            );
             void this.operatorInputQueue
-              .run(() => this.handleUpdate(update))
+              .run(() => this.drainTelegramIngress())
               .catch((error) => this.logUpdateFailure(error, update.updateId))
               .finally(() => {
                 metrics.observe("telegram_update_latency_ms", Date.now() - receivedAt, {
@@ -303,9 +334,12 @@ export class OperatorDaemon {
 
   async compact(reason = "daily maintenance"): Promise<void> {
     this.refreshStructuredThreadSummaries();
+    await this.maintainStructuredMemory(this.buildOperatorMemorySnapshot());
     const snapshot = this.buildOperatorMemorySnapshot();
     const result = await this.operatorRuntimeQueue.run(() => this.runtime.compact(reason));
     this.operatorSessionId = result.sessionId;
+    this.store.setRuntimeState("operator_context_usage_percent", "0");
+    this.store.setRuntimeState("operator_context_tokens", "0");
     this.store.setRuntimeState("operator_session_id", result.sessionId);
     this.store.saveCompaction(result.sessionId, reason, result.summary);
     this.store.setRuntimeState("last_compaction_at", nowIso());
@@ -338,10 +372,20 @@ export class OperatorDaemon {
 
     const lastCompaction = this.store.getRuntimeState("last_compaction_at");
     const lastCompactionAt = lastCompaction ? Date.parse(lastCompaction) : Number.NaN;
+    const contextUsagePercent = Number(
+      this.store.getRuntimeState("operator_context_usage_percent") ?? "0",
+    );
     if (!Number.isFinite(lastCompactionAt)) {
       this.store.setRuntimeState("last_compaction_at", nowIso());
-    } else if (Date.now() - lastCompactionAt >= 24 * 60 * 60 * 1_000) {
-      await this.compact(reason);
+    } else if (
+      Date.now() - lastCompactionAt >= 24 * 60 * 60 * 1_000 ||
+      contextUsagePercent >= this.config.operator.compactThresholdPercent
+    ) {
+      await this.compact(
+        contextUsagePercent >= this.config.operator.compactThresholdPercent
+          ? `context threshold ${contextUsagePercent.toFixed(1)}%`
+          : reason,
+      );
     }
 
     if (reason !== "startup") await this.recoverWorkers();
@@ -357,7 +401,7 @@ export class OperatorDaemon {
     });
   }
 
-  private async handleUpdate(update: TelegramInbound): Promise<void> {
+  private async handleUpdate(update: TelegramInbound, processExisting = false): Promise<void> {
     if (update.type === "callback") {
       await this.handleCallback(update);
       return;
@@ -389,7 +433,7 @@ export class OperatorDaemon {
     const unseenMessageIds = update.messageIds.filter(
       (messageId) => !this.store.hasTelegramMessage(update.chatId, messageId),
     );
-    if (!unseenMessageIds.length) {
+    if (!unseenMessageIds.length && !processExisting) {
       if (update.edited) {
         this.store.appendEvent("telegram.message.edited", {
           correlationId: correlationForUpdate(update),
@@ -416,6 +460,15 @@ export class OperatorDaemon {
         ...(update.mediaGroupId ? { mediaGroupId: update.mediaGroupId } : {}),
       },
     });
+
+    if (this.roleForUser(update.userId) === "viewer" && !isViewerSafeMessage(update.text)) {
+      await this.telegram.sendRich(
+        update.chatId,
+        "Ваша роль viewer разрешает только `/status`, `/projects`, `/work`, `/focus` и `/help`.",
+        replyOptions(update),
+      );
+      return;
+    }
 
     const ingested = await Promise.all(
       update.attachments.map(async (attachment) => {
@@ -482,6 +535,10 @@ export class OperatorDaemon {
         update.replyToMessageId,
       );
       if (pendingInput) {
+        if (!this.canEditThread(update.userId, pendingInput.threadId)) {
+          await this.telegram.sendRich(update.chatId, "У вас нет прав отвечать за эту работу.", replyOptions(update));
+          return;
+        }
         await this.submitCustomUserInput(update, pendingInput);
         return;
       }
@@ -501,17 +558,26 @@ export class OperatorDaemon {
     }
     if (await this.handleNaturalMemory(update)) return;
 
-    const replyContext = update.replyToMessageId
+    let replyContext = update.replyToMessageId
       ? this.store.getReplyContext(update.chatId, update.replyToMessageId)
       : undefined;
+    if (replyContext?.primaryThreadId && !this.canReadThread(update.userId, replyContext.primaryThreadId)) {
+      replyContext = undefined;
+    }
     const focusKey = String(update.userId);
-    const focus = this.store.getFocus(focusKey);
+    const storedFocus = this.store.getFocus(focusKey);
+    const focus = storedFocus.primary && this.canReadProject(update.userId, storedFocus.primary.projectId)
+      ? storedFocus
+      : { secondary: storedFocus.secondary.filter((item) => this.canReadProject(update.userId, item.projectId)) };
     let projects: Project[];
     try {
-      projects = await this.broker.listProjects();
+      projects = this.projectsVisibleToUser(
+        update.userId,
+        await this.broker.listProjects(),
+      );
     } catch (error) {
       this.logger.warn({ err: error }, "Using cached projects because T3 is unavailable");
-      projects = this.store.listProjects();
+      projects = this.projectsVisibleToUser(update.userId, this.store.listProjects());
     }
     const candidates = this.router.searchCandidates(update.text);
     let route = this.router.route({
@@ -596,7 +662,7 @@ export class OperatorDaemon {
       : [];
     if (shouldDelegate(update.text, delegationArtifacts, route.binding)) {
       if (shouldPlanParallelDelegation(update.text)) {
-        const plan = await this.planParallelDelegation(update.text);
+        const plan = await this.planParallelDelegation(update);
         if (plan.mode === "parallel" && plan.workers.length >= 2) {
           await this.delegateParallel(update, enrichedArtifacts, route.binding, projects, route.confidence, plan);
           return;
@@ -614,7 +680,13 @@ export class OperatorDaemon {
     focus: ReturnType<OperatorStore["getFocus"]>,
     artifacts: ArtifactRef[],
   ): Promise<void> {
-    const operatorTurnId = newId("opturn");
+    const operatorTurnId = stableExternalId("opturn", stableUpdateOperationKey(update));
+    const finalDedupeKey = `telegram:operator:${operatorTurnId}:final`;
+    const existingFinal = this.store.getTelegramOutbox(finalDedupeKey);
+    if (existingFinal) {
+      if (existingFinal.status === "pending") await this.flushTelegramOutbox();
+      return;
+    }
     const correlationId = correlationForUpdate(update);
     this.store.appendEvent("operator.turn.started", {
       correlationId,
@@ -636,8 +708,10 @@ export class OperatorDaemon {
     const toolLease = this.operatorTools?.issue({
       chatId: update.chatId,
       ownerId: String(update.userId),
+      teamRole: this.roleForUser(update.userId),
       originMessageId: update.messageId,
       allowedMessageIds: update.messageIds,
+      allowedArtifactIds: artifacts.map((artifact) => artifact.id),
       operatorTurnId,
       ...(update.messageThreadId ? { messageThreadId: update.messageThreadId } : {}),
       ...(update.directMessagesTopicId
@@ -696,7 +770,7 @@ export class OperatorDaemon {
       toolLease?.revoke();
     }
 
-    this.enqueueTelegramOutbox(`telegram:operator:${operatorTurnId}:final`, update.chatId, "rich", {
+    this.enqueueTelegramOutbox(finalDedupeKey, update.chatId, "rich", {
       text: finalText,
       options: replyOptions(update),
       ...(writer?.draft.mode === "edit" && writer.draft.messageId
@@ -831,7 +905,16 @@ export class OperatorDaemon {
     }
   }
 
-  private async planParallelDelegation(task: string): Promise<DelegationPlan> {
+  private async planParallelDelegation(
+    update: Extract<TelegramInbound, { type: "message" }>,
+  ): Promise<DelegationPlan> {
+    const task = update.text;
+    const stateKey = `telegram_delegation_plan:${stableUpdateOperationKey(update)}`;
+    const persisted = this.store.getRuntimeState(stateKey);
+    if (persisted) {
+      const restored = parseDelegationPlan(persisted);
+      if (restored) return restored;
+    }
     const fallback = fallbackParallelDelegationPlan(task);
     const prompt = [
       "Plan a parallel T3 worker delegation for the user's task.",
@@ -842,9 +925,12 @@ export class OperatorDaemon {
       `User task:\n${task.slice(0, 12_000)}`,
     ].join("\n\n");
     try {
-      return parseDelegationPlan(await this.askOperator(prompt)) ?? fallback;
+      const plan = parseDelegationPlan(await this.askOperator(prompt)) ?? fallback;
+      this.store.setRuntimeState(stateKey, JSON.stringify(plan));
+      return plan;
     } catch (error) {
       this.logger.warn({ err: error }, "Operator parallel planner failed; using deterministic decomposition");
+      this.store.setRuntimeState(stateKey, JSON.stringify(fallback));
       return fallback;
     }
   }
@@ -944,7 +1030,8 @@ export class OperatorDaemon {
           }
         : {}),
     };
-    const handoffId = newId("handoff");
+    const operationKey = stableUpdateOperationKey(update);
+    const handoffId = stableExternalId("handoff", operationKey);
     this.store.saveThreadHandoff({ id: handoffId, packet, status: "prepared" });
 
     const providers = await this.broker.getProviders().catch(() => []);
@@ -955,6 +1042,8 @@ export class OperatorDaemon {
       defaultModel: this.config.t3.model,
     });
     const targetThread = await this.broker.createThread({
+      threadId: stableExternalId("th", operationKey, "handoff"),
+      commandId: stableExternalId("cmd", operationKey, "handoff-thread-create"),
       projectId: targetProject.id,
       title: semanticProjectName(`${sourceThread.title} Handoff`),
       providerInstanceId: workerModel.providerInstanceId,
@@ -993,7 +1082,7 @@ export class OperatorDaemon {
       String(update.userId),
       this.router.updateFocus(focus, { type: "thread", threadId: targetThread.id }, update.text, 0.99),
     );
-    const commandId = newId("dispatch");
+    const commandId = stableExternalId("dispatch", operationKey, "handoff-turn");
     this.store.enqueueBackgroundJob<DurableT3Dispatch>("t3_dispatch", {
       commandId,
       correlationId: correlationForUpdate(update),
@@ -1088,6 +1177,7 @@ export class OperatorDaemon {
     confidence: number,
     plan: DelegationPlan,
   ): Promise<void> {
+    const operationKey = stableUpdateOperationKey(update);
     let project = await this.projectForBinding(binding, projects);
     let createdProject = false;
     if (!project) {
@@ -1095,10 +1185,12 @@ export class OperatorDaemon {
       const workspaceRoot = join(
         this.config.operator.home,
         "workspaces",
-        `${slugify(name)}-${crypto.randomUUID().slice(0, 8)}`,
+        `${slugify(name)}-${stableExternalId("ws", operationKey).slice(-8)}`,
       );
       await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
       project = await this.broker.createProject({
+        projectId: stableExternalId("prj", operationKey),
+        commandId: stableExternalId("cmd", operationKey, "project-create"),
         name,
         workspaceRoot,
         createWorkspaceRootIfMissing: true,
@@ -1106,6 +1198,7 @@ export class OperatorDaemon {
       createdProject = true;
     }
     this.store.upsertProject(project);
+    if (createdProject) this.store.grantProjectAccess(project.id, String(update.userId), "owner");
     const providers = await this.broker.getProviders().catch((error) => {
       this.logger.warn({ err: error }, "T3 provider catalog unavailable during parallel delegation");
       return [];
@@ -1124,9 +1217,11 @@ export class OperatorDaemon {
     }
 
     const created: Array<{ thread: WorkThread; worker: DelegationPlan["workers"][number] }> = [];
-    for (const worker of plan.workers.slice(0, 4)) {
+    for (const [workerIndex, worker] of plan.workers.slice(0, 4).entries()) {
       try {
         const thread = await this.broker.createThread({
+          threadId: stableExternalId("th", operationKey, `parallel-${workerIndex}`),
+          commandId: stableExternalId("cmd", operationKey, `parallel-thread-${workerIndex}`),
           projectId: project.id,
           title: semanticProjectName(worker.title),
           providerInstanceId: workerModel.providerInstanceId,
@@ -1154,7 +1249,7 @@ export class OperatorDaemon {
           confidence,
         ),
       );
-      const commandId = newId("dispatch");
+      const commandId = stableExternalId("dispatch", operationKey, "parallel-degraded-turn");
       this.store.enqueueBackgroundJob<DurableT3Dispatch>("t3_dispatch", {
         commandId,
         correlationId: correlationForUpdate(update),
@@ -1176,7 +1271,7 @@ export class OperatorDaemon {
       return;
     }
 
-    const groupId = newId("group");
+    const groupId = stableExternalId("group", operationKey);
     this.store.createWorkerGroup({
       id: groupId,
       title: semanticProjectName(update.text),
@@ -1241,8 +1336,8 @@ export class OperatorDaemon {
       correlationId: correlationForUpdate(update),
     });
     await this.flushTelegramOutbox();
-    for (const entry of created) {
-      const commandId = newId("dispatch");
+    for (const [workerIndex, entry] of created.entries()) {
+      const commandId = stableExternalId("dispatch", operationKey, `parallel-turn-${workerIndex}`);
       this.store.enqueueBackgroundJob<DurableT3Dispatch>("t3_dispatch", {
         commandId,
         correlationId: correlationForUpdate(update),
@@ -1289,6 +1384,7 @@ export class OperatorDaemon {
     projects: Project[],
     confidence: number,
   ): Promise<void> {
+    const operationKey = stableUpdateOperationKey(update);
     let thread: WorkThread | undefined;
     let project: Project | undefined;
     let reusedExistingThread = false;
@@ -1311,10 +1407,12 @@ export class OperatorDaemon {
       const workspaceRoot = join(
         this.config.operator.home,
         "workspaces",
-        `${slugify(name)}-${crypto.randomUUID().slice(0, 8)}`,
+        `${slugify(name)}-${stableExternalId("ws", operationKey).slice(-8)}`,
       );
       await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
       project = await this.broker.createProject({
+        projectId: stableExternalId("prj", operationKey),
+        commandId: stableExternalId("cmd", operationKey, "project-create"),
         name,
         workspaceRoot,
         createWorkspaceRootIfMissing: true,
@@ -1371,6 +1469,8 @@ export class OperatorDaemon {
     }
     if (!thread) {
       thread = await this.broker.createThread({
+        threadId: stableExternalId("th", operationKey, "worker"),
+        commandId: stableExternalId("cmd", operationKey, "thread-create"),
         projectId: project.id,
         title: semanticProjectName(update.text || "Worker task"),
         providerInstanceId: workerModel.providerInstanceId,
@@ -1393,6 +1493,7 @@ export class OperatorDaemon {
     }
     this.store.upsertProject(project);
     this.store.upsertThread(thread);
+    if (createdProject) this.store.grantProjectAccess(project.id, String(update.userId), "owner");
 
     const activeFollowUp =
       reusedExistingThread &&
@@ -1477,7 +1578,7 @@ export class OperatorDaemon {
       });
       await this.flushTelegramOutbox();
     } else {
-      const commandId = newId("dispatch");
+      const commandId = stableExternalId("dispatch", operationKey, "worker-turn");
       const dispatch: DurableT3Dispatch = {
         commandId,
         correlationId: correlationForUpdate(update),
@@ -2185,8 +2286,11 @@ export class OperatorDaemon {
       action === "new_thread" ||
       (action === "switch_provider" && selectedProvider?.requiresNewThreadForModelChange === true);
     const selectedModel = operatorDecision?.model ?? selectedProvider?.models.find((model) => model.isDefault)?.slug;
+    const recoveryKey = `${threadId}:${recoveryCount + 1}`;
     if (mustCreateThread) {
       targetThread = await this.broker.createThread({
+        threadId: stableExternalId("th", recoveryKey, "recovery"),
+        commandId: stableExternalId("cmd", recoveryKey, "recovery-thread-create"),
         projectId: project.id,
         title: `${thread.title} recovery`,
         ...(selectedProvider ? { providerInstanceId: selectedProvider.instanceId } : {}),
@@ -2221,7 +2325,7 @@ export class OperatorDaemon {
     const originMessageId = Number(this.store.getRuntimeState(`thread_origin_message:${threadId}`));
     if (!Number.isSafeInteger(chatId) || !Number.isSafeInteger(originMessageId)) return false;
     const destination = this.recoveredDestination(threadId);
-    const commandId = newId("recovery");
+    const commandId = stableExternalId("recovery", recoveryKey, "turn");
     this.store.setRuntimeState(`thread_failure_recovery_count:${threadId}`, String(recoveryCount + 1));
     this.store.setRuntimeState(
       `thread_failure_recovery_count:${targetThread.id}`,
@@ -2423,6 +2527,12 @@ export class OperatorDaemon {
     if (!this.store.beginEvent(eventKey)) return;
     const userInputMatch = /^ui:([^:]+):(\d+):(o\d+|s|c)$/.exec(update.data);
     if (userInputMatch) {
+      const pending = this.store.getUserInput(userInputMatch[1]!);
+      if (!pending || !this.canEditThread(update.userId, pending.threadId)) {
+        await this.telegram.answerCallback(update.callbackId, "You do not have permission for this work item");
+        this.store.completeEvent(eventKey);
+        return;
+      }
       await this.handleUserInputCallback(
         update,
         userInputMatch[1]!,
@@ -2445,6 +2555,11 @@ export class OperatorDaemon {
         this.enqueueKeyboardCleanup(approval.chatId, approval.messageId, approval.threadId, eventKey);
         await this.flushTelegramOutbox();
       }
+      this.store.completeEvent(eventKey);
+      return;
+    }
+    if (!this.isAdministrator(update.userId)) {
+      await this.telegram.answerCallback(update.callbackId, "Only an owner or admin can resolve approvals");
       this.store.completeEvent(eventKey);
       return;
     }
@@ -2496,6 +2611,14 @@ export class OperatorDaemon {
       await this.telegram.sendRich(
         update.chatId,
         "Не вижу активной работы, которую нужно остановить.",
+        replyOptions(update),
+      );
+      return;
+    }
+    if (!this.canEditThread(update.userId, threadId)) {
+      await this.telegram.sendRich(
+        update.chatId,
+        "У вас нет прав на остановку этой работы.",
         replyOptions(update),
       );
       return;
@@ -2651,21 +2774,24 @@ export class OperatorDaemon {
       .split(/\s+/, 1)[0]!
       .split("@", 1)[0]!
       .toLocaleLowerCase();
+    const visibleThreads = this.threadsVisibleToUser(update.userId, this.store.listThreads());
+    const visibleThreadIds = new Set(visibleThreads.map((thread) => thread.id));
     if (command === "/status") {
       try {
         await this.broker.listThreads();
       } catch {
         // Cached status remains useful while T3 is unavailable.
       }
-      const active = this.store.listThreads({
+      const active = this.threadsVisibleToUser(update.userId, this.store.listThreads({
         statuses: ["queued", "running", "waiting_approval", "waiting_user"],
-      });
+      }));
       const focus = this.store.getFocus(String(update.userId));
-      const approvals = this.store.listPendingApprovals();
-      const userInputs = this.store.listPendingUserInputs();
-      const groups = this.store.listUndeliveredWorkerGroups();
-      const recentCompletions = this.store
-        .listThreads()
+      const approvals = this.store.listPendingApprovals().filter((item) => visibleThreadIds.has(item.threadId));
+      const userInputs = this.store.listPendingUserInputs().filter((item) => visibleThreadIds.has(item.threadId));
+      const groups = this.store.listUndeliveredWorkerGroups().filter((group) =>
+        group.members.some((member) => visibleThreadIds.has(member.threadId)),
+      );
+      const recentCompletions = visibleThreads
         .filter((thread) => ["completed", "failed", "cancelled"].includes(thread.status))
         .slice(0, 5);
       const groupedThreadIds = new Set(
@@ -2705,7 +2831,10 @@ export class OperatorDaemon {
       return true;
     }
     if (command === "/projects") {
-      const projects = await this.broker.listProjects().catch(() => this.store.listProjects());
+      const projects = this.projectsVisibleToUser(
+        update.userId,
+        await this.broker.listProjects().catch(() => this.store.listProjects()),
+      );
       await this.telegram.sendRich(
         update.chatId,
         projects.length ? `## Проекты\n\n${projects.map((project) => `- **${project.name}**`).join("\n")}` : "Проектов пока нет.",
@@ -2714,7 +2843,7 @@ export class OperatorDaemon {
       return true;
     }
     if (command === "/work") {
-      const threads = this.store.listThreads().slice(0, 20);
+      const threads = visibleThreads.slice(0, 20);
       await this.telegram.sendRich(
         update.chatId,
         threads.length
@@ -2727,12 +2856,16 @@ export class OperatorDaemon {
     if (command === "/focus") {
       const action = update.text.trim().split(/\s+/).slice(1).join(" ").toLocaleLowerCase();
       if (action === "clear" || action === "reset" || action === "очистить") {
+        if (this.roleForUser(update.userId) === "viewer") {
+          await this.telegram.sendRich(update.chatId, "Роль viewer не может изменять фокус.", replyOptions(update));
+          return true;
+        }
         this.store.setFocus(String(update.userId), { secondary: [] });
         await this.telegram.sendRich(update.chatId, "Рабочий фокус очищен.", replyOptions(update));
         return true;
       }
       const focus = this.store.getFocus(String(update.userId));
-      if (!focus.primary) {
+      if (!focus.primary || !this.canReadProject(update.userId, focus.primary.projectId)) {
         await this.telegram.sendRich(update.chatId, "Текущего рабочего фокуса нет.", replyOptions(update));
         return true;
       }
@@ -2746,11 +2879,12 @@ export class OperatorDaemon {
         `**${escapeMarkdownText(primaryProject?.name ?? focus.primary.projectId)}**${primaryThread ? ` — ${escapeMarkdownText(primaryThread.title)}` : ""}`,
         escapeMarkdownText(focus.primary.topic),
       ];
-      if (focus.secondary.length) {
+      const secondary = focus.secondary.filter((item) => this.canReadProject(update.userId, item.projectId));
+      if (secondary.length) {
         lines.push(
           "",
           "**Недавние контексты**",
-          ...focus.secondary.map((item) => {
+          ...secondary.map((item) => {
             const project = this.store.getProject(item.projectId);
             const thread = item.threadId ? this.store.getThread(item.threadId) : undefined;
             return `- ${escapeMarkdownText(project?.name ?? item.projectId)}${thread ? ` — ${escapeMarkdownText(thread.title)}` : ""}`;
@@ -2761,6 +2895,10 @@ export class OperatorDaemon {
       return true;
     }
     if (command === "/memory") {
+      if (!this.isAdministrator(update.userId)) {
+        await this.telegram.sendRich(update.chatId, "Память Operator доступна только owner/admin.", replyOptions(update));
+        return true;
+      }
       await this.handleMemoryCommand(update);
       return true;
     }
@@ -2782,13 +2920,27 @@ export class OperatorDaemon {
           "- `/focus` — текущий контекст; `/focus clear` — очистить",
           "- `/memory` — durable notes; `remember`, `search`, `forget`, `compact`",
           "- `/stop` или `/cancel` — остановить focused work",
+          "- `/team` — роли команды (owner/admin)",
+          "- `/share <project> <user-id> <editor|viewer>` — доступ к проекту",
           "- `/debug` — owner-only runtime diagnostics",
         ].join("\n"),
         replyOptions(update),
       );
       return true;
     }
+    if (command === "/team") {
+      await this.handleTeamCommand(update);
+      return true;
+    }
+    if (command === "/share") {
+      await this.handleShareCommand(update);
+      return true;
+    }
     if (command === "/debug") {
+      if (!this.isAdministrator(update.userId)) {
+        await this.telegram.sendRich(update.chatId, "Диагностика доступна только owner/admin.", replyOptions(update));
+        return true;
+      }
       const [t3, operator, telegram] = await Promise.all([
         this.broker.health(),
         this.runtime.health(),
@@ -2814,6 +2966,7 @@ export class OperatorDaemon {
           `- Chat: \`${hashChatId(update.chatId)}\``,
           `- Operator session: \`${escapeMarkdownText(this.operatorSessionId)}\``,
           `- Restorable context: ${contextBytes} bytes`,
+          `- Provider context: ${operator.contextTokens ?? "unknown"}/${operator.contextWindow ?? "unknown"} tokens (${operator.contextUsagePercent?.toFixed(1) ?? "unknown"}%)`,
           `- T3: ${t3.healthy ? "ok" : "unavailable"}; pending dispatches=${pendingDispatches}`,
           `- Claude: ${operator.healthy ? "ok" : "unavailable"}`,
           `- Telegram: ${telegram.healthy ? "ok" : "unavailable"}; ${capabilities}`,
@@ -2829,6 +2982,110 @@ export class OperatorDaemon {
       return true;
     }
     return false;
+  }
+
+  private async handleTeamCommand(
+    update: Extract<TelegramInbound, { type: "message" }>,
+  ): Promise<void> {
+    if (!this.isAdministrator(update.userId)) {
+      await this.telegram.sendRich(update.chatId, "Команда доступна только owner/admin.", replyOptions(update));
+      return;
+    }
+    const args = update.text.trim().split(/\s+/).slice(1);
+    if (!args.length || args[0]?.toLocaleLowerCase() === "list") {
+      const members = this.store.listTeamMembers();
+      await this.telegram.sendRich(
+        update.chatId,
+        members.length
+          ? `## Команда\n\n${members.map((member) => `- \`${member.userId}\` — **${member.role}**${member.displayName ? ` · ${escapeMarkdownText(member.displayName)}` : ""}`).join("\n")}`
+          : "Команда пока пуста.",
+        replyOptions(update),
+      );
+      return;
+    }
+    const normalized = args[0]?.toLocaleLowerCase() === "set" ? args.slice(1) : args;
+    const [rawUserId, rawRole] = normalized;
+    if (!rawUserId || !/^\d+$/.test(rawUserId) || !rawRole || !isTeamRole(rawRole)) {
+      await this.telegram.sendRich(
+        update.chatId,
+        "Использование: `/team set <telegram-user-id> <owner|admin|member|viewer>`",
+        replyOptions(update),
+      );
+      return;
+    }
+    const targetId = Number(rawUserId);
+    if (!Object.hasOwn(this.config.telegram.users, targetId)) {
+      await this.telegram.sendRich(
+        update.chatId,
+        "Сначала добавьте пользователя в `TELEGRAM_ALLOWED_USERS` и перезапустите daemon.",
+        replyOptions(update),
+      );
+      return;
+    }
+    const actorRole = this.roleForUser(update.userId);
+    if (targetId === this.config.telegram.allowedUserId && rawRole !== "owner") {
+      await this.telegram.sendRich(update.chatId, "Основного owner нельзя понизить.", replyOptions(update));
+      return;
+    }
+    if (actorRole !== "owner" && (rawRole === "owner" || rawRole === "admin")) {
+      await this.telegram.sendRich(update.chatId, "Только owner может назначать owner/admin.", replyOptions(update));
+      return;
+    }
+    this.store.upsertTeamMember(rawUserId, rawRole);
+    this.store.appendEvent("team.role.updated", {
+      payload: { actorUserId: String(update.userId), targetUserId: rawUserId, role: rawRole },
+    });
+    await this.telegram.sendRich(update.chatId, `Роль \`${rawUserId}\` обновлена: **${rawRole}**.`, replyOptions(update));
+  }
+
+  private async handleShareCommand(
+    update: Extract<TelegramInbound, { type: "message" }>,
+  ): Promise<void> {
+    const [, rawProject, rawUserId, rawAccess] = update.text.trim().split(/\s+/, 4);
+    if (!rawProject || !rawUserId || !/^\d+$/.test(rawUserId) || !isProjectAccessRole(rawAccess)) {
+      await this.telegram.sendRich(
+        update.chatId,
+        "Использование: `/share <project-id-or-name> <telegram-user-id> <owner|editor|viewer>`",
+        replyOptions(update),
+      );
+      return;
+    }
+    const projects = this.projectsVisibleToUser(
+      update.userId,
+      await this.broker.listProjects().catch(() => this.store.listProjects()),
+    );
+    const project = projects.find((candidate) =>
+      candidate.id === rawProject || candidate.name.toLocaleLowerCase() === rawProject.toLocaleLowerCase(),
+    );
+    if (!project) {
+      await this.telegram.sendRich(update.chatId, "Проект не найден или недоступен.", replyOptions(update));
+      return;
+    }
+    const actorAccess = this.store.getProjectAccess(project.id, String(update.userId));
+    if (!this.isAdministrator(update.userId) && actorAccess !== "owner") {
+      await this.telegram.sendRich(update.chatId, "Делиться проектом может owner проекта или team admin.", replyOptions(update));
+      return;
+    }
+    const target = this.store.getTeamMember(rawUserId);
+    if (!target || target.status !== "active") {
+      await this.telegram.sendRich(update.chatId, "Пользователь не состоит в активной команде.", replyOptions(update));
+      return;
+    }
+    if (target.role === "viewer" && rawAccess !== "viewer") {
+      await this.telegram.sendRich(update.chatId, "Team viewer можно выдать только viewer-доступ.", replyOptions(update));
+      return;
+    }
+    this.store.upsertProject(project);
+    this.store.grantProjectAccess(project.id, rawUserId, rawAccess);
+    this.store.appendEvent("project.access.updated", {
+      projectId: project.id,
+      payload: { actorUserId: String(update.userId), targetUserId: rawUserId, access: rawAccess },
+    });
+    await this.telegram.sendRich(
+      update.chatId,
+      `Доступ к **${escapeMarkdownText(project.name)}** для \`${rawUserId}\`: **${rawAccess}**.`,
+      replyOptions(update),
+    );
   }
 
   private async handleMemoryCommand(
@@ -2911,6 +3168,14 @@ export class OperatorDaemon {
   ): Promise<boolean> {
     const intent = parseNaturalMemoryIntent(update.text);
     if (!intent) return false;
+    if (!this.isAdministrator(update.userId)) {
+      await this.telegram.sendRich(
+        update.chatId,
+        "Глобальная память Operator доступна только owner/admin.",
+        replyOptions(update),
+      );
+      return true;
+    }
     if (intent.action === "remember") {
       const note = this.store.rememberOperatorNote({
         category: "user",
@@ -3141,6 +3406,7 @@ export class OperatorDaemon {
       try {
         await this.flushTelegramOutbox();
         await this.drainT3Dispatches();
+        await this.operatorInputQueue.run(() => this.drainTelegramIngress());
       } catch (error) {
         this.logger.warn(
           { errorCode: classifyOperationalError(error).code },
@@ -3148,6 +3414,28 @@ export class OperatorDaemon {
         );
       }
       await delay(1_000, this.shutdown.signal);
+    }
+  }
+
+  private async drainTelegramIngress(): Promise<void> {
+    for (let index = 0; index < 50; index += 1) {
+      const job = this.store.claimBackgroundJob<DurableTelegramIngress>(
+        "telegram_ingress",
+        () => true,
+      );
+      if (!job) return;
+      try {
+        await this.handleUpdate(job.payload.update, job.payload.processExisting);
+        this.store.completeBackgroundJob(job.id);
+      } catch (error) {
+        const classified = classifyOperationalError(error);
+        this.store.retryBackgroundJob(job.id, classified.code);
+        this.store.appendEvent("telegram.ingress.deferred", {
+          correlationId: correlationForUpdate(job.payload.update),
+          payload: { jobId: job.id, errorCode: classified.code },
+        });
+        throw error;
+      }
     }
   }
 
@@ -3481,6 +3769,7 @@ export class OperatorDaemon {
             onDelta?.(event.text);
           } else if (event.type === "result") {
             result = event.text;
+            this.recordOperatorUsage(event.usage);
             if (event.sessionId && event.sessionId !== this.operatorSessionId) {
               this.operatorSessionId = event.sessionId;
               this.store.setRuntimeState("operator_session_id", event.sessionId);
@@ -3503,6 +3792,7 @@ export class OperatorDaemon {
               streamed += event.text;
               onDelta?.(event.text);
             } else if (event.type === "result") result = event.text;
+            if (event.type === "result") this.recordOperatorUsage(event.usage);
           }
           return streamed || result;
         }
@@ -3515,6 +3805,54 @@ export class OperatorDaemon {
     const session = await this.runtime.start({ systemPrompt: OPERATOR_SYSTEM_PROMPT });
     this.operatorSessionId = session.id;
     this.store.setRuntimeState("operator_session_id", session.id);
+  }
+
+  private recordOperatorUsage(
+    usage: Extract<OperatorEvent, { type: "result" }>["usage"],
+  ): void {
+    if (!usage) return;
+    this.store.setRuntimeState("operator_context_tokens", String(usage.contextTokens));
+    if (usage.contextWindow) {
+      this.store.setRuntimeState("operator_context_window", String(usage.contextWindow));
+    }
+    if (usage.percentUsed !== undefined) {
+      this.store.setRuntimeState("operator_context_usage_percent", String(usage.percentUsed));
+    }
+  }
+
+  private async maintainStructuredMemory(snapshot: Record<string, unknown>): Promise<void> {
+    const response = await this.askOperator(
+      [
+        "Prepare durable memory maintenance before context compaction.",
+        "Use the current Operator conversation plus the bounded authoritative state below.",
+        "Return ONLY JSON with notes (array of {category,content,expiresAt?}) and obsoleteNoteIds (string[]).",
+        "Keep only stable preferences, decisions, open loops, and cross-session facts. Never store credentials, secrets, raw transcripts, or temporary chatter. Merge duplicates conceptually and return no more than 20 notes.",
+        `State JSON:\n${serializeBoundedJson(snapshot, 20_000)}`,
+      ].join("\n\n"),
+    ).catch(() => "");
+    const plan = parseMemoryMaintenancePlan(response);
+    if (!plan) return;
+    let remembered = 0;
+    let obsoleted = 0;
+    for (const note of plan.notes.slice(0, 20)) {
+      try {
+        this.store.rememberOperatorNote({
+          category: note.category,
+          content: note.content,
+          source: "maintenance",
+          ...(note.expiresAt ? { expiresAt: note.expiresAt } : {}),
+        });
+        remembered += 1;
+      } catch {
+        // Invalid or secret-only note is intentionally skipped.
+      }
+    }
+    for (const id of plan.obsoleteNoteIds.slice(0, 50)) {
+      if (this.store.markOperatorNoteObsolete(id)) obsoleted += 1;
+    }
+    this.store.appendEvent("memory.maintained", {
+      payload: { remembered, obsoleted },
+    });
   }
 
   private bindInboundToThreads(
@@ -3629,6 +3967,53 @@ export class OperatorDaemon {
       "Update handling failed",
     );
   }
+
+  private roleForUser(userId: number): TeamRole {
+    return this.store.getTeamMember(String(userId))?.role ??
+      this.config.telegram.users[userId] ??
+      "viewer";
+  }
+
+  private projectsVisibleToUser(userId: number, projects: Project[]): Project[] {
+    const role = this.roleForUser(userId);
+    if (role === "owner" || role === "admin") return projects;
+    const allowed = new Set(
+      this.store.listProjectsForUser(String(userId), role).map((project) => project.id),
+    );
+    return projects.filter((project) => allowed.has(project.id));
+  }
+
+  private threadsVisibleToUser(userId: number, threads: WorkThread[]): WorkThread[] {
+    return threads.filter((thread) => this.canReadProject(userId, thread.projectId));
+  }
+
+  private isAdministrator(userId: number): boolean {
+    const role = this.roleForUser(userId);
+    return role === "owner" || role === "admin";
+  }
+
+  private canReadProject(userId: number, projectId: string): boolean {
+    if (this.isAdministrator(userId)) return true;
+    return Boolean(this.store.getProjectAccess(projectId, String(userId)));
+  }
+
+  private canEditProject(userId: number, projectId: string): boolean {
+    if (this.isAdministrator(userId)) return true;
+    if (this.roleForUser(userId) !== "member") return false;
+    const access = this.store.getProjectAccess(projectId, String(userId));
+    return access === "owner" || access === "editor";
+  }
+
+  private canReadThread(userId: number, threadId: string): boolean {
+    const thread = this.store.getThread(threadId);
+    return Boolean(thread && this.canReadProject(userId, thread.projectId));
+  }
+
+  private canEditThread(userId: number, threadId: string): boolean {
+    const thread = this.store.getThread(threadId);
+    if (!thread) return this.isAdministrator(userId);
+    return this.canEditProject(userId, thread.projectId);
+  }
 }
 
 function destinationFromUpdate(
@@ -3642,6 +4027,42 @@ function destinationFromUpdate(
 
 function correlationForUpdate(update: Extract<TelegramInbound, { type: "message" }>): string {
   return `tg:${hashChatId(update.chatId)}:${update.updateId}`;
+}
+
+function telegramIngressJobId(
+  update: Extract<TelegramInbound, { type: "message" }>,
+): string {
+  const messageKey = [...update.messageIds].sort((a, b) => a - b).join(",");
+  return `telegram-ingress:${update.chatId}:${messageKey}${update.edited ? `:edit:${update.updateId}` : ""}`;
+}
+
+function stableUpdateOperationKey(
+  update: Extract<TelegramInbound, { type: "message" }>,
+): string {
+  return createHash("sha256")
+    .update(String(update.chatId))
+    .update(":")
+    .update([...update.messageIds].sort((a, b) => a - b).join(","))
+    .digest("hex");
+}
+
+function stableExternalId(prefix: string, ...parts: string[]): string {
+  const digest = createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 32);
+  return `${prefix}_${digest}`;
+}
+
+function isViewerSafeMessage(text: string): boolean {
+  const normalized = text.trim();
+  return /^\/(?:status|projects|work|help|start)(?:@\w+)?(?:\s|$)/iu.test(normalized) ||
+    /^\/focus(?:@\w+)?$/iu.test(normalized);
+}
+
+function isTeamRole(value: string): value is TeamRole {
+  return ["owner", "admin", "member", "viewer"].includes(value);
+}
+
+function isProjectAccessRole(value: string | undefined): value is "owner" | "editor" | "viewer" {
+  return value !== undefined && ["owner", "editor", "viewer"].includes(value);
 }
 
 function destinationFromOptions(options: TelegramSendOptions): TelegramDestination {
@@ -4017,6 +4438,42 @@ function parseWorkerImportantDecisions(value: string): string[] {
       : [];
   } catch {
     return [];
+  }
+}
+
+function parseMemoryMaintenancePlan(value: string):
+  | {
+      notes: Array<{ category: string; content: string; expiresAt?: string }>;
+      obsoleteNoteIds: string[];
+    }
+  | undefined {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/iu.exec(value)?.[1];
+  const candidate = fenced ?? value.slice(value.indexOf("{"), value.lastIndexOf("}") + 1);
+  if (!candidate) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(candidate);
+    if (!isRecord(parsed)) return undefined;
+    const notes = Array.isArray(parsed.notes)
+      ? parsed.notes.flatMap((entry) => {
+          if (!isRecord(entry) || typeof entry.content !== "string" || !entry.content.trim()) return [];
+          const expiresAt = typeof entry.expiresAt === "string" && Number.isFinite(Date.parse(entry.expiresAt))
+            ? entry.expiresAt
+            : undefined;
+          return [{
+            category: typeof entry.category === "string" ? safeExcerpt(entry.category.trim(), 80) : "general",
+            content: safeExcerpt(entry.content.trim(), 8_000),
+            ...(expiresAt ? { expiresAt } : {}),
+          }];
+        })
+      : [];
+    const obsoleteNoteIds = Array.isArray(parsed.obsoleteNoteIds)
+      ? parsed.obsoleteNoteIds
+          .filter((entry): entry is string => typeof entry === "string")
+          .map((entry) => entry.slice(0, 200))
+      : [];
+    return { notes, obsoleteNoteIds };
+  } catch {
+    return undefined;
   }
 }
 

@@ -7,6 +7,12 @@
 - `/memory` — active durable notes and the latest compaction. Subcommands: `remember [category:] text`, `search query`, `forget note_id`, and `compact`.
 - `/stop` — interrupts the focused worker; when focus is a fan-out group, it interrupts every active member and suppresses a later duplicate synthesis.
 - `/debug` — hashed owner identity, Operator session/context size, Telegram/T3/Claude health, Telegram capability states, subscriptions, SQLite integrity/size/event count, durable queue counts, recent classified errors, and metrics.
+- `/team` — owner/admin team roster; `/team set <id> <role>` changes a role for
+  an ID already present in `TELEGRAM_ALLOWED_USERS` (only owner may appoint
+  owner/admin).
+- `/share <project> <id> <owner|editor|viewer>` — grant project access. Team
+  viewers may receive viewer access only; callbacks and process-scoped tools
+  re-check the same permissions instead of trusting Telegram UI visibility.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
 - Set `OBSERVABILITY_HASH_SALT` to a random secret so the irreversible chat
   pseudonym remains stable across restarts. Without it, a process-random salt
@@ -17,7 +23,8 @@
 The daemon starts one Streamable HTTP MCP endpoint on a random `127.0.0.1`
 port. It is not placed in `~/.claude`, a project settings file, or a worker
 provider configuration. Each direct Telegram turn gets a 256-bit capability
-that fixes the owner, chat, topic, origin message, and Operator turn ID. Claude
+that fixes the user role, chat, topic, origin message, allowed inbound artifacts,
+and Operator turn ID. Claude
 receives that capability only in a mode-`0600` MCP config inside the mode-`0700`
 Operator runtime directory; the config is removed when the subprocess exits.
 The command line contains only that file's path. Claude never receives the

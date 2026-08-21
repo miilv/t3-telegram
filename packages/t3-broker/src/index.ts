@@ -147,11 +147,11 @@ export class HttpT3Broker implements T3Broker {
   }
 
   async createProject(input: CreateProjectInput): Promise<Project> {
-    const projectId = newId("prj");
+    const projectId = input.projectId ?? newId("prj");
     const createdAt = nowIso();
     await this.dispatch({
       type: "project.create",
-      commandId: newId("cmd"),
+      commandId: input.commandId ?? newId("cmd"),
       projectId,
       title: input.name,
       workspaceRoot: input.workspaceRoot,
@@ -178,9 +178,15 @@ export class HttpT3Broker implements T3Broker {
   }
 
   async renameProject(projectId: string, name: string): Promise<void> {
-    await this.dispatch({ type: "project.meta.update", commandId: newId("cmd"), projectId, title: name });
+    const commandId = newId("cmd");
+    await this.dispatch({ type: "project.meta.update", commandId, projectId, title: name });
     const existing = this.store.getProject(projectId);
     if (existing) this.store.upsertProject({ ...existing, name, updatedAt: nowIso() });
+    this.store.appendEvent("project.renamed", {
+      correlationId: commandId,
+      projectId,
+      payload: { name },
+    });
   }
 
   async listThreads(input: { projectId?: string; statuses?: ThreadStatus[] } = {}): Promise<WorkThread[]> {
@@ -227,13 +233,13 @@ export class HttpT3Broker implements T3Broker {
   }
 
   async createThread(input: CreateThreadInput): Promise<WorkThread> {
-    const threadId = newId("th");
+    const threadId = input.threadId ?? newId("th");
     const createdAt = nowIso();
     const providerInstanceId = input.providerInstanceId ?? this.options.providerInstanceId;
     const model = input.model ?? this.options.model;
     await this.dispatch({
       type: "thread.create",
-      commandId: newId("cmd"),
+      commandId: input.commandId ?? newId("cmd"),
       threadId,
       projectId: input.projectId,
       title: input.title,
@@ -324,14 +330,16 @@ export class HttpT3Broker implements T3Broker {
 
   async interruptThread(threadId: string): Promise<void> {
     const detail = await this.threadSnapshot(threadId);
+    const commandId = newId("cmd");
     await this.dispatch({
       type: "thread.turn.interrupt",
-      commandId: newId("cmd"),
+      commandId,
       threadId,
       ...(detail.thread.latestTurn?.turnId ? { turnId: detail.thread.latestTurn.turnId } : {}),
       createdAt: nowIso(),
     });
     this.store.updateThreadStatus(threadId, "cancelled");
+    this.store.appendEvent("thread.interrupted", { correlationId: commandId, threadId });
   }
 
   async *subscribeThread(threadId: string, signal?: AbortSignal): AsyncIterable<WorkerEvent> {
@@ -463,24 +471,36 @@ export class HttpT3Broker implements T3Broker {
   }
 
   async respondApproval(input: ApprovalDecision): Promise<void> {
+    const commandId = input.commandId ?? newId("cmd");
     await this.dispatch({
       type: "thread.approval.respond",
-      commandId: input.commandId ?? newId("cmd"),
+      commandId,
       threadId: input.threadId,
       requestId: input.approvalId,
       decision: input.decision,
       createdAt: nowIso(),
     });
+    this.store.appendEvent("thread.approval.responded", {
+      correlationId: commandId,
+      threadId: input.threadId,
+      payload: { approvalId: input.approvalId, decision: input.decision },
+    });
   }
 
   async respondUserInput(input: UserInputDecision): Promise<void> {
+    const commandId = input.commandId ?? newId("cmd");
     await this.dispatch({
       type: "thread.user-input.respond",
-      commandId: input.commandId ?? newId("cmd"),
+      commandId,
       threadId: input.threadId,
       requestId: input.requestId,
       answers: input.answers,
       createdAt: nowIso(),
+    });
+    this.store.appendEvent("thread.user_input.responded", {
+      correlationId: commandId,
+      threadId: input.threadId,
+      payload: { requestId: input.requestId },
     });
   }
 

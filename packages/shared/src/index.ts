@@ -1,5 +1,7 @@
 export type Id = string;
 
+export type TeamRole = "owner" | "admin" | "member" | "viewer";
+
 export type ThreadStatus =
   | "idle"
   | "queued"
@@ -307,7 +309,12 @@ export type OperatorEvent =
   | { type: "session"; sessionId: string }
   | { type: "text_delta"; text: string }
   | { type: "message"; text: string }
-  | { type: "result"; text: string; sessionId?: string }
+  | {
+      type: "result";
+      text: string;
+      sessionId?: string;
+      usage?: { contextTokens: number; contextWindow?: number; percentUsed?: number };
+    }
   | { type: "error"; error: string };
 
 export interface OperatorSession {
@@ -335,7 +342,13 @@ export interface OperatorRuntime {
   interrupt(): Promise<void>;
   compact(reason?: string): Promise<{ sessionId: string; summary?: string }>;
   resume(sessionId: string): Promise<void>;
-  health(): Promise<{ healthy: boolean; detail?: string }>;
+  health(): Promise<{
+    healthy: boolean;
+    detail?: string;
+    contextTokens?: number;
+    contextWindow?: number;
+    contextUsagePercent?: number;
+  }>;
 }
 
 export interface TurnHandle {
@@ -344,12 +357,16 @@ export interface TurnHandle {
 }
 
 export interface CreateProjectInput {
+  projectId?: string;
+  commandId?: string;
   name: string;
   workspaceRoot: string;
   createWorkspaceRootIfMissing?: boolean;
 }
 
 export interface CreateThreadInput {
+  threadId?: string;
+  commandId?: string;
   projectId: string;
   title: string;
   providerInstanceId?: string;

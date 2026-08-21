@@ -24,4 +24,19 @@ describe("Telegram rich rendering", () => {
     expect(chunks.every((chunk) => chunk.length <= 240)).toBe(true);
     expect(chunks.every((chunk) => chunk.startsWith("```ts\n") && chunk.endsWith("\n```"))).toBe(true);
   });
+
+  it("keeps table headers, details wrappers, and media references valid across splits", () => {
+    const table = [
+      "| Name | Result |",
+      "| --- | --- |",
+      ...Array.from({ length: 20 }, (_, index) => `| check-${index} | ${"ok ".repeat(8)} |`),
+    ].join("\n");
+    const chunks = splitRichText(`${table}\n\n<details><summary>Evidence</summary>\n${"fact ".repeat(80)}\n</details>\n\n![chart](attachment://chart.png)`, 180);
+    const tableChunks = chunks.filter((chunk) => chunk.startsWith("| Name"));
+    expect(tableChunks.length).toBeGreaterThan(1);
+    expect(tableChunks.every((chunk) => chunk.startsWith("| Name | Result |\n| --- | --- |"))).toBe(true);
+    expect(chunks.filter((chunk) => chunk.startsWith("<details")).every((chunk) => chunk.endsWith("</details>"))).toBe(true);
+    expect(chunks.some((chunk) => chunk.includes("![chart](attachment://chart.png)"))).toBe(true);
+    expect(chunks.every((chunk) => chunk.length <= 180)).toBe(true);
+  });
 });

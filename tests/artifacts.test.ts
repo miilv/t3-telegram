@@ -21,6 +21,15 @@ describe("ArtifactRegistry", () => {
     });
     expect(artifact.filename).toBe("unsafe-report.txt");
     expect(artifact.sha256).toHaveLength(64);
+    const replay = await registry.ingestTelegram({
+      bytes: new TextEncoder().encode("hello"),
+      filename: "../../unsafe report.txt",
+      mimeType: "text/plain",
+      telegramFileId: "file_1",
+      chatId: 1,
+      messageId: 2,
+    });
+    expect(replay.id).toBe(artifact.id);
     const materialized = await registry.materializeForThread(artifact.id, project);
     expect(materialized.localPath).toContain(`${project}/.operator-inbox/`);
     store.close();
@@ -67,10 +76,17 @@ describe("ArtifactRegistry", () => {
       mimeType: "audio/ogg",
       derivedFromArtifactId: original.id,
     });
+    const derivedReplay = await registry.ingestDerivedFile({
+      path: derivedPath,
+      filename: "../../transcoded voice.ogg",
+      mimeType: "audio/ogg",
+      derivedFromArtifactId: original.id,
+    });
 
     expect(derived.localPath).toContain(`${root}/${derived.id}/`);
     expect(derived.filename).toBe("transcoded-voice.ogg");
     expect(derived.derivedFromArtifactId).toBe(original.id);
+    expect(derivedReplay.id).toBe(derived.id);
     expect(derived.expiresAt).toBe(original.expiresAt);
     expect(store.getArtifact(derived.id)?.derivedFromArtifactId).toBe(original.id);
     expect(existsSync(derived.localPath)).toBe(true);

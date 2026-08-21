@@ -3,7 +3,9 @@ export const RICH_SAFE_LIMIT = 30_000;
 
 export function splitRichText(text: string, limit = LEGACY_SAFE_LIMIT): string[] {
   if (text.length <= limit) return [text];
-  const segments = tokenizeFencedBlocks(text);
+  const segments = tokenizeFencedBlocks(text).flatMap((segment) =>
+    segment.trimStart().startsWith("```") ? [segment] : tokenizeAtomicMarkdownBlocks(segment),
+  );
   const chunks: string[] = [];
   let current = "";
   for (const segment of segments) {
@@ -20,6 +22,10 @@ export function splitRichText(text: string, limit = LEGACY_SAFE_LIMIT): string[]
     }
     if (segment.trimStart().startsWith("```")) {
       chunks.push(...splitFencedBlock(segment.trim(), limit));
+    } else if (isMarkdownTable(segment)) {
+      chunks.push(...splitMarkdownTable(segment.trim(), limit));
+    } else if (segment.trimStart().startsWith("<details")) {
+      chunks.push(...splitDetailsBlock(segment.trim(), limit));
     } else {
       const plainChunks = splitPlainText(segment, limit);
       chunks.push(...plainChunks.slice(0, -1));
@@ -28,6 +34,85 @@ export function splitRichText(text: string, limit = LEGACY_SAFE_LIMIT): string[]
   }
   if (current) chunks.push(current);
   return chunks;
+}
+
+function tokenizeAtomicMarkdownBlocks(text: string): string[] {
+  const lines = text.split(/(?<=\n)/u);
+  const segments: string[] = [];
+  let plain = "";
+  const flushPlain = () => {
+    if (plain) segments.push(plain);
+    plain = "";
+  };
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const trimmed = line.trim();
+    if (trimmed.startsWith("<details")) {
+      flushPlain();
+      let block = line;
+      while (!block.includes("</details>") && index + 1 < lines.length) block += lines[++index]!;
+      segments.push(block);
+      continue;
+    }
+    if (
+      trimmed.startsWith("|") &&
+      index + 1 < lines.length &&
+      /^\s*\|?\s*:?-{3,}/u.test(lines[index + 1]!)
+    ) {
+      flushPlain();
+      let table = line + lines[++index]!;
+      while (index + 1 < lines.length && lines[index + 1]!.trimStart().startsWith("|")) {
+        table += lines[++index]!;
+      }
+      segments.push(table);
+      continue;
+    }
+    if (/^!\[[^\]]*\]\([^\n]+\)\s*$/u.test(trimmed)) {
+      flushPlain();
+      segments.push(line);
+      continue;
+    }
+    plain += line;
+  }
+  flushPlain();
+  return segments.filter(Boolean);
+}
+
+function isMarkdownTable(value: string): boolean {
+  const lines = value.trim().split("\n");
+  return lines.length >= 2 && lines[0]!.trimStart().startsWith("|") && /^\s*\|?\s*:?-{3,}/u.test(lines[1]!);
+}
+
+function splitMarkdownTable(table: string, limit: number): string[] {
+  const lines = table.split("\n").filter(Boolean);
+  const header = lines.slice(0, 2).join("\n");
+  if (header.length > limit) return splitPlainText(table, limit);
+  const chunks: string[] = [];
+  let current = header;
+  for (const row of lines.slice(2)) {
+    if (row.length + header.length + 1 > limit) {
+      if (current !== header) chunks.push(current);
+      chunks.push(...splitPlainText(row, limit));
+      current = header;
+      continue;
+    }
+    if (current.length + row.length + 1 > limit) {
+      chunks.push(current);
+      current = `${header}\n${row}`;
+    } else {
+      current += `\n${row}`;
+    }
+  }
+  if (current !== header || !chunks.length) chunks.push(current);
+  return chunks;
+}
+
+function splitDetailsBlock(block: string, limit: number): string[] {
+  const open = /^(<details[^>]*>\s*(?:<summary>[\s\S]*?<\/summary>)?)/iu.exec(block)?.[1] ?? "<details>";
+  const close = "</details>";
+  const inner = block.slice(open.length, block.toLocaleLowerCase().lastIndexOf(close)).trim();
+  const allowance = Math.max(1, limit - open.length - close.length - 2);
+  return splitPlainText(inner, allowance).map((piece) => `${open}\n${piece}\n${close}`);
 }
 
 export function truncateRichPreview(text: string, limit = RICH_SAFE_LIMIT): string {

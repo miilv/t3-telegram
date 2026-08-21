@@ -21,7 +21,12 @@ process.stdin.on("end", () => {
   console.log(JSON.stringify({ type: "system", session_id: session }));
   console.log(JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello " } } }));
   console.log(JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: input.trim() } } }));
-  console.log(JSON.stringify({ type: "result", result: "Hello " + input.trim(), session_id: session }));
+  console.log(JSON.stringify({
+    type: "result",
+    result: "Hello " + input.trim(),
+    session_id: session,
+    modelUsage: { opus: { inputTokens: 1000, cacheReadInputTokens: 6000, contextWindow: 10000 } }
+  }));
 });
 `,
       { mode: 0o700 },
@@ -53,6 +58,11 @@ process.stdin.on("end", () => {
       }
       expect(streamed).toBe("Hello world");
       expect(result).toBe("Hello world");
+      await expect(runtime.health()).resolves.toMatchObject({
+        contextTokens: 7_000,
+        contextWindow: 10_000,
+        contextUsagePercent: 70,
+      });
     } finally {
       for (const key of secretKeys) {
         if (previous[key] === undefined) delete process.env[key];

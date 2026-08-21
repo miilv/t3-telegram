@@ -1,10 +1,11 @@
 # Telegram Operator for T3 Code
 
-Always-on, single-user AI Operator in Telegram. It answers quick questions itself through a persistent Claude session and delegates substantial work to persistent, project-scoped T3 Code threads without blocking the Telegram conversation.
+Always-on team AI Operator in Telegram. It answers quick questions itself through a persistent Claude session and delegates substantial work to persistent, project-scoped T3 Code threads without blocking the Telegram conversation.
 
 ## What is implemented
 
-- Authorized private Telegram chat with idempotent long polling.
+- Allowlisted private/group Telegram ingress with owner/admin/member/viewer roles,
+  shared-project memberships, topic preservation, and idempotent long polling.
 - Persistent Claude CLI Operator runtime with resume/compact, built-in web
   retrieval, and a process-scoped privileged MCP surface for T3, Telegram,
   memory, artifacts, time, search, calculator, and safe file metadata.
@@ -30,7 +31,7 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 - Telegram approval buttons (`Allow once`, `Allow session`, `Deny`) backed by an explicit eight-category risk policy.
 - Sequential structured T3 questions in Telegram, including single-select, multi-select, and custom text answers.
 - Provider-aware follow-ups: immediate live steering when supported, otherwise a durable queue dispatched after the current turn.
-- Natural-language durable remember/recall plus `/status`, `/projects`, `/work`, `/focus`, `/memory`, `/stop`/`/cancel`, `/help`, and `/debug`.
+- Natural-language durable remember/recall plus `/status`, `/projects`, `/work`, `/focus`, `/memory`, `/stop`/`/cancel`, `/team`, `/share`, `/help`, and `/debug`.
 - Minute maintenance ticks coalesce safely and enforce daily context compaction, bounded authoritative context restoration, T3 worker reconciliation, note expiry, and managed artifact retention cleanup.
 - Restart recovery for running workers, pending routing clarifications/interactions, interrupted T3 dispatches and group synthesis, and terminal results that arrived while the daemon was down. T3 command receipts and anchored Telegram edits make retries idempotent.
 - Secret-redacted structured logs, hashed chat identities, cross-component correlation IDs, owner diagnostics, classified errors and in-process latency/error/queue metrics.
@@ -40,7 +41,7 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 - Node.js 24.2 or newer (the daemon uses built-in `node:sqlite`).
 - T3 Code running locally or remotely.
 - Claude Code CLI installed and authenticated.
-- A Telegram bot token from BotFather and the numeric Telegram user ID of the single owner.
+- A Telegram bot token from BotFather and the numeric Telegram user ID of the primary owner.
 - `ffmpeg` and `ffprobe` with Opus, H.264, and AAC support.
 
 T3 Code itself may require a newer Node release than this daemon. Follow the requirements of the T3 version you run.
@@ -59,6 +60,18 @@ TELEGRAM_BOT_TOKEN=123456:...
 TELEGRAM_ALLOWED_USER_ID=123456789
 T3_BASE_URL=http://127.0.0.1:3773
 ```
+
+Optional team and group access is explicit:
+
+```dotenv
+TELEGRAM_ALLOWED_USERS=222222222:admin,333333333:member,444444444:viewer
+TELEGRAM_ALLOW_GROUPS=true
+```
+
+Use `/share <project-id-or-name> <user-id> <owner|editor|viewer>` to grant a
+member access to an existing project. Viewer roles remain read-only. `/team`
+lists roles; the primary owner can persist role changes for already allowlisted
+IDs with `/team set <user-id> <role>`.
 
 For a locally trusted T3 environment, `T3_BEARER_TOKEN` may be unnecessary. For a paired/remote environment, provide an access token with `orchestration:read orchestration:operate` scopes.
 

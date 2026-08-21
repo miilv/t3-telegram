@@ -6,6 +6,32 @@ import { OperatorStore } from "../packages/storage/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
 
 describe("OperatorStore", () => {
+  it("persists team roles and filters shared projects by membership", () => {
+    const store = tempStore();
+    const timestamp = nowIso();
+    const projects = ["alpha", "beta"].map((name) => ({
+      id: `prj_${name}`,
+      t3ProjectId: `prj_${name}`,
+      name,
+      workspaceRoot: `/tmp/${name}`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }));
+    for (const project of projects) store.upsertProject(project);
+    store.upsertTeamMember("42", "owner", "Owner");
+    store.upsertTeamMember("9", "member", "Engineer");
+    store.upsertTeamMember("11", "viewer");
+    store.grantProjectAccess("prj_alpha", "9", "editor");
+    store.grantProjectAccess("prj_beta", "11", "viewer");
+
+    expect(store.getTeamMember("9")).toMatchObject({ role: "member", displayName: "Engineer" });
+    expect(store.listProjectsForUser("42", "owner")).toHaveLength(2);
+    expect(store.listProjectsForUser("9", "member").map((project) => project.id)).toEqual(["prj_alpha"]);
+    expect(store.getProjectAccess("prj_alpha", "9")).toBe("editor");
+    expect(store.listProjectsForUser("11", "viewer").map((project) => project.id)).toEqual(["prj_beta"]);
+    store.close();
+  });
+
   it("persists message mappings idempotently and restores reply context", () => {
     const store = tempStore();
     const createdAt = nowIso();

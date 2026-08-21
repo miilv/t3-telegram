@@ -200,6 +200,32 @@ describe("grammY Telegram transport", () => {
 });
 
 describe("Telegram inbound normalization", () => {
+  it("rejects groups by default and accepts only configured group members when enabled", () => {
+    const groupUpdate = {
+      update_id: 8,
+      message: {
+        message_id: 49,
+        chat: { id: -100, type: "supergroup", title: "Work" },
+        from: { id: 42, first_name: "M" },
+        date: 1_700_000_000,
+        text: "status",
+      },
+    } as never;
+    expect(normalizeTelegramUpdate(groupUpdate, 42)).toBeUndefined();
+    expect(
+      normalizeTelegramUpdate(groupUpdate, {
+        users: { 7: "member" },
+        allowGroups: true,
+      }),
+    ).toBeUndefined();
+    expect(
+      normalizeTelegramUpdate(groupUpdate, {
+        users: { 42: "member" },
+        allowGroups: true,
+      }),
+    ).toMatchObject({ type: "message", userId: 42, chatType: "supergroup" });
+  });
+
   it("preserves voice, reply, forward and forum-topic context", () => {
     const inbound = normalizeTelegramUpdate(
       {
@@ -232,7 +258,7 @@ describe("Telegram inbound normalization", () => {
           },
         },
       } as never,
-      42,
+      { users: { 42: "owner" }, allowGroups: true },
     );
 
     expect(inbound).toMatchObject({
@@ -285,7 +311,7 @@ describe("Telegram inbound normalization", () => {
           forum_topic_created: { name: "Backend", icon_color: 123 },
         },
       } as never,
-      42,
+      { users: { 42: "owner" }, allowGroups: true },
     );
     expect(topic).toMatchObject({
       type: "topic",

@@ -17,6 +17,7 @@ import type {
   ArtifactRef,
   OperatorToolAccess,
   Project,
+  TeamRole,
   T3Broker,
   WorkThread,
 } from "../../shared/src/index.js";
@@ -74,6 +75,8 @@ export interface OperatorToolTurnContext extends TelegramDestination {
   originMessageId: number;
   allowedMessageIds?: number[];
   operatorTurnId: string;
+  teamRole: TeamRole;
+  allowedArtifactIds?: string[];
 }
 
 export interface ToolStartedThread {
@@ -228,6 +231,7 @@ export class OperatorToolServer {
       context: {
         ...context,
         allowedMessageIds: [...new Set([context.originMessageId, ...(context.allowedMessageIds ?? [])])],
+        allowedArtifactIds: [...new Set(context.allowedArtifactIds ?? [])],
       },
       expiresAt: Date.now() + CAPABILITY_TTL_MS,
       sentMessageIds: new Set(),
@@ -284,7 +288,9 @@ export class OperatorToolServer {
       description: "List T3 projects as compact metadata without transcripts.",
       schema: z.object({}),
       readOnly: true,
-      handler: async () => (await this.options.broker.listProjects()).map((project) => compactProject(project)),
+      handler: async (_input, capability) => (await this.options.broker.listProjects())
+        .filter((project) => this.canReadProject(capability, project.id))
+        .map((project) => compactProject(project)),
     });
     this.addTool(server, token, {
       name: "t3.create_project",
@@ -294,21 +300,24 @@ export class OperatorToolServer {
         workspaceRoot: z.string().trim().min(1).max(4_096),
         createWorkspaceRootIfMissing: z.boolean().optional(),
       }),
-      handler: async (input) =>
-        compactProject(
-          await this.options.broker.createProject({
+      handler: async (input, capability) => {
+        this.requireTeamMutation(capability, "create projects");
+        const project = await this.options.broker.createProject({
             name: input.name,
             workspaceRoot: input.workspaceRoot,
             createWorkspaceRootIfMissing: input.createWorkspaceRootIfMissing ?? true,
-          }),
-          true,
-        ),
+          });
+        this.options.store.upsertProject(project);
+        this.options.store.grantProjectAccess(project.id, capability.context.ownerId, "owner");
+        return compactProject(project, true);
+      },
     });
     this.addTool(server, token, {
       name: "t3.rename_project",
       description: "Rename an existing T3 project.",
       schema: z.object({ projectId: z.string().min(1), name: z.string().trim().min(1).max(160) }),
-      handler: async ({ projectId, name }) => {
+      handler: async ({ projectId, name }, capability) => {
+        this.requireProjectAccess(capability, projectId, true);
         await this.options.broker.renameProject(projectId, name);
         return { projectId, name, renamed: true };
       },
@@ -322,23 +331,29 @@ export class OperatorToolServer {
         limit: z.number().int().min(1).max(MAX_SEARCH_RESULTS).optional(),
       }),
       readOnly: true,
-      handler: async (input) =>
-        (await this.options.broker.searchThreads({
+      handler: async (input, capability) => {
+        if (input.projectId) this.requireProjectAccess(capability, input.projectId, false);
+        return (await this.options.broker.searchThreads({
           query: input.query,
           ...(input.projectId ? { projectId: input.projectId } : {}),
           ...(input.limit ? { limit: input.limit } : {}),
-        })).map((candidate) => ({
+        })).filter((candidate) => this.canReadProject(capability, candidate.thread.projectId))
+          .map((candidate) => ({
           ...compactThread(candidate.thread),
           score: candidate.score,
           reasons: candidate.reasons.slice(0, 3),
-        })),
+          }));
+      },
     });
     this.addTool(server, token, {
       name: "t3.get_thread",
       description: "Get one thread's compact metadata. Use a separate explicit tail tool for transcript content.",
       schema: z.object({ threadId: z.string().min(1) }),
       readOnly: true,
-      handler: async ({ threadId }) => compactThread(await this.options.broker.getThread(threadId)),
+      handler: async ({ threadId }, capability) => {
+        const thread = await this.requireThreadAccess(capability, threadId, false);
+        return compactThread(thread);
+      },
     });
     this.addTool(server, token, {
       name: "t3.create_thread",
@@ -349,12 +364,15 @@ export class OperatorToolServer {
         providerInstanceId: z.string().min(1).optional(),
         model: z.string().min(1).optional(),
       }),
-      handler: async (input) => compactThread(await this.options.broker.createThread({
-        projectId: input.projectId,
-        title: input.title,
-        ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
-        ...(input.model ? { model: input.model } : {}),
-      })),
+      handler: async (input, capability) => {
+        this.requireProjectAccess(capability, input.projectId, true);
+        return compactThread(await this.options.broker.createThread({
+          projectId: input.projectId,
+          title: input.title,
+          ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
+          ...(input.model ? { model: input.model } : {}),
+        }));
+      },
     });
     this.addTool(server, token, {
       name: "t3.send_turn",
@@ -367,7 +385,9 @@ export class OperatorToolServer {
         model: z.string().min(1).optional(),
       }),
       handler: async (input, capability) => {
+        await this.requireThreadAccess(capability, input.threadId, true);
         const artifacts = (input.artifactIds ?? []).map((id) => this.options.artifacts.resolve(id));
+        for (const artifact of artifacts) this.requireArtifactAccess(capability, artifact);
         const handle = await this.options.broker.sendTurn({
           threadId: input.threadId,
           text: input.text,
@@ -384,7 +404,8 @@ export class OperatorToolServer {
       description: "Interrupt a running T3 thread.",
       schema: z.object({ threadId: z.string().min(1) }),
       destructive: true,
-      handler: async ({ threadId }) => {
+      handler: async ({ threadId }, capability) => {
+        await this.requireThreadAccess(capability, threadId, true);
         await this.options.broker.interruptThread(threadId);
         return { threadId, interrupted: true };
       },
@@ -394,8 +415,8 @@ export class OperatorToolServer {
       description: "Get status and latest compact summary for a T3 thread.",
       schema: z.object({ threadId: z.string().min(1) }),
       readOnly: true,
-      handler: async ({ threadId }) => {
-        const thread = await this.options.broker.getThread(threadId);
+      handler: async ({ threadId }, capability) => {
+        const thread = await this.requireThreadAccess(capability, threadId, false);
         const summary = this.options.store.getThreadSummary(thread.id);
         return {
           threadId: thread.id,
@@ -410,15 +431,18 @@ export class OperatorToolServer {
       description: "Get the daemon's structured summary for a thread, never its raw transcript.",
       schema: z.object({ threadId: z.string().min(1) }),
       readOnly: true,
-      handler: ({ threadId }) => this.options.store.getThreadSummary(threadId) ?? { threadId, summary: null },
+      handler: async ({ threadId }, capability) => {
+        await this.requireThreadAccess(capability, threadId, false);
+        return this.options.store.getThreadSummary(threadId) ?? { threadId, summary: null };
+      },
     });
     this.addTool(server, token, {
       name: "t3.get_thread_artifacts",
       description: "List compact artifact metadata discovered for a T3 thread.",
       schema: z.object({ threadId: z.string().min(1) }),
       readOnly: true,
-      handler: async ({ threadId }) => {
-        const thread = await this.options.broker.getThread(threadId);
+      handler: async ({ threadId }, capability) => {
+        const thread = await this.requireThreadAccess(capability, threadId, false);
         const project = await this.options.broker.getProject(thread.projectId);
         const discovered = (await this.options.broker.getThreadArtifacts(threadId)).slice(0, 30);
         if (!project.workspaceRoot) {
@@ -462,7 +486,8 @@ export class OperatorToolServer {
         decision: z.enum(["accept", "acceptForSession", "decline", "cancel"]),
       }),
       destructive: true,
-      handler: async ({ approvalId, threadId, decision }) => {
+      handler: async ({ approvalId, threadId, decision }, capability) => {
+        this.requireAdministrativeRole(capability, "resolve approvals");
         const pending = this.options.store.getApproval(approvalId);
         const resolvedThreadId = pending?.threadId ?? threadId;
         if (!resolvedThreadId) throw new Error("threadId is required for an unknown local approval id");
@@ -481,7 +506,8 @@ export class OperatorToolServer {
       description: "Search durable Operator notes and compact thread summaries.",
       schema: z.object({ query: z.string().trim().min(2).max(1_000), limit: z.number().int().min(1).max(20).optional() }),
       readOnly: true,
-      handler: ({ query, limit }) => {
+      handler: ({ query, limit }, capability) => {
+        this.requireAdministrativeRole(capability, "search global Operator memory");
         const bounded = limit ?? 8;
         return {
           notes: this.options.store.searchOperatorNotes(query, bounded),
@@ -500,12 +526,15 @@ export class OperatorToolServer {
         category: z.string().trim().min(1).max(80).optional(),
         expiresAt: z.string().datetime().optional(),
       }),
-      handler: (input) => this.options.store.rememberOperatorNote({
-        content: input.content,
-        ...(input.category ? { category: input.category } : {}),
-        ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
-        source: "manual",
-      }),
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "write global Operator memory");
+        return this.options.store.rememberOperatorNote({
+          content: input.content,
+          ...(input.category ? { category: input.category } : {}),
+          ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+          source: "manual",
+        });
+      },
     });
     this.addTool(server, token, {
       name: "memory.update_focus",
@@ -517,6 +546,7 @@ export class OperatorToolServer {
         confidence: z.number().min(0).max(1).optional(),
       }),
       handler: async (input, capability) => {
+        this.requireProjectAccess(capability, input.projectId, false);
         const project = await this.options.broker.getProject(input.projectId);
         if (input.threadId) {
           const thread = await this.options.broker.getThread(input.threadId);
@@ -547,15 +577,20 @@ export class OperatorToolServer {
       description: "Resolve a registered artifact to validated compact metadata and its local path.",
       schema: z.object({ artifactId: z.string().min(1) }),
       readOnly: true,
-      handler: ({ artifactId }) => compactArtifact(this.options.artifacts.resolve(artifactId), true),
+      handler: ({ artifactId }, capability) => {
+        const artifact = this.options.artifacts.resolve(artifactId);
+        this.requireArtifactAccess(capability, artifact);
+        return compactArtifact(artifact, true);
+      },
     });
     this.addTool(server, token, {
       name: "artifacts.view_image",
       description: "View a registered JPEG, PNG, GIF, or WebP artifact, including a video-note keyframe.",
       schema: z.object({ artifactId: z.string().min(1) }),
       readOnly: true,
-      handler: async ({ artifactId }) => {
+      handler: async ({ artifactId }, capability) => {
         const artifact = this.options.artifacts.resolve(artifactId);
+        this.requireArtifactAccess(capability, artifact);
         const mimeType = artifact.mimeType ?? "";
         if (!["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mimeType)) {
           throw new Error("artifact is not a supported image");
@@ -572,8 +607,9 @@ export class OperatorToolServer {
       name: "artifacts.materialize_for_thread",
       description: "Copy a registered artifact into a T3 thread's project-local .operator-inbox.",
       schema: z.object({ artifactId: z.string().min(1), threadId: z.string().min(1) }),
-      handler: async ({ artifactId, threadId }) => {
-        const thread = await this.options.broker.getThread(threadId);
+      handler: async ({ artifactId, threadId }, capability) => {
+        this.requireArtifactAccess(capability, this.options.artifacts.resolve(artifactId));
+        const thread = await this.requireThreadAccess(capability, threadId, true);
         const project = await this.options.broker.getProject(thread.projectId);
         if (!project.workspaceRoot) throw new Error("thread project has no workspace root");
         return compactArtifact(
@@ -628,12 +664,14 @@ export class OperatorToolServer {
         message: "provide artifactId, or both path and projectId",
       }),
       readOnly: true,
-      handler: async (input) => {
+      handler: async (input, capability) => {
         if (input.artifactId) {
           const artifact = this.options.artifacts.resolve(input.artifactId);
+          this.requireArtifactAccess(capability, artifact);
           const metadata = await stat(artifact.localPath);
           return { ...compactArtifact(artifact), modifiedAt: metadata.mtime.toISOString() };
         }
+        this.requireProjectAccess(capability, input.projectId!, false);
         const project = await this.options.broker.getProject(input.projectId!);
         if (!project.workspaceRoot) throw new Error("project has no workspace root");
         const metadata = await this.options.artifacts.inspectOutbound(input.path!, [project.workspaceRoot]);
@@ -649,28 +687,33 @@ export class OperatorToolServer {
       name: "telegram.send_message",
       description: "Send an additional message to the current Telegram chat/topic. Do not use for the normal final answer.",
       schema: textSchema,
-      handler: async ({ text }, capability) =>
-        this.recordSent(await this.options.telegram.sendRich(
+      handler: async ({ text }, capability) => {
+        this.requireTeamMutation(capability, "send Telegram messages");
+        return this.recordSent(await this.options.telegram.sendRich(
           capability.context.chatId,
           text,
           destination(capability.context),
-        ), capability, "operator_tool_message"),
+        ), capability, "operator_tool_message");
+      },
     });
     this.addTool(server, token, {
       name: "telegram.reply",
       description: "Reply natively to the inbound Telegram message fixed by this turn's capability.",
       schema: textSchema,
-      handler: async ({ text }, capability) =>
-        this.recordSent(await this.options.telegram.sendRich(capability.context.chatId, text, {
+      handler: async ({ text }, capability) => {
+        this.requireTeamMutation(capability, "send Telegram replies");
+        return this.recordSent(await this.options.telegram.sendRich(capability.context.chatId, text, {
           ...destination(capability.context),
           replyToMessageId: capability.context.originMessageId,
-        }), capability, "operator_tool_reply"),
+        }), capability, "operator_tool_reply");
+      },
     });
     this.addTool(server, token, {
       name: "telegram.edit",
       description: "Edit a message sent earlier through this same turn capability.",
       schema: z.object({ messageId: z.number().int().positive(), text: z.string().trim().min(1).max(64_000) }),
       handler: async ({ messageId, text }, capability) => {
+        this.requireTeamMutation(capability, "edit Telegram messages");
         if (!capability.sentMessageIds.has(messageId)) throw new Error("message was not sent by this turn capability");
         await this.options.telegram.editRich(
           capability.context.chatId,
@@ -695,7 +738,8 @@ export class OperatorToolServer {
           message: "provide artifactId, or both path and projectId",
         }),
         handler: async (input, capability) => {
-          const artifact = await this.resolveOutboundArtifact(input);
+          this.requireTeamMutation(capability, "send Telegram media");
+          const artifact = await this.resolveOutboundArtifact(input, capability);
           const options = destination(capability.context);
           const caption = input.caption ?? "";
           let sent: SentMessage;
@@ -722,10 +766,11 @@ export class OperatorToolServer {
         { message: "provide text, artifactId, or both path and projectId" },
       ),
       handler: async (input, capability) => {
+        this.requireTeamMutation(capability, "send Telegram voice notes");
         if (!this.options.media) throw new Error("media processor is unavailable");
         const voice = input.text
           ? await this.options.media.synthesizeVoice(input.text)
-          : await this.options.media.normalizeVoice(await this.resolveOutboundArtifact(input));
+          : await this.options.media.normalizeVoice(await this.resolveOutboundArtifact(input, capability));
         const sent = await this.options.telegram.sendVoice(
           capability.context.chatId,
           voice.localPath,
@@ -746,9 +791,10 @@ export class OperatorToolServer {
         message: "provide artifactId, or both path and projectId",
       }),
       handler: async (input, capability) => {
+        this.requireTeamMutation(capability, "send Telegram video notes");
         if (!this.options.media) throw new Error("media processor is unavailable");
         const videoNote = await this.options.media.normalizeVideoNote(
-          await this.resolveOutboundArtifact(input),
+          await this.resolveOutboundArtifact(input, capability),
         );
         const sent = await this.options.telegram.sendVideoNote(
           capability.context.chatId,
@@ -763,6 +809,7 @@ export class OperatorToolServer {
       description: "React to the triggering message or a message sent by this turn capability.",
       schema: z.object({ messageId: z.number().int().positive().optional(), emoji: z.string().min(1).max(16) }),
       handler: async ({ messageId, emoji }, capability) => {
+        this.requireTeamMutation(capability, "send Telegram reactions");
         const target = messageId ?? capability.context.originMessageId;
         const inboundIds = new Set(capability.context.allowedMessageIds ?? [capability.context.originMessageId]);
         if (!inboundIds.has(target) && !capability.sentMessageIds.has(target)) {
@@ -822,15 +869,81 @@ export class OperatorToolServer {
     artifactId?: string | undefined;
     path?: string | undefined;
     projectId?: string | undefined;
-  }): Promise<Artifact> {
-    if (input.artifactId) return this.options.artifacts.resolve(input.artifactId);
+  }, capability: TurnCapability): Promise<Artifact> {
+    if (input.artifactId) {
+      const artifact = this.options.artifacts.resolve(input.artifactId);
+      this.requireArtifactAccess(capability, artifact);
+      return artifact;
+    }
     if (!input.path || !input.projectId) throw new Error("provide artifactId, or both path and projectId");
+    this.requireProjectAccess(capability, input.projectId, false);
     const project = await this.options.broker.getProject(input.projectId);
     if (!project.workspaceRoot) throw new Error("project has no workspace root");
     return this.options.artifacts.registerOutbound(input.path, [project.workspaceRoot], {
       projectId: project.id,
       source: "operator_generated",
     });
+  }
+
+  private teamRole(capability: TurnCapability): TeamRole {
+    return capability.context.teamRole;
+  }
+
+  private requireAdministrativeRole(capability: TurnCapability, action: string): void {
+    const role = this.teamRole(capability);
+    if (role !== "owner" && role !== "admin") {
+      throw new Error(`${action} requires owner or admin role`);
+    }
+  }
+
+  private requireTeamMutation(capability: TurnCapability, action: string): void {
+    if (this.teamRole(capability) === "viewer") {
+      throw new Error(`${action} is not available to viewer role`);
+    }
+  }
+
+  private canReadProject(capability: TurnCapability, projectId: string): boolean {
+    const role = this.teamRole(capability);
+    if (role === "owner" || role === "admin") return true;
+    return Boolean(this.options.store.getProjectAccess(projectId, capability.context.ownerId));
+  }
+
+  private requireProjectAccess(
+    capability: TurnCapability,
+    projectId: string,
+    mutate: boolean,
+  ): void {
+    const role = this.teamRole(capability);
+    if (role === "owner" || role === "admin") return;
+    const access = this.options.store.getProjectAccess(projectId, capability.context.ownerId);
+    const allowed = mutate ? role === "member" && (access === "owner" || access === "editor") : Boolean(access);
+    if (!allowed) throw new Error(`project access denied for ${mutate ? "mutation" : "read"}`);
+  }
+
+  private async requireThreadAccess(
+    capability: TurnCapability,
+    threadId: string,
+    mutate: boolean,
+  ): Promise<WorkThread> {
+    const thread = await this.options.broker.getThread(threadId);
+    this.requireProjectAccess(capability, thread.projectId, mutate);
+    return thread;
+  }
+
+  private requireArtifactAccess(capability: TurnCapability, artifact: Artifact): void {
+    if (capability.context.allowedArtifactIds?.includes(artifact.id)) return;
+    if (artifact.projectId) {
+      this.requireProjectAccess(capability, artifact.projectId, false);
+      return;
+    }
+    if (artifact.threadId) {
+      const thread = this.options.store.getThread(artifact.threadId);
+      if (thread) {
+        this.requireProjectAccess(capability, thread.projectId, false);
+        return;
+      }
+    }
+    this.requireAdministrativeRole(capability, "access unscoped artifacts");
   }
 
   private recordSent(

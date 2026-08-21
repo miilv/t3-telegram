@@ -5,6 +5,8 @@ import { z } from "zod";
 const envSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
   TELEGRAM_ALLOWED_USER_ID: z.coerce.number().int().positive(),
+  TELEGRAM_ALLOWED_USERS: z.string().default(""),
+  TELEGRAM_ALLOW_GROUPS: z.enum(["true", "false"]).default("false"),
   T3_BASE_URL: z.string().url().default("http://127.0.0.1:3773"),
   T3_BEARER_TOKEN: z.string().optional(),
   T3_PROVIDER_INSTANCE_ID: z.string().min(1).default("claude"),
@@ -15,6 +17,7 @@ const envSchema = z.object({
   CLAUDE_BIN: z.string().min(1).default("claude"),
   OPERATOR_MODEL: z.string().min(1).default("opus"),
   OPERATOR_EFFORT: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high"),
+  OPERATOR_COMPACT_THRESHOLD_PERCENT: z.coerce.number().min(50).max(95).default(80),
   OPERATOR_HOME: z.string().min(1).default("~/.operator"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   TELEGRAM_POLL_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(50).default(30),
@@ -49,6 +52,8 @@ const approvalRiskCategory = z.enum([
   "secret-sensitive",
 ]);
 
+const telegramAccessRole = z.enum(["owner", "admin", "member", "viewer"]);
+
 export type Config = ReturnType<typeof loadConfig>;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
@@ -64,10 +69,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
         .map((value) => approvalRiskCategory.parse(value)),
     ),
   ];
+  const telegramUsers = new Map<number, "owner" | "admin" | "member" | "viewer">([
+    [parsed.TELEGRAM_ALLOWED_USER_ID, "owner"],
+  ]);
+  for (const entry of parsed.TELEGRAM_ALLOWED_USERS.split(",").map((value) => value.trim()).filter(Boolean)) {
+    const [rawId, rawRole = "member"] = entry.split(":");
+    const userId = z.coerce.number().int().positive().parse(rawId);
+    const role = telegramAccessRole.parse(rawRole);
+    if (userId !== parsed.TELEGRAM_ALLOWED_USER_ID || role === "owner") telegramUsers.set(userId, role);
+  }
   return {
     telegram: {
       token: parsed.TELEGRAM_BOT_TOKEN,
       allowedUserId: parsed.TELEGRAM_ALLOWED_USER_ID,
+      users: Object.fromEntries(telegramUsers),
+      allowGroups: parsed.TELEGRAM_ALLOW_GROUPS === "true",
       pollTimeoutSeconds: parsed.TELEGRAM_POLL_TIMEOUT_SECONDS,
     },
     t3: {
@@ -82,6 +98,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       claudeBin: parsed.CLAUDE_BIN,
       model: parsed.OPERATOR_MODEL,
       effort: parsed.OPERATOR_EFFORT,
+      compactThresholdPercent: parsed.OPERATOR_COMPACT_THRESHOLD_PERCENT,
       home: operatorHome,
       runtimeDir: resolve(operatorHome, "runtime"),
       artifactDir: resolve(operatorHome, "artifacts"),

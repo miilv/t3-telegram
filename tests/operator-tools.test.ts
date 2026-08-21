@@ -117,8 +117,10 @@ describe("OperatorToolServer", () => {
     const lease = server.issue({
       chatId: 777,
       ownerId: "42",
+      teamRole: "owner",
       originMessageId: 91,
       allowedMessageIds: [91, 92],
+      allowedArtifactIds: [imageArtifact.id],
       operatorTurnId: "opturn_1",
       messageThreadId: 12,
     });
@@ -200,6 +202,39 @@ describe("OperatorToolServer", () => {
       });
       expect(denied.isError).toBe(true);
       expect(textResult(denied)).toContain("not sent by this turn capability");
+
+      store.grantProjectAccess(project.id, "11", "viewer");
+      const viewerLease = server.issue({
+        chatId: 777,
+        ownerId: "11",
+        teamRole: "viewer",
+        originMessageId: 93,
+        operatorTurnId: "opturn_viewer",
+      });
+      const viewerClient = new Client({ name: "operator-tools-viewer-test", version: "1.0.0" });
+      try {
+        await viewerClient.connect(
+          new StreamableHTTPClientTransport(new URL(viewerLease.access.url), {
+            requestInit: { headers: { Authorization: `Bearer ${viewerLease.access.token}` } },
+          }),
+        );
+        expect(await callJson(viewerClient, "t3.list_projects", {})).toMatchObject([{ id: project.id }]);
+        const deniedRename = await viewerClient.callTool({
+          name: "t3.rename_project",
+          arguments: { projectId: project.id, name: "Forbidden" },
+        });
+        expect(deniedRename.isError).toBe(true);
+        expect(textResult(deniedRename)).toContain("project access denied for mutation");
+        const deniedMemory = await viewerClient.callTool({
+          name: "memory.search",
+          arguments: { query: "capabilities" },
+        });
+        expect(deniedMemory.isError).toBe(true);
+        expect(textResult(deniedMemory)).toContain("requires owner or admin role");
+      } finally {
+        viewerLease.revoke();
+        await viewerClient.close().catch(() => undefined);
+      }
 
       lease.revoke();
       await expect(

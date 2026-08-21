@@ -35,7 +35,7 @@ async function main(): Promise<void> {
   );
   const telegram = new TelegramBotTransport(
     config.telegram.token,
-    config.telegram.allowedUserId,
+    { users: config.telegram.users, allowGroups: config.telegram.allowGroups },
     config.telegram.pollTimeoutSeconds,
     logger,
   );

@@ -10,6 +10,7 @@ import type {
   OperatorNote,
   Project,
   ReplyContext,
+  TeamRole,
   TelegramMessageRecord,
   ThreadHandoff,
   ThreadCandidate,
@@ -223,6 +224,70 @@ export class OperatorStore {
       | Row
       | undefined;
     return row ? rowToProject(row) : undefined;
+  }
+
+  upsertTeamMember(userId: string, role: TeamRole, displayName?: string): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO team_members(user_id,role,display_name,status,created_at,updated_at)
+        VALUES (?,?,?,'active',?,?)
+        ON CONFLICT(user_id) DO UPDATE SET role=excluded.role,
+          display_name=COALESCE(excluded.display_name,team_members.display_name),
+          status='active',updated_at=excluded.updated_at
+      `)
+      .run(userId, role, displayName ?? null, now, now);
+  }
+
+  getTeamMember(userId: string):
+    | { userId: string; role: TeamRole; displayName?: string; status: string }
+    | undefined {
+    const row = this.db.prepare("SELECT * FROM team_members WHERE user_id=?").get(userId) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      userId: String(row.user_id),
+      role: String(row.role) as TeamRole,
+      status: String(row.status),
+      ...(row.display_name ? { displayName: String(row.display_name) } : {}),
+    };
+  }
+
+  listTeamMembers(): Array<NonNullable<ReturnType<OperatorStore["getTeamMember"]>>> {
+    return (this.db.prepare("SELECT user_id FROM team_members WHERE status='active' ORDER BY created_at").all() as Row[])
+      .flatMap((row) => {
+        const member = this.getTeamMember(String(row.user_id));
+        return member ? [member] : [];
+      });
+  }
+
+  grantProjectAccess(projectId: string, userId: string, accessRole: "owner" | "editor" | "viewer"): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO project_memberships(project_id,user_id,access_role,created_at,updated_at)
+        VALUES (?,?,?,?,?)
+        ON CONFLICT(project_id,user_id) DO UPDATE SET
+          access_role=excluded.access_role,updated_at=excluded.updated_at
+      `)
+      .run(projectId, userId, accessRole, now, now);
+  }
+
+  getProjectAccess(projectId: string, userId: string): "owner" | "editor" | "viewer" | undefined {
+    const row = this.db
+      .prepare("SELECT access_role FROM project_memberships WHERE project_id=? AND user_id=?")
+      .get(projectId, userId) as Row | undefined;
+    return row ? (String(row.access_role) as "owner" | "editor" | "viewer") : undefined;
+  }
+
+  listProjectsForUser(userId: string, role: TeamRole): Project[] {
+    if (role === "owner" || role === "admin") return this.listProjects();
+    return (this.db
+      .prepare(`
+        SELECT p.* FROM projects p
+        JOIN project_memberships m ON m.project_id=p.id
+        WHERE m.user_id=? ORDER BY p.updated_at DESC
+      `)
+      .all(userId) as Row[]).map(rowToProject);
   }
 
   upsertThread(thread: WorkThread): void {
@@ -662,6 +727,32 @@ export class OperatorStore {
 
   getArtifact(id: string): Artifact | undefined {
     const row = this.db.prepare("SELECT * FROM artifacts WHERE id=?").get(id) as Row | undefined;
+    return row ? rowToArtifact(row) : undefined;
+  }
+
+  findTelegramArtifact(chatId: number, messageId: number, telegramFileId: string): Artifact | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM artifacts
+        WHERE telegram_chat_id=? AND telegram_message_id=? AND telegram_file_id=?
+        ORDER BY created_at LIMIT 1
+      `)
+      .get(chatId, messageId, telegramFileId) as Row | undefined;
+    return row ? rowToArtifact(row) : undefined;
+  }
+
+  findDerivedArtifact(
+    derivedFromArtifactId: string,
+    filename: string,
+    mimeType: string,
+  ): Artifact | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM artifacts
+        WHERE derived_from_artifact_id=? AND filename=? AND mime_type=?
+        ORDER BY created_at LIMIT 1
+      `)
+      .get(derivedFromArtifactId, filename, mimeType) as Row | undefined;
     return row ? rowToArtifact(row) : undefined;
   }
 

@@ -21,6 +21,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   private readonly systemPrompts = new Map<string, string>();
   private active: ChildProcessWithoutNullStreams | undefined;
   private currentSessionId?: string;
+  private lastUsage?: { contextTokens: number; contextWindow?: number; percentUsed?: number };
 
   constructor(private readonly options: ClaudeCliRuntimeOptions) {}
 
@@ -113,7 +114,10 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     });
 
     try {
-      for await (const event of queue) yield event;
+      for await (const event of queue) {
+        if (event.type === "result" && event.usage) this.lastUsage = event.usage;
+        yield event;
+      }
       this.newSessions.delete(input.sessionId);
       this.systemPrompts.delete(input.sessionId);
     } finally {
@@ -146,15 +150,40 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     this.newSessions.delete(sessionId);
   }
 
-  async health(): Promise<{ healthy: boolean; detail?: string }> {
+  async health(): Promise<{
+    healthy: boolean;
+    detail?: string;
+    contextTokens?: number;
+    contextWindow?: number;
+    contextUsagePercent?: number;
+  }> {
     return new Promise((resolve) => {
-      const child = spawn(this.options.binary, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(this.options.binary, ["--version"], {
+        env: sanitizedEnvironment(process.env),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
       let output = "";
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => (output += chunk));
       child.once("error", (error) => resolve({ healthy: false, detail: error.message }));
       child.once("close", (code) =>
-        resolve(code === 0 ? { healthy: true, detail: output.trim() } : { healthy: false, detail: output.trim() }),
+        resolve(code === 0
+          ? {
+              healthy: true,
+              detail: output.trim(),
+              ...(this.lastUsage
+                ? {
+                    contextTokens: this.lastUsage.contextTokens,
+                    ...(this.lastUsage.contextWindow
+                      ? { contextWindow: this.lastUsage.contextWindow }
+                      : {}),
+                    ...(this.lastUsage.percentUsed !== undefined
+                      ? { contextUsagePercent: this.lastUsage.percentUsed }
+                      : {}),
+                  }
+                : {}),
+            }
+          : { healthy: false, detail: output.trim() }),
       );
     });
   }
@@ -213,13 +242,42 @@ function parseClaudeEvent(line: string): OperatorEvent | undefined {
   }
   if (event.type === "result") {
     const text = typeof event.result === "string" ? event.result : "";
+    const usage = parseContextUsage(event);
     return {
       type: "result",
       text,
       ...(typeof event.session_id === "string" ? { sessionId: event.session_id } : {}),
+      ...(usage ? { usage } : {}),
     };
   }
   return undefined;
+}
+
+function parseContextUsage(event: Record<string, unknown>):
+  | { contextTokens: number; contextWindow?: number; percentUsed?: number }
+  | undefined {
+  const modelUsage = isRecord(event.modelUsage) ? Object.values(event.modelUsage).filter(isRecord) : [];
+  const usage = isRecord(event.usage) ? event.usage : undefined;
+  const candidates = modelUsage.length ? modelUsage : usage ? [usage] : [];
+  let contextTokens = 0;
+  let contextWindow = 0;
+  for (const candidate of candidates) {
+    const input = numeric(candidate.inputTokens ?? candidate.input_tokens);
+    const cacheRead = numeric(candidate.cacheReadInputTokens ?? candidate.cache_read_input_tokens);
+    const cacheCreate = numeric(candidate.cacheCreationInputTokens ?? candidate.cache_creation_input_tokens);
+    contextTokens = Math.max(contextTokens, input + cacheRead + cacheCreate);
+    contextWindow = Math.max(contextWindow, numeric(candidate.contextWindow ?? candidate.context_window));
+  }
+  if (!contextTokens) return undefined;
+  return {
+    contextTokens,
+    ...(contextWindow > 0 ? { contextWindow } : {}),
+    ...(contextWindow > 0 ? { percentUsed: (contextTokens / contextWindow) * 100 } : {}),
+  };
+}
+
+function numeric(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 function sanitizedEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

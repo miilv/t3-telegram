@@ -236,6 +236,100 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("enforces team roles, shared-project visibility, and owner-only approvals", async () => {
+    const home = tempDirectory("daemon-rbac-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const timestamp = nowIso();
+    const sharedProject: Project = {
+      id: "prj_shared",
+      t3ProjectId: "prj_shared",
+      name: "Shared",
+      workspaceRoot: `${home}/shared`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const privateProject: Project = {
+      ...sharedProject,
+      id: "prj_private",
+      t3ProjectId: "prj_private",
+      name: "Private",
+      workspaceRoot: `${home}/private`,
+    };
+    const sharedThread: WorkThread = {
+      id: "th_shared",
+      t3ThreadId: "th_shared",
+      projectId: sharedProject.id,
+      title: "Shared work",
+      shortSummary: "visible",
+      keywords: [],
+      status: "waiting_approval",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    const privateThread: WorkThread = {
+      ...sharedThread,
+      id: "th_private",
+      t3ThreadId: "th_private",
+      projectId: privateProject.id,
+      title: "Private work",
+      status: "idle",
+    };
+    broker.projects.push(sharedProject, privateProject);
+    broker.threads.push(sharedThread, privateThread);
+    store.upsertProject(sharedProject);
+    store.upsertProject(privateProject);
+    store.upsertThread(sharedThread);
+    store.upsertThread(privateThread);
+    store.upsertTeamMember("11", "viewer");
+    store.grantProjectAccess(sharedProject.id, "11", "viewer");
+    store.saveApproval({
+      id: "approval_shared",
+      t3ApprovalId: "t3_approval_shared",
+      threadId: sharedThread.id,
+      payload: { summary: "deploy" },
+      chatId: 7,
+      messageId: 777,
+    });
+    const baseConfig = config(home);
+    const teamConfig: Config = {
+      ...baseConfig,
+      telegram: { ...baseConfig.telegram, users: { 42: "owner", 11: "viewer" } },
+    };
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(teamConfig, store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(messageAs(1, "/projects", 11));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Shared")));
+    expect(telegram.sent.at(-1)?.text).not.toContain("Private");
+    telegram.push(messageAs(2, "/work", 11));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Shared work")));
+    expect(telegram.sent.at(-1)?.text).not.toContain("Private work");
+    telegram.push(messageAs(3, "/focus clear", 11));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("роль viewer")));
+
+    telegram.push(callbackAs(4, "cb_viewer", 777, "approval:approval_shared:accept", 11));
+    await waitFor(() => {
+      const row = store.db.prepare("SELECT status FROM processed_events WHERE dedupe_key=?").get("telegram-callback:cb_viewer") as { status?: string } | undefined;
+      return row?.status === "completed";
+    });
+    expect(broker.approvalResponses).toHaveLength(0);
+    expect(store.getApproval("approval_shared")?.status).toBe("pending");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("keeps a completed direct answer in the durable outbox until its draft edit succeeds", async () => {
     const home = tempDirectory("daemon-direct-outbox-");
     const store = tempStore();
@@ -730,6 +824,10 @@ describe("OperatorDaemon product flow", () => {
     expect(runtime.compactReasons).toContain("test daily maintenance");
     expect(store.listCompactions(1)[0]?.reason).toBe("test daily maintenance");
     expect(
+      runtime.prompts.some((prompt) => prompt.includes("Prepare durable memory maintenance")),
+    ).toBe(true);
+    expect(store.searchOperatorNotes("durable focus")).toHaveLength(1);
+    expect(
       runtime.prompts.some((prompt) =>
         prompt.includes("Restore the Operator's compact operational context"),
       ),
@@ -740,6 +838,11 @@ describe("OperatorDaemon product flow", () => {
     const snapshotJson = /Snapshot JSON:\n([\s\S]+)\n\nReply exactly/u.exec(restorePrompt)?.[1];
     expect(snapshotJson?.length).toBeLessThanOrEqual(24_000);
     expect(() => JSON.parse(snapshotJson!)).not.toThrow();
+
+    store.setRuntimeState("last_compaction_at", nowIso());
+    store.setRuntimeState("operator_context_usage_percent", "86");
+    await daemon.maintain("threshold check");
+    expect(runtime.compactReasons).toContain("context threshold 86.0%");
 
     telegram.finish();
     await run;
@@ -1122,6 +1225,50 @@ describe("OperatorDaemon product flow", () => {
     verify.close();
   });
 
+  it("resumes a durably accepted Telegram request after mapping-time crash without creating a second worker", async () => {
+    const home = tempDirectory("daemon-ingress-restart-");
+    const databasePath = `${home}/operator.db`;
+    const inbound = message(91, "implement durable auth locking and run tests");
+    const jobId = `telegram-ingress:${inbound.chatId}:${inbound.messageId}`;
+    const seed = new OperatorStore(databasePath);
+    seed.migrate();
+    seed.saveTelegramMessage({
+      chatId: inbound.chatId,
+      messageId: inbound.messageId,
+      relatedThreadIds: [],
+      artifactIds: [],
+      messageType: "inbound",
+      createdAt: nowIso(),
+    });
+    seed.enqueueBackgroundJob(
+      "telegram_ingress",
+      { update: inbound, processExisting: true },
+      undefined,
+      { id: jobId, dedupeKey: jobId },
+    );
+    seed.close();
+
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const startOnce = async () => {
+      const store = new OperatorStore(databasePath);
+      const runtime = new FakeRuntime();
+      const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+      let daemon: OperatorDaemon;
+      const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+      daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+      await daemon.initialize();
+      await daemon.stop();
+    };
+
+    await startOnce();
+    expect(broker.turns).toHaveLength(1);
+    expect(broker.turns[0]?.commandId).toMatch(/^dispatch_[a-f0-9]{32}$/);
+    await startOnce();
+    expect(broker.turns).toHaveLength(1);
+  });
+
   it("persists a T3 dispatch outage, retries with the same command id, and starts automatically", async () => {
     const home = tempDirectory("daemon-t3-retry-");
     const store = tempStore();
@@ -1253,7 +1400,13 @@ function seedAmbiguousAuthThreads(store: ReturnType<typeof tempStore>, broker: F
 
 function config(home: string): Config {
   return {
-    telegram: { token: "test", allowedUserId: 42, pollTimeoutSeconds: 1 },
+    telegram: {
+      token: "test",
+      allowedUserId: 42,
+      users: { 42: "owner" },
+      allowGroups: false,
+      pollTimeoutSeconds: 1,
+    },
     t3: {
       baseUrl: "http://127.0.0.1:1",
       bearerToken: undefined,
@@ -1266,6 +1419,7 @@ function config(home: string): Config {
       claudeBin: "claude",
       model: "opus",
       effort: "high",
+      compactThresholdPercent: 80,
       home,
       runtimeDir: `${home}/runtime`,
       artifactDir: `${home}/artifacts`,
@@ -1302,6 +1456,14 @@ function message(messageId: number, text: string): Extract<TelegramInbound, { ty
     text,
     attachments: [],
   };
+}
+
+function messageAs(
+  messageId: number,
+  text: string,
+  userId: number,
+): Extract<TelegramInbound, { type: "message" }> {
+  return { ...message(messageId, text), userId };
 }
 
 function voiceMessage(messageId: number): Extract<TelegramInbound, { type: "message" }> {
@@ -1351,6 +1513,16 @@ function callback(
   };
 }
 
+function callbackAs(
+  updateId: number,
+  callbackId: string,
+  messageId: number,
+  data: string,
+  userId: number,
+): Extract<TelegramInbound, { type: "callback" }> {
+  return { ...callback(updateId, callbackId, messageId, data), userId };
+}
+
 class FakeRuntime implements OperatorRuntime {
   routingSelectionThreadId?: string;
   readonly prompts: string[] = [];
@@ -1394,8 +1566,18 @@ class FakeRuntime implements OperatorRuntime {
             synthesisGoal: "Explain production latency with reconciled evidence.",
             rationale: "Independent evidence streams.",
           })
-        : input.prompt.includes("Synthesize this completed parallel")
+      : input.prompt.includes("Synthesize this completed parallel")
           ? "Parallel synthesis: backend, database, and history evidence reconciled."
+          : input.prompt.includes("Prepare durable memory maintenance")
+            ? JSON.stringify({
+                notes: [
+                  {
+                    category: "decision",
+                    content: "Always preserve durable focus after compaction.",
+                  },
+                ],
+                obsoleteNoteIds: [],
+              })
           : "Париж.";
     yield { type: "text_delta", text };
     yield { type: "result", text, sessionId: input.sessionId };

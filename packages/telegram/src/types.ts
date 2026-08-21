@@ -1,5 +1,12 @@
 export type TelegramChatType = "private" | "group" | "supergroup" | "channel";
 
+export type TelegramAccessRole = "owner" | "admin" | "member" | "viewer";
+
+export interface TelegramAccessPolicy {
+  users: Readonly<Record<number, TelegramAccessRole>>;
+  allowGroups: boolean;
+}
+
 export type TelegramAttachmentType =
   | "photo"
   | "document"

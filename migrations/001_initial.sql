@@ -267,6 +267,24 @@ CREATE TABLE IF NOT EXISTS runtime_state (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS team_members (
+  user_id TEXT PRIMARY KEY,
+  role TEXT NOT NULL,
+  display_name TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_memberships (
+  project_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  access_role TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id);
 CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
 CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity_at DESC);
@@ -275,6 +293,8 @@ CREATE INDEX IF NOT EXISTS idx_events_created ON daemon_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_operator_notes_status ON operator_notes(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_telegram_outbox_delivery
   ON telegram_outbox(status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_project_memberships_user
+  ON project_memberships(user_id, access_role);
 
 DELETE FROM operator_note_search;
 INSERT INTO operator_note_search(id,category,content)

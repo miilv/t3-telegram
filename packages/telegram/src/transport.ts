@@ -14,6 +14,7 @@ import type {
   SentMessage,
   StreamDraft,
   TelegramAttachment,
+  TelegramAccessPolicy,
   TelegramCallbackInbound,
   TelegramChatAction,
   TelegramDestination,
@@ -159,7 +160,7 @@ export class TelegramBotTransport implements TelegramTransport {
 
   constructor(
     private readonly token: string,
-    private readonly allowedUserId: number,
+    private readonly accessPolicy: number | TelegramAccessPolicy,
     private readonly pollTimeoutSeconds: number,
     private readonly logger: Logger,
     private readonly apiBase = "https://api.telegram.org",
@@ -560,7 +561,7 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   private acceptUpdate(update: RawUpdate): void {
-    const normalized = normalizeTelegramUpdate(update, this.allowedUserId);
+    const normalized = normalizeTelegramUpdate(update, this.accessPolicy);
     if (!normalized) return;
     if (normalized.type !== "message" || !normalized.mediaGroupId) {
       this.inbound.push(normalized);
@@ -772,10 +773,13 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 }
 
-export function normalizeTelegramUpdate(update: RawUpdate, allowedUserId: number): TelegramInbound | undefined {
+export function normalizeTelegramUpdate(
+  update: RawUpdate,
+  access: number | TelegramAccessPolicy,
+): TelegramInbound | undefined {
   const callback = update.callback_query;
   if (callback?.message && callback.data) {
-    if (callback.from.id !== allowedUserId) return undefined;
+    if (!authorized(access, callback.from.id, callback.message.chat.type)) return undefined;
     const result: TelegramCallbackInbound = {
       type: "callback",
       updateId: update.update_id,
@@ -794,7 +798,7 @@ export function normalizeTelegramUpdate(update: RawUpdate, allowedUserId: number
 
   const reaction = update.message_reaction;
   if (reaction?.user) {
-    if (reaction.user.id !== allowedUserId) return undefined;
+    if (!authorized(access, reaction.user.id, reaction.chat.type)) return undefined;
     const oldKeys = reaction.old_reaction.map(reactionKey);
     const newKeys = reaction.new_reaction.map(reactionKey);
     const result: TelegramReactionInbound = {
@@ -812,7 +816,7 @@ export function normalizeTelegramUpdate(update: RawUpdate, allowedUserId: number
   }
 
   const message = update.message ?? update.edited_message;
-  if (!message?.from || message.from.id !== allowedUserId) return undefined;
+  if (!message?.from || !authorized(access, message.from.id, message.chat.type)) return undefined;
   const topic = normalizeTopic(update.update_id, message);
   if (topic) return topic;
   const attachments = normalizeAttachments(message);
@@ -839,6 +843,16 @@ export function normalizeTelegramUpdate(update: RawUpdate, allowedUserId: number
     attachments,
   };
   return result;
+}
+
+function authorized(
+  access: number | TelegramAccessPolicy,
+  userId: number,
+  chatType: RawChat["type"],
+): boolean {
+  if (typeof access === "number") return userId === access && chatType === "private";
+  if (!access.users[userId]) return false;
+  return chatType === "private" || (access.allowGroups && (chatType === "group" || chatType === "supergroup"));
 }
 
 export function mergeTelegramAlbum(messages: TelegramMessageInbound[]): TelegramMessageInbound {
