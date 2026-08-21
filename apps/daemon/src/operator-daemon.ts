@@ -1648,11 +1648,15 @@ export class OperatorDaemon {
       }
     }
     const workerPrompt = formatWorkerPrompt(update.text, materialized);
+    const workLabel =
+      project.name.trim().toLocaleLowerCase() === thread.title.trim().toLocaleLowerCase()
+        ? thread.title
+        : `${project.name} — ${thread.title}`;
     const ackText = queueFollowUp
-      ? `Поставил уточнение для **${project.name} — ${thread.title}** в очередь: T3 отправит его после текущего turn.`
+      ? `Поставил уточнение для **${workLabel}** в очередь: T3 отправит его после текущего turn.`
       : activeFollowUp
-        ? `Передал уточнение в текущий turn **${project.name} — ${thread.title}**.`
-        : `Запустил работу **${project.name} — ${thread.title}**. Я останусь доступен, пока worker выполняет задачу.`;
+        ? `Передал уточнение в текущий turn **${workLabel}**.`
+        : `Запустил работу **${workLabel}**. Я останусь доступен, пока worker выполняет задачу.`;
 
     this.store.setRuntimeState(`thread_user_intent:${thread.id}`, update.text);
     this.store.updateThreadIntent(thread.id, update.text);

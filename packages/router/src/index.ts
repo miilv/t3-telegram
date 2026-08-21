@@ -174,7 +174,9 @@ export function shouldDelegate(text: string, artifacts: ArtifactRef[], binding: 
   if (/(?:^|\s)(fix|implement|build|debug|test|review|investigate|analy[sz]e|refactor|deploy|continue|resume|finish|исправ|реализ|собер|отлад|протест|проверь код|разберись|проанализ|продолж|доработ|допили|заверш)[\p{L}\p{N}_-]*/iu.test(normalized)) {
     return true;
   }
-  if (extractPaths(text).length > 0) return true;
+  // A bare filesystem path is a routing signal, not a work order: with host
+  // tools available the Operator answers path-referencing questions directly
+  // unless the wording also reads as durable work (verbs/length/attachments).
   if (text.length > 700) return true;
   return false;
 }
