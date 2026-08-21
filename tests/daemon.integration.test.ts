@@ -3,6 +3,7 @@ import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { OperatorDaemon } from "../apps/daemon/src/operator-daemon.js";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
+import { compactCallbackToken } from "../packages/telegram/src/index.js";
 import { createAutomation } from "../packages/automations/src/index.js";
 import { OperatorToolServer } from "../packages/operator-tools/src/index.js";
 import type { MediaProcessor } from "../packages/media/src/index.js";
@@ -287,7 +288,7 @@ describe("OperatorDaemon product flow", () => {
 
     telegram.push(message(1, "столица Франции?"));
     await waitFor(() => runtime.turnStarted);
-    telegram.push(callback(2, "cb_while_busy", 777, "approval:approval_live:accept"));
+    telegram.push(callback(2, "cb_while_busy", 777, `a:${compactCallbackToken("approval_live")}:1`));
     await waitFor(() => broker.approvalResponses.length === 1);
 
     expect(runtime.turnReleased).toBe(false);
@@ -381,7 +382,7 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(messageAs(3, "/focus clear", 11));
     await waitFor(() => telegram.sent.some((entry) => entry.text.includes("роль viewer")));
 
-    telegram.push(callbackAs(4, "cb_viewer", 777, "approval:approval_shared:accept", 11));
+    telegram.push(callbackAs(4, "cb_viewer", 777, `a:${compactCallbackToken("approval_shared")}:1`, 11));
     await waitFor(() => {
       const row = store.db.prepare("SELECT status FROM processed_events WHERE dedupe_key=?").get("telegram-callback:cb_viewer") as { status?: string } | undefined;
       return row?.status === "completed";
@@ -803,7 +804,7 @@ describe("OperatorDaemon product flow", () => {
         2,
         "cb_deny_delete",
         telegram.approvals[0]!.messageId,
-        `approval:${telegram.approvals[0]!.approvalId}:decline`,
+        `a:${compactCallbackToken(telegram.approvals[0]!.approvalId)}:0`,
       ),
     );
     await waitFor(() => broker.approvalResponses.length === 2);

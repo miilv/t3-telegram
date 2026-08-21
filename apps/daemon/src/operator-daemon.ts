@@ -52,7 +52,7 @@ import type {
   TelegramSendOptions,
   TelegramTransport,
 } from "../../../packages/telegram/src/index.js";
-import { classifyTelegramDeliveryError, delay, DraftWriter } from "../../../packages/telegram/src/index.js";
+import { classifyTelegramDeliveryError, compactCallbackToken, delay, DraftWriter } from "../../../packages/telegram/src/index.js";
 import {
   mayAutoApprove,
   OPERATOR_SYSTEM_PROMPT,
@@ -913,6 +913,7 @@ export class OperatorDaemon {
     ].join("\n\n");
     const operatorStartedAt = Date.now();
     let toolSteps = 0;
+    const progressLines: string[] = [];
     let observedFirstToken = false;
     let finalText: string;
     let messageType = "operator_answer";
@@ -929,7 +930,13 @@ export class OperatorDaemon {
         toolLease?.access,
         (tool) => {
           toolSteps += 1;
-          writer?.reset(`⏳ ${describeOperatorTool(tool)} · шаг ${toolSteps}`);
+          const label = describeOperatorTool(tool);
+          if (progressLines.at(-1) !== label) progressLines.push(label);
+          // Keep the text growing: Telegram animates only the appended part,
+          // while a full replacement restarts the typing effect every step.
+          writer?.reset(
+            [`⏳ Разбираюсь… (шаг ${toolSteps})`, ...progressLines.slice(-6).map((line) => `▸ ${line}`)].join("\n"),
+          );
         },
       );
       if (writer && !writer.text && answer) writer.append(answer);
@@ -2813,13 +2820,17 @@ export class OperatorDaemon {
       }
       return;
     }
-    const match = /^approval:([^:]+):(accept|acceptForSession|decline|cancel)$/.exec(update.data);
+    const match = /^a:([A-Za-z0-9_-]+):(1|s|0)$/.exec(update.data);
     if (!match) {
       await this.telegram.answerCallback(update.callbackId, "Unknown action");
       this.store.completeEvent(eventKey);
       return;
     }
-    const approval = this.store.getApproval(match[1]!);
+    // callback_data is capped at 64 bytes, so the button carries a short token
+    // derived from the approval id rather than the id itself.
+    const approval = this.store
+      .listPendingApprovals()
+      .find((candidate) => compactCallbackToken(candidate.id) === match[1]!);
     if (!approval || approval.status !== "pending") {
       await this.telegram.answerCallback(update.callbackId, "Approval is no longer pending");
       if (approval?.chatId !== undefined && approval.messageId !== undefined) {
@@ -2834,7 +2845,8 @@ export class OperatorDaemon {
       this.store.completeEvent(eventKey);
       return;
     }
-    const decision = match[2]! as "accept" | "acceptForSession" | "decline" | "cancel";
+    const decision =
+      match[2] === "1" ? "accept" : match[2] === "s" ? "acceptForSession" : "decline";
     await this.broker.respondApproval({
       threadId: approval.threadId,
       approvalId: approval.t3ApprovalId,

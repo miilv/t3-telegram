@@ -474,4 +474,20 @@ describe("inbound batch merging", () => {
     expect(merged.text.indexOf("суммаризируй")).toBeLessThan(merged.text.indexOf("Пересланный материал"));
     expect(merged.text).toContain("срочно зайди на сервер");
   });
+
+  it("keeps every inline callback payload inside Telegram's 64-byte cap", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    // Real approval ids are `approval_<uuid>`: the old scheme overflowed and
+    // Telegram answered BUTTON_DATA_INVALID, so no approval ever reached chat.
+    await transport.sendApproval(7, "нужно разрешение", "approval_a338783d-03be-438e-9bb9-f54891114ed6");
+    const markup = calls.at(-1)?.body?.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
+    const payloads = markup.inline_keyboard.flat().map((button) => button.callback_data);
+    expect(payloads).toHaveLength(3);
+    for (const payload of payloads) {
+      expect(Buffer.byteLength(payload, "utf8")).toBeLessThanOrEqual(64);
+    }
+    expect(new Set(payloads).size).toBe(3);
+  });
 });

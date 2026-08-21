@@ -1,5 +1,6 @@
 import { realpath, stat } from "node:fs/promises";
 import { extname } from "node:path";
+import { createHash } from "node:crypto";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Logger } from "pino";
 import { metrics } from "../../observability/src/index.js";
@@ -1425,15 +1426,24 @@ function choiceKeyboard(choiceId: string, labels: string[]) {
 }
 
 function approvalKeyboard(approvalId: string) {
+  // Telegram caps callback_data at 64 bytes; ids arrive as `approval_<uuid>`,
+  // so only the uuid's leading bytes fit alongside the verb. The daemon
+  // resolves this short token back to the full approval.
+  const token = compactCallbackToken(approvalId);
   return {
     inline_keyboard: [
       [
-        { text: "Allow once", callback_data: `approval:${approvalId}:accept` },
-        { text: "Allow session", callback_data: `approval:${approvalId}:acceptForSession` },
+        { text: "Allow once", callback_data: `a:${token}:1` },
+        { text: "Allow session", callback_data: `a:${token}:s` },
       ],
-      [{ text: "Deny", callback_data: `approval:${approvalId}:decline` }],
+      [{ text: "Deny", callback_data: `a:${token}:0` }],
     ],
   };
+}
+
+/** Stable ≤32-char token derived from an interaction id (fits callback_data). */
+export function compactCallbackToken(id: string): string {
+  return createHash("sha256").update(id).digest("base64url").slice(0, 24);
 }
 
 export interface TelegramDeliveryError {
