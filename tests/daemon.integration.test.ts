@@ -11,11 +11,13 @@ import type {
   OperatorEvent,
   OperatorRuntime,
   Project,
+  ProviderDescriptor,
   SendThreadTurnInput,
   T3Broker,
   ThreadCandidate,
   ThreadStatus,
   TurnHandle,
+  UserInputDecision,
   WorkThread,
   WorkerEvent,
 } from "../packages/shared/src/index.js";
@@ -65,6 +67,358 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   });
+
+  it("collects multi-question T3 user input through buttons and a custom Telegram reply", async () => {
+    const home = tempDirectory("daemon-user-input-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      {
+        type: "user_input_required",
+        threadId: "th_1",
+        requestId: "t3_input_1",
+        questions: [
+          {
+            id: "regions",
+            header: "Regions",
+            question: "Choose deployment regions",
+            options: [
+              { label: "EU", description: "Frankfurt" },
+              { label: "US", description: "Virginia" },
+            ],
+            multiSelect: true,
+          },
+          {
+            id: "note",
+            header: "Note",
+            question: "Any deployment note?",
+            options: [],
+            multiSelect: false,
+          },
+        ],
+      },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "deploy auth service and ask me for regions"));
+    await waitFor(() => telegram.userInputs.length === 1);
+    const prompt = telegram.userInputs[0]!;
+    telegram.push(callback(2, "cb_eu", prompt.messageId, `ui:${prompt.inputId}:0:o0`));
+    telegram.push(callback(3, "cb_us", prompt.messageId, `ui:${prompt.inputId}:0:o1`));
+    telegram.push(callback(4, "cb_submit", prompt.messageId, `ui:${prompt.inputId}:0:s`));
+    await waitFor(() => telegram.userInputEdits.some((edit) => edit.questionIndex === 1));
+    telegram.push({ ...message(5, "Deploy after 22:00 UTC"), replyToMessageId: prompt.messageId });
+
+    await waitFor(() => broker.userInputResponses.length === 1);
+    expect(broker.userInputResponses[0]).toEqual({
+      threadId: "th_1",
+      requestId: "t3_input_1",
+      answers: { regions: ["EU", "US"], note: "Deploy after 22:00 UTC" },
+    });
+    expect(telegram.keyboardClears).toContain(prompt.messageId);
+    expect(store.listPendingUserInputs()).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("auto-approves only policy-allowed risk and requires Telegram confirmation for destructive work", async () => {
+    const home = tempDirectory("daemon-approval-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      {
+        type: "approval_required",
+        threadId: "th_1",
+        approvalId: "read_1",
+        summary: "Read source file",
+        requestKind: "file-read",
+        requestType: "file_read_approval",
+        detail: "src/index.ts",
+      },
+      {
+        type: "approval_required",
+        threadId: "th_1",
+        approvalId: "delete_1",
+        summary: "Delete generated database",
+        requestKind: "command",
+        requestType: "command_execution_approval",
+        detail: "rm -rf data",
+      },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "deploy and clean generated data"));
+    await waitFor(() => broker.approvalResponses.length === 1 && telegram.approvals.length === 1);
+    expect(broker.approvalResponses[0]).toMatchObject({ approvalId: "read_1", decision: "accept" });
+    expect(telegram.approvals[0]?.text).toContain("Risk category: **destructive**");
+    telegram.push(
+      callback(
+        2,
+        "cb_deny_delete",
+        telegram.approvals[0]!.messageId,
+        `approval:${telegram.approvals[0]!.approvalId}:decline`,
+      ),
+    );
+    await waitFor(() => broker.approvalResponses.length === 2);
+    expect(broker.approvalResponses[1]).toMatchObject({
+      approvalId: "delete_1",
+      decision: "decline",
+    });
+    expect(telegram.keyboardClears).toContain(telegram.approvals[0]!.messageId);
+    expect(store.listPendingApprovals()).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("classifies every approval risk category before presenting a decision", async () => {
+    const home = tempDirectory("daemon-approval-categories-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const cases: Array<{
+      approvalId: string;
+      requestKind: string;
+      requestType: string;
+      detail: string;
+      expected: string;
+    }> = [
+      { approvalId: "safe_read", requestKind: "file-read", requestType: "file_read_approval", detail: "src/index.ts", expected: "safe-read" },
+      { approvalId: "safe_write", requestKind: "file-change", requestType: "file_change_approval", detail: "src/index.ts", expected: "safe-write-in-project" },
+      { approvalId: "network", requestKind: "command", requestType: "command_execution_approval", detail: "curl https://example.test", expected: "network" },
+      { approvalId: "package", requestKind: "command", requestType: "command_execution_approval", detail: "pnpm install zod", expected: "package-install" },
+      { approvalId: "process", requestKind: "command", requestType: "command_execution_approval", detail: "kill 1234", expected: "process-control" },
+      { approvalId: "destructive", requestKind: "command", requestType: "command_execution_approval", detail: "rm -rf data", expected: "destructive" },
+      { approvalId: "cross_project", requestKind: "file-read", requestType: "file_read_approval", detail: "/etc/hosts", expected: "cross-project" },
+      { approvalId: "secret", requestKind: "file-read", requestType: "file_read_approval", detail: ".env", expected: "secret-sensitive" },
+    ];
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      ...cases.map(
+        (entry): WorkerEvent => ({
+          type: "approval_required",
+          threadId: "th_1",
+          approvalId: entry.approvalId,
+          summary: entry.approvalId,
+          requestKind: entry.requestKind,
+          requestType: entry.requestType,
+          detail: entry.detail,
+        }),
+      ),
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    const testConfig = { ...config(home), approval: { autoAllow: [] } };
+    daemon = new OperatorDaemon(testConfig, store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "run a policy classification test"));
+    await waitFor(() => telegram.approvals.length === cases.length);
+    for (const [index, entry] of cases.entries()) {
+      expect(telegram.approvals[index]?.text).toContain(`Risk category: **${entry.expected}**`);
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("passes explicit server-advertised model and reasoning choices into T3 thread creation", async () => {
+    const home = tempDirectory("daemon-model-policy-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.providers = [testProviderDescriptor()];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement this using Sonnet with maximum reasoning"));
+    await waitFor(() => broker.threadInputs.length === 1);
+    expect(broker.threadInputs[0]).toMatchObject({
+      providerInstanceId: "claude_work",
+      model: "claude-sonnet-5",
+      modelOptions: [{ id: "effort", value: "max" }],
+    });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("starts a new T3 thread when an explicit model change is forbidden after session start", async () => {
+    const home = tempDirectory("daemon-model-new-thread-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.providers = [{ ...testProviderDescriptor(), requiresNewThreadForModelChange: true }];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement the auth flow"));
+    await waitFor(() => broker.threads.length === 1 && store.getThread("th_1")?.status === "completed");
+    expect(broker.threads[0]?.model).toBe("claude-opus-5");
+
+    telegram.push(message(2, "continue this using Sonnet with maximum reasoning"));
+    await waitFor(() => broker.threadInputs.length === 2);
+    expect(broker.threadInputs[1]).toMatchObject({
+      providerInstanceId: "claude_work",
+      model: "claude-sonnet-5",
+      modelOptions: [{ id: "effort", value: "max" }],
+    });
+    expect(broker.turns[1]?.threadId).toBe("th_2");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("durably queues a follow-up when the provider cannot accept live input and dispatches it after completion", async () => {
+    const home = tempDirectory("daemon-followup-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.providers = [{ ...testProviderDescriptor(), capabilities: { ...testProviderDescriptor().capabilities, liveInput: false } }];
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "completed", threadId: "th_1", result: "First turn complete" },
+    ];
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement the auth flow"));
+    await waitFor(() => store.getThread("th_1")?.status === "running");
+    telegram.push(message(2, "also add a regression test"));
+    await waitFor(() => store.listBackgroundJobs("thread_followup").length === 1);
+    expect(broker.turns).toHaveLength(1);
+    broker.releaseTerminal();
+    await waitFor(() => broker.turns.length === 2);
+    expect(store.listBackgroundJobs("thread_followup", "completed")).toHaveLength(1);
+    expect(broker.turns[1]?.text).toContain("also add a regression test");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("steers a running turn immediately when T3 advertises live input", async () => {
+    const home = tempDirectory("daemon-live-input-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    broker.providers = [testProviderDescriptor()];
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "completed", threadId: "th_1", result: "Merged turn complete" },
+    ];
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement the auth flow"));
+    await waitFor(() => store.getThread("th_1")?.status === "running");
+    telegram.push(message(2, "also add a regression test"));
+    await waitFor(() => broker.turns.length === 2);
+    expect(store.listBackgroundJobs("thread_followup")).toHaveLength(0);
+    expect(broker.turns[1]?.text).toContain("also add a regression test");
+    broker.releaseTerminal();
+    await waitFor(() => store.getThread("th_1")?.status === "completed");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("restores durable approval and structured-input prompts during startup", async () => {
+    const home = tempDirectory("daemon-interaction-recovery-");
+    const store = tempStore();
+    store.saveApproval({
+      id: "approval_local_1",
+      t3ApprovalId: "approval_t3_1",
+      threadId: "th_missing",
+      chatId: 7,
+      payload: { summary: "Run deploy", risk: "network" },
+    });
+    store.saveUserInput({
+      id: "input_local_1",
+      t3RequestId: "input_t3_1",
+      threadId: "th_missing",
+      chatId: 7,
+      questions: [
+        {
+          id: "region",
+          header: "Region",
+          question: "Choose region",
+          options: [{ label: "EU", description: "Frankfurt" }],
+          multiSelect: false,
+        },
+      ],
+    });
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+
+    await daemon.initialize();
+    expect(telegram.approvals).toHaveLength(1);
+    expect(telegram.userInputs).toHaveLength(1);
+    expect(store.getApproval("approval_local_1")?.messageId).toBeDefined();
+    expect(store.getUserInput("input_local_1")?.messageId).toBeDefined();
+    await daemon.stop();
+  });
 });
 
 function config(home: string): Config {
@@ -87,6 +441,7 @@ function config(home: string): Config {
       artifactDir: `${home}/artifacts`,
       databasePath: `${home}/operator.db`,
     },
+    approval: { autoAllow: ["safe-read"] },
     logLevel: "info",
   };
 }
@@ -104,6 +459,23 @@ function message(messageId: number, text: string): Extract<TelegramInbound, { ty
     date: Math.floor(Date.now() / 1000),
     text,
     attachments: [],
+  };
+}
+
+function callback(
+  updateId: number,
+  callbackId: string,
+  messageId: number,
+  data: string,
+): Extract<TelegramInbound, { type: "callback" }> {
+  return {
+    type: "callback",
+    updateId,
+    callbackId,
+    chatId: 7,
+    userId: 42,
+    messageId,
+    data,
   };
 }
 
@@ -134,6 +506,23 @@ class FakeBroker implements T3Broker {
   readonly projects: Project[] = [];
   readonly threads: WorkThread[] = [];
   readonly turns: SendThreadTurnInput[] = [];
+  readonly userInputResponses: UserInputDecision[] = [];
+  readonly approvalResponses: ApprovalDecision[] = [];
+  readonly threadInputs: CreateThreadInput[] = [];
+  providers: ProviderDescriptor[] = [];
+  workerEvents: WorkerEvent[] | undefined;
+  private terminalGate: Promise<void> | undefined;
+  private releaseTerminalGate: (() => void) | undefined;
+
+  holdTerminal(): void {
+    this.terminalGate = new Promise((resolve) => {
+      this.releaseTerminalGate = resolve;
+    });
+  }
+
+  releaseTerminal(): void {
+    this.releaseTerminalGate?.();
+  }
 
   async listProjects(): Promise<Project[]> {
     return this.projects;
@@ -163,6 +552,9 @@ class FakeBroker implements T3Broker {
       .filter((thread) => !input.projectId || thread.projectId === input.projectId)
       .filter((thread) => !input.statuses?.length || input.statuses.includes(thread.status));
   }
+  async getProviders(): Promise<ProviderDescriptor[]> {
+    return this.providers;
+  }
   async searchThreads(): Promise<ThreadCandidate[]> {
     return [];
   }
@@ -170,11 +562,15 @@ class FakeBroker implements T3Broker {
     return this.threads.find((thread) => thread.id === id)!;
   }
   async createThread(input: CreateThreadInput): Promise<WorkThread> {
+    this.threadInputs.push(input);
     const timestamp = nowIso();
+    const threadId = `th_${this.threads.length + 1}`;
     const thread: WorkThread = {
-      id: "th_1",
-      t3ThreadId: "th_1",
+      id: threadId,
+      t3ThreadId: threadId,
       projectId: input.projectId,
+      ...(input.providerInstanceId ? { provider: input.providerInstanceId } : {}),
+      ...(input.model ? { model: input.model } : {}),
       title: input.title,
       shortSummary: "",
       keywords: [],
@@ -197,6 +593,18 @@ class FakeBroker implements T3Broker {
     (await this.getThread(threadId)).status = "cancelled";
   }
   async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+    if (this.workerEvents) {
+      for (const event of this.workerEvents) {
+        if (
+          this.terminalGate &&
+          (event.type === "completed" || event.type === "failed" || event.type === "cancelled")
+        ) {
+          await this.terminalGate;
+        }
+        yield event;
+      }
+      return;
+    }
     yield { type: "started", threadId };
     await Promise.resolve();
     yield { type: "completed", threadId, result: "Fixed auth race. Tests pass." };
@@ -207,14 +615,65 @@ class FakeBroker implements T3Broker {
   async getThreadArtifacts(): Promise<ArtifactRef[]> {
     return [];
   }
-  async respondApproval(_input: ApprovalDecision): Promise<void> {}
+  async respondApproval(input: ApprovalDecision): Promise<void> {
+    this.approvalResponses.push(input);
+  }
+  async respondUserInput(input: UserInputDecision): Promise<void> {
+    this.userInputResponses.push(input);
+  }
   async health(): Promise<{ healthy: boolean }> {
     return { healthy: true };
   }
 }
 
+function testProviderDescriptor(): ProviderDescriptor {
+  return {
+    instanceId: "claude_work",
+    driver: "claudeAgent",
+    displayName: "Claude Work",
+    enabled: true,
+    installed: true,
+    available: true,
+    ready: true,
+    authenticated: true,
+    requiresNewThreadForModelChange: false,
+    showInteractionModeToggle: false,
+    capabilities: {
+      liveInput: true,
+      interrupt: true,
+      approvals: true,
+      resume: true,
+      cwdSwitch: false,
+      structuredEvents: true,
+      toolEvents: true,
+    },
+    models: [
+      {
+        slug: "claude-sonnet-5",
+        name: "Claude Sonnet 5",
+        capabilities: [
+          {
+            id: "effort",
+            label: "Reasoning effort",
+            type: "select",
+            choices: [
+              { id: "high", label: "High", isDefault: true },
+              { id: "max", label: "Max" },
+            ],
+          },
+        ],
+      },
+      { slug: "claude-opus-5", name: "Claude Opus 5", isDefault: true, capabilities: [] },
+    ],
+  };
+}
+
 class FakeTelegram implements TelegramTransport {
   readonly sent: Array<{ messageId: number; text: string }> = [];
+  readonly userInputs: Array<{ messageId: number; inputId: string; questionIndex: number }> = [];
+  readonly userInputEdits: Array<{ messageId: number; questionIndex: number }> = [];
+  readonly keyboardClears: number[] = [];
+  readonly approvals: Array<{ messageId: number; text: string; approvalId: string }> = [];
   private readonly queue = new AsyncInputQueue<TelegramInbound>();
   private nextMessageId = 100;
 
@@ -267,8 +726,36 @@ class FakeTelegram implements TelegramTransport {
   async sendSticker(): Promise<SentMessage> {
     return { chatId: 7, messageId: this.nextMessageId++ };
   }
-  async sendApproval(): Promise<SentMessage> {
-    return { chatId: 7, messageId: this.nextMessageId++ };
+  async sendApproval(
+    _chatId: number,
+    text: string,
+    approvalId: string,
+  ): Promise<SentMessage> {
+    const messageId = this.nextMessageId++;
+    this.approvals.push({ messageId, text, approvalId });
+    return { chatId: 7, messageId };
+  }
+  async sendUserInput(
+    _chatId: number,
+    _text: string,
+    inputId: string,
+    questionIndex: number,
+  ): Promise<SentMessage> {
+    const messageId = this.nextMessageId++;
+    this.userInputs.push({ messageId, inputId, questionIndex });
+    return { chatId: 7, messageId };
+  }
+  async editUserInput(
+    _chatId: number,
+    messageId: number,
+    _text: string,
+    _inputId: string,
+    questionIndex: number,
+  ): Promise<void> {
+    this.userInputEdits.push({ messageId, questionIndex });
+  }
+  async clearInlineKeyboard(_chatId: number, messageId: number): Promise<void> {
+    this.keyboardClears.push(messageId);
   }
   async answerCallback(): Promise<void> {}
   async editRich(): Promise<void> {}

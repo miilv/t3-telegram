@@ -9,20 +9,23 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 - Current T3 Code orchestration adapter:
   - project list/create/rename;
   - thread list/create/reuse plus server-side full-text RPC search;
-  - turn dispatch, interrupt, approval responses;
+  - turn dispatch, interrupt, approval and structured user-input responses;
   - thread detail/tail/artifact discovery;
   - native Effect RPC/WebSocket event subscriptions with ticket authentication,
     sequence resume/deduplication, streamed assistant assembly, approvals,
     progress and authoritative session completion;
+  - server-advertised provider/model/reasoning catalog with per-turn switching;
   - explicit snapshot-polling compatibility mode for legacy/test servers.
-- SQLite/WAL source of truth for projects, threads, FTS search, focus, Telegram mappings, artifacts, approvals, events, runtime state, and compactions.
+- SQLite/WAL source of truth for projects, threads, FTS search, focus, Telegram mappings, artifacts, approvals, structured input, background jobs, events, runtime state, and compactions.
 - Routing cascade for explicit project names, Telegram replies, artifact provenance, filesystem paths, active focus, lexical thread summaries, and confidence policy.
 - Focus survives unrelated factual questions.
 - Multiple T3 workers can run concurrently while Operator messages remain queued and responsive.
 - Inbound Telegram documents/photos are hashed, stored with safe names, and materialized into the selected project.
 - Requested outbound worker documents/photos are resolved from T3 checkpoints, path-validated, and sent through Telegram.
 - Native rich draft/final methods are capability-detected, with HTML/edit/plain fallbacks, semantic message splitting, retry, and flood-control backoff.
-- Telegram approval buttons (`Allow once`, `Allow session`, `Deny`).
+- Telegram approval buttons (`Allow once`, `Allow session`, `Deny`) backed by an explicit eight-category risk policy.
+- Sequential structured T3 questions in Telegram, including single-select, multi-select, and custom text answers.
+- Provider-aware follow-ups: immediate live steering when supported, otherwise a durable queue dispatched after the current turn.
 - `/status`, `/projects`, `/work`, `/stop`, `/debug`.
 - Restart recovery for running workers and completions that arrived while the daemon was down.
 - Secret-redacted structured logs and worker/Operator capability isolation.
@@ -53,7 +56,7 @@ T3_BASE_URL=http://127.0.0.1:3773
 
 For a locally trusted T3 environment, `T3_BEARER_TOKEN` may be unnecessary. For a paired/remote environment, provide an access token with `orchestration:read orchestration:operate` scopes.
 
-The provider instance and model must match the configured T3 runtime:
+The provider instance and model are fallbacks and must match the configured T3 runtime. At runtime the daemon reads T3's provider catalog, applies the spec's task-complexity defaults, and honors explicit model/reasoning requests:
 
 ```dotenv
 T3_PROVIDER_INSTANCE_ID=claude
@@ -128,7 +131,7 @@ pnpm test
 pnpm build
 ```
 
-Tests cover routing/focus/path selection, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, Claude CLI streaming and secret isolation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
+Tests cover routing/focus/path selection, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
 
 ## Full-spec implementation status
 

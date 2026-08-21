@@ -25,6 +25,7 @@ export interface WorkThread {
   t3ThreadId: string;
   projectId: string;
   provider?: string;
+  model?: string;
   title: string;
   shortSummary: string;
   keywords: string[];
@@ -143,10 +144,95 @@ export interface WorkerResult {
   needsUserInput?: boolean;
 }
 
+export interface UserInputQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface UserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: UserInputQuestionOption[];
+  multiSelect: boolean;
+}
+
+export type ApprovalRiskCategory =
+  | "safe-read"
+  | "safe-write-in-project"
+  | "network"
+  | "package-install"
+  | "process-control"
+  | "destructive"
+  | "cross-project"
+  | "secret-sensitive";
+
+export interface ProviderCapabilities {
+  liveInput: boolean;
+  interrupt: boolean;
+  approvals: boolean;
+  resume: boolean;
+  cwdSwitch: boolean;
+  structuredEvents: boolean;
+  toolEvents: boolean;
+}
+
+export interface ProviderModelOption {
+  id: string;
+  label: string;
+  type: "select" | "boolean";
+  choices?: Array<{ id: string; label: string; isDefault?: boolean }>;
+}
+
+export interface ProviderModel {
+  slug: string;
+  name: string;
+  shortName?: string;
+  isDefault?: boolean;
+  capabilities: ProviderModelOption[];
+}
+
+export interface ProviderDescriptor {
+  instanceId: string;
+  driver: string;
+  displayName: string;
+  enabled: boolean;
+  installed: boolean;
+  available: boolean;
+  ready: boolean;
+  authenticated: boolean | null;
+  requiresNewThreadForModelChange: boolean;
+  showInteractionModeToggle: boolean;
+  continuationGroup?: string;
+  capabilities: ProviderCapabilities;
+  models: ProviderModel[];
+}
+
 export type WorkerEvent =
   | { type: "started"; threadId: string }
   | { type: "progress"; threadId: string; summary: string }
-  | { type: "approval_required"; threadId: string; approvalId: string; summary: string }
+  | {
+      type: "approval_required";
+      threadId: string;
+      approvalId: string;
+      summary: string;
+      requestKind?: string;
+      requestType?: string;
+      detail?: string;
+    }
+  | {
+      type: "user_input_required";
+      threadId: string;
+      requestId: string;
+      questions: UserInputQuestion[];
+    }
+  | {
+      type: "approval_resolved";
+      threadId: string;
+      approvalId: string;
+      decision?: string;
+    }
+  | { type: "user_input_resolved"; threadId: string; requestId: string }
   | { type: "artifact_created"; threadId: string; artifact: ArtifactRef }
   | { type: "completed"; threadId: string; result: string }
   | { type: "failed"; threadId: string; error: string }
@@ -188,12 +274,16 @@ export interface CreateThreadInput {
   title: string;
   providerInstanceId?: string;
   model?: string;
+  modelOptions?: Array<{ id: string; value: string | boolean }>;
 }
 
 export interface SendThreadTurnInput {
   threadId: string;
   text: string;
   artifacts?: ArtifactRef[];
+  providerInstanceId?: string;
+  model?: string;
+  modelOptions?: Array<{ id: string; value: string | boolean }>;
 }
 
 export interface ApprovalDecision {
@@ -202,12 +292,19 @@ export interface ApprovalDecision {
   decision: "accept" | "acceptForSession" | "decline" | "cancel";
 }
 
+export interface UserInputDecision {
+  threadId: string;
+  requestId: string;
+  answers: Record<string, string | string[]>;
+}
+
 export interface T3Broker {
   listProjects(): Promise<Project[]>;
   getProject(projectId: string): Promise<Project>;
   createProject(input: CreateProjectInput): Promise<Project>;
   renameProject(projectId: string, name: string): Promise<void>;
   listThreads(input?: { projectId?: string; statuses?: ThreadStatus[] }): Promise<WorkThread[]>;
+  getProviders(): Promise<ProviderDescriptor[]>;
   searchThreads(input: { query: string; projectId?: string; limit?: number }): Promise<ThreadCandidate[]>;
   getThread(threadId: string): Promise<WorkThread>;
   createThread(input: CreateThreadInput): Promise<WorkThread>;
@@ -217,6 +314,7 @@ export interface T3Broker {
   getThreadTail(threadId: string, limit?: number): Promise<Array<{ role: string; text: string }>>;
   getThreadArtifacts(threadId: string): Promise<ArtifactRef[]>;
   respondApproval(input: ApprovalDecision): Promise<void>;
+  respondUserInput(input: UserInputDecision): Promise<void>;
   health(): Promise<{ healthy: boolean; detail?: string }>;
 }
 

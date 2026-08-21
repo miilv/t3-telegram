@@ -19,7 +19,19 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   TELEGRAM_POLL_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(50).default(30),
   T3_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(30_000).default(1500),
+  APPROVAL_AUTO_ALLOW: z.string().default("safe-read"),
 });
+
+const approvalRiskCategory = z.enum([
+  "safe-read",
+  "safe-write-in-project",
+  "network",
+  "package-install",
+  "process-control",
+  "destructive",
+  "cross-project",
+  "secret-sensitive",
+]);
 
 export type Config = ReturnType<typeof loadConfig>;
 
@@ -28,6 +40,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const operatorHome = parsed.OPERATOR_HOME.startsWith("~/")
     ? resolve(homedir(), parsed.OPERATOR_HOME.slice(2))
     : resolve(parsed.OPERATOR_HOME);
+  const approvalAutoAllow = [
+    ...new Set(
+      parsed.APPROVAL_AUTO_ALLOW.split(",")
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .map((value) => approvalRiskCategory.parse(value)),
+    ),
+  ];
   return {
     telegram: {
       token: parsed.TELEGRAM_BOT_TOKEN,
@@ -51,6 +71,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       artifactDir: resolve(operatorHome, "artifacts"),
       databasePath: resolve(operatorHome, "operator.db"),
     },
+    approval: { autoAllow: approvalAutoAllow },
     logLevel: parsed.LOG_LEVEL,
   } as const;
 }

@@ -101,6 +101,55 @@ describe("grammY Telegram transport", () => {
     await expect(ambiguous.sendRich(7, "do not duplicate")).rejects.toThrow();
     expect(ambiguousCalls.map((call) => call.method)).toEqual(["sendRichMessage"]);
   });
+
+  it("renders persistent structured user-input buttons and clears them after submission", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    const sent = await transport.sendUserInput(
+      7,
+      "**Choose regions**",
+      "input_123",
+      0,
+      [{ label: "EU" }, { label: "US" }],
+      true,
+      { replyToMessageId: 11, messageThreadId: 22 },
+    );
+    await transport.editUserInput(
+      7,
+      sent.messageId,
+      "**Choose regions**",
+      "input_123",
+      0,
+      [{ label: "EU", selected: true }, { label: "US" }],
+      true,
+    );
+    await transport.clearInlineKeyboard(7, sent.messageId);
+
+    expect(calls.map((call) => call.method)).toEqual([
+      "sendMessage",
+      "editMessageText",
+      "editMessageReplyMarkup",
+    ]);
+    expect(calls[0]?.body).toMatchObject({
+      chat_id: 7,
+      message_thread_id: 22,
+      reply_parameters: { message_id: 11 },
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "EU", callback_data: "ui:input_123:0:o0" }],
+          [{ text: "US", callback_data: "ui:input_123:0:o1" }],
+          [{ text: "Write another answer", callback_data: "ui:input_123:0:c" }],
+          [{ text: "Submit selected", callback_data: "ui:input_123:0:s" }],
+        ],
+      },
+    });
+    expect(
+      ((calls[1]?.body.reply_markup as { inline_keyboard: unknown[][] }).inline_keyboard[0] as unknown[])[0],
+    ).toEqual({ text: "✓ EU", callback_data: "ui:input_123:0:o0" });
+    expect(calls[2]?.body).toMatchObject({ reply_markup: { inline_keyboard: [] } });
+  });
 });
 
 describe("Telegram inbound normalization", () => {

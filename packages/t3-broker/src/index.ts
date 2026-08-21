@@ -6,11 +6,15 @@ import type {
   CreateProjectInput,
   CreateThreadInput,
   Project,
+  ProviderCapabilities,
+  ProviderDescriptor,
   SendThreadTurnInput,
   T3Broker,
   ThreadCandidate,
   ThreadStatus,
   TurnHandle,
+  UserInputDecision,
+  UserInputQuestion,
   WorkThread,
   WorkerEvent,
 } from "../../shared/src/index.js";
@@ -54,7 +58,12 @@ interface T3ThreadWire {
   id: string;
   projectId: string;
   title: string;
-  modelSelection?: { instanceId?: string; provider?: string; model: string };
+  modelSelection?: {
+    instanceId?: string;
+    provider?: string;
+    model: string;
+    options?: Array<{ id: string; value: string | boolean }>;
+  };
   latestTurn: T3LatestTurnWire | null;
   createdAt: string;
   updatedAt: string;
@@ -227,7 +236,11 @@ export class HttpT3Broker implements T3Broker {
       threadId,
       projectId: input.projectId,
       title: input.title,
-      modelSelection: { instanceId: providerInstanceId, model },
+      modelSelection: {
+        instanceId: providerInstanceId,
+        model,
+        ...(input.modelOptions?.length ? { options: input.modelOptions } : {}),
+      },
       runtimeMode: this.options.runtimeMode,
       interactionMode: "default",
       branch: null,
@@ -239,6 +252,7 @@ export class HttpT3Broker implements T3Broker {
       t3ThreadId: threadId,
       projectId: input.projectId,
       provider: providerInstanceId,
+      model,
       title: input.title,
       shortSummary: "",
       keywords: keywords(input.title),
@@ -277,10 +291,31 @@ export class HttpT3Broker implements T3Broker {
       commandId,
       threadId: input.threadId,
       message: { messageId, role: "user", text, attachments },
+      ...(input.model
+        ? {
+            modelSelection: {
+              instanceId: input.providerInstanceId ?? this.options.providerInstanceId,
+              model: input.model,
+              ...(input.modelOptions?.length ? { options: input.modelOptions } : {}),
+            },
+          }
+        : {}),
       runtimeMode: this.options.runtimeMode,
       interactionMode: "default",
       createdAt: nowIso(),
     });
+    if (input.model) {
+      const existing = this.store.getThread(input.threadId);
+      if (existing) {
+        this.store.upsertThread({
+          ...existing,
+          provider: input.providerInstanceId ?? existing.provider ?? this.options.providerInstanceId,
+          model: input.model,
+          updatedAt: nowIso(),
+          lastActivityAt: nowIso(),
+        });
+      }
+    }
     this.store.updateThreadStatus(input.threadId, "queued", { summary: input.text.slice(0, 240) });
     this.store.appendEvent("thread.turn.started", { threadId: input.threadId, correlationId: commandId });
     return { threadId: input.threadId, commandId };
@@ -437,6 +472,22 @@ export class HttpT3Broker implements T3Broker {
     });
   }
 
+  async respondUserInput(input: UserInputDecision): Promise<void> {
+    await this.dispatch({
+      type: "thread.user-input.respond",
+      commandId: newId("cmd"),
+      threadId: input.threadId,
+      requestId: input.requestId,
+      answers: input.answers,
+      createdAt: nowIso(),
+    });
+  }
+
+  async getProviders(): Promise<ProviderDescriptor[]> {
+    if (!this.liveClient) return [];
+    return parseProviderDescriptors(await this.liveClient.getServerConfig());
+  }
+
   async health(): Promise<{ healthy: boolean; detail?: string }> {
     try {
       await Promise.all([
@@ -503,6 +554,7 @@ function mapThread(thread: T3ThreadWire): WorkThread {
     ...(thread.modelSelection?.instanceId || thread.modelSelection?.provider
       ? { provider: thread.modelSelection.instanceId ?? thread.modelSelection.provider }
       : {}),
+    ...(thread.modelSelection?.model ? { model: thread.modelSelection.model } : {}),
     title: thread.title,
     shortSummary: summary,
     keywords: keywords(`${thread.title} ${summary}`),
@@ -562,6 +614,124 @@ function parseThreadSearchMatches(value: unknown): T3ThreadSearchMatch[] {
   });
 }
 
+function parseProviderDescriptors(value: unknown): ProviderDescriptor[] {
+  if (!isRecord(value) || !Array.isArray(value.providers)) {
+    throw new Error("T3 server.getConfig returned an invalid provider catalog");
+  }
+  return value.providers.flatMap((candidate) => {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.instanceId !== "string" ||
+      typeof candidate.driver !== "string" ||
+      typeof candidate.enabled !== "boolean" ||
+      typeof candidate.installed !== "boolean" ||
+      typeof candidate.status !== "string" ||
+      !Array.isArray(candidate.models)
+    ) {
+      return [];
+    }
+    const available = candidate.availability !== "unavailable";
+    const auth = isRecord(candidate.auth) ? candidate.auth.status : undefined;
+    const operational =
+      available &&
+      candidate.enabled &&
+      candidate.installed &&
+      candidate.status === "ready" &&
+      auth !== "unauthenticated";
+    return [
+      {
+        instanceId: candidate.instanceId,
+        driver: candidate.driver,
+        displayName:
+          typeof candidate.displayName === "string" ? candidate.displayName : candidate.instanceId,
+        enabled: candidate.enabled,
+        installed: candidate.installed,
+        available,
+        ready: candidate.status === "ready",
+        authenticated:
+          auth === "authenticated" ? true : auth === "unauthenticated" ? false : null,
+        requiresNewThreadForModelChange: candidate.requiresNewThreadForModelChange === true,
+        showInteractionModeToggle: candidate.showInteractionModeToggle === true,
+        ...(isRecord(candidate.continuation) && typeof candidate.continuation.groupKey === "string"
+          ? { continuationGroup: candidate.continuation.groupKey }
+          : {}),
+        capabilities: normalizeProviderCapabilities(candidate.driver, operational),
+        models: candidate.models.flatMap(parseProviderModel),
+      },
+    ];
+  });
+}
+
+function parseProviderModel(value: unknown): ProviderDescriptor["models"] {
+  if (!isRecord(value) || typeof value.slug !== "string" || typeof value.name !== "string") {
+    return [];
+  }
+  const descriptors =
+    isRecord(value.capabilities) && Array.isArray(value.capabilities.optionDescriptors)
+      ? value.capabilities.optionDescriptors
+      : [];
+  return [
+    {
+      slug: value.slug,
+      name: value.name,
+      ...(typeof value.shortName === "string" ? { shortName: value.shortName } : {}),
+      ...(typeof value.isDefault === "boolean" ? { isDefault: value.isDefault } : {}),
+      capabilities: descriptors.flatMap((descriptor) => {
+        if (
+          !isRecord(descriptor) ||
+          typeof descriptor.id !== "string" ||
+          typeof descriptor.label !== "string" ||
+          (descriptor.type !== "select" && descriptor.type !== "boolean")
+        ) {
+          return [];
+        }
+        const choices =
+          descriptor.type === "select" && Array.isArray(descriptor.options)
+            ? descriptor.options.flatMap((choice) =>
+                isRecord(choice) && typeof choice.id === "string" && typeof choice.label === "string"
+                  ? [
+                      {
+                        id: choice.id,
+                        label: choice.label,
+                        ...(typeof choice.isDefault === "boolean"
+                          ? { isDefault: choice.isDefault }
+                          : {}),
+                      },
+                    ]
+                  : [],
+              )
+            : undefined;
+        return [
+          {
+            id: descriptor.id,
+            label: descriptor.label,
+            type: descriptor.type,
+            ...(choices ? { choices } : {}),
+          },
+        ];
+      }),
+    },
+  ];
+}
+
+function normalizeProviderCapabilities(driver: string, operational: boolean): ProviderCapabilities {
+  // Current T3 adapters expose one provider-independent surface for these
+  // operations. Mid-turn steering is source-proved for these shipped drivers;
+  // unknown future drivers remain conservative until T3 advertises it.
+  const liveInput = new Set(["claudeAgent", "claude", "codex", "cursor", "opencode", "grok"]).has(
+    driver,
+  );
+  return {
+    liveInput: operational && liveInput,
+    interrupt: operational,
+    approvals: operational,
+    resume: operational,
+    cwdSwitch: false,
+    structuredEvents: operational,
+    toolEvents: operational,
+  };
+}
+
 class ThreadSubscriptionProjection {
   private readonly assistantMessages = new Map<string, string>();
   private readonly seenActivities = new Set<string>();
@@ -595,7 +765,23 @@ class ThreadSubscriptionProjection {
       this.pushStarted(events);
     }
     if (thread.planProgress?.step) this.pushProgress(events, thread.planProgress.step);
+    const resolvedRequestIds = new Set(
+      (thread.activities ?? []).flatMap((activity) => {
+        if (activity.kind !== "approval.resolved" && activity.kind !== "user-input.resolved") return [];
+        const payload = isRecord(activity.payload) ? activity.payload : {};
+        return typeof payload.requestId === "string" ? [payload.requestId] : [];
+      }),
+    );
     for (const activity of thread.activities ?? []) {
+      const activityPayload = isRecord(activity.payload) ? activity.payload : {};
+      if (
+        (activity.kind === "approval.requested" || activity.kind === "user-input.requested") &&
+        typeof activityPayload.requestId === "string" &&
+        resolvedRequestIds.has(activityPayload.requestId)
+      ) {
+        this.seenActivities.add(activity.id);
+        continue;
+      }
       events.push(...this.applyActivity(activity));
     }
     const terminal = this.terminalForState(state, thread.session?.lastError ?? undefined);
@@ -702,14 +888,45 @@ class ThreadSubscriptionProjection {
           threadId: this.threadId,
           approvalId,
           summary: summary || "T3 requires approval.",
+          ...(typeof payload.requestKind === "string" ? { requestKind: payload.requestKind } : {}),
+          ...(typeof payload.requestType === "string" ? { requestType: payload.requestType } : {}),
+          ...(typeof payload.detail === "string" ? { detail: payload.detail } : {}),
+        },
+      ];
+    }
+    if (kind === "approval.resolved") {
+      const approvalId = typeof payload.requestId === "string" ? payload.requestId : undefined;
+      if (!approvalId) return [];
+      this.store.updateThreadStatus(this.threadId, "running");
+      return [
+        {
+          type: "approval_resolved",
+          threadId: this.threadId,
+          approvalId,
+          ...(typeof payload.decision === "string" ? { decision: payload.decision } : {}),
         },
       ];
     }
     if (kind === "user-input.requested") {
+      const requestId = typeof payload.requestId === "string" ? payload.requestId : id;
+      const questions = parseUserInputQuestions(payload.questions);
+      if (!requestId || questions.length === 0) return [];
       this.store.updateThreadStatus(this.threadId, "waiting_user");
-      const events: WorkerEvent[] = [];
-      this.pushProgress(events, summary || "T3 is waiting for user input.");
-      return events;
+      return [{ type: "user_input_required", threadId: this.threadId, requestId, questions }];
+    }
+    if (kind === "user-input.resolved") {
+      const requestId = typeof payload.requestId === "string" ? payload.requestId : undefined;
+      if (!requestId) return [];
+      this.store.updateThreadStatus(this.threadId, "running");
+      return [{ type: "user_input_resolved", threadId: this.threadId, requestId }];
+    }
+    if (kind === "runtime.error") {
+      const error =
+        typeof payload.message === "string"
+          ? payload.message
+          : summary || "T3 provider runtime failed";
+      this.store.updateThreadStatus(this.threadId, "failed", { result: error });
+      return [{ type: "failed", threadId: this.threadId, error }];
     }
     if (
       summary &&
@@ -772,6 +989,35 @@ function parseThreadWire(value: unknown): T3ThreadWire {
     throw new Error("T3 thread subscription returned an invalid snapshot");
   }
   return value as unknown as T3ThreadWire;
+}
+
+function parseUserInputQuestions(value: unknown): UserInputQuestion[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.id !== "string" ||
+      typeof candidate.header !== "string" ||
+      typeof candidate.question !== "string" ||
+      !Array.isArray(candidate.options)
+    ) {
+      return [];
+    }
+    const options = candidate.options.flatMap((option) =>
+      isRecord(option) && typeof option.label === "string" && typeof option.description === "string"
+        ? [{ label: option.label, description: option.description }]
+        : [],
+    );
+    return [
+      {
+        id: candidate.id,
+        header: candidate.header,
+        question: candidate.question,
+        options,
+        multiSelect: candidate.multiSelect === true,
+      },
+    ];
+  });
 }
 
 function keywords(value: string): string[] {

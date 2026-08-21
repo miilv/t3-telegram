@@ -136,6 +136,11 @@ export interface TelegramGalleryItem {
   hasSpoiler?: boolean;
 }
 
+export interface TelegramUserInputChoice {
+  label: string;
+  selected?: boolean;
+}
+
 export interface TelegramHealth {
   healthy: boolean;
   username?: string;
@@ -163,7 +168,26 @@ export interface TelegramTransport {
     approvalId: string,
     options?: TelegramSendOptions,
   ): Promise<SentMessage>;
+  sendUserInput(
+    chatId: number,
+    text: string,
+    inputId: string,
+    questionIndex: number,
+    choices: TelegramUserInputChoice[],
+    multiSelect: boolean,
+    options?: TelegramSendOptions,
+  ): Promise<SentMessage>;
+  editUserInput(
+    chatId: number,
+    messageId: number,
+    text: string,
+    inputId: string,
+    questionIndex: number,
+    choices: TelegramUserInputChoice[],
+    multiSelect: boolean,
+  ): Promise<void>;
   editRich(chatId: number, messageId: number, text: string, options?: TelegramDestination): Promise<void>;
+  clearInlineKeyboard(chatId: number, messageId: number): Promise<void>;
   answerCallback(callbackId: string, text?: string): Promise<void>;
   downloadFile(fileId: string): Promise<Uint8Array>;
   react(chatId: number, messageId: number, emoji: string): Promise<void>;

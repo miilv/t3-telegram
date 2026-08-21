@@ -69,6 +69,22 @@ Before the RPC broker implementation, the current T3 fork was reread at
 - Provider ingestion source established the normalized approval, user-input,
   plan, task, tool-progress and runtime-error activity kinds.
 
+For the provider/interaction block, the same T3 revision was reread at the
+contract and adapter boundaries:
+
+- `packages/contracts/src/server.ts` established `instanceId` as the routing
+  key, provider readiness/authentication, model option descriptors,
+  continuation groups, interaction-mode presentation and
+  `requiresNewThreadForModelChange`.
+- `packages/contracts/src/providerRuntime.ts` and `orchestration.ts` supplied
+  the exact structured question/answer shapes and the
+  `thread.user-input.respond` command.
+- `apps/web/src/components/ChatView.logic.ts` and the server provider reactor
+  established when a requested model change must start a new thread.
+- Shipped adapter sources prove mid-turn steering for Claude Agent, Codex,
+  Cursor, OpenCode and Grok. Unknown drivers are normalized conservatively with
+  `liveInput: false` until T3 advertises that capability directly.
+
 The local client therefore uses the same `effect@4.0.0-beta.103` protocol
 instead of defining a second JSON-RPC dialect. Its deliberately narrow schema
 group keeps the private full T3 contracts out of this repository; unknown RPC

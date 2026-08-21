@@ -1,3 +1,8 @@
+import type { ApprovalRiskCategory } from "../../shared/src/index.js";
+
+export { classifyTaskComplexity, selectWorkerModel } from "./provider-selection.js";
+export type { TaskComplexity, WorkerModelSelection } from "./provider-selection.js";
+
 export const OPERATOR_SYSTEM_PROMPT = `You are Operator, the user's always-available general-purpose AI coworker in Telegram.
 
 Core behavior:
@@ -13,18 +18,9 @@ Core behavior:
 - Do not claim an action was performed unless the prompt explicitly supplies its result.
 `;
 
-export type ApprovalRisk =
-  | "safe-read"
-  | "safe-write-in-project"
-  | "network"
-  | "package-install"
-  | "process-control"
-  | "destructive"
-  | "cross-project"
-  | "secret-sensitive";
-
-export function mayAutoApprove(_risk: ApprovalRisk): boolean {
-  // MVP defaults to explicit owner approval for every provider request. This is
-  // conservative and keeps destructive/cross-project authority out of the model.
-  return false;
+export function mayAutoApprove(
+  risk: ApprovalRiskCategory,
+  explicitlyAllowed: readonly ApprovalRiskCategory[],
+): boolean {
+  return explicitlyAllowed.includes(risk);
 }

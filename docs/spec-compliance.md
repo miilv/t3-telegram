@@ -62,7 +62,7 @@ branch, not an aspiration.
 | 39 | Worker result is normalized to structured `WorkerResult` and synthesized by Operator. | MISSING |
 | 40–41 | Completion policy and rich status card with useful links/artifacts/state. | PARTIAL |
 | 42–43 | Cancel/interrupt plus provider-aware live input or queued follow-up while a turn runs. | PARTIAL |
-| 44–45 | Provider abstraction, capabilities, model/reasoning defaults, user overrides and Operator provider switching. | MISSING |
+| 44–45 | Provider abstraction, capabilities, model/reasoning defaults, user overrides and Operator provider switching. | PARTIAL |
 | 46 | Complete Telegram-to-Operator input envelope including topic/reply/forward/media/reaction metadata. | PARTIAL |
 | 47–48 | Operator tool surface for T3, Telegram, memory, artifacts, time/web; concise structured results. | MISSING |
 | 49–50 | Required durable schema and append-only event log with correlation/idempotency fields. | PARTIAL |
@@ -133,5 +133,19 @@ Before completion:
   plan/approval projection, server-side search and ticket redaction. A live T3
   server exercise is still required before the complete broker row can be
   `PROVED`.
+- T3's provider catalog is normalized at the broker boundary, including model
+  option descriptors and the new-thread model-change constraint. Task policy
+  selects Sonnet/high for mechanical, Opus/high for ordinary and Fable/medium
+  for complex work when those advertised models exist; explicit provider,
+  model and reasoning requests take priority.
+- Structured T3 questions are durable and rendered sequentially with Telegram
+  single-select, multi-select and custom-answer flows. Approval decisions use
+  the spec's eight risk categories and only the configured allowlist may be
+  accepted automatically.
+- Active follow-ups are sent immediately only for source-proved live-input
+  providers. Other follow-ups use a durable SQLite job and dispatch after the
+  current terminal event or startup recovery. The retry scheduler and a real
+  multi-client crash exercise are still required before the relevant rows can
+  be `PROVED`.
 - These checks prove only their slices; all remaining `PARTIAL`/`MISSING` rows
   still block completion.

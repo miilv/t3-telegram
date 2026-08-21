@@ -47,7 +47,13 @@ describe("HttpT3Broker", () => {
       createWorkspaceRootIfMissing: true,
     });
     const thread = await broker.createThread({ projectId: project.id, title: "Auth refresh race" });
-    const turn = await broker.sendTurn({ threadId: thread.id, text: "Reproduce and fix it" });
+    const turn = await broker.sendTurn({
+      threadId: thread.id,
+      text: "Reproduce and fix it",
+      providerInstanceId: "codex_work",
+      model: "gpt-5.6-sol",
+      modelOptions: [{ id: "effort", value: "max" }],
+    });
 
     expect(turn.threadId).toBe(thread.id);
     expect(fixture.commands.map((command) => command.type)).toEqual([
@@ -58,6 +64,11 @@ describe("HttpT3Broker", () => {
     expect(fixture.commands[1]?.modelSelection).toEqual({
       instanceId: "claude",
       model: "claude-opus-4-1",
+    });
+    expect(fixture.commands[2]?.modelSelection).toEqual({
+      instanceId: "codex_work",
+      model: "gpt-5.6-sol",
+      options: [{ id: "effort", value: "max" }],
     });
     expect(fixture.authorizationHeaders).toEqual(["Bearer test-token", "Bearer test-token", "Bearer test-token"]);
   });
@@ -218,16 +229,33 @@ describe("HttpT3Broker", () => {
         },
       }),
       t3Event(5, "thread.session-set", {
+        session: { status: "running", activeTurnId: "turn_1", lastError: null },
+      }),
+      t3Event(6, "thread.activity-appended", {
+        activity: {
+          id: "activity_approval_resolved",
+          kind: "approval.resolved",
+          summary: "Approval resolved",
+          payload: { requestId: "approval_1", decision: "decline" },
+        },
+      }),
+      t3Event(7, "thread.session-set", {
         session: { status: "interrupted", activeTurnId: null, lastError: null },
       }),
     ];
     const events = [];
     for await (const event of broker.subscribeThread(thread.id)) events.push(event);
-    expect(events).toContainEqual({
+    expect(events.find((event) => event.type === "approval_required")).toMatchObject({
       type: "approval_required",
       threadId: thread.id,
       approvalId: "approval_1",
       summary: "Allow production deployment?",
+    });
+    expect(events).toContainEqual({
+      type: "approval_resolved",
+      threadId: thread.id,
+      approvalId: "approval_1",
+      decision: "decline",
     });
   });
 
@@ -252,6 +280,156 @@ describe("HttpT3Broker", () => {
     expect(socketUrl).toBe("wss://t3.example.test/ws?wsTicket=one-time-ticket");
     expect(socketUrl).not.toContain("secret-token");
   });
+
+  it("normalizes provider capabilities and round-trips structured user input", async () => {
+    const liveClient = new FakeLiveClient();
+    liveClient.serverConfig = {
+      providers: [
+        {
+          instanceId: "codex_work",
+          driver: "codex",
+          displayName: "Codex Work",
+          enabled: true,
+          installed: true,
+          status: "ready",
+          availability: "available",
+          auth: { status: "authenticated" },
+          requiresNewThreadForModelChange: true,
+          showInteractionModeToggle: true,
+          continuation: { groupKey: "codex:home:/tmp/codex" },
+          models: [
+            {
+              slug: "gpt-5.6-sol",
+              name: "GPT-5.6 Sol",
+              isDefault: true,
+              capabilities: {
+                optionDescriptors: [
+                  {
+                    id: "effort",
+                    label: "Reasoning effort",
+                    type: "select",
+                    options: [
+                      { id: "high", label: "High", isDefault: true },
+                      { id: "max", label: "Max" },
+                    ],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const broker = new HttpT3Broker(
+      {
+        baseUrl: fixture.url,
+        providerInstanceId: "codex_work",
+        model: "gpt-5.6-sol",
+        runtimeMode: "approval-required",
+        pollIntervalMs: 5,
+        liveClient,
+      },
+      store,
+      pino({ enabled: false }),
+    );
+    const providers = await broker.getProviders();
+    expect(providers[0]).toMatchObject({
+      instanceId: "codex_work",
+      driver: "codex",
+      ready: true,
+      authenticated: true,
+      requiresNewThreadForModelChange: true,
+      showInteractionModeToggle: true,
+      continuationGroup: "codex:home:/tmp/codex",
+      capabilities: {
+        liveInput: true,
+        interrupt: true,
+        approvals: true,
+        resume: true,
+        cwdSwitch: false,
+        structuredEvents: true,
+        toolEvents: true,
+      },
+    });
+    expect(providers[0]?.models[0]?.capabilities[0]?.choices?.map((choice) => choice.id)).toEqual([
+      "high",
+      "max",
+    ]);
+
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: "/tmp/acme" });
+    const thread = await broker.createThread({ projectId: project.id, title: "Deploy" });
+    await broker.sendTurn({ threadId: thread.id, text: "Deploy safely" });
+    liveClient.threadItems = [
+      t3Event(4, "thread.activity-appended", {
+        activity: {
+          id: "activity_questions",
+          kind: "user-input.requested",
+          summary: "User input requested",
+          payload: {
+            requestId: "request_1",
+            questions: [
+              {
+                id: "region",
+                header: "Region",
+                question: "Where should this deploy?",
+                options: [
+                  { label: "EU", description: "Frankfurt" },
+                  { label: "US", description: "Virginia" },
+                ],
+                multiSelect: false,
+              },
+            ],
+          },
+        },
+      }),
+      t3Event(5, "thread.activity-appended", {
+        activity: {
+          id: "activity_questions_resolved",
+          kind: "user-input.resolved",
+          summary: "User input submitted",
+          payload: { requestId: "request_1", answers: { region: "EU" } },
+        },
+      }),
+      t3Event(6, "thread.session-set", {
+        session: { status: "interrupted", activeTurnId: null, lastError: null },
+      }),
+    ];
+    const events = [];
+    for await (const event of broker.subscribeThread(thread.id)) events.push(event);
+    expect(events).toContainEqual({
+      type: "user_input_required",
+      threadId: thread.id,
+      requestId: "request_1",
+      questions: [
+        {
+          id: "region",
+          header: "Region",
+          question: "Where should this deploy?",
+          options: [
+            { label: "EU", description: "Frankfurt" },
+            { label: "US", description: "Virginia" },
+          ],
+          multiSelect: false,
+        },
+      ],
+    });
+    expect(events).toContainEqual({
+      type: "user_input_resolved",
+      threadId: thread.id,
+      requestId: "request_1",
+    });
+    await broker.respondUserInput({
+      threadId: thread.id,
+      requestId: "request_1",
+      answers: { region: "EU" },
+    });
+    expect(fixture.commands.at(-1)).toMatchObject({
+      type: "thread.user-input.respond",
+      threadId: thread.id,
+      requestId: "request_1",
+      answers: { region: "EU" },
+    });
+  });
 });
 
 class FakeLiveClient implements T3LiveClient {
@@ -259,6 +437,7 @@ class FakeLiveClient implements T3LiveClient {
   threadInputs: T3ThreadSubscriptionInput[] = [];
   shellInputs: T3ShellSubscriptionInput[] = [];
   searchResult: unknown = { matches: [] };
+  serverConfig: unknown = { providers: [] };
 
   async *subscribeThread(input: T3ThreadSubscriptionInput): AsyncIterable<unknown> {
     this.threadInputs.push(input);
@@ -274,7 +453,7 @@ class FakeLiveClient implements T3LiveClient {
   }
 
   async getServerConfig(): Promise<unknown> {
-    return { environment: { capabilities: {} } };
+    return this.serverConfig;
   }
 }
 

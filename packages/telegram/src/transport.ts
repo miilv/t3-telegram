@@ -26,6 +26,7 @@ import type {
   TelegramSendOptions,
   TelegramTopicInbound,
   TelegramTransport,
+  TelegramUserInputChoice,
 } from "./types.js";
 
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
@@ -412,6 +413,42 @@ export class TelegramBotTransport implements TelegramTransport {
     return sentMessage(chatId, message.message_id, options);
   }
 
+  async sendUserInput(
+    chatId: number,
+    text: string,
+    inputId: string,
+    questionIndex: number,
+    choices: TelegramUserInputChoice[],
+    multiSelect: boolean,
+    options: TelegramSendOptions = {},
+  ): Promise<SentMessage> {
+    const message = await this.outbound(chatId, () =>
+      this.bot.api.sendMessage(chatId, markdownToTelegramHtml(text), {
+        ...messageOptions(options),
+        parse_mode: "HTML",
+        reply_markup: userInputKeyboard(inputId, questionIndex, choices, multiSelect),
+      }),
+    );
+    return sentMessage(chatId, message.message_id, options);
+  }
+
+  async editUserInput(
+    chatId: number,
+    messageId: number,
+    text: string,
+    inputId: string,
+    questionIndex: number,
+    choices: TelegramUserInputChoice[],
+    multiSelect: boolean,
+  ): Promise<void> {
+    await this.outbound(chatId, () =>
+      this.bot.api.editMessageText(chatId, messageId, markdownToTelegramHtml(text), {
+        parse_mode: "HTML",
+        reply_markup: userInputKeyboard(inputId, questionIndex, choices, multiSelect),
+      }),
+    );
+  }
+
   async editRich(
     chatId: number,
     messageId: number,
@@ -419,6 +456,14 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramDestination = {},
   ): Promise<void> {
     await this.editRichSingle(chatId, messageId, text, options);
+  }
+
+  async clearInlineKeyboard(chatId: number, messageId: number): Promise<void> {
+    await this.outbound(chatId, () =>
+      this.bot.api.editMessageReplyMarkup(chatId, messageId, {
+        reply_markup: { inline_keyboard: [] },
+      }),
+    );
   }
 
   async answerCallback(callbackId: string, text?: string): Promise<void> {
@@ -976,6 +1021,37 @@ function messageOptions(options: TelegramSendOptions) {
     ...(options.disableNotification ? { disable_notification: true } : {}),
     ...(options.protectContent ? { protect_content: true } : {}),
   };
+}
+
+function userInputKeyboard(
+  inputId: string,
+  questionIndex: number,
+  choices: TelegramUserInputChoice[],
+  multiSelect: boolean,
+) {
+  const callback = (action: string) => {
+    const value = `ui:${inputId}:${questionIndex}:${action}`;
+    if (Buffer.byteLength(value, "utf8") > 64) {
+      throw new Error("Telegram user-input callback identifier exceeds 64 bytes");
+    }
+    return value;
+  };
+  const inline_keyboard = choices.map((choice, index) => [
+    {
+      text: `${choice.selected ? "✓ " : ""}${truncateButtonLabel(choice.label)}`,
+      callback_data: callback(`o${index}`),
+    },
+  ]);
+  inline_keyboard.push([{ text: "Write another answer", callback_data: callback("c") }]);
+  if (multiSelect) {
+    inline_keyboard.push([{ text: "Submit selected", callback_data: callback("s") }]);
+  }
+  return { inline_keyboard };
+}
+
+function truncateButtonLabel(value: string): string {
+  const points = [...value.trim()];
+  return points.length <= 52 ? points.join("") : `${points.slice(0, 51).join("")}…`;
 }
 
 function copySendOptions(options: TelegramSendOptions): TelegramSendOptions {

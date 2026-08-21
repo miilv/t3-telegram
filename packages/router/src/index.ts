@@ -12,7 +12,7 @@ import { nowIso, unique } from "../../shared/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 
 const followUpPattern =
-  /^(продолжай|готово\??|что там\??|а тесты\??|пусть исправит|сделай это|дальше|continue|status\??|done\??|what's up\??)/iu;
+  /^(продолжай|готово\??|что там\??|а тесты\??|пусть исправит|сделай это|дальше|ещ[её]|также|добавь|continue|also|and also|status\??|done\??|what's up\??)/iu;
 const cancelPattern = /^(стоп|отмени|хватит|cancel|stop)\b/iu;
 const sideQuestionPattern =
   /^(который час|сколько времени|столица|переведи|что значит|посчитай|what time|capital of|translate|calculate)\b/iu;

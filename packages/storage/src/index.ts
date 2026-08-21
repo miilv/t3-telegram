@@ -11,11 +11,39 @@ import type {
   TelegramMessageRecord,
   ThreadCandidate,
   ThreadStatus,
+  UserInputQuestion,
   WorkThread,
 } from "../../shared/src/index.js";
 import { newId, nowIso } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
+
+export interface UserInputDraftAnswer {
+  selectedOptionLabels?: string[];
+  customAnswer?: string;
+}
+
+export interface PendingUserInput {
+  id: string;
+  t3RequestId: string;
+  threadId: string;
+  questions: UserInputQuestion[];
+  draftAnswers: Record<string, UserInputDraftAnswer>;
+  currentQuestion: number;
+  status: string;
+  chatId?: number;
+  messageId?: number;
+}
+
+export interface BackgroundJob<T = unknown> {
+  id: string;
+  kind: string;
+  payload: T;
+  status: string;
+  attempts: number;
+  runAfter?: string;
+  lastError?: string;
+}
 
 function resolveMigrationPath(): string {
   const moduleDirectory = dirname(fileURLToPath(import.meta.url));
@@ -48,6 +76,10 @@ export class OperatorStore {
   migrate(): void {
     const sql = readFileSync(resolveMigrationPath(), "utf8");
     this.db.exec(sql);
+    const threadColumns = this.db.prepare("PRAGMA table_info(threads)").all() as Row[];
+    if (!threadColumns.some((column) => column.name === "model")) {
+      this.db.exec("ALTER TABLE threads ADD COLUMN model TEXT");
+    }
     this.db
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)")
       .run(nowIso());
@@ -107,13 +139,13 @@ export class OperatorStore {
       this.db
         .prepare(`
           INSERT INTO threads(
-            id,t3_thread_id,project_id,provider,title,short_summary,keywords_json,status,
+            id,t3_thread_id,project_id,provider,model,title,short_summary,keywords_json,status,
             last_activity_at,last_user_intent,last_result_summary,related_artifacts_json,
             created_at,updated_at
-          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(id) DO UPDATE SET
             t3_thread_id=excluded.t3_thread_id,project_id=excluded.project_id,
-            provider=excluded.provider,title=excluded.title,short_summary=excluded.short_summary,
+            provider=excluded.provider,model=excluded.model,title=excluded.title,short_summary=excluded.short_summary,
             keywords_json=excluded.keywords_json,status=excluded.status,
             last_activity_at=excluded.last_activity_at,last_user_intent=excluded.last_user_intent,
             last_result_summary=excluded.last_result_summary,
@@ -124,6 +156,7 @@ export class OperatorStore {
           thread.t3ThreadId,
           thread.projectId,
           thread.provider ?? null,
+          thread.model ?? null,
           thread.title,
           thread.shortSummary,
           JSON.stringify(thread.keywords),
@@ -366,8 +399,24 @@ export class OperatorStore {
     this.db.prepare("UPDATE pending_approvals SET status=?,updated_at=? WHERE id=?").run(status, nowIso(), id);
   }
 
+  updateApprovalMessage(id: string, chatId: number, messageId: number): void {
+    this.db
+      .prepare(`
+        UPDATE pending_approvals SET telegram_chat_id=?,telegram_message_id=?,updated_at=? WHERE id=?
+      `)
+      .run(chatId, messageId, nowIso(), id);
+  }
+
   getApproval(id: string):
-    | { id: string; t3ApprovalId: string; threadId: string; status: string }
+    | {
+        id: string;
+        t3ApprovalId: string;
+        threadId: string;
+        status: string;
+        payload: unknown;
+        chatId?: number;
+        messageId?: number;
+      }
     | undefined {
     const row = this.db.prepare("SELECT * FROM pending_approvals WHERE id=?").get(id) as Row | undefined;
     if (!row) return undefined;
@@ -376,13 +425,198 @@ export class OperatorStore {
       t3ApprovalId: String(row.t3_approval_id),
       threadId: String(row.thread_id),
       status: String(row.status),
+      payload: JSON.parse(String(row.payload_json)),
+      ...(row.telegram_chat_id !== null && row.telegram_chat_id !== undefined
+        ? { chatId: Number(row.telegram_chat_id) }
+        : {}),
+      ...(row.telegram_message_id !== null && row.telegram_message_id !== undefined
+        ? { messageId: Number(row.telegram_message_id) }
+        : {}),
     };
   }
 
-  listPendingApprovals(): Array<{ id: string; threadId: string }> {
+  findPendingApprovalByT3(threadId: string, t3ApprovalId: string) {
+    const row = this.db
+      .prepare(`
+        SELECT id FROM pending_approvals
+        WHERE thread_id=? AND t3_approval_id=? AND status='pending'
+        ORDER BY created_at DESC LIMIT 1
+      `)
+      .get(threadId, t3ApprovalId) as Row | undefined;
+    return row ? this.getApproval(String(row.id)) : undefined;
+  }
+
+  listPendingApprovals(): Array<NonNullable<ReturnType<OperatorStore["getApproval"]>>> {
     return (
-      this.db.prepare("SELECT id,thread_id FROM pending_approvals WHERE status='pending'").all() as Row[]
-    ).map((row) => ({ id: String(row.id), threadId: String(row.thread_id) }));
+      this.db.prepare("SELECT * FROM pending_approvals WHERE status='pending'").all() as Row[]
+    ).flatMap((row) => {
+      const approval = this.getApproval(String(row.id));
+      return approval ? [approval] : [];
+    });
+  }
+
+  saveUserInput(input: {
+    id: string;
+    t3RequestId: string;
+    threadId: string;
+    questions: UserInputQuestion[];
+    chatId?: number;
+    messageId?: number;
+  }): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT OR REPLACE INTO pending_user_inputs(
+          id,t3_request_id,thread_id,questions_json,draft_answers_json,current_question,status,
+          telegram_chat_id,telegram_message_id,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `)
+      .run(
+        input.id,
+        input.t3RequestId,
+        input.threadId,
+        JSON.stringify(input.questions),
+        "{}",
+        0,
+        "pending",
+        input.chatId ?? null,
+        input.messageId ?? null,
+        now,
+        now,
+      );
+  }
+
+  updateUserInput(
+    id: string,
+    input: {
+      draftAnswers?: Record<string, UserInputDraftAnswer>;
+      currentQuestion?: number;
+      messageId?: number;
+      status?: string;
+    },
+  ): void {
+    this.db
+      .prepare(`
+        UPDATE pending_user_inputs SET
+          draft_answers_json=COALESCE(?,draft_answers_json),
+          current_question=COALESCE(?,current_question),
+          telegram_message_id=COALESCE(?,telegram_message_id),
+          status=COALESCE(?,status),updated_at=?
+        WHERE id=?
+      `)
+      .run(
+        input.draftAnswers ? JSON.stringify(input.draftAnswers) : null,
+        input.currentQuestion ?? null,
+        input.messageId ?? null,
+        input.status ?? null,
+        nowIso(),
+        id,
+      );
+  }
+
+  getUserInput(id: string): PendingUserInput | undefined {
+    const row = this.db.prepare("SELECT * FROM pending_user_inputs WHERE id=?").get(id) as
+      | Row
+      | undefined;
+    return row ? rowToPendingUserInput(row) : undefined;
+  }
+
+  findPendingUserInputByT3(threadId: string, t3RequestId: string): PendingUserInput | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM pending_user_inputs
+        WHERE thread_id=? AND t3_request_id=? AND status='pending'
+        ORDER BY created_at DESC LIMIT 1
+      `)
+      .get(threadId, t3RequestId) as Row | undefined;
+    return row ? rowToPendingUserInput(row) : undefined;
+  }
+
+  findPendingUserInputByMessage(chatId: number, messageId: number): PendingUserInput | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM pending_user_inputs
+        WHERE telegram_chat_id=? AND telegram_message_id=? AND status='pending'
+        ORDER BY created_at DESC LIMIT 1
+      `)
+      .get(chatId, messageId) as Row | undefined;
+    return row ? rowToPendingUserInput(row) : undefined;
+  }
+
+  listPendingUserInputs(): PendingUserInput[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM pending_user_inputs WHERE status='pending' ORDER BY created_at")
+        .all() as Row[]
+    ).map(rowToPendingUserInput);
+  }
+
+  enqueueBackgroundJob<T>(kind: string, payload: T, runAfter?: string): string {
+    const id = newId("job");
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO background_jobs(
+          id,kind,payload_json,status,run_after,attempts,last_error,created_at,updated_at
+        ) VALUES (?,?,?,?,?,0,NULL,?,?)
+      `)
+      .run(id, kind, JSON.stringify(payload), "pending", runAfter ?? null, now, now);
+    return id;
+  }
+
+  listBackgroundJobs<T>(kind: string, status = "pending"): BackgroundJob<T>[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM background_jobs WHERE kind=? AND status=? ORDER BY created_at")
+        .all(kind, status) as Row[]
+    ).map((row) => rowToBackgroundJob<T>(row));
+  }
+
+  claimBackgroundJob<T>(kind: string, predicate: (payload: T) => boolean): BackgroundJob<T> | undefined {
+    return this.transaction(() => {
+      const rows = this.db
+        .prepare(`
+          SELECT * FROM background_jobs
+          WHERE kind=? AND status='pending' AND (run_after IS NULL OR run_after<=?)
+          ORDER BY created_at
+        `)
+        .all(kind, nowIso()) as Row[];
+      for (const row of rows) {
+        const job = rowToBackgroundJob<T>(row);
+        if (!predicate(job.payload)) continue;
+        const claimed = this.db
+          .prepare("UPDATE background_jobs SET status='running',updated_at=? WHERE id=? AND status='pending'")
+          .run(nowIso(), job.id);
+        if (claimed.changes > 0) return { ...job, status: "running" };
+      }
+      return undefined;
+    });
+  }
+
+  completeBackgroundJob(id: string): void {
+    this.db
+      .prepare("UPDATE background_jobs SET status='completed',updated_at=? WHERE id=?")
+      .run(nowIso(), id);
+  }
+
+  retryBackgroundJob(id: string, error: string): void {
+    const row = this.db.prepare("SELECT attempts FROM background_jobs WHERE id=?").get(id) as
+      | Row
+      | undefined;
+    const attempts = Number(row?.attempts ?? 0) + 1;
+    const delayMs = Math.min(60_000, 1_000 * 2 ** Math.min(attempts - 1, 6));
+    this.db
+      .prepare(`
+        UPDATE background_jobs SET status='pending',attempts=?,last_error=?,run_after=?,updated_at=?
+        WHERE id=?
+      `)
+      .run(
+        attempts,
+        error.slice(0, 1000),
+        new Date(Date.now() + delayMs).toISOString(),
+        nowIso(),
+        id,
+      );
   }
 
   appendEvent(
@@ -456,6 +690,7 @@ function rowToThread(row: Row): WorkThread {
     t3ThreadId: String(row.t3_thread_id),
     projectId: String(row.project_id),
     ...(row.provider ? { provider: String(row.provider) } : {}),
+    ...(row.model ? { model: String(row.model) } : {}),
     title: String(row.title),
     shortSummary: String(row.short_summary ?? ""),
     keywords: JSON.parse(String(row.keywords_json ?? "[]")) as string[],
@@ -485,5 +720,38 @@ function rowToArtifact(row: Row): Artifact {
     ...(row.telegram_message_id ? { telegramMessageId: Number(row.telegram_message_id) } : {}),
     createdAt: String(row.created_at),
     ...(row.expires_at ? { expiresAt: String(row.expires_at) } : {}),
+  };
+}
+
+function rowToPendingUserInput(row: Row): PendingUserInput {
+  return {
+    id: String(row.id),
+    t3RequestId: String(row.t3_request_id),
+    threadId: String(row.thread_id),
+    questions: JSON.parse(String(row.questions_json)) as UserInputQuestion[],
+    draftAnswers: JSON.parse(String(row.draft_answers_json)) as Record<
+      string,
+      UserInputDraftAnswer
+    >,
+    currentQuestion: Number(row.current_question),
+    status: String(row.status),
+    ...(row.telegram_chat_id !== null && row.telegram_chat_id !== undefined
+      ? { chatId: Number(row.telegram_chat_id) }
+      : {}),
+    ...(row.telegram_message_id !== null && row.telegram_message_id !== undefined
+      ? { messageId: Number(row.telegram_message_id) }
+      : {}),
+  };
+}
+
+function rowToBackgroundJob<T>(row: Row): BackgroundJob<T> {
+  return {
+    id: String(row.id),
+    kind: String(row.kind),
+    payload: JSON.parse(String(row.payload_json)) as T,
+    status: String(row.status),
+    attempts: Number(row.attempts),
+    ...(row.run_after ? { runAfter: String(row.run_after) } : {}),
+    ...(row.last_error ? { lastError: String(row.last_error) } : {}),
   };
 }

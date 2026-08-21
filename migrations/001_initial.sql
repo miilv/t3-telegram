@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS threads (
   t3_thread_id TEXT UNIQUE NOT NULL,
   project_id TEXT NOT NULL,
   provider TEXT,
+  model TEXT,
   title TEXT NOT NULL,
   short_summary TEXT NOT NULL DEFAULT '',
   keywords_json TEXT NOT NULL DEFAULT '[]',
@@ -125,6 +126,23 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pending_user_inputs (
+  id TEXT PRIMARY KEY,
+  t3_request_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  questions_json TEXT NOT NULL,
+  draft_answers_json TEXT NOT NULL,
+  current_question INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  telegram_chat_id INTEGER,
+  telegram_message_id INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_user_inputs_message
+  ON pending_user_inputs(telegram_chat_id, telegram_message_id, status);
 
 CREATE TABLE IF NOT EXISTS background_jobs (
   id TEXT PRIMARY KEY,
