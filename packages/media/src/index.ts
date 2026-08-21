@@ -429,6 +429,7 @@ export class MediaProcessor {
           structuredJson = converted.json;
           provider = "docling";
         } catch (error) {
+          this.doclingActiveConversions = Math.max(0, this.doclingActiveConversions - 1);
           this.logger.warn(
             { artifactId: original.id, error: safeError(error) },
             "Docling conversion failed; falling back to local OCR",
@@ -519,6 +520,7 @@ export class MediaProcessor {
   }
 
   private doclingLastUsedAt = 0;
+  private doclingActiveConversions = 0;
   private doclingIdleTimer: NodeJS.Timeout | undefined;
 
   /**
@@ -530,6 +532,7 @@ export class MediaProcessor {
     const docling = this.config.docling!;
     await this.ensureDoclingRunning();
     this.doclingLastUsedAt = Date.now();
+    this.doclingActiveConversions += 1;
     this.scheduleDoclingIdleStop();
     const bytes = await readFile(original.localPath);
     const form = new FormData();
@@ -549,6 +552,7 @@ export class MediaProcessor {
       body: form,
       signal: AbortSignal.timeout(docling.convertTimeoutMs),
     });
+    this.doclingActiveConversions -= 1;
     if (!response.ok) throw httpFailure("docling", response.status);
     const payload = (await response.json()) as {
       document?: { md_content?: unknown; json_content?: unknown };
@@ -565,6 +569,27 @@ export class MediaProcessor {
         ? { json: JSON.stringify(payload.document.json_content) }
         : {}),
     };
+  }
+
+  /**
+   * Maintenance hook: the in-memory idle timer dies with the daemon process,
+   * so a restart could leave the container running forever. Called
+   * periodically; stops the container once the idle window has passed.
+   */
+  async stopIdleDocling(): Promise<boolean> {
+    const docling = this.config.docling;
+    if (!docling) return false;
+    if (this.doclingActiveConversions > 0) return false;
+    if (Date.now() - this.doclingLastUsedAt < docling.idleStopMinutes * 60_000) return false;
+    if (!(await this.doclingHealthy())) return false;
+    try {
+      await runCommand("docker", ["stop", docling.container], 60_000);
+      this.logger.info({ container: docling.container }, "Idle Docling container stopped");
+      return true;
+    } catch (error) {
+      this.logger.warn({ error: safeError(error) }, "Idle Docling stop failed");
+      return false;
+    }
   }
 
   private async ensureDoclingRunning(): Promise<void> {

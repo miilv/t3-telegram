@@ -410,6 +410,7 @@ export class OperatorDaemon {
     await this.flushTelegramOutbox();
     await this.drainT3Dispatches();
     const expiredNotes = this.store.expireOperatorNotes();
+    await this.media?.stopIdleDocling?.();
     const expiredArtifacts = await this.artifacts.cleanupExpired().catch((error) => {
       this.logger.warn({ err: error }, "Expired artifact cleanup failed");
       return 0;
