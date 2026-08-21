@@ -2048,17 +2048,19 @@ class FakeRuntime implements OperatorRuntime {
           status: "success",
           importantDecisions: ["Use single-flight refresh locking."],
         })
-      : input.prompt.includes("Plan a parallel T3 worker delegation")
-        ? JSON.stringify({
-            mode: "parallel",
-            workers: [
-              { title: "Backend profiling", role: "backend investigator", task: "Profile backend latency." },
-              { title: "Database analysis", role: "database investigator", task: "Analyze database latency." },
-              { title: "Git history", role: "history investigator", task: "Inspect recent git history." },
-            ],
-            synthesisGoal: "Explain production latency with reconciled evidence.",
-            rationale: "Independent evidence streams.",
-          })
+      : input.prompt.includes("Decide how to delegate the user's task")
+        ? input.prompt.includes("latency")
+          ? JSON.stringify({
+              mode: "parallel",
+              workers: [
+                { title: "Backend profiling", role: "backend investigator", task: "Profile backend latency." },
+                { title: "Database analysis", role: "database investigator", task: "Analyze database latency." },
+                { title: "Git history", role: "history investigator", task: "Inspect recent git history." },
+              ],
+              synthesisGoal: "Explain production latency with reconciled evidence.",
+              rationale: "Independent evidence streams.",
+            })
+          : JSON.stringify({ mode: "single", rationale: "One scope is enough." })
       : input.prompt.includes("Synthesize this completed parallel")
           ? "Parallel synthesis: backend, database, and history evidence reconciled."
           : input.prompt.includes("Prepare durable memory maintenance")

@@ -1,21 +1,15 @@
 import { describe, expect, it } from "vitest";
-import {
-  fallbackParallelDelegationPlan,
-  parseDelegationPlan,
-  shouldPlanParallelDelegation,
-} from "../packages/policy/src/delegation-planning.js";
+import { parseDelegationPlan, singleDelegationPlan } from "../packages/policy/src/delegation-planning.js";
 
-describe("parallel delegation policy", () => {
-  it("detects explicit fan-out and multi-domain investigations", () => {
-    expect(shouldPlanParallelDelegation("use three workers in parallel")).toBe(true);
-    expect(shouldPlanParallelDelegation("запусти три воркера параллельно")).toBe(true);
-    expect(
-      shouldPlanParallelDelegation("investigate production latency across backend, database, and logs"),
-    ).toBe(true);
-    expect(shouldPlanParallelDelegation("fix this typo")).toBe(false);
+describe("delegation planning", () => {
+  it("accepts an explicit single-worker plan", () => {
+    const plan = parseDelegationPlan('{"mode":"single","rationale":"One file write."}');
+    expect(plan?.mode).toBe("single");
+    expect(plan?.workers).toHaveLength(0);
+    expect(plan?.rationale).toBe("One file write.");
   });
 
-  it("strictly parses and bounds an Operator plan", () => {
+  it("keeps every distinct scope the Operator asked for", () => {
     const plan = parseDelegationPlan(
       JSON.stringify({
         mode: "parallel",
@@ -24,14 +18,20 @@ describe("parallel delegation policy", () => {
           { title: "Database", role: "database", task: "Analyze queries." },
           { title: "History", role: "history", task: "Inspect git history." },
           { title: "Tests", role: "tests", task: "Run regressions." },
-          { title: "Ignored", role: "extra", task: "This fifth scope is bounded out." },
+          { title: "Fifth", role: "extra", task: "Check the cache layer." },
         ],
         synthesisGoal: "Explain latency.",
         rationale: "Independent evidence.",
       }),
     );
-    expect(plan?.workers).toHaveLength(4);
-    expect(parseDelegationPlan('{"mode":"parallel","workers":[{"title":"one"}]}')).toBeUndefined();
+    expect(plan?.mode).toBe("parallel");
+    expect(plan?.workers).toHaveLength(5);
+  });
+
+  it("rejects malformed plans and collapses degenerate fan-outs to single", () => {
+    expect(parseDelegationPlan("not json at all")).toBeUndefined();
+    expect(parseDelegationPlan('{"mode":"swarm","workers":[]}')).toBeUndefined();
+    expect(parseDelegationPlan('{"mode":"parallel","workers":[{"title":"one"}]}')?.mode).toBe("single");
     expect(
       parseDelegationPlan(
         JSON.stringify({
@@ -41,13 +41,12 @@ describe("parallel delegation policy", () => {
             { title: "Duplicate", role: "b", task: "  inspect   the BACKEND. " },
           ],
         }),
-      ),
-    ).toBeUndefined();
+      )?.mode,
+    ).toBe("single");
   });
 
-  it("provides three non-duplicate deterministic fallback scopes", () => {
-    const plan = fallbackParallelDelegationPlan("Investigate latency");
-    expect(plan.workers).toHaveLength(3);
-    expect(new Set(plan.workers.map((worker) => worker.role)).size).toBe(3);
+  it("provides a single-worker default", () => {
+    expect(singleDelegationPlan().mode).toBe("single");
+    expect(singleDelegationPlan("planner down").rationale).toBe("planner down");
   });
 });
