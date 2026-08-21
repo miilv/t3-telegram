@@ -3,6 +3,7 @@ import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { OperatorDaemon } from "../apps/daemon/src/operator-daemon.js";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
+import { OperatorToolServer } from "../packages/operator-tools/src/index.js";
 import type { Config } from "../packages/shared/src/config.js";
 import type {
   ApprovalDecision,
@@ -11,6 +12,7 @@ import type {
   CreateThreadInput,
   OperatorEvent,
   OperatorRuntime,
+  OperatorToolAccess,
   Project,
   ProviderDescriptor,
   SendThreadTurnInput,
@@ -33,6 +35,49 @@ import type {
 import { tempDirectory, tempStore } from "./helpers.js";
 
 describe("OperatorDaemon product flow", () => {
+  it("issues privileged MCP access only for the user-facing direct turn", async () => {
+    const home = tempDirectory("daemon-tools-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(
+      config(home),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    expect(runtime.toolAccesses).toHaveLength(1);
+    expect(runtime.toolAccesses[0]?.allowedTools).toContain("mcp__operator__telegram_reply");
+    expect(runtime.toolAccesses[0]?.token).not.toContain("test-token");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("answers directly, delegates durable work, completes in background, and preserves focus", async () => {
     const home = tempDirectory("daemon-home-");
     const store = tempStore();
@@ -875,13 +920,19 @@ class FakeRuntime implements OperatorRuntime {
   routingSelectionThreadId?: string;
   readonly prompts: string[] = [];
   readonly compactReasons: string[] = [];
+  readonly toolAccesses: OperatorToolAccess[] = [];
 
   async start(): Promise<{ id: string }> {
     return { id: "operator-session" };
   }
 
-  async *sendTurn(input: { sessionId: string; prompt: string }): AsyncIterable<OperatorEvent> {
+  async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
     this.prompts.push(input.prompt);
+    if (input.toolAccess) this.toolAccesses.push(input.toolAccess);
     const text = input.prompt.includes("Arbitrate routing")
       ? this.routingSelectionThreadId
         ? JSON.stringify({

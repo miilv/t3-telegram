@@ -9,6 +9,24 @@
 - `/debug` — connectivity for Telegram, Claude CLI, T3, and subscription count.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
 
+## Operator MCP isolation
+
+The daemon starts one Streamable HTTP MCP endpoint on a random `127.0.0.1`
+port. It is not placed in `~/.claude`, a project settings file, or a worker
+provider configuration. Each direct Telegram turn gets a 256-bit capability
+that fixes the owner, chat, topic, origin message, and Operator turn ID. Claude
+receives that capability only in a mode-`0600` MCP config inside the mode-`0700`
+Operator runtime directory; the config is removed when the subprocess exits.
+The command line contains only that file's path. Claude never receives the
+Telegram bot token or T3 bearer token. The lease is revoked after the turn and
+all leases are cleared on shutdown.
+
+Telegram message/reply/media tools cannot select another chat. Reactions may
+target only the triggering envelope or a same-turn sent message, and edits may
+target only a same-turn sent message. Paths supplied to media/file tools are
+accepted only after project-root, realpath/symlink, secret-name, size and hash
+validation. Tool audit events store tool name and duration, not arguments.
+
 ## Restart behavior
 
 SQLite uses WAL mode. On startup the daemon:

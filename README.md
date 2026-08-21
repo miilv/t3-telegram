@@ -5,7 +5,9 @@ Always-on, single-user AI Operator in Telegram. It answers quick questions itsel
 ## What is implemented
 
 - Authorized private Telegram chat with idempotent long polling.
-- Persistent Claude CLI Operator runtime with resume/compact and a restricted tool surface (`WebSearch`, `WebFetch` only).
+- Persistent Claude CLI Operator runtime with resume/compact, built-in web
+  retrieval, and a process-scoped privileged MCP surface for T3, Telegram,
+  memory, artifacts, time, search, calculator, and safe file metadata.
 - Current T3 Code orchestration adapter:
   - project list/create/rename;
   - thread list/create/reuse plus server-side full-text RPC search;
@@ -102,7 +104,13 @@ The default data root is `~/.operator`:
 └── workspaces/       # auto-created non-repository projects
 ```
 
-Workers never receive the Telegram token, T3 bearer token, Operator database, or cross-project broker. Claude Operator runs in `--safe-mode` with no shell/filesystem tools. Worker prompts receive only the chosen project context and explicitly materialized files.
+Workers never receive the Telegram token, T3 bearer token, Operator database,
+or cross-project broker. For a user-facing turn, Claude receives only a random,
+expiring capability for a loopback MCP endpoint. Ambient Claude settings,
+skills and global MCP configuration are disabled; the explicit turn MCP is
+loaded with `--strict-mcp-config`. The capability is revoked when the turn
+ends. Claude has no shell or unrestricted filesystem tool. Worker prompts
+receive only the chosen project context and explicitly materialized files.
 
 Outbound files are sent only after realpath/symlink resolution, allowed-root validation, regular-file and size checks, secret-like filename rejection, hashing, and audit logging.
 
@@ -115,7 +123,7 @@ Telegram Bot API
 Operator daemon ── SQLite / artifact registry / routing / scheduler
       │                         │
       │                         └── Claude CLI Operator session
-      │                              (conversation + web only)
+      │                              (conversation + per-turn MCP)
       ▼
 T3 Code orchestration (HTTP snapshots/commands + Effect RPC/WebSocket events)
       ├── Project A / persistent thread(s)
@@ -133,7 +141,7 @@ pnpm test
 pnpm build
 ```
 
-Tests cover routing/focus/path and git-aware selection, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, structured memory/search/migration/compaction restoration, maintenance scheduling and retention cleanup, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
+Tests cover routing/focus/path and git-aware selection, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, structured memory/search/migration/compaction restoration, maintenance scheduling and retention cleanup, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, process-scoped MCP discovery/calls/revocation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
 
 ## Full-spec implementation status
 

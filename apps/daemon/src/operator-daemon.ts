@@ -8,6 +8,7 @@ import type {
   DelegationPlan,
   OperatorNote,
   OperatorRuntime,
+  OperatorToolAccess,
   Project,
   RoutingDecision,
   T3Broker,
@@ -52,6 +53,10 @@ import {
   shouldPlanParallelDelegation,
 } from "../../../packages/policy/src/index.js";
 import type { DailyScheduler } from "../../../packages/scheduler/src/index.js";
+import type {
+  OperatorToolServer,
+  ToolStartedThread,
+} from "../../../packages/operator-tools/src/index.js";
 
 interface QueuedThreadFollowup {
   threadId: string;
@@ -83,6 +88,7 @@ export class OperatorDaemon {
     private readonly artifacts: ArtifactRegistry,
     private readonly scheduler: DailyScheduler,
     private readonly logger: Logger,
+    private readonly operatorTools?: OperatorToolServer,
   ) {
     this.router = new RoutingEngine(store);
   }
@@ -91,6 +97,7 @@ export class OperatorDaemon {
     this.store.migrate();
     await this.artifacts.initialize();
     await mkdir(this.config.operator.runtimeDir, { recursive: true, mode: 0o700 });
+    await this.operatorTools?.start();
 
     const existingSession = this.store.getRuntimeState("operator_session_id");
     if (existingSession) {
@@ -147,7 +154,50 @@ export class OperatorDaemon {
     for (const controller of this.monitors.values()) controller.abort();
     await this.ingressQueue.idle();
     await Promise.allSettled([...this.monitorTasks]);
+    await this.operatorTools?.stop();
     this.store.close();
+  }
+
+  async trackOperatorToolThread(input: ToolStartedThread): Promise<void> {
+    const thread = await this.broker.getThread(input.threadId);
+    const messageIds = input.context.allowedMessageIds?.length
+      ? input.context.allowedMessageIds
+      : [input.context.originMessageId];
+    for (const messageId of messageIds) {
+      this.store.updateTelegramMessageBinding(input.context.chatId, messageId, {
+        primaryProjectId: thread.projectId,
+        primaryThreadId: thread.id,
+        relatedThreadIds: [thread.id],
+      });
+      this.store.linkMessageThread(input.context.chatId, messageId, thread.id, "primary");
+    }
+    this.store.setRuntimeState(`thread_chat:${thread.id}`, String(input.context.chatId));
+    this.store.setRuntimeState(
+      `thread_origin_message:${thread.id}`,
+      String(input.context.originMessageId),
+    );
+    this.store.setRuntimeState(
+      `thread_message_thread:${thread.id}`,
+      String(input.context.messageThreadId ?? ""),
+    );
+    this.store.setRuntimeState(
+      `thread_direct_topic:${thread.id}`,
+      String(input.context.directMessagesTopicId ?? ""),
+    );
+    this.store.setRuntimeState(`thread_completion_delivered:${thread.id}`, "");
+    this.monitorThread(
+      thread.id,
+      input.context.chatId,
+      input.context.originMessageId,
+      {
+        ...(input.context.messageThreadId
+          ? { messageThreadId: input.context.messageThreadId }
+          : {}),
+        ...(input.context.directMessagesTopicId
+          ? { directMessagesTopicId: input.context.directMessagesTopicId }
+          : {}),
+      },
+    );
   }
 
   async compact(reason = "daily maintenance"): Promise<void> {
@@ -418,6 +468,17 @@ export class OperatorDaemon {
     }
     const draft = await this.telegram.startDraft(update.chatId, replyOptions(update));
     const writer = new DraftWriter(this.telegram, draft);
+    const toolLease = this.operatorTools?.issue({
+      chatId: update.chatId,
+      ownerId: String(update.userId),
+      originMessageId: update.messageId,
+      allowedMessageIds: update.messageIds,
+      operatorTurnId,
+      ...(update.messageThreadId ? { messageThreadId: update.messageThreadId } : {}),
+      ...(update.directMessagesTopicId
+        ? { directMessagesTopicId: update.directMessagesTopicId }
+        : {}),
+    });
     const prompt = [
       "Answer the user's Telegram message directly. This is a quick task and no T3 worker was created.",
       `User message: ${update.text || "(attachment only)"}`,
@@ -429,7 +490,11 @@ export class OperatorDaemon {
         : "No current durable work focus.",
     ].join("\n\n");
     try {
-      const answer = await this.askOperator(prompt, (delta) => writer.append(delta));
+      const answer = await this.askOperator(
+        prompt,
+        (delta) => writer.append(delta),
+        toolLease?.access,
+      );
       if (!writer.text && answer) writer.append(answer);
       const sent = await writer.finalize(answer || "Не смог сформировать ответ.");
       this.recordOutgoing(sent, {
@@ -442,6 +507,8 @@ export class OperatorDaemon {
       this.logger.error({ err: error }, "Direct Operator turn failed");
       const sent = await writer.finalize("Не удалось ответить из-за ошибки Operator runtime. Попробуйте ещё раз.");
       this.recordOutgoing(sent, { operatorTurnId, messageType: "operator_error" });
+    } finally {
+      toolLease?.revoke();
     }
   }
 
@@ -2500,12 +2567,20 @@ export class OperatorDaemon {
     }
   }
 
-  private async askOperator(prompt: string, onDelta?: (delta: string) => void): Promise<string> {
+  private async askOperator(
+    prompt: string,
+    onDelta?: (delta: string) => void,
+    toolAccess?: OperatorToolAccess,
+  ): Promise<string> {
     return this.operatorQueue.run(async () => {
       let streamed = "";
       let result = "";
       try {
-        for await (const event of this.runtime.sendTurn({ sessionId: this.operatorSessionId, prompt })) {
+        for await (const event of this.runtime.sendTurn({
+          sessionId: this.operatorSessionId,
+          prompt,
+          ...(toolAccess ? { toolAccess } : {}),
+        })) {
           if (event.type === "text_delta") {
             streamed += event.text;
             onDelta?.(event.text);
@@ -2524,7 +2599,11 @@ export class OperatorDaemon {
           await this.createOperatorSession();
           streamed = "";
           result = "";
-          for await (const event of this.runtime.sendTurn({ sessionId: this.operatorSessionId, prompt })) {
+          for await (const event of this.runtime.sendTurn({
+            sessionId: this.operatorSessionId,
+            prompt,
+            ...(toolAccess ? { toolAccess } : {}),
+          })) {
             if (event.type === "text_delta") {
               streamed += event.text;
               onDelta?.(event.text);

@@ -312,9 +312,24 @@ export interface OperatorSession {
   id: string;
 }
 
+export interface OperatorToolAccess {
+  /** Loopback-only MCP endpoint minted by the daemon for this Operator turn. */
+  url: string;
+  /** Ephemeral capability token. This is never a Telegram or T3 credential. */
+  token: string;
+  /** Fully-qualified Claude MCP tool names permitted for this turn. */
+  allowedTools: string[];
+}
+
 export interface OperatorRuntime {
   start(input: { systemPrompt: string }): Promise<OperatorSession>;
-  sendTurn(input: { sessionId: string; prompt: string }): AsyncIterable<OperatorEvent>;
+  sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+    /** Internal runtime maintenance may opt into Claude's built-in /compact command. */
+    allowBuiltInSlashCommands?: boolean;
+  }): AsyncIterable<OperatorEvent>;
   interrupt(): Promise<void>;
   compact(reason?: string): Promise<{ sessionId: string; summary?: string }>;
   resume(sessionId: string): Promise<void>;

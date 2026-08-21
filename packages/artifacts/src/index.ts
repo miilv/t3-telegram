@@ -11,6 +11,13 @@ const MAX_OUTBOUND_BYTES = 50 * 1024 * 1024;
 const INBOUND_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const secretPattern = /(^|[._-])(env|secret|token|credential|id_rsa|id_ed25519)([._-]|$)/i;
 
+export interface SafeFileMetadata {
+  localPath: string;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
 export class ArtifactRegistry {
   constructor(
     private readonly root: string,
@@ -90,21 +97,14 @@ export class ArtifactRegistry {
       mimeType?: string;
     } = {},
   ): Promise<Artifact> {
-    if (!existsSync(path)) throw new Error("Outbound artifact does not exist");
-    const resolvedPath = await realpath(path);
-    const roots = await Promise.all(allowedRoots.map((root) => realpath(root)));
-    if (!roots.some((root) => isInside(root, resolvedPath))) throw new Error("Outbound path is outside allowed roots");
-    if (secretPattern.test(basename(resolvedPath))) throw new Error("Secret-like files cannot be sent");
-    const metadata = await stat(resolvedPath);
-    if (!metadata.isFile()) throw new Error("Outbound artifact must be a regular file");
-    if (metadata.size > MAX_OUTBOUND_BYTES) throw new Error("Outbound artifact exceeds 50 MiB limit");
+    const file = await this.inspectOutbound(path, allowedRoots);
     const id = newId("art");
     const artifact: Artifact = {
       id,
-      localPath: resolvedPath,
-      filename: basename(resolvedPath),
-      sizeBytes: metadata.size,
-      sha256: await hashFile(resolvedPath),
+      localPath: file.localPath,
+      filename: file.filename,
+      sizeBytes: file.sizeBytes,
+      sha256: file.sha256,
       source: input.source ?? "worker_generated",
       ...(input.mimeType ? { mimeType: input.mimeType } : {}),
       ...(input.projectId ? { projectId: input.projectId } : {}),
@@ -113,6 +113,23 @@ export class ArtifactRegistry {
     };
     this.store.saveArtifact(artifact);
     return artifact;
+  }
+
+  async inspectOutbound(path: string, allowedRoots: string[]): Promise<SafeFileMetadata> {
+    if (!existsSync(path)) throw new Error("Outbound artifact does not exist");
+    const resolvedPath = await realpath(path);
+    const roots = await Promise.all(allowedRoots.map((root) => realpath(root)));
+    if (!roots.some((root) => isInside(root, resolvedPath))) throw new Error("Outbound path is outside allowed roots");
+    if (secretPattern.test(basename(resolvedPath))) throw new Error("Secret-like files cannot be sent");
+    const metadata = await stat(resolvedPath);
+    if (!metadata.isFile()) throw new Error("Outbound artifact must be a regular file");
+    if (metadata.size > MAX_OUTBOUND_BYTES) throw new Error("Outbound artifact exceeds 50 MiB limit");
+    return {
+      localPath: resolvedPath,
+      filename: basename(resolvedPath),
+      sizeBytes: metadata.size,
+      sha256: await hashFile(resolvedPath),
+    };
   }
 
   async cleanupExpired(at = nowIso()): Promise<number> {

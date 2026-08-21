@@ -18,12 +18,15 @@
     "check": "pnpm typecheck && pnpm test && pnpm build"
   },
   "dependencies": {
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
     "effect": "4.0.0-beta.103",
     "grammy": "1.45.1",
     "pino": "^9.9.0",
     "zod": "^4.1.5"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/node": "^24.3.0",
     "tsup": "^8.5.0",
     "tsx": "^4.20.5",

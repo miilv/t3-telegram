@@ -125,6 +125,45 @@ a second copy of full T3 history. Completion results update the summary, handoff
 consumes it, and compaction restoration uses a bounded SQLite/T3-derived state
 snapshot. This preserves the spec's source-of-truth boundary.
 
+## Privileged Operator tool source gate
+
+Before implementing sections 29–30 and 47–48, the agent-facing action sources
+were reread at the revisions recorded above:
+
+- Anthropic's official Telegram channel server applies the same inbound policy
+  to outbound actions, uses native `reply_parameters`, validates attachment
+  paths, constrains reactions, and documents that a final notification should
+  be a new reply rather than an edit.
+- Pavel Molyanov's MCP server fixes chat/topic routing in process environment,
+  validates every file before send, bounds galleries to Telegram's 2–10 range,
+  and falls back from rejected photos to documents.
+- Mark-Life's `executor-mcp.ts` injects an HTTP MCP server into an individual
+  agent run and explicitly lists the resulting fully-qualified MCP permission
+  names. Its T3/Telegram workers are not globally configured with that server.
+- The installed Claude CLI `2.1.237` source-facing help confirms
+  `--mcp-config`, `--strict-mcp-config`, `--allowed-tools`,
+  `--setting-sources`, and `--disable-slash-commands`. It also confirms that
+  `--safe-mode` disables MCP, so the Operator now uses explicit empty settings
+  sources plus strict per-run MCP configuration instead. Ambient slash commands
+  are disabled on user turns; only the daemon's internal compaction turn enables
+  Claude's built-in `/compact` command.
+- The official `@modelcontextprotocol/server` and
+  `@modelcontextprotocol/node` `2.0.0` implementation supplies the
+  per-request Streamable HTTP handler, Zod validation, Node adapter, and
+  localhost host/origin guards. The daemon binds it only to `127.0.0.1`.
+
+The resulting MCP endpoint accepts only random, expiring turn capabilities.
+Telegram and T3 credentials remain inside the daemon; a capability fixes the
+owner/chat/topic/origin message and is revoked as soon as the Claude turn ends.
+Files still pass the artifact registry's realpath/root/symlink/secret/size/hash
+gate. Tool results are bounded JSON and thread tools never return raw
+transcripts by default.
+
+A live Claude CLI smoke run proved Streamable HTTP discovery, header delivery,
+`dontAsk` permission matching, and a real MCP call. That check also established
+Claude's permission-name normalization (`t3.send_turn` becomes
+`mcp__operator__t3_send_turn`), which is now covered by regression tests.
+
 ## Remaining source gates
 
 Before each media block, reread the corresponding donor implementation and the

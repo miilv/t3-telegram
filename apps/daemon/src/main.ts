@@ -6,6 +6,7 @@ import { loadConfig } from "../../../packages/shared/src/config.js";
 import { OperatorStore } from "../../../packages/storage/src/index.js";
 import { HttpT3Broker } from "../../../packages/t3-broker/src/index.js";
 import { TelegramBotTransport } from "../../../packages/telegram/src/index.js";
+import { OperatorToolServer } from "../../../packages/operator-tools/src/index.js";
 import { OperatorDaemon } from "./operator-daemon.js";
 
 async function main(): Promise<void> {
@@ -38,8 +39,26 @@ async function main(): Promise<void> {
     logger,
   );
   let daemon: OperatorDaemon;
+  const operatorTools = new OperatorToolServer({
+    broker,
+    store,
+    telegram,
+    artifacts,
+    logger,
+    onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+  });
   const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
-  daemon = new OperatorDaemon(config, store, runtime, broker, telegram, artifacts, scheduler, logger);
+  daemon = new OperatorDaemon(
+    config,
+    store,
+    runtime,
+    broker,
+    telegram,
+    artifacts,
+    scheduler,
+    logger,
+    operatorTools,
+  );
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "Shutting down Operator");

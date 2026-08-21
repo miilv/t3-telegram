@@ -1,4 +1,4 @@
-import { chmodSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ClaudeCliOperatorRuntime } from "../packages/operator-runtime/src/index.js";
@@ -53,5 +53,103 @@ process.stdin.on("end", () => {
       if (previousT3 === undefined) delete process.env.T3_BEARER_TOKEN;
       else process.env.T3_BEARER_TOKEN = previousT3;
     }
+  });
+
+  it("injects only the explicit turn MCP and does not use MCP-blocking safe mode", async () => {
+    const directory = tempDirectory("fake-claude-mcp-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+const { readFileSync } = require("node:fs");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const sessionIndex = process.argv.indexOf("--session-id");
+  const session = process.argv[sessionIndex + 1];
+  const args = process.argv.slice(2);
+  const configPath = args[args.indexOf("--mcp-config") + 1];
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  console.log(JSON.stringify({ type: "result", result: JSON.stringify({ args, configPath, config }), session_id: session }));
+});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+    let captured: { args: string[]; configPath: string; config: unknown } = {
+      args: [],
+      configPath: "",
+      config: undefined,
+    };
+    for await (const event of runtime.sendTurn({
+      sessionId: session.id,
+      prompt: "use tools",
+      toolAccess: {
+        url: "http://127.0.0.1:43123/mcp",
+        token: "ephemeral-capability",
+        allowedTools: ["mcp__operator__utility_time"],
+      },
+    })) {
+      if (event.type === "result") {
+        captured = JSON.parse(event.text) as typeof captured;
+      }
+    }
+    const args = captured.args;
+    expect(args).not.toContain("--safe-mode");
+    expect(args).toContain("--strict-mcp-config");
+    expect(args).toContain("--disable-slash-commands");
+    expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
+    expect(args[args.indexOf("--allowed-tools") + 1]).toBe("mcp__operator__utility_time");
+    expect(args[args.indexOf("--mcp-config") + 1]).toBe(captured.configPath);
+    expect(captured.configPath).not.toContain("ephemeral-capability");
+    expect(existsSync(captured.configPath)).toBe(false);
+    const mcpConfig = captured.config as {
+      mcpServers: { operator: { url: string; headers: { Authorization: string } } };
+    };
+    expect(mcpConfig).toEqual({
+      mcpServers: {
+        operator: {
+          type: "http",
+          url: "http://127.0.0.1:43123/mcp",
+          headers: { Authorization: "Bearer ephemeral-capability" },
+        },
+      },
+    });
+  });
+
+  it("keeps ambient slash commands disabled except for the built-in compaction turn", async () => {
+    const directory = tempDirectory("fake-claude-compact-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const sessionIndex = process.argv.indexOf("--session-id");
+  const session = process.argv[sessionIndex + 1];
+  console.log(JSON.stringify({ type: "result", result: JSON.stringify(process.argv.slice(2)), session_id: session }));
+});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+    });
+    await runtime.start({ systemPrompt: "system" });
+    const result = await runtime.compact("test compaction");
+    const args = JSON.parse(result.summary ?? "[]") as string[];
+    expect(args).not.toContain("--disable-slash-commands");
+    expect(args).toContain("--strict-mcp-config");
+    expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
   });
 });

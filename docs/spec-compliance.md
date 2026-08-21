@@ -53,7 +53,7 @@ branch, not an aspiration.
 | 25 | Forum topics are preserved as Telegram context but never assumed to map 1:1 to T3 threads. | PARTIAL |
 | 26 | Inbound/outbound reactions with allowlist and durable event context. | PARTIAL |
 | 27–28 | Approval UI, normalized decisions, risk categories, safe auto-approval and explicit dangerous approval. | PARTIAL |
-| 29–30 | Process-scoped privileged Operator tools; workers receive only project-scoped capabilities/skills. | MISSING |
+| 29–30 | Process-scoped privileged Operator tools use a loopback MCP endpoint with random expiring per-turn capabilities, empty ambient settings sources and a strict per-run config. Telegram/T3 credentials stay in the daemon and workers are launched only through ordinary T3 provider configuration. MCP protocol, daemon lifecycle, CLI argv and live Claude invocation evidence pass. | PROVED |
 | 31–32 | Filesystem isolation and secure outbound files: realpath, roots, symlinks, secret/content checks, ownership, MIME, size, audit and hash. | PARTIAL |
 | 33–34 | Project detection by path/git root/remote/aliases plus stable auto-naming. | PARTIAL |
 | 35–36 | Thread reuse/search with metadata, FTS/semantic retrieval, recency and LLM reranking. | PARTIAL |
@@ -64,12 +64,12 @@ branch, not an aspiration.
 | 42–43 | Cancel/interrupt plus provider-aware live input or queued follow-up while a turn runs. | PARTIAL |
 | 44–45 | Provider abstraction, capabilities, model/reasoning defaults, user overrides and Operator provider switching. | PARTIAL |
 | 46 | Complete Telegram-to-Operator input envelope including topic/reply/forward/media/reaction metadata. | PARTIAL |
-| 47–48 | Operator tool surface for T3, Telegram, memory, artifacts, time/web; concise structured results. | MISSING |
+| 47–48 | All named T3, Telegram, memory, artifact and time/web tools are Zod-validated, audited and bounded to compact JSON; thread reads exclude raw transcripts. MCP discovery/call tests cover the complete list and representative mutation/security paths. | PROVED |
 | 49–50 | Required durable schema and append-only event log with correlation/idempotency fields. | PARTIAL |
 | 51–52 | Crash recovery and transactional/exactly-once effects across Telegram/T3 boundaries. | PARTIAL |
 | 53–55 | Separate ingress/operator/worker/outbound queues, bounded concurrency and interrupt policy. | PARTIAL |
 | 56–59 | Correct draft strategy, UTF-8/UTF-16 limits, flood control and per-capability/per-message fallback. | PARTIAL |
-| 60 | General web/time tools available only to Operator under policy. | PARTIAL |
+| 60 | Operator-only time, web search/retrieval (MCP plus built-in WebSearch/WebFetch), calculator, safe file metadata and memory search are process-scoped and protocol-tested. | PROVED |
 | 61–64 | Coalescing minute scheduler, daily durable compaction gate, T3 reconciliation, note/artifact cleanup, structured thread summaries and post-compact state restoration. Long-term automation and context-size trigger remain. | PARTIAL |
 | 65–69 | `/status`, `/projects`, `/work`, `/focus`, `/stop`/`/cancel`, `/memory`, `/help` and redacted admin diagnostics exist; full debug metrics/capability detail remains. | PARTIAL |
 | 70–71 | Single-user authorization at every ingress/action and secrets never logged/persisted in plaintext artifacts. | PARTIAL |
@@ -166,5 +166,15 @@ Before completion:
   safely cleans only registry-owned expired files, and restores a bounded
   authoritative snapshot after Operator context compaction. Storage migration,
   scheduler, cleanup and daemon integration tests cover this slice.
+- `packages/operator-tools/src/index.ts` implements all section 47 tools behind
+  a loopback-only, expiring per-turn MCP capability. Telegram routing is fixed
+  by daemon context; reactions and edits are restricted to the inbound or
+  same-turn messages; file paths pass the artifact registry; tool calls are
+  audited without persisting arguments; and results are capped at 16K.
+- `tests/operator-tools.test.ts` uses the official MCP client to discover all
+  tools, exercise compact T3/memory/Telegram/time/web/calculator paths, prove
+  message-scope denial, and prove revocation. Runtime and daemon tests prove
+  strict process injection and lease lifecycle. A live Claude CLI 2.1.237 run
+  called an HTTP MCP tool successfully with no permission denials.
 - These checks prove only their slices; all remaining `PARTIAL`/`MISSING` rows
   still block completion.

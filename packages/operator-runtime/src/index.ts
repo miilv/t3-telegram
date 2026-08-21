@@ -1,10 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import type {
   OperatorEvent,
   OperatorRuntime,
   OperatorSession,
+  OperatorToolAccess,
 } from "../../shared/src/index.js";
 
 export interface ClaudeCliRuntimeOptions {
@@ -23,7 +25,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   constructor(private readonly options: ClaudeCliRuntimeOptions) {}
 
   async start(input: { systemPrompt: string }): Promise<OperatorSession> {
-    await mkdir(this.options.cwd, { recursive: true, mode: 0o700 });
+    await this.prepareRuntimeDirectory();
     const id = randomUUID();
     this.newSessions.add(id);
     this.systemPrompts.set(id, input.systemPrompt);
@@ -31,9 +33,23 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     return { id };
   }
 
-  async *sendTurn(input: { sessionId: string; prompt: string }): AsyncIterable<OperatorEvent> {
+  async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+    allowBuiltInSlashCommands?: boolean;
+  }): AsyncIterable<OperatorEvent> {
     if (this.active) throw new Error("Operator runtime already has an active turn");
     const isNew = this.newSessions.has(input.sessionId);
+    const mcpConfigPath = input.toolAccess
+      ? join(this.options.cwd, `.operator-mcp-${randomUUID()}.json`)
+      : undefined;
+    if (input.toolAccess && mcpConfigPath) {
+      await writeFile(mcpConfigPath, operatorMcpConfig(input.toolAccess), { mode: 0o600 });
+    }
+    const mcpArgs = input.toolAccess && mcpConfigPath
+      ? operatorMcpArgs(input.toolAccess, mcpConfigPath)
+      : [];
     const args = [
       "-p",
       "--output-format",
@@ -45,10 +61,16 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       this.options.effort,
       "--permission-mode",
       "dontAsk",
-      "--safe-mode",
+      // Prevent ambient user/project settings and slash-command skills from
+      // acquiring privileges. Unlike --safe-mode, this still permits the one
+      // explicit process-scoped MCP server supplied below.
+      "--setting-sources",
+      "",
+      ...(input.allowBuiltInSlashCommands ? [] : ["--disable-slash-commands"]),
       "--tools",
       "WebSearch,WebFetch",
       "--strict-mcp-config",
+      ...mcpArgs,
       ...(isNew
         ? ["--session-id", input.sessionId, "--system-prompt", this.systemPrompts.get(input.sessionId) ?? ""]
         : ["--resume", input.sessionId]),
@@ -96,6 +118,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       this.systemPrompts.delete(input.sessionId);
     } finally {
       this.active = undefined;
+      if (mcpConfigPath) await unlink(mcpConfigPath).catch(() => undefined);
     }
   }
 
@@ -110,6 +133,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     for await (const event of this.sendTurn({
       sessionId,
       prompt: `/compact\nPreserve focus, active workers, pending approvals, open loops, and project/thread references. Reason: ${reason}`,
+      allowBuiltInSlashCommands: true,
     })) {
       if (event.type === "result") summary = event.text;
     }
@@ -117,7 +141,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   }
 
   async resume(sessionId: string): Promise<void> {
-    await mkdir(this.options.cwd, { recursive: true, mode: 0o700 });
+    await this.prepareRuntimeDirectory();
     this.currentSessionId = sessionId;
     this.newSessions.delete(sessionId);
   }
@@ -134,6 +158,39 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       );
     });
   }
+
+  private async prepareRuntimeDirectory(): Promise<void> {
+    await mkdir(this.options.cwd, { recursive: true, mode: 0o700 });
+    await chmod(this.options.cwd, 0o700);
+    const entries = await readdir(this.options.cwd, { withFileTypes: true });
+    await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && /^\.operator-mcp-[0-9a-f-]+\.json$/.test(entry.name))
+        .map((entry) => unlink(join(this.options.cwd, entry.name)).catch(() => undefined)),
+    );
+  }
+}
+
+function operatorMcpConfig(access: OperatorToolAccess): string {
+  const config = {
+    mcpServers: {
+      operator: {
+        type: "http",
+        url: access.url,
+        headers: { Authorization: `Bearer ${access.token}` },
+      },
+    },
+  };
+  return JSON.stringify(config);
+}
+
+function operatorMcpArgs(access: OperatorToolAccess, configPath: string): string[] {
+  return [
+    "--mcp-config",
+    configPath,
+    "--allowed-tools",
+    access.allowedTools.join(","),
+  ];
 }
 
 function parseClaudeEvent(line: string): OperatorEvent | undefined {
