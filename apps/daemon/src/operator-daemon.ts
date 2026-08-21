@@ -538,6 +538,9 @@ export class OperatorDaemon {
     }
     const enrichedArtifacts = [...ingested];
     const mediaContext: string[] = [];
+    // Attachments whose textual content already reached the Operator context
+    // (OCR, transcripts) must not force delegation by themselves.
+    const contextCovered = new Set<number>();
     if (this.media) {
       for (const [index, attachment] of update.attachments.entries()) {
         const original = ingested[index];
@@ -548,6 +551,7 @@ export class OperatorDaemon {
             const ocr = await this.media.ocrInbound(original);
             if (ocr.artifact) enrichedArtifacts.push(ocr.artifact);
             if (ocr.text) {
+              contextCovered.add(index);
               mediaContext.push(
                 `[OCR of ${original.filename ?? original.id} via ${ocr.provider}; full text saved as artifact ${ocr.artifact?.id}]\n${ocr.text.slice(0, 4_000)}`,
               );
@@ -571,6 +575,7 @@ export class OperatorDaemon {
                 ? "Voice"
                 : "Audio";
         if (enrichment.transcript) {
+          contextCovered.add(index);
           mediaContext.push(
             `[${label} transcript; original artifact ${original.id}]\n${enrichment.transcript}`,
           );
@@ -756,7 +761,10 @@ export class OperatorDaemon {
     }
 
     const delegationArtifacts = update.attachments.some(
-      (attachment) => attachment.type !== "voice" && attachment.type !== "video_note",
+      (attachment, index) =>
+        attachment.type !== "voice" &&
+        attachment.type !== "video_note" &&
+        !contextCovered.has(index),
     )
       ? enrichedArtifacts
       : [];
