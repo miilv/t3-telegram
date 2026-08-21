@@ -69,4 +69,41 @@ describe("media configuration", () => {
     });
     expect(config.media.groq).toBeUndefined();
   });
+
+  it("requires an explicit gate for Codex and parses Phase 3 controls", () => {
+    expect(() => loadConfig({
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      OPERATOR_PROVIDER: "codex",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+    })).toThrow("OPERATOR_PROVIDER=codex requires OPERATOR_CODEX_ENABLED=true");
+
+    const config = loadConfig({
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      OPERATOR_PROVIDER: "codex",
+      OPERATOR_CODEX_ENABLED: "true",
+      CODEX_BIN: "/opt/codex",
+      CODEX_MODEL: "gpt-test",
+      CODEX_EFFORT: "xhigh",
+      MAX_PARALLEL_WORKERS: "3",
+      PROGRESS_INTERVAL_MS: "45000",
+      PROVIDER_MODEL_COSTS_USD: "anthropic/opus=0.15,openai/gpt=0.08",
+      GOOGLE_WORKSPACE_ACCESS_TOKEN: "workspace-test",
+      DASHBOARD_PORT: "43100",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+    });
+
+    expect(config.operator).toMatchObject({
+      provider: "codex",
+      codex: { binary: "/opt/codex", model: "gpt-test", effort: "xhigh" },
+    });
+    expect(config.policy).toMatchObject({
+      maxParallelWorkers: 3,
+      progressIntervalMs: 45_000,
+      providerModelCostsUsd: { "anthropic/opus": 0.15, "openai/gpt": 0.08 },
+    });
+    expect(config.connectors.google.accessToken).toBe("workspace-test");
+    expect(config.dashboard).toEqual({ enabled: true, port: 43_100 });
+  });
 });

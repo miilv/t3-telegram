@@ -15,7 +15,7 @@ import type { OperatorStore } from "../../storage/src/index.js";
 
 const followUpPattern =
   /^(продолжай|готово\??|что там\??|а тесты\??|пусть исправит|сделай это|дальше|ещ[её]|также|добавь|continue|also|and also|status\??|done\??|what's up\??)/iu;
-const cancelPattern = /^(стоп|отмени|хватит|cancel|stop)\b/iu;
+const cancelPattern = /^(?:стоп|отмени|хватит|cancel|stop)(?=$|[^\p{L}\p{N}_])/iu;
 const handoffPattern =
   /(?:^|[^\p{L}\p{N}_])(перенеси|перенести|перемести|переведи\s+(?:работу|задачу)|move\s+(?:this|the\s+work|task)|transfer\s+(?:this|the\s+work|task)|handoff)(?=$|[^\p{L}\p{N}_])/iu;
 const sideQuestionPattern =
@@ -215,11 +215,15 @@ function decision(binding: WorkBinding, confidence: number, reasons: string[]): 
 
 function bestNamedProject(lowered: string, projects: Project[]): Project | undefined {
   return projects
-    .filter((project) => {
-      const name = project.name.toLocaleLowerCase();
-      return name.length >= 3 && (lowered.includes(name) || lowered.includes(`проекте ${name}`));
-    })
-    .sort((a, b) => b.name.length - a.name.length)[0];
+    .map((project) => ({
+      project,
+      matchedLength: [project.name, ...(project.aliases ?? [])]
+        .map((value) => value.toLocaleLowerCase())
+        .filter((value) => value.length >= 2 && (lowered.includes(value) || lowered.includes(`проекте ${value}`)))
+        .reduce((longest, value) => Math.max(longest, value.length), 0),
+    }))
+    .filter((entry) => entry.matchedLength > 0)
+    .sort((left, right) => right.matchedLength - left.matchedLength)[0]?.project;
 }
 
 function projectFromPath(text: string, projects: Project[]): Project | undefined {

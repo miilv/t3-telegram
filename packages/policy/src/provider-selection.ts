@@ -1,4 +1,4 @@
-import type { ProviderDescriptor } from "../../shared/src/index.js";
+import type { ProviderDescriptor, ProviderPerformance } from "../../shared/src/index.js";
 
 export type TaskComplexity = "mechanical" | "ordinary" | "complex";
 
@@ -9,6 +9,7 @@ export interface WorkerModelSelection {
   complexity: TaskComplexity;
   explicit: boolean;
   rationale: string;
+  estimatedCostUsd?: number;
 }
 
 export function selectWorkerModel(input: {
@@ -16,6 +17,14 @@ export function selectWorkerModel(input: {
   providers: ProviderDescriptor[];
   defaultProviderInstanceId: string;
   defaultModel: string;
+  performance?: ProviderPerformance[];
+  estimatedCostsUsd?: Record<string, number>;
+  optimization?: {
+    enabled: boolean;
+    costWeight: number;
+    latencyWeight: number;
+    reliabilityWeight: number;
+  };
 }): WorkerModelSelection {
   const task = input.task.normalize("NFKC").toLocaleLowerCase();
   const operational = input.providers.filter(
@@ -35,20 +44,35 @@ export function selectWorkerModel(input: {
   const explicitModel = modelMatches.sort(
     (left, right) => right.model.slug.length - left.model.slug.length,
   )[0];
-  const provider =
+  const complexity = classifyTaskComplexity(task);
+  const desiredFamily =
+    complexity === "mechanical" ? "sonnet" : complexity === "complex" ? "fable" : "opus";
+  let provider =
     explicitModel?.provider ??
     explicitProvider ??
     operational.find((candidate) => candidate.instanceId === input.defaultProviderInstanceId) ??
     operational[0];
-  const complexity = classifyTaskComplexity(task);
-  const desiredFamily =
-    complexity === "mechanical" ? "sonnet" : complexity === "complex" ? "fable" : "opus";
-  const model =
+  let model =
     explicitModel?.model ??
     provider?.models.find((candidate) => modelHasFamily(candidate.slug, candidate.name, desiredFamily)) ??
     provider?.models.find((candidate) => candidate.slug === input.defaultModel) ??
     provider?.models.find((candidate) => candidate.isDefault) ??
     provider?.models[0];
+  let optimizationRationale: string | undefined;
+  if (!explicitModel && !explicitProvider && input.optimization?.enabled) {
+    const optimized = optimizeProviderModel({
+      operational,
+      desiredFamily,
+      performance: input.performance ?? [],
+      costs: input.estimatedCostsUsd ?? {},
+      weights: input.optimization,
+    });
+    if (optimized) {
+      provider = optimized.provider;
+      model = optimized.model;
+      optimizationRationale = optimized.rationale;
+    }
+  }
   const explicitEffort = parseExplicitEffort(task);
   const desiredEffort = explicitEffort ?? (complexity === "complex" ? "medium" : "high");
 
@@ -81,11 +105,60 @@ export function selectWorkerModel(input: {
       effortDescriptor && effortChoice ? [{ id: effortDescriptor.id, value: effortChoice.id }] : [],
     complexity,
     explicit: Boolean(explicitProvider || explicitModel || explicitEffort),
+    ...(input.estimatedCostsUsd?.[`${provider.instanceId}/${model.slug}`] !== undefined
+      ? { estimatedCostUsd: input.estimatedCostsUsd[`${provider.instanceId}/${model.slug}`] }
+      : {}),
     rationale: explicitModel
       ? `User explicitly selected ${model.name}.`
       : explicitProvider
         ? `User explicitly selected ${provider.displayName}; ${model.name} follows task policy.`
-        : `${complexity} task policy selected ${model.name} with ${desiredEffort} reasoning when available.`,
+        : optimizationRationale ?? `${complexity} task policy selected ${model.name} with ${desiredEffort} reasoning when available.`,
+  };
+}
+
+function optimizeProviderModel(input: {
+  operational: ProviderDescriptor[];
+  desiredFamily: string;
+  performance: ProviderPerformance[];
+  costs: Record<string, number>;
+  weights: { costWeight: number; latencyWeight: number; reliabilityWeight: number };
+}): { provider: ProviderDescriptor; model: ProviderDescriptor["models"][number]; rationale: string } | undefined {
+  const familyCandidates = input.operational.flatMap((provider) => provider.models
+    .filter((model) => modelHasFamily(model.slug, model.name, input.desiredFamily))
+    .map((model) => ({ provider, model })));
+  const candidates = familyCandidates.length
+    ? familyCandidates
+    : input.operational.flatMap((provider) => provider.models.map((model) => ({ provider, model })));
+  const performance = new Map(
+    input.performance.map((item) => [`${item.providerInstanceId}/${item.model}`, item]),
+  );
+  const hasEvidence = candidates.some(({ provider, model }) =>
+    performance.has(`${provider.instanceId}/${model.slug}`) ||
+    input.costs[`${provider.instanceId}/${model.slug}`] !== undefined,
+  );
+  if (!hasEvidence) return undefined;
+  const observedLatencies = [...performance.values()].filter((item) => item.samples > 0).map((item) => item.averageLatencyMs);
+  const configuredCosts = Object.values(input.costs);
+  const maxLatency = Math.max(1, ...observedLatencies);
+  const maxCost = Math.max(0.000_001, ...configuredCosts);
+  const scored = candidates.map(({ provider, model }) => {
+    const key = `${provider.instanceId}/${model.slug}`;
+    const stats = performance.get(key);
+    const latency = stats?.samples ? stats.averageLatencyMs : maxLatency * 1.25;
+    const cost = input.costs[key] ?? maxCost * 1.25;
+    const failureRate = stats?.samples ? stats.failures / stats.samples : 0.25;
+    const score =
+      input.weights.costWeight * (cost / maxCost) +
+      input.weights.latencyWeight * (latency / maxLatency) +
+      input.weights.reliabilityWeight * failureRate;
+    return { provider, model, score, latency, cost, failureRate };
+  }).sort((left, right) => left.score - right.score);
+  const selected = scored[0];
+  if (!selected) return undefined;
+  return {
+    provider: selected.provider,
+    model: selected.model,
+    rationale: `Cost/latency policy selected ${selected.model.name}: score ${selected.score.toFixed(3)}, observed/estimated latency ${Math.round(selected.latency)} ms, estimated cost $${selected.cost.toFixed(4)}, failure rate ${(selected.failureRate * 100).toFixed(1)}%.`,
   };
 }
 

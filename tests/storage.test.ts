@@ -335,6 +335,31 @@ describe("OperatorStore", () => {
       content: "authorization=sensitive-value-that-must-not-persist",
     });
     expect(redacted.content).toBe("authorization=[REDACTED]");
+    const hybrid = store.rememberOperatorNote({
+      category: "decision",
+      content: "Repair the authentication defect before release",
+    });
+    expect(store.searchOperatorNotes("исправить ошибку авторизации")[0]?.id).toBe(hybrid.id);
+    const vector = store.db
+      .prepare("SELECT model,dimensions FROM operator_note_vectors WHERE note_id=?")
+      .get(hybrid.id);
+    expect(vector).toMatchObject({ model: "local-hybrid-v1", dimensions: 128 });
+    store.close();
+  });
+
+  it("persists project aliases for durable human-friendly routing", () => {
+    const store = tempStore();
+    const timestamp = nowIso();
+    store.upsertProject({
+      id: "prj_checkout",
+      t3ProjectId: "prj_checkout",
+      name: "Payments Service",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    expect(store.addProjectAlias("prj_checkout", "касса")).toBe("касса");
+    expect(store.listProjectAliases("prj_checkout")).toEqual(["касса"]);
+    expect(store.findProjectByAlias("проверь касса сегодня")?.id).toBe("prj_checkout");
     store.close();
   });
 

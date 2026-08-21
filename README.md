@@ -1,12 +1,13 @@
 # Telegram Operator for T3 Code
 
-Always-on team AI Operator in Telegram. It answers quick questions itself through a persistent Claude session and delegates substantial work to persistent, project-scoped T3 Code threads without blocking the Telegram conversation.
+Always-on team AI Operator in Telegram. It answers quick questions itself through a persistent Claude or Codex session and delegates substantial work to persistent, project-scoped T3 Code threads without blocking the Telegram conversation.
 
 ## What is implemented
 
 - Allowlisted private/group Telegram ingress with owner/admin/member/viewer roles,
   shared-project memberships, topic preservation, and idempotent long polling.
-- Persistent Claude CLI Operator runtime with resume/compact, built-in web
+- Switchable Claude/Codex CLI Operator runtime with native resume/compact,
+  provider handoff restoration, built-in web
   retrieval, and a process-scoped privileged MCP surface for T3, Telegram,
   memory, artifacts, time, search, calculator, and safe file metadata.
 - Current T3 Code orchestration adapter:
@@ -35,12 +36,16 @@ Always-on team AI Operator in Telegram. It answers quick questions itself throug
 - Minute maintenance ticks coalesce safely and enforce daily context compaction, bounded authoritative context restoration, T3 worker reconciliation, note expiry, and managed artifact retention cleanup.
 - Restart recovery for running workers, pending routing clarifications/interactions, interrupted T3 dispatches and group synthesis, and terminal results that arrived while the daemon was down. T3 command receipts and anchored Telegram edits make retries idempotent.
 - Secret-redacted structured logs, hashed chat identities, cross-component correlation IDs, owner diagnostics, classified errors and in-process latency/error/queue metrics.
+- Durable timezone-aware one-shot/interval/daily automations, optional bounded
+  Google Calendar/Gmail tools, hybrid lexical/vector memory, project aliases,
+  provider cost/latency/reliability optimization, a live policy editor, and a
+  capability-protected loopback operations dashboard.
 
 ## Requirements
 
 - Node.js 24.2 or newer (the daemon uses built-in `node:sqlite`).
 - T3 Code running locally or remotely.
-- Claude Code CLI installed and authenticated.
+- Claude Code CLI and/or Codex CLI installed and authenticated.
 - A Telegram bot token from BotFather and the numeric Telegram user ID of the primary owner.
 - `ffmpeg` and `ffprobe` with Opus, H.264, and AAC support.
 
@@ -98,6 +103,33 @@ T3_MODEL=claude-opus-4-1
 T3_RUNTIME_MODE=approval-required
 ```
 
+Claude is the default conversational runtime. Codex must be explicitly enabled;
+`/operator switch claude|codex` snapshots durable context and restores it into
+the new provider. Ambient settings/rules and shell/edit/image tools are disabled
+for Codex user turns, and only the process-scoped Operator MCP allowlist is
+injected:
+
+```dotenv
+OPERATOR_PROVIDER=claude
+OPERATOR_CODEX_ENABLED=true
+CODEX_MODEL=gpt-5.4
+CODEX_EFFORT=high
+```
+
+Optional Phase 3 services are configured independently. A Google access token
+must carry the Calendar/Gmail scopes required for the tools you enable and is
+never passed to either Operator subprocess:
+
+```dotenv
+GOOGLE_WORKSPACE_ACCESS_TOKEN=...
+DASHBOARD_ENABLED=true
+DASHBOARD_PORT=0
+PROVIDER_MODEL_COSTS_USD=anthropic/claude-opus-4-1=0.15,openai/gpt-5.4=0.08
+```
+
+Use `/automation` for scheduled proactive work, `/policy` for live controls,
+`/alias` for durable project nicknames, and `/dashboard` for the local cockpit.
+
 Start T3 Code if it is not already running:
 
 ```bash
@@ -129,12 +161,13 @@ The default data root is `~/.operator`:
 ```text
 ~/.operator/
 ├── operator.db
-├── runtime/          # infrastructure Claude session cwd
+├── runtime/          # infrastructure Operator provider cwd
 ├── artifacts/        # Telegram uploads
 └── workspaces/       # auto-created non-repository projects
 ```
 
-Workers never receive the Telegram token, T3 bearer token, Operator database,
+Workers and Operator subprocesses never receive the Telegram token, T3 bearer
+token, Google bearer token, Operator database,
 or cross-project broker. For a user-facing turn, Claude receives only a random,
 expiring capability for a loopback MCP endpoint. Ambient Claude settings,
 skills and global MCP configuration are disabled; the explicit turn MCP is
@@ -152,7 +185,7 @@ Telegram Bot API
       ▼
 Operator daemon ── SQLite / artifact registry / routing / scheduler
       │                         │
-      │                         └── Claude CLI Operator session
+      │                         └── Claude/Codex Operator session
       │                              (conversation + per-turn MCP)
       ▼
 T3 Code orchestration (HTTP snapshots/commands + Effect RPC/WebSocket events)
@@ -171,7 +204,7 @@ pnpm test
 pnpm build
 ```
 
-Tests cover routing/focus/path and git-aware selection, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, structured memory/search/migration/compaction restoration, maintenance scheduling and retention cleanup, FTS and T3 RPC thread search, idempotent reply mappings, artifact security/materialization/provenance, real FFmpeg voice and video-note conversion, STT fallback behavior, local TTS, Telegram rich rendering/splitting, structured questions, approval risk policy, live/queued follow-ups, provider selection, Claude CLI streaming and secret isolation, process-scoped MCP discovery/calls/revocation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
+Tests cover routing/focus/path and git-aware selection, a quantitative routing corpus, durable ambiguity handling, handoff artifact transfer, concurrent fan-out/synthesis/group control, structured and hybrid memory/search/migration/compaction restoration, timezone-aware automation, Google connector contracts, dashboard/policy authorization, cost/latency-aware provider selection, local latency budgets, idempotent mappings and recovery, artifact security/provenance, real FFmpeg media conversion, Telegram rich rendering, structured interactions, Claude/Codex CLI isolation and resume, process-scoped MCP calls/revocation, T3 HTTP commands, RPC event projection and WebSocket ticket authentication.
 
 ## Full-spec implementation status
 

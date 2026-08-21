@@ -1,0 +1,55 @@
+import { describe, expect, it } from "vitest";
+import {
+  createAutomation,
+  firstAutomationRun,
+  nextAutomationRun,
+  parseAutomationSchedule,
+} from "../packages/automations/src/index.js";
+import { tempStore } from "./helpers.js";
+
+describe("proactive automations", () => {
+  it("computes once, interval, and timezone-aware daily schedules", () => {
+    expect(parseAutomationSchedule("once 2026-08-21T12:00:00Z")).toEqual({
+      type: "once",
+      runAt: "2026-08-21T12:00:00.000Z",
+    });
+    expect(parseAutomationSchedule("every 15m")).toEqual({ type: "interval", intervalMinutes: 15 });
+    const daily = parseAutomationSchedule("daily 09:30 Europe/Moscow");
+    expect(firstAutomationRun(daily, new Date("2026-08-21T05:00:00Z"))).toBe("2026-08-21T06:30:00.000Z");
+    expect(nextAutomationRun(
+      { type: "interval", intervalMinutes: 10 },
+      "2026-08-21T09:00:00.000Z",
+      new Date("2026-08-21T09:31:00.000Z"),
+    )).toBe("2026-08-21T09:40:00.000Z");
+  });
+
+  it("claims and dispatches a scheduled run to durable ingress exactly once", () => {
+    const store = tempStore();
+    const automation = createAutomation({
+      ownerId: "42",
+      name: "Morning brief",
+      prompt: "Summarize active work",
+      schedule: { type: "once", runAt: "2026-08-21T09:00:00.000Z" },
+      chatId: 7,
+      now: new Date("2026-08-21T08:00:00.000Z"),
+    });
+    store.saveAutomation(automation);
+    const claimed = store.claimDueAutomation("2026-08-21T09:00:00.000Z");
+    expect(claimed?.id).toBe(automation.id);
+    const first = store.dispatchAutomationRun({
+      automation: claimed!,
+      scheduledFor: claimed!.nextRunAt!,
+      ingressPayload: { update: { automationRunId: "run_1" }, processExisting: false },
+    });
+    const duplicate = store.dispatchAutomationRun({
+      automation: claimed!,
+      scheduledFor: claimed!.nextRunAt!,
+      ingressPayload: { update: { automationRunId: "run_1" }, processExisting: false },
+    });
+    expect(first.inserted).toBe(true);
+    expect(duplicate).toMatchObject({ runId: first.runId, jobId: first.jobId, inserted: false });
+    expect(store.listBackgroundJobs("telegram_ingress")).toHaveLength(1);
+    expect(store.getAutomation(automation.id)?.status).toBe("completed");
+    store.close();
+  });
+});

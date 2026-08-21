@@ -78,6 +78,9 @@ export interface TelegramMessageInbound extends TelegramDestination {
   forwardOrigin?: TelegramForwardOrigin;
   text: string;
   attachments: TelegramAttachment[];
+  /** Daemon-created proactive ingress; never passed through Telegram normalization. */
+  synthetic?: boolean;
+  automationRunId?: string;
 }
 
 export interface TelegramCallbackInbound extends TelegramDestination {

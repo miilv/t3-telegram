@@ -3,6 +3,7 @@ import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { OperatorDaemon } from "../apps/daemon/src/operator-daemon.js";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
+import { createAutomation } from "../packages/automations/src/index.js";
 import { OperatorToolServer } from "../packages/operator-tools/src/index.js";
 import type { MediaProcessor } from "../packages/media/src/index.js";
 import type { Config } from "../packages/shared/src/config.js";
@@ -37,6 +38,41 @@ import type {
 import { tempDirectory, tempStore } from "./helpers.js";
 
 describe("OperatorDaemon product flow", () => {
+  it("meets the local first-visible and worker-ack latency budgets", async () => {
+    const home = tempDirectory("daemon-latency-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const directBaseline = telegram.visible.length;
+    const directStartedAt = Date.now();
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => telegram.visible.length > directBaseline);
+    const directFirstVisibleMs = telegram.visible[directBaseline]!.at - directStartedAt;
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+
+    const workerStartedAt = Date.now();
+    telegram.push(message(2, "исправь race condition в auth и прогони тесты"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Запустил работу")));
+    const workerAck = telegram.sent.find((entry) => entry.text.includes("Запустил работу"))!;
+    const workerAckMs = workerAck.at - workerStartedAt;
+
+    expect(directFirstVisibleMs).toBeLessThan(3_000);
+    expect(workerAckMs).toBeLessThan(2_000);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("routes voice by its transcript while preserving the original artifact", async () => {
     const home = tempDirectory("daemon-voice-");
     const store = tempStore();
@@ -325,6 +361,42 @@ describe("OperatorDaemon product flow", () => {
     expect(broker.approvalResponses).toHaveLength(0);
     expect(store.getApproval("approval_shared")?.status).toBe("pending");
 
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("executes due proactive work from durable ingress exactly once", async () => {
+    const home = tempDirectory("daemon-automation-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const automation = createAutomation({
+      ownerId: "42",
+      name: "Time brief",
+      prompt: "который час в Токио?",
+      schedule: { type: "once", runAt: "2020-01-01T00:00:00.000Z" },
+      chatId: 7,
+      now: new Date("2019-01-01T00:00:00.000Z"),
+    });
+    store.saveAutomation(automation);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    expect(runtime.prompts.filter((prompt) => prompt.includes("Scheduled automation"))).toHaveLength(1);
+    expect(store.getAutomation(automation.id)?.status).toBe("completed");
+    expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(1);
+    expect(store.db.prepare("SELECT count(*) AS count FROM automation_runs").get()).toMatchObject({ count: 1 });
+
+    await daemon.maintain("test replay");
+    expect(runtime.prompts.filter((prompt) => prompt.includes("Scheduled automation"))).toHaveLength(1);
     telegram.finish();
     await run;
     await daemon.stop();
@@ -1416,6 +1488,7 @@ function config(home: string): Config {
       pollIntervalMs: 5,
     },
     operator: {
+      provider: "claude",
       claudeBin: "claude",
       model: "opus",
       effort: "high",
@@ -1424,8 +1497,18 @@ function config(home: string): Config {
       runtimeDir: `${home}/runtime`,
       artifactDir: `${home}/artifacts`,
       databasePath: `${home}/operator.db`,
+      codex: undefined,
     },
     approval: { autoAllow: ["safe-read"] },
+    policy: {
+      maxParallelWorkers: 4,
+      progressIntervalMs: 60_000,
+      providerOptimizationEnabled: true,
+      providerCostWeight: 0.35,
+      providerLatencyWeight: 0.35,
+      providerReliabilityWeight: 0.3,
+      providerModelCostsUsd: {},
+    },
     media: {
       ffmpegBin: "ffmpeg",
       ffprobeBin: "ffprobe",
@@ -1438,6 +1521,15 @@ function config(home: string): Config {
       elevenlabs: undefined,
       sayBin: undefined,
     },
+    connectors: {
+      google: {
+        accessToken: undefined,
+        calendarId: "primary",
+        gmailUserId: "me",
+        timeoutMs: 15_000,
+      },
+    },
+    dashboard: { enabled: false, port: 0 },
     logLevel: "info",
   };
 }
@@ -1795,7 +1887,8 @@ function testProviderDescriptor(): ProviderDescriptor {
 }
 
 class FakeTelegram implements TelegramTransport {
-  readonly sent: Array<{ messageId: number; text: string }> = [];
+  readonly sent: Array<{ messageId: number; text: string; at: number }> = [];
+  readonly visible: Array<{ kind: "draft" | "message"; at: number }> = [];
   readonly userInputs: Array<{ messageId: number; inputId: string; questionIndex: number }> = [];
   readonly userInputEdits: Array<{ messageId: number; questionIndex: number }> = [];
   readonly keyboardClears: number[] = [];
@@ -1814,15 +1907,18 @@ class FakeTelegram implements TelegramTransport {
   }
   async sendRich(_chatId: number, text: string): Promise<SentMessage[]> {
     const messageId = this.nextMessageId++;
-    this.sent.push({ messageId, text });
+    const at = Date.now();
+    this.visible.push({ kind: "message", at });
+    this.sent.push({ messageId, text, at });
     return [{ chatId: 7, messageId }];
   }
   async startDraft(chatId: number): Promise<StreamDraft> {
+    this.visible.push({ kind: "draft", at: Date.now() });
     return { mode: "edit", phase: "text", chatId, draftId: this.nextMessageId, messageId: this.nextMessageId++, text: "…" };
   }
   async updateDraft(): Promise<void> {}
   async finalizeDraft(draft: StreamDraft, text: string): Promise<SentMessage[]> {
-    this.sent.push({ messageId: draft.messageId!, text });
+    this.sent.push({ messageId: draft.messageId!, text, at: Date.now() });
     return [{ chatId: draft.chatId, messageId: draft.messageId! }];
   }
   async sendDocument(): Promise<SentMessage> {
@@ -1898,7 +1994,7 @@ class FakeTelegram implements TelegramTransport {
   async editRich(_chatId: number, messageId: number, text: string): Promise<void> {
     // Keep a call history: real Telegram replaces the message in place, while
     // tests need to assert both the durable start frame and terminal edit.
-    this.sent.push({ messageId, text });
+    this.sent.push({ messageId, text, at: Date.now() });
   }
   async downloadFile(): Promise<Uint8Array> {
     return new Uint8Array();

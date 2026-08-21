@@ -7,6 +7,11 @@
 - `/memory` — active durable notes and the latest compaction. Subcommands: `remember [category:] text`, `search query`, `forget note_id`, and `compact`.
 - `/stop` — interrupts the focused worker; when focus is a fan-out group, it interrupts every active member and suppresses a later duplicate synthesis.
 - `/debug` — hashed owner identity, Operator session/context size, Telegram/T3/Claude health, Telegram capability states, subscriptions, SQLite integrity/size/event count, durable queue counts, recent classified errors, and metrics.
+- `/operator` — current conversational provider and configured providers;
+  `/operator switch <provider>` performs a durable summary/snapshot handoff.
+- `/automation` — timezone-aware `once`, `every`, and `daily` proactive work.
+- `/policy` — live approval, concurrency, progress, and routing controls.
+- `/dashboard` — owner/admin-only link to the loopback operations cockpit.
 - `/team` — owner/admin team roster; `/team set <id> <role>` changes a role for
   an ID already present in `TELEGRAM_ALLOWED_USERS` (only owner may appoint
   owner/admin).
@@ -18,7 +23,7 @@
   pseudonym remains stable across restarts. Without it, a process-random salt
   intentionally changes the pseudonym on every launch.
 
-## Operator MCP isolation
+## Operator runtime and MCP isolation
 
 The daemon starts one Streamable HTTP MCP endpoint on a random `127.0.0.1`
 port. It is not placed in `~/.claude`, a project settings file, or a worker
@@ -29,7 +34,31 @@ receives that capability only in a mode-`0600` MCP config inside the mode-`0700`
 Operator runtime directory; the config is removed when the subprocess exits.
 The command line contains only that file's path. Claude never receives the
 Telegram bot token or T3 bearer token. The lease is revoked after the turn and
-all leases are cleared on shutdown.
+all leases are cleared on shutdown. Codex receives the same endpoint through an
+environment-variable bearer reference in an inline, isolated MCP config; the
+token itself never appears in argv. Codex user/project rules and user config are
+ignored, and its shell/edit/image tool paths are disabled.
+
+Provider identity and native session ID are stored together. A switch first
+refreshes structured memory, compacts the current runtime, starts a new native
+session, and restores a bounded daemon snapshot. A failed start rolls back to
+the previous provider.
+
+## Phase 3 controls and connectors
+
+Automation claims and their unique run jobs are committed transactionally.
+Restart resets an interrupted claim, while the unique run key prevents duplicate
+triggers. Daily schedules compute the next local wall-clock occurrence in their
+IANA timezone, including DST transitions.
+
+Google Calendar and Gmail tools are absent unless
+`GOOGLE_WORKSPACE_ACCESS_TOKEN` is configured. Calls have fixed official API
+origins, bounded schemas/results, timeouts, encoded path/query values, and
+header-injection checks. Calendar creation and email sending are admin-only.
+
+The dashboard binds only `127.0.0.1`, puts its random capability in the URL
+fragment, requires `Authorization: Bearer` on its APIs, sends `no-store` and
+restrictive security headers, and exposes no credentials or raw messages.
 
 Telegram message/reply/media tools cannot select another chat. Reactions may
 target only the triggering envelope or a same-turn sent message, and edits may
@@ -63,8 +92,8 @@ then calls `sendVideoNote`. Telegram's 50 MiB upload ceiling is enforced.
 SQLite uses WAL mode. On startup the daemon:
 
 1. migrates/reopens durable state;
-2. resumes the infrastructure Claude session;
-3. checks Telegram, Claude, and T3 health;
+2. resumes the persisted infrastructure provider and native session;
+3. checks Telegram, Operator runtime, and T3 health;
 4. restores unsent approval and structured-question prompts;
 5. reconciles T3 thread state;
 6. restores monitors for running/waiting workers and dispatches due queued follow-ups for idle threads;
@@ -76,7 +105,8 @@ SQLite uses WAL mode. On startup the daemon:
 9. refreshes pending approval/question keyboards and resets an interrupted
    clarification so the owner's response can be retried;
 10. resumes all-terminal fan-out groups whose synthesis was pending or interrupted;
-11. delivers an undelivered completion for an Operator-owned thread.
+11. resets interrupted automation claims and dispatches due unique runs;
+12. delivers an undelivered completion for an Operator-owned thread.
 
 ## Memory and maintenance
 
@@ -84,7 +114,7 @@ The daemon runs a coalescing maintenance tick every minute. The tick does not co
 
 Thread memory stores purpose, current state, important decisions, files, open issues, and next actions. Worker completion normalization updates it; handoff packets consume it. Full T3 transcripts and tool histories remain in T3. After Claude context compaction, the daemon injects a bounded, secret-redacted snapshot containing focus, project/thread references, active work, pending interactions, open loops, and active notes.
 
-Natural-language forms such as “запомни, что …” / “remember that …” and “что ты помнишь про …?” / “what do you remember about …?” use the same durable note store. Duplicate notes are merged, expiring notes become obsolete, and note/thread-summary text is redacted before persistence.
+Natural-language forms such as “запомни, что …” / “remember that …” and “что ты помнишь про …?” / “what do you remember about …?” use the same durable note store. Duplicate notes are merged, expiring notes become obsolete, and note/thread-summary text is redacted before persistence. Search combines SQLite FTS with deterministic local semantic vectors; no note text leaves the process for embedding.
 
 Telegram updates are deduplicated by `(chat_id, message_id)`. Approval callbacks, structured-input callbacks, and T3 interaction events have separate durable dedupe keys. Resolved interactions have their inline keyboards cleared even when they were resolved from another T3 client.
 

@@ -154,6 +154,24 @@ describe("RoutingEngine", () => {
     ).toEqual({ type: "project", projectId: "target" });
   });
 
+  it("routes by a durable project alias", () => {
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "payments",
+      t3ProjectId: "payments",
+      name: "Payments Service",
+      aliases: ["касса", "billing core"],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    expect(new RoutingEngine().route({
+      text: "исправь баг в касса",
+      artifacts: [],
+      focus: emptyFocus,
+      projects: [project],
+    }).binding).toEqual({ type: "project", projectId: "payments" });
+  });
+
   it("asks instead of choosing arbitrarily between close thread candidates", () => {
     const timestamp = nowIso();
     const makeThread = (id: string, title: string) => ({

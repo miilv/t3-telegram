@@ -1,14 +1,18 @@
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
 import type {
   Artifact,
+  Automation,
+  AutomationSchedule,
   ConversationCompaction,
   FocusState,
   OperatorNote,
   Project,
+  ProviderPerformance,
   ReplyContext,
   TeamRole,
   TelegramMessageRecord,
@@ -172,6 +176,13 @@ export class OperatorStore {
       this.db.exec("ALTER TABLE processed_events ADD COLUMN updated_at TEXT");
       this.db.prepare("UPDATE processed_events SET updated_at=created_at WHERE updated_at IS NULL").run();
     }
+    for (const row of this.db.prepare("SELECT id,category,content,updated_at FROM operator_notes WHERE status='active'").all() as Row[]) {
+      this.upsertNoteVector(
+        String(row.id),
+        `${String(row.category)} ${String(row.content)}`,
+        String(row.updated_at),
+      );
+    }
     this.db
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)")
       .run(nowIso());
@@ -224,6 +235,35 @@ export class OperatorStore {
       | Row
       | undefined;
     return row ? rowToProject(row) : undefined;
+  }
+
+  addProjectAlias(projectId: string, alias: string, source = "manual"): string {
+    const normalized = redactStoredText(alias).normalize("NFKC").trim().replace(/\s+/g, " ").slice(0, 160);
+    if (normalized.length < 2) throw new Error("project alias is too short");
+    if (!this.getProject(projectId)) throw new Error("project not found");
+    this.db
+      .prepare("INSERT OR IGNORE INTO project_aliases(project_id,alias,source,created_at) VALUES (?,?,?,?)")
+      .run(projectId, normalized, source.slice(0, 40), nowIso());
+    return normalized;
+  }
+
+  listProjectAliases(projectId: string): string[] {
+    return (this.db.prepare("SELECT alias FROM project_aliases WHERE project_id=? ORDER BY created_at").all(projectId) as Row[])
+      .map((row) => String(row.alias));
+  }
+
+  findProjectByAlias(text: string, allowedProjectIds?: string[]): Project | undefined {
+    const normalized = text.normalize("NFKC").toLocaleLowerCase();
+    const aliases = this.db
+      .prepare("SELECT project_id,alias FROM project_aliases ORDER BY length(alias) DESC")
+      .all() as Row[];
+    for (const row of aliases) {
+      const projectId = String(row.project_id);
+      if (allowedProjectIds && !allowedProjectIds.includes(projectId)) continue;
+      const alias = String(row.alias).toLocaleLowerCase();
+      if (alias.length >= 2 && normalized.includes(alias)) return this.getProject(projectId);
+    }
+    return undefined;
   }
 
   upsertTeamMember(userId: string, role: TeamRole, displayName?: string): void {
@@ -288,6 +328,206 @@ export class OperatorStore {
         WHERE m.user_id=? ORDER BY p.updated_at DESC
       `)
       .all(userId) as Row[]).map(rowToProject);
+  }
+
+  saveAutomation(automation: Automation): void {
+    this.db
+      .prepare(`
+        INSERT INTO automations(
+          id,owner_id,name,prompt,schedule_json,chat_id,message_thread_id,
+          direct_messages_topic_id,project_id,status,next_run_at,last_run_at,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+          name=excluded.name,prompt=excluded.prompt,schedule_json=excluded.schedule_json,
+          chat_id=excluded.chat_id,message_thread_id=excluded.message_thread_id,
+          direct_messages_topic_id=excluded.direct_messages_topic_id,
+          project_id=excluded.project_id,status=excluded.status,
+          next_run_at=excluded.next_run_at,last_run_at=excluded.last_run_at,
+          updated_at=excluded.updated_at
+      `)
+      .run(
+        automation.id,
+        automation.ownerId,
+        automation.name,
+        automation.prompt,
+        JSON.stringify(automation.schedule),
+        automation.chatId,
+        automation.messageThreadId ?? null,
+        automation.directMessagesTopicId ?? null,
+        automation.projectId ?? null,
+        automation.status,
+        automation.nextRunAt ?? null,
+        automation.lastRunAt ?? null,
+        automation.createdAt,
+        automation.updatedAt,
+      );
+  }
+
+  getAutomation(id: string): Automation | undefined {
+    const row = this.db.prepare("SELECT * FROM automations WHERE id=?").get(id) as Row | undefined;
+    return row ? rowToAutomation(row) : undefined;
+  }
+
+  listAutomations(ownerId?: string, includeDeleted = false): Automation[] {
+    const statusClause = includeDeleted ? "" : " AND status!='deleted'";
+    const rows = ownerId
+      ? this.db.prepare(`SELECT * FROM automations WHERE owner_id=?${statusClause} ORDER BY created_at DESC`).all(ownerId)
+      : this.db.prepare(`SELECT * FROM automations WHERE 1=1${statusClause} ORDER BY created_at DESC`).all();
+    return (rows as Row[]).map(rowToAutomation);
+  }
+
+  updateAutomationStatus(id: string, status: Automation["status"]): boolean {
+    const result = this.db
+      .prepare("UPDATE automations SET status=?,updated_at=? WHERE id=? AND status!='deleted'")
+      .run(status, nowIso(), id);
+    return Number(result.changes) > 0;
+  }
+
+  resetRunningAutomations(): number {
+    const result = this.db
+      .prepare("UPDATE automations SET status='active',updated_at=? WHERE status='running'")
+      .run(nowIso());
+    return Number(result.changes);
+  }
+
+  claimDueAutomation(at = nowIso()): Automation | undefined {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare(`
+          SELECT * FROM automations
+          WHERE status='active' AND next_run_at IS NOT NULL AND next_run_at<=?
+          ORDER BY next_run_at,id LIMIT 1
+        `)
+        .get(at) as Row | undefined;
+      if (!row) return undefined;
+      const automation = rowToAutomation(row);
+      const result = this.db
+        .prepare("UPDATE automations SET status='running',updated_at=? WHERE id=? AND status='active'")
+        .run(nowIso(), automation.id);
+      return Number(result.changes) === 1 ? automation : undefined;
+    });
+  }
+
+  dispatchAutomationRun<T>(input: {
+    automation: Automation;
+    scheduledFor: string;
+    nextRunAt?: string;
+    ingressPayload: T;
+  }): { runId: string; jobId: string; inserted: boolean } {
+    return this.transaction(() => {
+      const runId = stableAutomationRunId(input.automation.id, input.scheduledFor);
+      const jobId = `automation-ingress:${runId}`;
+      const createdAt = nowIso();
+      const inserted = this.db
+        .prepare(`
+          INSERT OR IGNORE INTO automation_runs(
+            id,automation_id,scheduled_for,status,background_job_id,created_at
+          ) VALUES (?,?,?,'dispatched',?,?)
+        `)
+        .run(runId, input.automation.id, input.scheduledFor, jobId, createdAt);
+      if (Number(inserted.changes) === 1) {
+        this.db
+          .prepare(`
+            INSERT OR IGNORE INTO background_jobs(
+              id,dedupe_key,kind,payload_json,status,run_after,attempts,last_error,created_at,updated_at
+            ) VALUES (?,?, 'telegram_ingress',?,'pending',NULL,0,NULL,?,?)
+          `)
+          .run(jobId, `automation:${input.automation.id}:${input.scheduledFor}`, JSON.stringify(input.ingressPayload), createdAt, createdAt);
+      }
+      this.db
+        .prepare(`
+          UPDATE automations SET status=?,last_run_at=?,next_run_at=?,updated_at=? WHERE id=?
+        `)
+        .run(input.nextRunAt ? "active" : "completed", input.scheduledFor, input.nextRunAt ?? null, createdAt, input.automation.id);
+      return { runId, jobId, inserted: Number(inserted.changes) === 1 };
+    });
+  }
+
+  releaseAutomationClaim(id: string, lastError?: string): void {
+    this.db
+      .prepare("UPDATE automations SET status='active',updated_at=? WHERE id=? AND status='running'")
+      .run(nowIso(), id);
+    if (lastError) {
+      this.appendEvent("automation.dispatch.failed", { payload: { automationId: id, errorCode: lastError } });
+    }
+  }
+
+  completeAutomationRunByJob(jobId: string): void {
+    this.db
+      .prepare("UPDATE automation_runs SET status='completed',completed_at=? WHERE background_job_id=?")
+      .run(nowIso(), jobId);
+  }
+
+  getPolicySetting<T>(key: string): T | undefined {
+    const row = this.db.prepare("SELECT value_json FROM operator_policy WHERE key=?").get(key) as Row | undefined;
+    return row ? (JSON.parse(String(row.value_json)) as T) : undefined;
+  }
+
+  setPolicySetting<T>(key: string, value: T, updatedBy: string): void {
+    const now = nowIso();
+    this.db
+      .prepare(`
+        INSERT INTO operator_policy(key,value_json,updated_by,updated_at) VALUES (?,?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,
+          updated_by=excluded.updated_by,updated_at=excluded.updated_at
+      `)
+      .run(key, JSON.stringify(value), updatedBy, now);
+  }
+
+  listPolicySettings(): Record<string, unknown> {
+    return Object.fromEntries(
+      (this.db.prepare("SELECT key,value_json FROM operator_policy ORDER BY key").all() as Row[])
+        .map((row) => [String(row.key), JSON.parse(String(row.value_json))]),
+    );
+  }
+
+  recordProviderPerformance(input: {
+    providerInstanceId: string;
+    model: string;
+    latencyMs: number;
+    success: boolean;
+    estimatedCostUsd?: number;
+  }): void {
+    this.db
+      .prepare(`
+        INSERT INTO provider_performance(
+          provider_instance_id,model,samples,successes,failures,total_latency_ms,
+          estimated_cost_usd,updated_at
+        ) VALUES (?,?,1,?,?,?, ?,?)
+        ON CONFLICT(provider_instance_id,model) DO UPDATE SET
+          samples=samples+1,
+          successes=successes+excluded.successes,
+          failures=failures+excluded.failures,
+          total_latency_ms=total_latency_ms+excluded.total_latency_ms,
+          estimated_cost_usd=estimated_cost_usd+excluded.estimated_cost_usd,
+          updated_at=excluded.updated_at
+      `)
+      .run(
+        input.providerInstanceId,
+        input.model,
+        input.success ? 1 : 0,
+        input.success ? 0 : 1,
+        Math.max(0, Math.round(input.latencyMs)),
+        Math.max(0, input.estimatedCostUsd ?? 0),
+        nowIso(),
+      );
+  }
+
+  listProviderPerformance(): ProviderPerformance[] {
+    return (this.db.prepare("SELECT * FROM provider_performance ORDER BY updated_at DESC").all() as Row[])
+      .map((row) => {
+        const samples = Number(row.samples);
+        return {
+          providerInstanceId: String(row.provider_instance_id),
+          model: String(row.model),
+          samples,
+          successes: Number(row.successes),
+          failures: Number(row.failures),
+          averageLatencyMs: samples ? Number(row.total_latency_ms) / samples : 0,
+          estimatedCostUsd: Number(row.estimated_cost_usd),
+          updatedAt: String(row.updated_at),
+        };
+      });
   }
 
   upsertThread(thread: WorkThread): void {
@@ -621,6 +861,7 @@ export class OperatorStore {
       this.db
         .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
         .run(id, category, content);
+      this.upsertNoteVector(id, `${category} ${content}`, now);
     });
     return this.getOperatorNote(id)!;
   }
@@ -648,16 +889,33 @@ export class OperatorStore {
       ?.slice(0, 10);
     if (!terms?.length) return [];
     const match = terms.map((term) => `"${term.replaceAll('"', '""')}"*`).join(" OR ");
-    return (
-      this.db
-        .prepare(`
-          SELECT n.* FROM operator_note_search s
-          JOIN operator_notes n ON n.id=s.id
-          WHERE operator_note_search MATCH ? AND n.status='active'
-          ORDER BY bm25(operator_note_search),n.updated_at DESC LIMIT ?
-        `)
-        .all(match, Math.max(1, Math.min(limit, 50))) as Row[]
-    ).map(rowToOperatorNote);
+    const boundedLimit = Math.max(1, Math.min(limit, 50));
+    const lexical = this.db
+      .prepare(`
+        SELECT n.* FROM operator_note_search s
+        JOIN operator_notes n ON n.id=s.id
+        WHERE operator_note_search MATCH ? AND n.status='active'
+        ORDER BY bm25(operator_note_search),n.updated_at DESC LIMIT ?
+      `)
+      .all(match, Math.max(boundedLimit, 20)) as Row[];
+    const lexicalRank = new Map(lexical.map((row, index) => [String(row.id), 1 / (index + 1)]));
+    const queryVector = localMemoryVector(query);
+    const vectorRows = this.db
+      .prepare(`
+        SELECT n.*,v.vector_json FROM operator_note_vectors v
+        JOIN operator_notes n ON n.id=v.note_id
+        WHERE n.status='active' ORDER BY n.updated_at DESC LIMIT 500
+      `)
+      .all() as Row[];
+    const ranked = vectorRows.map((row) => {
+      const vector = JSON.parse(String(row.vector_json)) as number[];
+      const similarity = cosineSimilarity(queryVector, vector);
+      const lexicalScore = lexicalRank.get(String(row.id)) ?? 0;
+      return { row, similarity, score: lexicalScore * 0.62 + Math.max(0, similarity) * 0.38 };
+    }).filter((entry) => lexicalRank.has(String(entry.row.id)) || entry.similarity >= 0.18)
+      .sort((left, right) => right.score - left.score || String(right.row.updated_at).localeCompare(String(left.row.updated_at)))
+      .slice(0, boundedLimit);
+    return ranked.map((entry) => rowToOperatorNote(entry.row));
   }
 
   markOperatorNoteObsolete(id: string): boolean {
@@ -665,7 +923,10 @@ export class OperatorStore {
       const result = this.db
         .prepare("UPDATE operator_notes SET status='obsolete',updated_at=? WHERE id=? AND status='active'")
         .run(nowIso(), id);
-      if (result.changes > 0) this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
+      if (result.changes > 0) {
+        this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
+        this.db.prepare("DELETE FROM operator_note_vectors WHERE note_id=?").run(id);
+      }
       return result.changes > 0;
     });
   }
@@ -1610,6 +1871,18 @@ export class OperatorStore {
     ).map(rowToConversationCompaction);
   }
 
+  private upsertNoteVector(noteId: string, text: string, updatedAt: string): void {
+    const vector = localMemoryVector(text);
+    this.db
+      .prepare(`
+        INSERT INTO operator_note_vectors(note_id,model,dimensions,vector_json,updated_at)
+        VALUES (?,'local-hybrid-v1',?,?,?)
+        ON CONFLICT(note_id) DO UPDATE SET model=excluded.model,
+          dimensions=excluded.dimensions,vector_json=excluded.vector_json,updated_at=excluded.updated_at
+      `)
+      .run(noteId, vector.length, JSON.stringify(vector), updatedAt);
+  }
+
   private readWorkerGroup(row: Row): WorkerGroupRecord {
     return { ...rowToWorkerGroup(row), members: this.workerGroupMembers(String(row.id)) };
   }
@@ -1633,6 +1906,33 @@ function rowToProject(row: Row): Project {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
+}
+
+function rowToAutomation(row: Row): Automation {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    name: String(row.name),
+    prompt: String(row.prompt),
+    schedule: JSON.parse(String(row.schedule_json)) as AutomationSchedule,
+    chatId: Number(row.chat_id),
+    status: String(row.status) as Automation["status"],
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    ...(row.message_thread_id !== null && row.message_thread_id !== undefined
+      ? { messageThreadId: Number(row.message_thread_id) }
+      : {}),
+    ...(row.direct_messages_topic_id !== null && row.direct_messages_topic_id !== undefined
+      ? { directMessagesTopicId: Number(row.direct_messages_topic_id) }
+      : {}),
+    ...(row.project_id ? { projectId: String(row.project_id) } : {}),
+    ...(row.next_run_at ? { nextRunAt: String(row.next_run_at) } : {}),
+    ...(row.last_run_at ? { lastRunAt: String(row.last_run_at) } : {}),
+  };
+}
+
+function stableAutomationRunId(automationId: string, scheduledFor: string): string {
+  return `autorun_${createHash("sha256").update(automationId).update("\0").update(scheduledFor).digest("hex").slice(0, 32)}`;
 }
 
 function rowToThread(row: Row): WorkThread {
@@ -1860,4 +2160,54 @@ function parseStringArray(value: unknown): string[] {
   } catch {
     return [value];
   }
+}
+
+const MEMORY_VECTOR_DIMENSIONS = 128;
+
+function localMemoryVector(input: string): number[] {
+  const normalized = input.normalize("NFKC").toLocaleLowerCase()
+    .replace(/исправ\p{L}*|почин\p{L}*/giu, " repair ")
+    .replace(/ошибк\p{L}*|баг\p{L}*/giu, " defect ")
+    .replace(/авторизац\p{L}*|аутентификац\p{L}*/giu, " auth ")
+    .replace(/автоматизац\p{L}*|расписан\p{L}*/giu, " schedule ")
+    .replace(/запомн\p{L}*|памят\p{L}*|вспомн\p{L}*/giu, " memory ")
+    .replace(/решени\p{L}*|решил\p{L}*/giu, " decision ")
+    .replace(/\b(?:fix|repair|исправ(?:ить|ь|ление)?|почин(?:ить|и)?)\b/giu, " repair ")
+    .replace(/\b(?:bug|error|ошибк\p{L}*|баг\p{L}*)\b/giu, " defect ")
+    .replace(/\b(?:auth|authentication|login|авторизац\p{L}*|аутентификац\p{L}*|вход)\b/giu, " auth ")
+    .replace(/\b(?:schedule|scheduled|automation|автоматизац\p{L}*|расписан\p{L}*)\b/giu, " schedule ")
+    .replace(/\b(?:remember|memory|recall|запомн\p{L}*|памят\p{L}*|вспомн\p{L}*)\b/giu, " memory ")
+    .replace(/\b(?:decision|decide|решени\p{L}*|решил\p{L}*)\b/giu, " decision ");
+  const tokens = normalized.match(/[\p{L}\p{N}_-]{2,}/gu)?.slice(0, 1_000) ?? [];
+  const vector = Array.from({ length: MEMORY_VECTOR_DIMENSIONS }, () => 0);
+  for (const token of tokens) {
+    addVectorFeature(vector, `w:${token}`, 1);
+    const bounded = `^${token.slice(0, 80)}$`;
+    for (let index = 0; index <= bounded.length - 3; index += 1) {
+      addVectorFeature(vector, `g:${bounded.slice(index, index + 3)}`, 0.22);
+    }
+  }
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+  return norm ? vector.map((value) => Number((value / norm).toFixed(6))) : vector;
+}
+
+function addVectorFeature(vector: number[], feature: string, weight: number): void {
+  const digest = createHash("sha256").update(feature).digest();
+  const index = digest.readUInt16BE(0) % vector.length;
+  vector[index] = (vector[index] ?? 0) + (digest[2]! % 2 === 0 ? weight : -weight);
+}
+
+function cosineSimilarity(left: number[], right: number[]): number {
+  const length = Math.min(left.length, right.length);
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < length; index += 1) {
+    const leftValue = left[index] ?? 0;
+    const rightValue = right[index] ?? 0;
+    dot += leftValue * rightValue;
+    leftNorm += leftValue * leftValue;
+    rightNorm += rightValue * rightValue;
+  }
+  return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
 }

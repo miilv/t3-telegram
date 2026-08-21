@@ -229,3 +229,35 @@ and keyboard cleanup may be replayed because they target the same message.
 Worker terminal delivery uses the recorded start/status message as its edit
 anchor, and its local completion marker advances only after that outbox row is
 delivered.
+
+## Codex Operator runtime source gate
+
+Local official Codex CLI `0.148.0` help and the checked-out Codex source were
+inspected before adding the second Operator provider. `codex exec --json` emits
+`thread.started`, agent-message item, and `turn.completed` usage events;
+`codex exec resume` accepts the native thread ID. The same source establishes
+`--ignore-user-config`, `--ignore-rules`, shell feature flags, and MCP fields
+`bearer_token_env_var` plus `enabled_tools`.
+
+The adapter therefore parses native JSONL, persists the returned thread ID,
+references its ephemeral MCP capability by environment variable, and disables
+shell/edit/image paths. A switch uses structured daemon memory plus a compact
+provider handoff instead of pretending native sessions can migrate.
+
+## Calendar and email connector source gate
+
+The connector follows the official Google Workspace REST contracts:
+
+- Calendar reads use [`events.list`](https://developers.google.com/calendar/api/v3/reference/events/list)
+  with encoded calendar ID, time range, query, and result bound;
+- Calendar writes use [`events.insert`](https://developers.google.com/workspace/calendar/api/v3/reference/events/insert)
+  with validated event/start/end/timezone JSON;
+- Gmail search uses [`users.messages.list`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list)
+  followed by bounded metadata reads through
+  [`users.messages.get`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get);
+- Gmail send follows the official
+  [sending guide](https://developers.google.com/workspace/gmail/api/guides/sending):
+  an RFC 2822 MIME message encoded as base64url in `raw`.
+
+No discovery response or arbitrary URL can redirect these calls. OAuth/token
+acquisition remains an Operator deployment responsibility.

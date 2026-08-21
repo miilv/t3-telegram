@@ -1,6 +1,7 @@
 import type { ApprovalRiskCategory } from "../../shared/src/index.js";
 
 export { classifyTaskComplexity, selectWorkerModel } from "./provider-selection.js";
+export { readOperatorPolicy, updateOperatorPolicy } from "./settings.js";
 export type { TaskComplexity, WorkerModelSelection } from "./provider-selection.js";
 export {
   fallbackParallelDelegationPlan,

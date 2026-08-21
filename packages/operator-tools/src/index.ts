@@ -15,6 +15,8 @@ import type { MediaProcessor } from "../../media/src/index.js";
 import type {
   Artifact,
   ArtifactRef,
+  AutomationSchedule,
+  OperatorPolicySettings,
   OperatorToolAccess,
   Project,
   TeamRole,
@@ -28,6 +30,8 @@ import type {
   TelegramDestination,
   TelegramTransport,
 } from "../../telegram/src/index.js";
+import type { GoogleWorkspaceConnectors } from "../../connectors/src/index.js";
+import { createAutomation, firstAutomationRun } from "../../automations/src/index.js";
 
 const CAPABILITY_TTL_MS = 2 * 60 * 60 * 1_000;
 const MAX_TOOL_RESULT_CHARS = 16_000;
@@ -38,6 +42,7 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "t3.list_projects",
   "t3.create_project",
   "t3.rename_project",
+  "t3.add_project_alias",
   "t3.search_threads",
   "t3.get_thread",
   "t3.create_thread",
@@ -50,6 +55,17 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "memory.search",
   "memory.remember",
   "memory.update_focus",
+  "scheduler.list_automations",
+  "scheduler.create_automation",
+  "scheduler.pause_automation",
+  "scheduler.resume_automation",
+  "scheduler.delete_automation",
+  "calendar.list_events",
+  "calendar.create_event",
+  "email.search",
+  "email.send",
+  "policy.get",
+  "policy.update",
   "telegram.send_message",
   "telegram.reply",
   "telegram.edit",
@@ -95,6 +111,9 @@ export interface OperatorToolServerOptions {
   telegram: TelegramTransport;
   artifacts: ArtifactRegistry;
   media?: MediaProcessor;
+  connectors?: GoogleWorkspaceConnectors;
+  getPolicy?: () => OperatorPolicySettings;
+  updatePolicy?: (patch: Partial<OperatorPolicySettings>, updatedBy: string) => OperatorPolicySettings;
   logger: Logger;
   onThreadStarted?: (input: ToolStartedThread) => void | Promise<void>;
   fetchImpl?: typeof fetch;
@@ -246,6 +265,7 @@ export class OperatorToolServer {
         allowedTools: OPERATOR_MCP_TOOL_NAMES.map(
           (name) => `mcp__operator__${name.replaceAll(".", "_")}`,
         ),
+        toolNames: [...OPERATOR_MCP_TOOL_NAMES],
       },
       revoke: () => {
         if (revoked) return;
@@ -320,6 +340,15 @@ export class OperatorToolServer {
         this.requireProjectAccess(capability, projectId, true);
         await this.options.broker.renameProject(projectId, name);
         return { projectId, name, renamed: true };
+      },
+    });
+    this.addTool(server, token, {
+      name: "t3.add_project_alias",
+      description: "Add a durable human-friendly alias used by routing for an accessible project.",
+      schema: z.object({ projectId: z.string().min(1), alias: z.string().trim().min(2).max(160) }),
+      handler: ({ projectId, alias }, capability) => {
+        this.requireProjectAccess(capability, projectId, true);
+        return { projectId, alias: this.options.store.addProjectAlias(projectId, alias, "operator_tool") };
       },
     });
     this.addTool(server, token, {
@@ -567,6 +596,195 @@ export class OperatorToolServer {
         };
         this.options.store.setFocus(capability.context.ownerId, next);
         return next;
+      },
+    });
+
+    const automationScheduleSchema = z.discriminatedUnion("type", [
+      z.object({ type: z.literal("once"), runAt: z.string().datetime() }),
+      z.object({ type: z.literal("interval"), intervalMinutes: z.number().int().min(1).max(525_600) }),
+      z.object({ type: z.literal("daily"), timeOfDay: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), timeZone: z.string().min(1).max(100) }),
+    ]);
+    this.addTool(server, token, {
+      name: "scheduler.list_automations",
+      description: "List proactive scheduled work owned by this user; admins can see the complete team list.",
+      schema: z.object({}),
+      readOnly: true,
+      handler: (_input, capability) => {
+        const ownerId = this.teamRole(capability) === "owner" || this.teamRole(capability) === "admin"
+          ? undefined
+          : capability.context.ownerId;
+        return this.options.store.listAutomations(ownerId).map((item) => ({
+          id: item.id,
+          name: item.name,
+          schedule: item.schedule,
+          status: item.status,
+          nextRunAt: item.nextRunAt,
+          lastRunAt: item.lastRunAt,
+          projectId: item.projectId,
+        }));
+      },
+    });
+    this.addTool(server, token, {
+      name: "scheduler.create_automation",
+      description: "Create durable proactive work for this Telegram chat/topic.",
+      schema: z.object({
+        name: z.string().trim().min(1).max(160),
+        prompt: z.string().trim().min(1).max(64_000),
+        schedule: automationScheduleSchema,
+        projectId: z.string().min(1).optional(),
+      }),
+      handler: (input, capability) => {
+        this.requireTeamMutation(capability, "create automations");
+        if (input.projectId) this.requireProjectAccess(capability, input.projectId, true);
+        const automation = createAutomation({
+          ownerId: capability.context.ownerId,
+          name: input.name,
+          prompt: input.prompt,
+          schedule: input.schedule as AutomationSchedule,
+          chatId: capability.context.chatId,
+          ...(capability.context.messageThreadId ? { messageThreadId: capability.context.messageThreadId } : {}),
+          ...(capability.context.directMessagesTopicId ? { directMessagesTopicId: capability.context.directMessagesTopicId } : {}),
+          ...(input.projectId ? { projectId: input.projectId } : {}),
+        });
+        this.options.store.saveAutomation(automation);
+        return automation;
+      },
+    });
+    for (const action of ["pause", "resume", "delete"] as const) {
+      this.addTool(server, token, {
+        name: `scheduler.${action}_automation`,
+        description: `${action[0]!.toUpperCase()}${action.slice(1)} an owned automation.`,
+        schema: z.object({ automationId: z.string().min(1) }),
+        destructive: action === "delete",
+        handler: ({ automationId }, capability) => {
+          this.requireTeamMutation(capability, `${action} automations`);
+          const automation = this.requireAutomationAccess(capability, automationId);
+          const status = action === "pause" ? "paused" : action === "delete" ? "deleted" : "active";
+          if (action === "resume" && !automation.nextRunAt) {
+            automation.nextRunAt = firstAutomationRun(automation.schedule);
+            automation.status = "active";
+            automation.updatedAt = nowIso();
+            this.options.store.saveAutomation(automation);
+          } else {
+            this.options.store.updateAutomationStatus(automationId, status);
+          }
+          return { automationId, status };
+        },
+      });
+    }
+
+    this.addTool(server, token, {
+      name: "calendar.list_events",
+      description: "List a bounded range of Google Calendar events when the connector is configured.",
+      schema: z.object({
+        timeMin: z.string().datetime(),
+        timeMax: z.string().datetime().optional(),
+        query: z.string().max(500).optional(),
+        limit: z.number().int().min(1).max(50).optional(),
+      }),
+      readOnly: true,
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "read the team calendar");
+        if (!this.options.connectors) throw new Error("Google Workspace connectors are unavailable");
+        return this.options.connectors.listCalendarEvents({
+          timeMin: input.timeMin,
+          ...(input.timeMax ? { timeMax: input.timeMax } : {}),
+          ...(input.query ? { query: input.query } : {}),
+          ...(input.limit ? { limit: input.limit } : {}),
+        });
+      },
+    });
+    this.addTool(server, token, {
+      name: "calendar.create_event",
+      description: "Create a Google Calendar event after an explicit Operator decision.",
+      schema: z.object({
+        title: z.string().trim().min(1).max(500),
+        start: z.string().datetime(),
+        end: z.string().datetime(),
+        timeZone: z.string().max(100).optional(),
+        description: z.string().max(8_000).optional(),
+        location: z.string().max(1_000).optional(),
+        attendees: z.array(z.string().email()).max(50).optional(),
+      }),
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "create calendar events");
+        if (!this.options.connectors) throw new Error("Google Workspace connectors are unavailable");
+        return this.options.connectors.createCalendarEvent({
+          title: input.title,
+          start: input.start,
+          end: input.end,
+          ...(input.timeZone ? { timeZone: input.timeZone } : {}),
+          ...(input.description ? { description: input.description } : {}),
+          ...(input.location ? { location: input.location } : {}),
+          ...(input.attendees ? { attendees: input.attendees } : {}),
+        });
+      },
+    });
+    this.addTool(server, token, {
+      name: "email.search",
+      description: "Search Gmail and return bounded metadata/snippets, never full mailbox dumps.",
+      schema: z.object({ query: z.string().trim().min(1).max(1_000), limit: z.number().int().min(1).max(10).optional() }),
+      readOnly: true,
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "search team email");
+        if (!this.options.connectors) throw new Error("Google Workspace connectors are unavailable");
+        return this.options.connectors.searchEmail({
+          query: input.query,
+          ...(input.limit ? { limit: input.limit } : {}),
+        });
+      },
+    });
+    this.addTool(server, token, {
+      name: "email.send",
+      description: "Send a plain-text email through Gmail after an explicit Operator decision.",
+      schema: z.object({
+        to: z.array(z.string().email()).min(1).max(50),
+        cc: z.array(z.string().email()).max(50).optional(),
+        subject: z.string().trim().min(1).max(998),
+        text: z.string().min(1).max(100_000),
+      }),
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "send team email");
+        if (!this.options.connectors) throw new Error("Google Workspace connectors are unavailable");
+        return this.options.connectors.sendEmail({
+          to: input.to,
+          subject: input.subject,
+          text: input.text,
+          ...(input.cc ? { cc: input.cc } : {}),
+        });
+      },
+    });
+
+    this.addTool(server, token, {
+      name: "policy.get",
+      description: "Read the live bounded Operator dispatch policy.",
+      schema: z.object({}),
+      readOnly: true,
+      handler: (_input, capability) => {
+        this.requireAdministrativeRole(capability, "read Operator policy");
+        if (!this.options.getPolicy) throw new Error("live policy controls are unavailable");
+        return this.options.getPolicy();
+      },
+    });
+    this.addTool(server, token, {
+      name: "policy.update",
+      description: "Update validated live Operator policy fields.",
+      schema: z.object({
+        approvalAutoAllow: z.array(z.enum(["safe-read", "safe-write-in-project", "network", "package-install", "process-control", "destructive", "cross-project", "secret-sensitive"])).max(8).optional(),
+        maxParallelWorkers: z.number().int().min(2).max(4).optional(),
+        progressIntervalMs: z.number().int().min(5_000).max(600_000).optional(),
+        providerOptimizationEnabled: z.boolean().optional(),
+        providerCostWeight: z.number().min(0).max(1).optional(),
+        providerLatencyWeight: z.number().min(0).max(1).optional(),
+        providerReliabilityWeight: z.number().min(0).max(1).optional(),
+      }),
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "update Operator policy");
+        if (!this.options.updatePolicy) throw new Error("live policy controls are unavailable");
+        const patch = Object.fromEntries(
+          Object.entries(input).filter((entry) => entry[1] !== undefined),
+        ) as Partial<OperatorPolicySettings>;
+        return this.options.updatePolicy(patch, capability.context.ownerId);
       },
     });
 
@@ -944,6 +1162,16 @@ export class OperatorToolServer {
       }
     }
     this.requireAdministrativeRole(capability, "access unscoped artifacts");
+  }
+
+  private requireAutomationAccess(capability: TurnCapability, automationId: string) {
+    const automation = this.options.store.getAutomation(automationId);
+    if (!automation) throw new Error("automation not found");
+    const role = this.teamRole(capability);
+    if (role !== "owner" && role !== "admin" && automation.ownerId !== capability.context.ownerId) {
+      throw new Error("automation access denied");
+    }
+    return automation;
   }
 
   private recordSent(

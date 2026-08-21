@@ -11,6 +11,7 @@ import {
   type ToolStartedThread,
 } from "../packages/operator-tools/src/index.js";
 import type {
+  OperatorPolicySettings,
   Project,
   T3Broker,
   WorkThread,
@@ -96,12 +97,23 @@ describe("OperatorToolServer", () => {
       normalizeVoice: async () => voiceArtifact,
       normalizeVideoNote: async () => voiceArtifact,
     } as unknown as MediaProcessor;
+    let policy: OperatorPolicySettings = {
+      approvalAutoAllow: ["safe-read"],
+      maxParallelWorkers: 4,
+      progressIntervalMs: 60_000,
+      providerOptimizationEnabled: true,
+      providerCostWeight: 0.35,
+      providerLatencyWeight: 0.35,
+      providerReliabilityWeight: 0.3,
+    };
     const server = new OperatorToolServer({
       broker,
       store,
       telegram: telegram as unknown as TelegramTransport,
       artifacts,
       media,
+      getPolicy: () => policy,
+      updatePolicy: (patch) => (policy = { ...policy, ...patch }),
       logger: pino({ enabled: false }),
       onThreadStarted: (input) => {
         started.push(input);
@@ -160,6 +172,13 @@ describe("OperatorToolServer", () => {
       await callJson(client, "memory.remember", { category: "decision", content: "Use MCP capabilities" });
       const memory = await callJson(client, "memory.search", { query: "capabilities" });
       expect(memory).toMatchObject({ notes: [{ category: "decision", content: "Use MCP capabilities" }] });
+      const automation = await callJson(client, "scheduler.create_automation", {
+        name: "Morning brief",
+        prompt: "Summarize active work",
+        schedule: { type: "daily", timeOfDay: "09:00", timeZone: "Europe/Moscow" },
+      }) as { id: string };
+      expect(await callJson(client, "scheduler.list_automations", {})).toMatchObject([{ id: automation.id }]);
+      expect(await callJson(client, "policy.update", { maxParallelWorkers: 3 })).toMatchObject({ maxParallelWorkers: 3 });
 
       const compactThread = await callJson(client, "t3.get_thread", { threadId: thread.id });
       expect(compactThread).toMatchObject({ id: thread.id, status: "idle", summary: "compact state" });

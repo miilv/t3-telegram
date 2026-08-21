@@ -119,6 +119,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS operator_note_search USING fts5(
   tokenize = 'unicode61'
 );
 
+CREATE TABLE IF NOT EXISTS operator_note_vectors (
+  note_id TEXT PRIMARY KEY,
+  model TEXT NOT NULL,
+  dimensions INTEGER NOT NULL,
+  vector_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS conversation_compactions (
   id TEXT PRIMARY KEY,
   operator_session_id TEXT,
@@ -285,6 +294,63 @@ CREATE TABLE IF NOT EXISTS project_memberships (
   PRIMARY KEY (project_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS project_aliases (
+  project_id TEXT NOT NULL,
+  alias TEXT NOT NULL COLLATE NOCASE,
+  source TEXT NOT NULL DEFAULT 'manual',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, alias),
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS automations (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  schedule_json TEXT NOT NULL,
+  chat_id INTEGER NOT NULL,
+  message_thread_id INTEGER,
+  direct_messages_topic_id INTEGER,
+  project_id TEXT,
+  status TEXT NOT NULL,
+  next_run_at TEXT,
+  last_run_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS automation_runs (
+  id TEXT PRIMARY KEY,
+  automation_id TEXT NOT NULL,
+  scheduled_for TEXT NOT NULL,
+  status TEXT NOT NULL,
+  background_job_id TEXT,
+  created_at TEXT NOT NULL,
+  completed_at TEXT,
+  UNIQUE(automation_id, scheduled_for),
+  FOREIGN KEY (automation_id) REFERENCES automations(id)
+);
+
+CREATE TABLE IF NOT EXISTS operator_policy (
+  key TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
+  updated_by TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_performance (
+  provider_instance_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  samples INTEGER NOT NULL DEFAULT 0,
+  successes INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0,
+  total_latency_ms INTEGER NOT NULL DEFAULT 0,
+  estimated_cost_usd REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (provider_instance_id, model)
+);
+
 CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id);
 CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
 CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity_at DESC);
@@ -295,6 +361,12 @@ CREATE INDEX IF NOT EXISTS idx_telegram_outbox_delivery
   ON telegram_outbox(status, next_attempt_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_project_memberships_user
   ON project_memberships(user_id, access_role);
+CREATE INDEX IF NOT EXISTS idx_project_aliases_alias
+  ON project_aliases(alias COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_automations_due
+  ON automations(status, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_automation
+  ON automation_runs(automation_id, scheduled_for DESC);
 
 DELETE FROM operator_note_search;
 INSERT INTO operator_note_search(id,category,content)

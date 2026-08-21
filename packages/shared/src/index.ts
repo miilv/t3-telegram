@@ -2,6 +2,49 @@ export type Id = string;
 
 export type TeamRole = "owner" | "admin" | "member" | "viewer";
 
+export type AutomationSchedule =
+  | { type: "once"; runAt: string }
+  | { type: "interval"; intervalMinutes: number }
+  | { type: "daily"; timeOfDay: string; timeZone: string };
+
+export interface Automation {
+  id: string;
+  ownerId: string;
+  name: string;
+  prompt: string;
+  schedule: AutomationSchedule;
+  chatId: number;
+  messageThreadId?: number;
+  directMessagesTopicId?: number;
+  projectId?: string;
+  status: "active" | "paused" | "running" | "completed" | "deleted";
+  nextRunAt?: string;
+  lastRunAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OperatorPolicySettings {
+  approvalAutoAllow: ApprovalRiskCategory[];
+  maxParallelWorkers: number;
+  progressIntervalMs: number;
+  providerOptimizationEnabled: boolean;
+  providerCostWeight: number;
+  providerLatencyWeight: number;
+  providerReliabilityWeight: number;
+}
+
+export interface ProviderPerformance {
+  providerInstanceId: string;
+  model: string;
+  samples: number;
+  successes: number;
+  failures: number;
+  averageLatencyMs: number;
+  estimatedCostUsd: number;
+  updatedAt: string;
+}
+
 export type ThreadStatus =
   | "idle"
   | "queued"
@@ -18,6 +61,7 @@ export interface Project {
   name: string;
   workspaceRoot?: string;
   summary?: string;
+  aliases?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -328,6 +372,8 @@ export interface OperatorToolAccess {
   token: string;
   /** Fully-qualified Claude MCP tool names permitted for this turn. */
   allowedTools: string[];
+  /** Original MCP tool names for runtimes that configure allowlists by server tool name. */
+  toolNames?: string[];
 }
 
 export interface OperatorRuntime {
@@ -341,7 +387,7 @@ export interface OperatorRuntime {
   }): AsyncIterable<OperatorEvent>;
   interrupt(): Promise<void>;
   compact(reason?: string): Promise<{ sessionId: string; summary?: string }>;
-  resume(sessionId: string): Promise<void>;
+  resume(sessionId: string, providerId?: string): Promise<void>;
   health(): Promise<{
     healthy: boolean;
     detail?: string;
@@ -349,6 +395,9 @@ export interface OperatorRuntime {
     contextWindow?: number;
     contextUsagePercent?: number;
   }>;
+  currentProvider?(): string;
+  availableProviders?(): string[];
+  switchProvider?(providerId: string, input: { systemPrompt: string }): Promise<OperatorSession>;
 }
 
 export interface TurnHandle {

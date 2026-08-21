@@ -15,9 +15,21 @@ const envSchema = z.object({
     .enum(["approval-required", "auto-accept-edits", "auto", "full-access"])
     .default("approval-required"),
   CLAUDE_BIN: z.string().min(1).default("claude"),
+  OPERATOR_PROVIDER: z.enum(["claude", "codex"]).default("claude"),
   OPERATOR_MODEL: z.string().min(1).default("opus"),
   OPERATOR_EFFORT: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high"),
+  OPERATOR_CODEX_ENABLED: z.enum(["true", "false"]).default("false"),
+  CODEX_BIN: z.string().min(1).default("codex"),
+  CODEX_MODEL: z.string().min(1).default("gpt-5.4"),
+  CODEX_EFFORT: z.enum(["low", "medium", "high", "xhigh"]).default("high"),
   OPERATOR_COMPACT_THRESHOLD_PERCENT: z.coerce.number().min(50).max(95).default(80),
+  MAX_PARALLEL_WORKERS: z.coerce.number().int().min(2).max(4).default(4),
+  PROGRESS_INTERVAL_MS: z.coerce.number().int().min(5_000).max(600_000).default(60_000),
+  PROVIDER_OPTIMIZATION_ENABLED: z.enum(["true", "false"]).default("true"),
+  PROVIDER_COST_WEIGHT: z.coerce.number().min(0).max(1).default(0.35),
+  PROVIDER_LATENCY_WEIGHT: z.coerce.number().min(0).max(1).default(0.35),
+  PROVIDER_RELIABILITY_WEIGHT: z.coerce.number().min(0).max(1).default(0.3),
+  PROVIDER_MODEL_COSTS_USD: z.string().default(""),
   OPERATOR_HOME: z.string().min(1).default("~/.operator"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   TELEGRAM_POLL_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(50).default(30),
@@ -39,6 +51,12 @@ const envSchema = z.object({
   ELEVENLABS_VOICE_ID: z.string().min(1).default("21m00Tcm4TlvDq8ikWAM"),
   ELEVENLABS_MODEL: z.string().min(1).default("eleven_multilingual_v2"),
   SAY_BIN: z.string().min(1).optional(),
+  GOOGLE_WORKSPACE_ACCESS_TOKEN: z.string().min(1).optional(),
+  GOOGLE_CALENDAR_ID: z.string().min(1).default("primary"),
+  GMAIL_USER_ID: z.string().min(1).default("me"),
+  CONNECTOR_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
+  DASHBOARD_ENABLED: z.enum(["true", "false"]).default("true"),
+  DASHBOARD_PORT: z.coerce.number().int().min(0).max(65_535).default(0),
 });
 
 const approvalRiskCategory = z.enum([
@@ -78,6 +96,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     const role = telegramAccessRole.parse(rawRole);
     if (userId !== parsed.TELEGRAM_ALLOWED_USER_ID || role === "owner") telegramUsers.set(userId, role);
   }
+  const providerModelCostsUsd = Object.fromEntries(
+    parsed.PROVIDER_MODEL_COSTS_USD.split(",").map((value) => value.trim()).filter(Boolean).map((entry) => {
+      const separator = entry.lastIndexOf("=");
+      if (separator < 1) throw new Error("PROVIDER_MODEL_COSTS_USD entries must use provider/model=usd");
+      const key = entry.slice(0, separator).trim();
+      const cost = z.coerce.number().nonnegative().parse(entry.slice(separator + 1));
+      return [key, cost];
+    }),
+  );
+  if (parsed.OPERATOR_PROVIDER === "codex" && parsed.OPERATOR_CODEX_ENABLED !== "true") {
+    throw new Error("OPERATOR_PROVIDER=codex requires OPERATOR_CODEX_ENABLED=true");
+  }
   return {
     telegram: {
       token: parsed.TELEGRAM_BOT_TOKEN,
@@ -95,6 +125,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       pollIntervalMs: parsed.T3_POLL_INTERVAL_MS,
     },
     operator: {
+      provider: parsed.OPERATOR_PROVIDER,
       claudeBin: parsed.CLAUDE_BIN,
       model: parsed.OPERATOR_MODEL,
       effort: parsed.OPERATOR_EFFORT,
@@ -103,8 +134,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       runtimeDir: resolve(operatorHome, "runtime"),
       artifactDir: resolve(operatorHome, "artifacts"),
       databasePath: resolve(operatorHome, "operator.db"),
+      codex: parsed.OPERATOR_CODEX_ENABLED === "true"
+        ? {
+            binary: parsed.CODEX_BIN,
+            model: parsed.CODEX_MODEL,
+            effort: parsed.CODEX_EFFORT,
+          }
+        : undefined,
     },
     approval: { autoAllow: approvalAutoAllow },
+    policy: {
+      maxParallelWorkers: parsed.MAX_PARALLEL_WORKERS,
+      progressIntervalMs: parsed.PROGRESS_INTERVAL_MS,
+      providerOptimizationEnabled: parsed.PROVIDER_OPTIMIZATION_ENABLED === "true",
+      providerCostWeight: parsed.PROVIDER_COST_WEIGHT,
+      providerLatencyWeight: parsed.PROVIDER_LATENCY_WEIGHT,
+      providerReliabilityWeight: parsed.PROVIDER_RELIABILITY_WEIGHT,
+      providerModelCostsUsd,
+    },
     media: {
       ffmpegBin: parsed.FFMPEG_BIN,
       ffprobeBin: parsed.FFPROBE_BIN,
@@ -130,6 +177,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
           }
         : undefined,
       sayBin: parsed.SAY_BIN,
+    },
+    connectors: {
+      google: {
+        accessToken: parsed.GOOGLE_WORKSPACE_ACCESS_TOKEN,
+        calendarId: parsed.GOOGLE_CALENDAR_ID,
+        gmailUserId: parsed.GMAIL_USER_ID,
+        timeoutMs: parsed.CONNECTOR_TIMEOUT_MS,
+      },
+    },
+    dashboard: {
+      enabled: parsed.DASHBOARD_ENABLED === "true",
+      port: parsed.DASHBOARD_PORT,
     },
     logLevel: parsed.LOG_LEVEL,
   } as const;
