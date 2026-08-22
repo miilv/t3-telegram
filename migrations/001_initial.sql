@@ -195,6 +195,10 @@ CREATE TABLE IF NOT EXISTS telegram_outbox (
   delivered_at TEXT
 );
 
+-- worker_groups, worker_group_members, thread_handoffs and
+-- routing_clarifications are legacy: the agent-routing refactor removed the
+-- code that wrote them. The DDL stays so existing databases keep migrating
+-- cleanly; the daemon no longer reads or writes these tables.
 CREATE TABLE IF NOT EXISTS worker_groups (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,

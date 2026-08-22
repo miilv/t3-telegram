@@ -21,10 +21,10 @@ Always-on team AI Operator in Telegram. It answers quick questions itself throug
   - server-advertised provider/model/reasoning catalog with per-turn switching;
   - explicit snapshot-polling compatibility mode for legacy/test servers.
 - SQLite/WAL source of truth for projects, structured thread summaries, searchable/deduplicated Operator notes, FTS search, focus, Telegram mappings, artifacts, approvals, structured input, background jobs, a durable Telegram outbox, events, runtime state, and compactions.
-- Routing cascade for explicit project names, Telegram replies, artifact provenance, quoted/relative/absolute filesystem paths, git roots/remotes, active focus, lexical thread summaries, status/recency, and confidence policy. A limited two-thread shortlist is arbitrated by Operator; material ambiguity becomes a durable clarification instead of a guessed mutation.
+- Agent-driven routing: every non-command message is one Operator turn. The daemon supplies mechanical facts in the envelope (Telegram reply→thread mapping, durable focus, forwarded-as-data separation, registered artifacts) and the Operator itself finds, continues, or creates T3 work threads through the per-turn `t3.*` tools, asking the owner in plain text when two threads are materially indistinguishable.
 - Focus survives unrelated factual questions.
 - Cross-project work moves through a structured handoff packet into a new target-project T3 thread; registered source artifacts are safely copied into the target workspace.
-- Broad tasks can fan out to 2–4 independent T3 workers. Their structured results are persisted and reconciled into one Operator synthesis; `/status` and `/stop` treat the fan-out as one group.
+- Broad tasks can fan out to a few independent T3 workers at the Operator's discretion; each worker is monitored and delivers its own result, and `/status` lists every active scope.
 - Every named inbound Telegram media kind is normalized and stored with safe names. Voice is transcribed through configured cloud/local STT while retaining its original artifact; video notes also yield a derived audio artifact and durable keyframes.
 - Requested outbound worker documents/photos are resolved from T3 checkpoints, path-validated, and sent through Telegram.
 - Agent-initiated spoken replies are synthesized and normalized to Telegram-native OGG/Opus. Arbitrary source video is cropped/scaled and transcoded to a square H.264/AAC video note capped at 60 seconds.

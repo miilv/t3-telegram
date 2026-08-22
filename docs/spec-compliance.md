@@ -49,7 +49,7 @@ branch, not an aspiration.
 | 20–21 | Agent-initiated document/image/gallery and Telegram-native outbound media are capability-bounded. Evidence: MCP and transport tests. | PROVED |
 | 22 | Preserve inbound voice, bounded multi-provider/local STT, include transcript and original artifact, plus outbound TTS normalized to OGG/Opus. Evidence: real-FFmpeg media tests, provider/degradation tests, daemon routing test and MCP send test. | PROVED |
 | 23 | Video-note download, durable source-linked audio extraction/STT, 3–6 keyframes viewable through bounded MCP image content, and probed square H.264/AAC outbound transcoding capped at 60 seconds. Evidence: real-FFmpeg media tests, daemon reasoning-envelope test and MCP image/send tests. | PROVED |
-| 24 | Replies use `reply_parameters`; reply context participates in routing and output. Evidence: Telegram/router tests. | PROVED |
+| 24 | Replies use `reply_parameters`; reply context reaches the Operator envelope and binds output. Evidence: Telegram tests, daemon reply-boundary test. | PROVED |
 | 25 | Forum topics are preserved without 1:1 T3-thread conflation. Evidence: Telegram and daemon topic tests. | PROVED |
 | 26 | Inbound/outbound reactions have allowlists, scope checks and durable context. Evidence: Telegram/MCP tests. | PROVED |
 | 27–28 | Approval UI, decisions, eight risk categories, safe auto-approval and explicit dangerous approval. Evidence: daemon/transport tests. | PROVED |
@@ -91,9 +91,9 @@ branch, not an aspiration.
 | 81–84 | MVP plus Phase 2/3 are implemented: media/rich/hybrid memory/handoff/fan-out, teams/RBAC/groups, connectors/automations/dashboard/policy and optimized provider routing. Evidence: full 111-test suite. | PROVED |
 | 85–87 | Repository is modular; donor/source decisions are attributed; grammY/Effect RPC are used; Operator, Telegram UI and T3 project/thread state remain separate. | PROVED |
 | 88 | All 18 MVP readiness paths pass component/integration gates and are mapped in `mvp-readiness.md`; the required real test-bot/T3 acceptance run remains. | UNVERIFIED |
-| 89 | Checked-in 80-scenario corpus reports 100% for reply, project/path and focus gates and 100% clarification/focus preservation. Evidence: `routing-quality.test.ts`, `verification-report.md`. | PROVED |
+| 89 | Routing moved from a deterministic cascade to the Operator agent over `t3.*` tools; mechanical reply/cancel signals stay in code. The §89 accuracy corpus is retired with the cascade; behavior gates live in `daemon.integration.test.ts` (reply continuation, forwarded-as-data, follow-up queue, fan-out). | SUPERSEDED |
 | 90 | Latency budgets, required metrics, restart/dedupe/idempotency and typed modular boundaries are measured/tested/documented. Evidence: daemon latency/recovery tests and verification report. | PROVED |
-| 91–92 | Every named risk/open question has a source-checked decision, isolation/fallback mitigation and regression evidence. Evidence: source research plus broker/runtime/router/transport tests. | PROVED |
+| 91–92 | Every named risk/open question has a source-checked decision, isolation/fallback mitigation and regression evidence. Evidence: source research plus broker/runtime/transport tests. | PROVED |
 | 93 | All local boundaries operate coherently in daemon integration; the spec-required real Telegram+T3 system run remains unavailable. | UNVERIFIED |
 
 ## Final audit procedure

@@ -18,7 +18,6 @@ describe("MVP readiness evidence matrix", () => {
       "tests/daemon.integration.test.ts",
       "tests/operator-runtime.test.ts",
       "tests/operator-tools.test.ts",
-      "tests/routing-quality.test.ts",
       "tests/telegram-transport.test.ts",
     ]) {
       expect(existsSync(resolve(referenced)), referenced).toBe(true);

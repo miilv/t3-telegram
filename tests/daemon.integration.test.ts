@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { OperatorDaemon } from "../apps/daemon/src/operator-daemon.js";
@@ -42,14 +43,22 @@ describe("OperatorDaemon product flow", () => {
   it("meets the local first-visible and worker-ack latency budgets", async () => {
     const home = tempDirectory("daemon-latency-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
     const broker = new FakeBroker();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -77,7 +86,9 @@ describe("OperatorDaemon product flow", () => {
   it("routes voice by its transcript while preserving the original artifact", async () => {
     const home = tempDirectory("daemon-voice-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /реализуй/u, title: "Refresh token check" }),
+    );
     const broker = new FakeBroker();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
@@ -93,6 +104,14 @@ describe("OperatorDaemon product flow", () => {
       }),
     } as unknown as MediaProcessor;
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
     daemon = new OperatorDaemon(
       config(home),
@@ -103,7 +122,7 @@ describe("OperatorDaemon product flow", () => {
       artifacts,
       scheduler,
       logger,
-      undefined,
+      tools,
       media,
     );
     await daemon.initialize();
@@ -158,6 +177,14 @@ describe("OperatorDaemon product flow", () => {
       },
     } as unknown as MediaProcessor;
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
     daemon = new OperatorDaemon(
       config(home),
@@ -168,7 +195,7 @@ describe("OperatorDaemon product flow", () => {
       artifacts,
       scheduler,
       logger,
-      undefined,
+      tools,
       media,
     );
     await daemon.initialize();
@@ -245,8 +272,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -273,8 +308,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     store.saveApproval({
       id: "approval_live",
@@ -413,8 +456,16 @@ describe("OperatorDaemon product flow", () => {
     });
     store.saveAutomation(automation);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -440,8 +491,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -465,14 +524,22 @@ describe("OperatorDaemon product flow", () => {
   it("answers directly, delegates durable work, completes in background, and preserves focus", async () => {
     const home = tempDirectory("daemon-home-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
     const broker = new FakeBroker();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -488,13 +555,13 @@ describe("OperatorDaemon product flow", () => {
     const traceRows = store.db
       .prepare(`
         SELECT event_type,correlation_id FROM daemon_events
-        WHERE event_type IN ('telegram.received','t3.dispatch.accepted','worker.completed','telegram.outbox.delivered')
+        WHERE event_type IN ('telegram.received','worker.completed','telegram.outbox.delivered')
           AND correlation_id IS NOT NULL
         ORDER BY created_at
       `)
       .all() as Array<{ event_type: string; correlation_id: string }>;
     const workTrace = traceRows.find(
-      (row) => row.event_type === "t3.dispatch.accepted",
+      (row) => row.event_type === "worker.completed",
     )?.correlation_id;
     expect(workTrace).toMatch(/^tg:chat_[a-f0-9]{12}:2$/);
     expect(
@@ -504,7 +571,7 @@ describe("OperatorDaemon product flow", () => {
           .map((row) => row.event_type),
       ),
     ).toEqual(
-      new Set(["telegram.received", "t3.dispatch.accepted", "worker.completed", "telegram.outbox.delivered"]),
+      new Set(["telegram.received", "worker.completed", "telegram.outbox.delivered"]),
     );
     const focusAfterWork = store.getFocus("42");
     expect(focusAfterWork.primary?.threadId).toBe(broker.threads[0]?.id);
@@ -519,48 +586,15 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("selects an existing project from a nested canonical path at the daemon boundary", async () => {
-    const home = tempDirectory("daemon-existing-path-");
-    const workspaceRoot = `${home}/acme-api`;
-    mkdirSync(`${workspaceRoot}/src/auth`, { recursive: true });
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const timestamp = nowIso();
-    const project: Project = {
-      id: "prj_existing_path",
-      t3ProjectId: "prj_existing_path",
-      name: "Acme API",
-      workspaceRoot,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    broker.projects.push(project);
-    store.upsertProject(project);
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(message(1, `fix the auth race in ${workspaceRoot}/src/auth/refresh.ts and run tests`));
-    await waitFor(() => broker.turns.length === 1);
-    expect(broker.projects).toHaveLength(1);
-    expect(broker.threadInputs[0]?.projectId).toBe(project.id);
-    expect(store.getFocus("42").primary?.projectId).toBe(project.id);
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
   it("continues the exact mapped thread from a Telegram reply at the daemon boundary", async () => {
     const home = tempDirectory("daemon-reply-routing-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      const threadId = envelopeThreadId(envelope);
+      if (!threadId) return "Париж.";
+      await call("t3.send_turn", { threadId, text: userText(envelope) });
+      return "Продолжаю **Mapped work**.";
+    });
     const broker = new FakeBroker();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
@@ -603,13 +637,22 @@ describe("OperatorDaemon product flow", () => {
     });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
     telegram.push({ ...message(1, "продолжай и добавь regression test"), replyToMessageId: 777 });
     await waitFor(() => broker.turns.length === 1);
+    expect(runtime.prompts.at(-1)).toContain('replies to work thread "Mapped work"');
     expect(broker.turns[0]?.threadId).toBe(thread.id);
     expect(broker.threadInputs).toHaveLength(0);
 
@@ -621,14 +664,24 @@ describe("OperatorDaemon product flow", () => {
   it("materializes an inbound Telegram document into the delegated worker workspace", async () => {
     const home = tempDirectory("daemon-document-in-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /analyze/u, title: "Requirements implementation" }),
+    );
     const broker = new FakeBroker();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -655,7 +708,9 @@ describe("OperatorDaemon product flow", () => {
     const outputPath = `${workspaceRoot}/result.patch`;
     writeFileSync(outputPath, "diff --git a/a b/a\n", { mode: 0o600 });
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /build a patch/u, title: "Patch build" }),
+    );
     const broker = new FakeBroker();
     broker.outputArtifacts = [{
       id: "t3-output-patch",
@@ -679,8 +734,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -697,7 +760,7 @@ describe("OperatorDaemon product flow", () => {
   it("collects multi-question T3 user input through buttons and a custom Telegram reply", async () => {
     const home = tempDirectory("daemon-user-input-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /deploy/u, title: "Auth deploy" }));
     const broker = new FakeBroker();
     broker.workerEvents = [
       { type: "started", threadId: "th_1" },
@@ -730,8 +793,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -762,7 +833,7 @@ describe("OperatorDaemon product flow", () => {
   it("auto-approves only policy-allowed risk and requires Telegram confirmation for destructive work", async () => {
     const home = tempDirectory("daemon-approval-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /deploy/u, title: "Cleanup deploy" }));
     const broker = new FakeBroker();
     broker.workerEvents = [
       { type: "started", threadId: "th_1" },
@@ -789,8 +860,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -824,7 +903,7 @@ describe("OperatorDaemon product flow", () => {
   it("classifies every approval risk category before presenting a decision", async () => {
     const home = tempDirectory("daemon-approval-categories-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /policy/u, title: "Risk matrix" }));
     const broker = new FakeBroker();
     const cases: Array<{
       approvalId: string;
@@ -860,9 +939,17 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
     const testConfig = { ...config(home), approval: { autoAllow: [] } };
-    daemon = new OperatorDaemon(testConfig, store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(testConfig, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -877,71 +964,12 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("passes explicit server-advertised model and reasoning choices into T3 thread creation", async () => {
-    const home = tempDirectory("daemon-model-policy-");
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    broker.providers = [testProviderDescriptor()];
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(message(1, "implement this using Sonnet with maximum reasoning"));
-    await waitFor(() => broker.threadInputs.length === 1);
-    expect(broker.threadInputs[0]).toMatchObject({
-      providerInstanceId: "claude_work",
-      model: "claude-sonnet-5",
-      modelOptions: [{ id: "effort", value: "max" }],
-    });
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
-  it("starts a new T3 thread when an explicit model change is forbidden after session start", async () => {
-    const home = tempDirectory("daemon-model-new-thread-");
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    broker.providers = [{ ...testProviderDescriptor(), requiresNewThreadForModelChange: true }];
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(message(1, "implement the auth flow"));
-    await waitFor(() => broker.threads.length === 1 && store.getThread("th_1")?.status === "completed");
-    expect(broker.threads[0]?.model).toBe("claude-opus-5");
-
-    telegram.push(message(2, "continue this using Sonnet with maximum reasoning"));
-    await waitFor(() => broker.threadInputs.length === 2);
-    expect(broker.threadInputs[1]).toMatchObject({
-      providerInstanceId: "claude_work",
-      model: "claude-sonnet-5",
-      modelOptions: [{ id: "effort", value: "max" }],
-    });
-    expect(broker.turns[1]?.threadId).toBe("th_2");
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
   it("durably queues a follow-up when the provider cannot accept live input and dispatches it after completion", async () => {
     const home = tempDirectory("daemon-followup-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /implement|also add/u, providerInstanceId: "claude_work", title: "Auth flow" }),
+    );
     const broker = new FakeBroker();
     broker.providers = [{ ...testProviderDescriptor(), capabilities: { ...testProviderDescriptor().capabilities, liveInput: false } }];
     broker.workerEvents = [
@@ -953,8 +981,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -976,7 +1012,9 @@ describe("OperatorDaemon product flow", () => {
   it("steers a running turn immediately when T3 advertises live input", async () => {
     const home = tempDirectory("daemon-live-input-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /implement|also add/u, providerInstanceId: "claude_work", title: "Auth flow" }),
+    );
     const broker = new FakeBroker();
     broker.providers = [testProviderDescriptor()];
     broker.workerEvents = [
@@ -988,8 +1026,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -1038,8 +1084,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
 
     await daemon.initialize();
     expect(telegram.approvals).toHaveLength(1);
@@ -1052,14 +1106,24 @@ describe("OperatorDaemon product flow", () => {
   it("maintains structured thread memory, durable notes, focus commands, and daily compaction restoration", async () => {
     const home = tempDirectory("daemon-memory-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /implement/u, title: "Refresh-token locking" }),
+    );
     const broker = new FakeBroker();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -1125,264 +1189,65 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("runs three independent T3 workers concurrently and delivers one synthesis", async () => {
-    const home = tempDirectory("daemon-worker-group-");
+  it("fans a separable task out to three independent monitored workers", async () => {
+    const home = tempDirectory("daemon-fanout-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(
-      message(
-        1,
-        "investigate production latency in parallel across backend, database, and git history",
-      ),
-    );
-    await waitFor(() => broker.turns.length === 3);
-    await waitFor(() =>
-      telegram.sent.some((entry) =>
-        entry.text.includes("Parallel synthesis: backend, database, and history evidence reconciled."),
-      ),
-    );
-
-    expect(broker.threads).toHaveLength(3);
-    expect(broker.turns.map((turn) => turn.text)).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining("Assigned role: backend investigator"),
-        expect.stringContaining("Assigned role: database investigator"),
-        expect.stringContaining("Assigned role: history investigator"),
-      ]),
-    );
-    expect(store.listUndeliveredWorkerGroups()).toHaveLength(0);
-    expect(telegram.sent.filter((entry) => entry.text === "Worker завершил задачу; тесты прошли.")).toHaveLength(0);
-    expect(store.getReplyContext(7, 1)?.relatedThreadIds).toHaveLength(3);
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
-  it("shows one grouped status card and stops every active worker in the group", async () => {
-    const home = tempDirectory("daemon-worker-group-control-");
-    const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      const task = userText(envelope);
+      if (!/latency/u.test(task)) return "Париж.";
+      const workspacesRoot =
+        /New project workspaces belong under (\S+)\./u.exec(envelope)?.[1] ?? "/tmp/workspaces";
+      const project = (await call("t3.create_project", {
+        name: "Latency Investigation",
+        workspaceRoot: `${workspacesRoot}/latency`,
+      })) as { id: string };
+      for (const scope of ["Backend profiling", "Database analysis", "Git history"]) {
+        const thread = (await call("t3.create_thread", { projectId: project.id, title: scope })) as {
+          id: string;
+        };
+        await call("t3.send_turn", { threadId: thread.id, text: `${scope}: ${task}` });
+      }
+      return "Запустил три независимых scope.";
+    });
     const broker = new FakeBroker();
     broker.holdTerminal();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
-    telegram.push(message(1, "investigate latency in parallel across backend, database, and history"));
+    telegram.push(message(1, "разберись с production latency по трем направлениям"));
     await waitFor(() => broker.turns.length === 3);
+    await waitFor(() => store.listThreads({ statuses: ["running"] }).length === 3);
+
     telegram.push(message(2, "/status"));
     await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Работа")));
     const status = telegram.sent.find((entry) => entry.text.startsWith("## Работа"))!.text;
-    expect(status).toContain("3 scopes");
-    expect(status).toContain("backend investigator — running");
-    expect(status).toContain("database investigator — running");
-    expect(status).toContain("history investigator — running");
-
-    telegram.push(message(3, "/stop"));
-    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Остановил группу")));
-    expect(broker.threads.every((thread) => thread.status === "cancelled")).toBe(true);
-    expect(store.listUndeliveredWorkerGroups()).toHaveLength(0);
+    for (const scope of ["Backend profiling", "Database analysis", "Git history"]) {
+      expect(status).toContain(scope);
+    }
 
     broker.releaseTerminal();
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
-  it("moves work across projects through a new thread and a structured handoff packet", async () => {
-    const home = tempDirectory("daemon-handoff-");
-    const sourceRoot = `${home}/source`;
-    const targetRoot = `${home}/target`;
-    mkdirSync(sourceRoot, { recursive: true });
-    mkdirSync(targetRoot, { recursive: true });
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    const timestamp = nowIso();
-    const sourceProject: Project = {
-      id: "prj_source",
-      t3ProjectId: "prj_source",
-      name: "Source Project",
-      workspaceRoot: sourceRoot,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    const targetProject: Project = {
-      id: "prj_target",
-      t3ProjectId: "prj_target",
-      name: "Target Project",
-      workspaceRoot: targetRoot,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    const sourceThread: WorkThread = {
-      id: "th_source",
-      t3ThreadId: "th_source",
-      projectId: sourceProject.id,
-      provider: "claude",
-      model: "opus",
-      title: "Auth redesign",
-      shortSummary: "Refresh-token architecture is drafted.",
-      keywords: ["auth", "refresh"],
-      status: "completed",
-      createdAt: timestamp,
-      updatedAt: timestamp,
-      lastActivityAt: timestamp,
-      lastUserIntent: "redesign refresh-token authentication",
-      lastResultSummary: "Selected rotating refresh tokens.",
-      relatedArtifacts: [],
-    };
-    broker.projects.push(sourceProject, targetProject);
-    broker.threads.push(sourceThread);
-    store.upsertProject(sourceProject);
-    store.upsertProject(targetProject);
-    store.upsertThread(sourceThread);
-    store.saveTelegramMessage({
-      chatId: 7,
-      messageId: 50,
-      primaryProjectId: sourceProject.id,
-      primaryThreadId: sourceThread.id,
-      relatedThreadIds: [sourceThread.id],
-      artifactIds: [],
-      messageType: "worker_completed",
-      createdAt: timestamp,
-    });
-    store.linkMessageThread(7, 50, sourceThread.id);
-    store.setFocus("42", {
-      primary: {
-        projectId: targetProject.id,
-        topic: targetProject.name,
-        confidence: 0.99,
-        updatedAt: timestamp,
-      },
-      secondary: [],
-    });
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    const sourceArtifactPath = `${sourceRoot}/handoff-notes.md`;
-    writeFileSync(sourceArtifactPath, "important handoff evidence", { mode: 0o600 });
-    await artifacts.initialize();
-    await artifacts.registerOutbound(sourceArtifactPath, [sourceRoot], {
-      projectId: sourceProject.id,
-      threadId: sourceThread.id,
-      mimeType: "text/markdown",
-    });
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push({
-      ...message(1, "перенеси эту работу в Target Project и продолжи"),
-      replyToMessageId: 50,
-    });
-    await waitFor(() => broker.turns.length === 1);
-    expect(broker.threads).toHaveLength(2);
-    expect(broker.threads[1]?.projectId).toBe(targetProject.id);
-    expect(broker.turns[0]?.text).toContain('"sourceThreadId": "th_source"');
-    expect(broker.turns[0]?.text).toContain('"targetProjectId": "prj_target"');
-    expect(broker.turns[0]?.artifacts).toHaveLength(1);
-    expect(broker.turns[0]?.artifacts?.[0]?.localPath).toContain(`${targetRoot}/.operator-inbox/`);
-    expect(store.getFocus("42").primary?.threadId).toBe(broker.threads[1]?.id);
-    expect(
-      telegram.sent.some((entry) => entry.text.includes("через новый T3 thread и handoff packet")),
-    ).toBe(true);
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
-  it("answers small talk directly even when lexical candidates exist", async () => {
-    const home = tempDirectory("daemon-route-smalltalk-");
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    seedAmbiguousAuthThreads(store, broker);
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(message(1, "привет! ответь одной фразой про auth work"));
-    await waitFor(() => telegram.sent.length > 0 || telegram.visible.length > 0);
-    expect(telegram.choicePrompts).toHaveLength(0);
-    expect(broker.turns).toHaveLength(0);
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
-  it("does not silently delegate small talk into a single lexical thread match", async () => {
-    const home = tempDirectory("daemon-route-single-lexical-");
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    const timestamp = nowIso();
-    const project: Project = {
-      id: "prj_checks",
-      t3ProjectId: "prj_checks",
-      name: "Checks",
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    const thread: WorkThread = {
-      id: "th_ipcheck",
-      t3ThreadId: "th_ipcheck",
-      projectId: project.id,
-      provider: "claude",
-      model: "opus",
-      title: "Проверка IP и пользователя",
-      shortSummary: "Проверка сервера",
-      keywords: ["проверка"],
-      status: "completed",
-      createdAt: timestamp,
-      updatedAt: timestamp,
-      lastActivityAt: timestamp,
-      relatedArtifacts: [],
-    };
-    broker.projects.push(project);
-    broker.threads.push(thread);
-    store.upsertProject(project);
-    store.upsertThread(thread);
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(message(1, "Привет! Проверка после фиксов. Ответь одной короткой фразой."));
-    await waitFor(() => telegram.sent.length > 0 || telegram.visible.length > 0);
-    expect(broker.turns).toHaveLength(0);
-    expect(telegram.choicePrompts).toHaveLength(0);
-    // A follow-up mentioning the freshly created thread's words must also stay
-    // direct when its only artifact evidence is context-covered.
+    await waitFor(
+      () => store.listThreads({ statuses: ["completed"] }).length === 3,
+      5_000,
+    );
+    await waitFor(
+      () => telegram.sent.filter((entry) => entry.text.includes("Worker завершил задачу")).length === 3,
+      5_000,
+    );
 
     telegram.finish();
     await run;
@@ -1398,8 +1263,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -1418,7 +1291,10 @@ describe("OperatorDaemon product flow", () => {
     });
 
     await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Принял 13 сообщ.")));
-    await waitFor(() => telegram.sent.length > 1 || telegram.visible.length > 0);
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("User message:")));
+    const envelope = runtime.prompts.findLast((prompt) => prompt.includes("User message:"))!;
+    expect(envelope).toContain("12 forwarded message(s)");
+    expect(envelope).toContain("Owner's own words: суммаризируй это");
     expect(broker.turns).toHaveLength(0);
     expect(store.listThreads()).toHaveLength(0);
 
@@ -1436,8 +1312,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -1448,144 +1332,6 @@ describe("OperatorDaemon product flow", () => {
 
     telegram.finish();
     await run;
-    await daemon.stop();
-  });
-
-  it("resolves a routing clarification from an inline button press", async () => {
-    const home = tempDirectory("daemon-route-button-");
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    seedAmbiguousAuthThreads(store, broker);
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(message(1, "continue auth work"));
-    await waitFor(() => telegram.choicePrompts.length === 1);
-    const prompt = telegram.choicePrompts[0]!;
-    const clarification = store.findPendingRoutingClarificationByMessage(7, prompt.messageId);
-    expect(clarification).toBeDefined();
-    expect(prompt.choiceId).toBe(clarification!.id);
-    const expectedThreadId = clarification!.candidateThreadIds[1]!;
-
-    telegram.push(callback(99, "cb_route_1", prompt.messageId, `route:${prompt.choiceId}:1`));
-    await waitFor(() => broker.turns.length === 1);
-    expect(broker.turns[0]?.threadId).toBe(expectedThreadId);
-    expect(broker.turns[0]?.text).toContain("continue auth work");
-    expect(store.getRoutingClarification(clarification!.id)).toBeUndefined();
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
-  it("uses Operator shortlist arbitration when one similar thread is materially identified", async () => {
-    const home = tempDirectory("daemon-route-arbitration-");
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    runtime.routingSelectionThreadId = "th_redesign";
-    const broker = new FakeBroker();
-    seedAmbiguousAuthThreads(store, broker);
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(message(1, "continue the auth redesign work"));
-    await waitFor(() => broker.turns.length === 1);
-    expect(broker.turns[0]?.threadId).toBe("th_redesign");
-    expect(telegram.sent.some((entry) => entry.text.includes("Какой продолжить"))).toBe(false);
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
-  it("persists a material routing clarification and resumes the original task from a numbered reply", async () => {
-    const home = tempDirectory("daemon-route-clarification-");
-    const store = tempStore();
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    seedAmbiguousAuthThreads(store, broker);
-    const candidates = store.searchThreads("continue auth work");
-    const expectedThreadId = candidates[1]!.thread.id;
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-    await daemon.initialize();
-    const run = daemon.run();
-
-    telegram.push(message(1, "continue auth work"));
-    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Какой продолжить")));
-    const prompt = telegram.sent.find((entry) => entry.text.includes("Какой продолжить"))!;
-    telegram.push({ ...message(2, "2"), replyToMessageId: prompt.messageId });
-    await waitFor(() => broker.turns.length === 1);
-    expect(broker.turns[0]?.threadId).toBe(expectedThreadId);
-    expect(broker.turns[0]?.text).toContain("continue auth work");
-    expect(store.getReplyContext(7, 2)?.primaryThreadId).toBe(expectedThreadId);
-
-    telegram.finish();
-    await run;
-    await daemon.stop();
-  });
-
-  it("recovers and delivers one pending worker-group synthesis after restart", async () => {
-    const home = tempDirectory("daemon-group-recovery-");
-    const store = tempStore();
-    store.createWorkerGroup({
-      id: "group_recovery",
-      title: "Recovered investigation",
-      synthesisGoal: "Reconcile recovered evidence",
-      chatId: 7,
-      originMessageId: 55,
-    });
-    store.addWorkerGroupMember({
-      groupId: "group_recovery",
-      threadId: "thread_a",
-      role: "backend",
-      task: "Inspect backend",
-    });
-    store.addWorkerGroupMember({
-      groupId: "group_recovery",
-      threadId: "thread_b",
-      role: "database",
-      task: "Inspect database",
-    });
-    store.updateWorkerGroupMember("thread_a", "completed", {
-      summary: "Backend evidence",
-      status: "success",
-    });
-    store.updateWorkerGroupMember("thread_b", "failed", {
-      summary: "Database evidence unavailable",
-      status: "failed",
-    });
-    const runtime = new FakeRuntime();
-    const broker = new FakeBroker();
-    const telegram = new FakeTelegram();
-    const logger = pino({ enabled: false });
-    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
-    let daemon: OperatorDaemon;
-    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
-
-    await daemon.initialize();
-    expect(
-      telegram.sent.filter((entry) => entry.text.includes("Parallel synthesis: backend")).length,
-    ).toBe(1);
-    expect(store.listUndeliveredWorkerGroups()).toHaveLength(0);
     await daemon.stop();
   });
 
@@ -1703,18 +1449,26 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const startOnce = async () => {
       const store = new OperatorStore(databasePath);
-      const runtime = new FakeRuntime();
+      const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /implement/u, title: "Durable auth locking" }));
       const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
       let daemon: OperatorDaemon;
+      const tools = new OperatorToolServer({
+        broker,
+        store,
+        telegram,
+        artifacts,
+        logger,
+        onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+      });
       const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
-      daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+      daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
       await daemon.initialize();
       await daemon.stop();
     };
 
     await startOnce();
     expect(broker.turns).toHaveLength(1);
-    expect(broker.turns[0]?.commandId).toMatch(/^dispatch_[a-f0-9]{32}$/);
+    expect(broker.turns[0]?.threadId).toBe("th_1");
     await startOnce();
     expect(broker.turns).toHaveLength(1);
   });
@@ -1729,13 +1483,63 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
-    telegram.push(message(1, "implement durable refresh-token locking and run all tests"));
-    await waitFor(() => store.listBackgroundJobs("t3_dispatch").length === 1);
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_retry",
+      t3ProjectId: "prj_retry",
+      name: "Retry Project",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const thread: WorkThread = {
+      id: "th_retry",
+      t3ThreadId: "th_retry",
+      projectId: project.id,
+      title: "Retry work",
+      shortSummary: "",
+      keywords: [],
+      status: "idle",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    broker.projects.push(project);
+    broker.threads.push(thread);
+    store.upsertProject(project);
+    store.upsertThread(thread);
+    store.enqueueBackgroundJob(
+      "t3_dispatch",
+      {
+        commandId: "cmd_retry_1",
+        correlationId: "test-retry",
+        threadId: thread.id,
+        projectId: project.id,
+        text: "resume the retry scope",
+        artifacts: [],
+        chatId: 7,
+        originMessageId: 1,
+        destination: {},
+        ackText: "Продолжил работу **Retry work**.",
+        messageType: "worker_followup_started",
+      },
+      undefined,
+      { id: "cmd_retry_1", dedupeKey: "t3-dispatch:cmd_retry_1" },
+    );
+    await daemon.maintain("first drain");
     await waitFor(() => telegram.sent.some((entry) => entry.text.includes("задача сохранена")));
     const pending = store.listBackgroundJobs("t3_dispatch")[0]!;
     expect(pending.status).toBe("pending");
@@ -1754,7 +1558,7 @@ describe("OperatorDaemon product flow", () => {
   it("classifies provider rate limits, retries once, and never exposes the raw provider error", async () => {
     const home = tempDirectory("daemon-provider-recovery-");
     const store = tempStore();
-    const runtime = new FakeRuntime();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /implement/u, title: "Auth recovery" }));
     const broker = new FakeBroker();
     broker.workerEvents = [
       {
@@ -1767,8 +1571,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -1792,8 +1604,16 @@ describe("OperatorDaemon product flow", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
     const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -1813,40 +1633,6 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 });
-
-function seedAmbiguousAuthThreads(store: ReturnType<typeof tempStore>, broker: FakeBroker): void {
-  const timestamp = nowIso();
-  const project: Project = {
-    id: "prj_auth",
-    t3ProjectId: "prj_auth",
-    name: "Identity Platform",
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-  const makeThread = (id: string, title: string): WorkThread => ({
-    id,
-    t3ThreadId: id,
-    projectId: project.id,
-    provider: "claude",
-    model: "opus",
-    title,
-    shortSummary: "auth work",
-    keywords: ["auth"],
-    status: "idle",
-    createdAt: timestamp,
-    updatedAt: timestamp,
-    lastActivityAt: timestamp,
-    relatedArtifacts: [],
-  });
-  const threads = [
-    makeThread("th_bug", "Production auth bug"),
-    makeThread("th_redesign", "Auth redesign"),
-  ];
-  broker.projects.push(project);
-  broker.threads.push(...threads);
-  store.upsertProject(project);
-  for (const thread of threads) store.upsertThread(thread);
-}
 
 function config(home: string): Config {
   return {
@@ -2018,7 +1804,6 @@ function callbackAs(
 }
 
 class FakeRuntime implements OperatorRuntime {
-  routingSelectionThreadId?: string;
   readonly prompts: string[] = [];
   readonly compactReasons: string[] = [];
   readonly toolAccesses: OperatorToolAccess[] = [];
@@ -2034,47 +1819,23 @@ class FakeRuntime implements OperatorRuntime {
   }): AsyncIterable<OperatorEvent> {
     this.prompts.push(input.prompt);
     if (input.toolAccess) this.toolAccesses.push(input.toolAccess);
-    const text = input.prompt.includes("Arbitrate routing")
-      ? this.routingSelectionThreadId
-        ? JSON.stringify({
-            decision: "select",
-            threadId: this.routingSelectionThreadId,
-            confidence: 0.91,
-            reason: "The user named the redesign context.",
-          })
-        : JSON.stringify({ decision: "ask", confidence: 0.55, reason: "Material ambiguity." })
-      : input.prompt.includes("Normalize this completed")
+    const text = input.prompt.includes("Normalize this completed")
       ? JSON.stringify({
           summary: "Worker завершил задачу; тесты прошли.",
           status: "success",
           importantDecisions: ["Use single-flight refresh locking."],
         })
-      : input.prompt.includes("Decide how to delegate the user's task")
-        ? input.prompt.includes("latency")
-          ? JSON.stringify({
-              mode: "parallel",
-              workers: [
-                { title: "Backend profiling", role: "backend investigator", task: "Profile backend latency." },
-                { title: "Database analysis", role: "database investigator", task: "Analyze database latency." },
-                { title: "Git history", role: "history investigator", task: "Inspect recent git history." },
-              ],
-              synthesisGoal: "Explain production latency with reconciled evidence.",
-              rationale: "Independent evidence streams.",
-            })
-          : JSON.stringify({ mode: "single", rationale: "One scope is enough." })
-      : input.prompt.includes("Synthesize this completed parallel")
-          ? "Parallel synthesis: backend, database, and history evidence reconciled."
-          : input.prompt.includes("Prepare durable memory maintenance")
-            ? JSON.stringify({
-                notes: [
-                  {
-                    category: "decision",
-                    content: "Always preserve durable focus after compaction.",
-                  },
-                ],
-                obsoleteNoteIds: [],
-              })
-          : "Париж.";
+      : input.prompt.includes("Prepare durable memory maintenance")
+        ? JSON.stringify({
+            notes: [
+              {
+                category: "decision",
+                content: "Always preserve durable focus after compaction.",
+              },
+            ],
+            obsoleteNoteIds: [],
+          })
+        : "Париж.";
     yield { type: "text_delta", text };
     yield { type: "result", text, sessionId: input.sessionId };
   }
@@ -2088,6 +1849,108 @@ class FakeRuntime implements OperatorRuntime {
   async health(): Promise<{ healthy: boolean }> {
     return { healthy: true };
   }
+}
+
+type ToolCall = (name: string, args: Record<string, unknown>) => Promise<unknown>;
+type OperatorScript = (envelope: string, call: ToolCall) => Promise<string>;
+
+/**
+ * Plays the Operator agent: on a user-facing envelope it connects to the
+ * per-turn MCP capability and routes work with the same t3.* tools the real
+ * CLI would use. Non-envelope prompts (normalization, maintenance) fall back
+ * to the scripted FakeRuntime answers.
+ */
+class DelegatingRuntime extends FakeRuntime {
+  constructor(private readonly script: OperatorScript) {
+    super();
+  }
+
+  override async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (!input.prompt.includes("User message:") || !input.toolAccess) {
+      yield* super.sendTurn(input);
+      return;
+    }
+    this.prompts.push(input.prompt);
+    this.toolAccesses.push(input.toolAccess);
+    const client = new Client({ name: "delegating-runtime", version: "1.0.0" });
+    let text: string;
+    try {
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(input.toolAccess.url), {
+          requestInit: { headers: { Authorization: `Bearer ${input.toolAccess.token}` } },
+        }),
+      );
+      text = await this.script(input.prompt, async (name, args) => {
+        const result = await client.callTool({ name, arguments: args });
+        const textItem = (result.content as Array<{ type?: string; text?: string }>).find(
+          (item) => item.type === "text",
+        );
+        if (result.isError) throw new Error(textItem?.text ?? "tool call failed");
+        return textItem?.text ? (JSON.parse(textItem.text) as unknown) : undefined;
+      });
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+    yield { type: "text_delta", text };
+    yield { type: "result", text, sessionId: input.sessionId };
+  }
+}
+
+function userText(envelope: string): string {
+  return /User message: ([\s\S]*?)(?:\n\n|$)/u.exec(envelope)?.[1] ?? "";
+}
+
+function envelopeThreadId(envelope: string): string | undefined {
+  return /threadId (th_[\w-]+)/u.exec(envelope)?.[1];
+}
+
+function envelopeArtifactIds(envelope: string): string[] {
+  const line = /Registered attachments[^:]*: (.+)/u.exec(envelope)?.[1] ?? "";
+  return [...new Set([...line.matchAll(/(art_[\w-]+):/g)].map((match) => match[1]!))];
+}
+
+/** A minimal agent policy: quick questions answer directly, work goes to one thread. */
+function delegatingScript(options: {
+  workPattern: RegExp;
+  title?: string;
+  providerInstanceId?: string;
+}): OperatorScript {
+  return async (envelope, call) => {
+    const task = userText(envelope);
+    const focusThreadId = envelopeThreadId(envelope);
+    if (!options.workPattern.test(task)) return "Париж.";
+    if (focusThreadId) {
+      const outcome = (await call("t3.send_turn", { threadId: focusThreadId, text: task })) as {
+        queued?: boolean;
+      };
+      return outcome.queued ? "Поставил уточнение в очередь." : "Передал уточнение в текущий turn.";
+    }
+    const workspacesRoot =
+      /New project workspaces belong under (\S+)\./u.exec(envelope)?.[1] ?? "/tmp/workspaces";
+    const projects = (await call("t3.list_projects", {})) as Array<{ id: string }>;
+    const project =
+      projects[0] ??
+      ((await call("t3.create_project", {
+        name: "Operator Work",
+        workspaceRoot: `${workspacesRoot}/operator-work`,
+      })) as { id: string });
+    const thread = (await call("t3.create_thread", {
+      projectId: project.id,
+      title: options.title ?? "Auth race fix",
+      ...(options.providerInstanceId ? { providerInstanceId: options.providerInstanceId } : {}),
+    })) as { id: string };
+    const artifactIds = envelopeArtifactIds(envelope);
+    await call("t3.send_turn", {
+      threadId: thread.id,
+      text: task,
+      ...(artifactIds.length ? { artifactIds } : {}),
+    });
+    return `Запустил работу **${options.title ?? "Auth race fix"}**.`;
+  };
 }
 
 class BlockingRuntime extends FakeRuntime {
@@ -2182,6 +2045,7 @@ class FakeBroker implements T3Broker {
   }
   async createProject(input: CreateProjectInput): Promise<Project> {
     const timestamp = nowIso();
+    if (input.workspaceRoot) mkdirSync(input.workspaceRoot, { recursive: true });
     const project: Project = {
       id: "prj_1",
       t3ProjectId: "prj_1",

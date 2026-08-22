@@ -4,9 +4,13 @@ This report records the reproducible, credential-free acceptance gates. The
 authoritative executable evidence is the named test; percentages are derived
 from its checked-in scenario corpus.
 
-## Routing quality (§89)
+## Routing quality (§89 — superseded)
 
-`tests/routing-quality.test.ts` contains 80 bilingual scenarios:
+Routing is now performed by the Operator agent through the per-turn `t3.*`
+tools; the deterministic cascade and its 80-scenario corpus were removed with
+it. Mechanical guarantees that stayed in code (Telegram reply continuation,
+forwarded-as-data, cancel intent, follow-up queueing) are asserted in
+`tests/daemon.integration.test.ts`. Historical corpus results:
 
 | Gate | Result | Required |
 |---|---:|---:|

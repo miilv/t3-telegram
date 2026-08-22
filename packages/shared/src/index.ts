@@ -114,12 +114,6 @@ export interface ConversationCompaction {
   createdAt: string;
 }
 
-export type WorkBinding =
-  | { type: "none" }
-  | { type: "project"; projectId: string }
-  | { type: "thread"; threadId: string }
-  | { type: "multi_thread"; primaryThreadId?: string; threadIds: string[] };
-
 export interface FocusState {
   primary?: {
     projectId: string;
@@ -176,39 +170,27 @@ export interface ReplyContext {
   relatedThreadIds?: string[];
 }
 
-export interface OperatorInput {
-  text?: string;
-  telegram: {
-    chatId: number;
-    userId: number;
-    messageId: number;
-    threadId?: number;
-    replyToMessageId?: number;
-  };
-  artifacts: ArtifactRef[];
-  replyContext?: ReplyContext;
-  focus: FocusState;
-  candidateProjects?: ProjectCandidate[];
-  candidateThreads?: ThreadCandidate[];
-}
-
-export interface ProjectCandidate {
-  project: Project;
-  score: number;
-  reasons: string[];
-}
-
 export interface ThreadCandidate {
   thread: WorkThread;
   score: number;
   reasons: string[];
 }
 
-export interface RoutingDecision {
-  binding: WorkBinding;
-  confidence: number;
-  reasons: string[];
-  shouldAsk: boolean;
+/**
+ * A durable follow-up for a busy thread whose provider cannot take live
+ * input; the daemon dispatches it when the current turn becomes terminal.
+ */
+export interface QueuedThreadFollowup {
+  threadId: string;
+  text: string;
+  artifacts: ArtifactRef[];
+  chatId: number;
+  originMessageId: number;
+  destination: { messageThreadId?: number; directMessagesTopicId?: number };
+  providerInstanceId?: string;
+  model?: string;
+  modelOptions?: Array<{ id: string; value: string | boolean }>;
+  correlationId?: string;
 }
 
 export interface WorkerResult {
@@ -225,34 +207,6 @@ export interface WorkerResult {
 export interface NormalizedMessage {
   role: string;
   text: string;
-}
-
-export interface ThreadHandoff {
-  sourceProjectId: string;
-  sourceThreadId: string;
-  targetProjectId: string;
-  taskSummary: string;
-  currentState: string;
-  conclusions: string[];
-  decisions: string[];
-  unresolvedQuestions: string[];
-  importantFiles: ArtifactRef[];
-  changedFiles?: string[];
-  nextActions: string[];
-  sourceTranscriptTail?: NormalizedMessage[];
-}
-
-export interface DelegatedWorkerPlan {
-  title: string;
-  task: string;
-  role: string;
-}
-
-export interface DelegationPlan {
-  mode: "single" | "parallel";
-  workers: DelegatedWorkerPlan[];
-  synthesisGoal: string;
-  rationale: string;
 }
 
 export interface UserInputQuestionOption {

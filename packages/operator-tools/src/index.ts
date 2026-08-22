@@ -19,6 +19,7 @@ import type {
   OperatorPolicySettings,
   OperatorToolAccess,
   Project,
+  QueuedThreadFollowup,
   TeamRole,
   T3Broker,
   WorkThread,
@@ -47,6 +48,7 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "t3.get_thread",
   "t3.create_thread",
   "t3.send_turn",
+  "t3.list_providers",
   "t3.interrupt_thread",
   "t3.get_thread_status",
   "t3.get_thread_summary",
@@ -99,6 +101,10 @@ export interface OperatorToolTurnContext extends TelegramDestination {
 export interface ToolStartedThread {
   threadId: string;
   context: OperatorToolTurnContext;
+  /** The user-facing task text sent to the worker, used as durable intent/focus. */
+  intentText?: string;
+  /** Registered artifacts the Operator attached to the turn. */
+  artifactIds?: string[];
 }
 
 export interface OperatorToolLease {
@@ -415,9 +421,57 @@ export class OperatorToolServer {
         model: z.string().min(1).optional(),
       }),
       handler: async (input, capability) => {
-        await this.requireThreadAccess(capability, input.threadId, true);
-        const artifacts = (input.artifactIds ?? []).map((id) => this.options.artifacts.resolve(id));
-        for (const artifact of artifacts) this.requireArtifactAccess(capability, artifact);
+        const thread = await this.requireThreadAccess(capability, input.threadId, true);
+        const resolved = (input.artifactIds ?? []).map((id) => this.options.artifacts.resolve(id));
+        for (const artifact of resolved) this.requireArtifactAccess(capability, artifact);
+        // The worker only sees its own workspace, so registered artifacts are
+        // copied into the project-local inbox before the turn is dispatched.
+        const workspaceRoot = resolved.length
+          ? (await this.options.broker.getProject(thread.projectId)).workspaceRoot
+          : undefined;
+        const artifacts = workspaceRoot
+          ? await Promise.all(
+              resolved.map((artifact) =>
+                this.options.artifacts.materializeForThread(artifact.id, workspaceRoot),
+              ),
+            )
+          : resolved;
+        const started: ToolStartedThread = {
+          threadId: input.threadId,
+          context: capability.context,
+          intentText: input.text,
+          ...(input.artifactIds?.length ? { artifactIds: input.artifactIds } : {}),
+        };
+        // A busy thread whose provider cannot take live input gets a durable
+        // follow-up; the daemon dispatches it when the current turn ends.
+        if (["queued", "running", "waiting_approval", "waiting_user"].includes(thread.status)) {
+          const providers = await this.options.broker.getProviders().catch(() => []);
+          const liveInput =
+            providers.find((provider) => provider.instanceId === thread.provider)?.capabilities
+              .liveInput === true;
+          if (!liveInput) {
+            const followup: QueuedThreadFollowup = {
+              threadId: input.threadId,
+              text: input.text,
+              artifacts,
+              chatId: capability.context.chatId,
+              originMessageId: capability.context.originMessageId,
+              destination: {
+                ...(capability.context.messageThreadId
+                  ? { messageThreadId: capability.context.messageThreadId }
+                  : {}),
+                ...(capability.context.directMessagesTopicId
+                  ? { directMessagesTopicId: capability.context.directMessagesTopicId }
+                  : {}),
+              },
+              ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
+              ...(input.model ? { model: input.model } : {}),
+            };
+            this.options.store.enqueueBackgroundJob("thread_followup", followup);
+            await this.options.onThreadStarted?.(started);
+            return { threadId: input.threadId, queued: true, reason: "thread is busy; the follow-up dispatches after the current turn" };
+          }
+        }
         const handle = await this.options.broker.sendTurn({
           threadId: input.threadId,
           text: input.text,
@@ -425,9 +479,26 @@ export class OperatorToolServer {
           ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
           ...(input.model ? { model: input.model } : {}),
         });
-        await this.options.onThreadStarted?.({ threadId: input.threadId, context: capability.context });
+        await this.options.onThreadStarted?.(started);
         return { threadId: handle.threadId, commandId: handle.commandId, status: "queued" };
       },
+    });
+    this.addTool(server, token, {
+      name: "t3.list_providers",
+      description: "List the T3 server's advertised providers and models for explicit user requests.",
+      schema: z.object({}),
+      readOnly: true,
+      handler: async () =>
+        (await this.options.broker.getProviders()).map((provider) => ({
+          instanceId: provider.instanceId,
+          ready: provider.ready,
+          available: provider.available,
+          liveInput: provider.capabilities.liveInput,
+          models: provider.models.map((model) => ({
+            slug: model.slug,
+            ...(model.isDefault ? { isDefault: true } : {}),
+          })),
+        })),
     });
     this.addTool(server, token, {
       name: "t3.interrupt_thread",
