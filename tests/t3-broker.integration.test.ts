@@ -200,6 +200,55 @@ describe("HttpT3Broker", () => {
     expect(fixture.threadReadCount).toBe(1);
   });
 
+  it("forwards intermediate agent narration but never the final answer twice", async () => {
+    const liveClient = new FakeLiveClient();
+    const broker = new HttpT3Broker(
+      {
+        baseUrl: fixture.url,
+        providerInstanceId: "claude",
+        model: "claude-opus-4-1",
+        runtimeMode: "approval-required",
+        pollIntervalMs: 5,
+        liveClient,
+      },
+      store,
+      pino({ enabled: false }),
+    );
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: "/tmp/acme" });
+    const thread = await broker.createThread({ projectId: project.id, title: "Auth" });
+    await broker.sendTurn({ threadId: thread.id, text: "Fix auth" });
+    liveClient.threadItems = [
+      t3Event(4, "thread.message-sent", {
+        messageId: "msg_1",
+        role: "assistant",
+        text: "Смотрю логи авторизации.",
+        streaming: false,
+      }),
+      t3Event(5, "thread.message-sent", {
+        messageId: "msg_2",
+        role: "assistant",
+        text: "Нашёл гонку в refresh.",
+        streaming: false,
+      }),
+      t3Event(6, "thread.message-sent", {
+        messageId: "msg_final",
+        role: "assistant",
+        text: "Готово: гонка закрыта, тесты зелёные.",
+        streaming: false,
+      }),
+      t3Event(7, "thread.session-set", {
+        session: { status: "ready", activeTurnId: null, lastError: null },
+      }),
+    ];
+    const events = [];
+    for await (const event of broker.subscribeThread(thread.id)) events.push(event);
+    const narration = events.filter((event) => event.type === "agent_message").map((event) => event.text);
+    expect(narration).toEqual(["Смотрю логи авторизации.", "Нашёл гонку в refresh."]);
+    const completed = events.find((event) => event.type === "completed");
+    expect(completed?.result).toBe("Готово: гонка закрыта, тесты зелёные.");
+    expect(narration).not.toContain("Готово: гонка закрыта, тесты зелёные.");
+  });
+
   it("uses T3 RPC full-text matches and exposes approval requests", async () => {
     const liveClient = new FakeLiveClient();
     const broker = new HttpT3Broker(

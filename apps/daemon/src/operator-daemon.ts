@@ -913,7 +913,6 @@ export class OperatorDaemon {
     ].join("\n\n");
     const operatorStartedAt = Date.now();
     let toolSteps = 0;
-    const progressLines: string[] = [];
     let observedFirstToken = false;
     let finalText: string;
     let messageType = "operator_answer";
@@ -928,15 +927,13 @@ export class OperatorDaemon {
           writer?.append(delta);
         },
         toolLease?.access,
-        (tool) => {
+        () => {
           toolSteps += 1;
-          const label = describeOperatorTool(tool);
-          if (progressLines.at(-1) !== label) progressLines.push(label);
-          // Keep the text growing: Telegram animates only the appended part,
-          // while a full replacement restarts the typing effect every step.
-          writer?.reset(
-            [`⏳ Разбираюсь… (шаг ${toolSteps})`, ...progressLines.slice(-6).map((line) => `▸ ${line}`)].join("\n"),
-          );
+          // Only the preamble before the very first tool call is throwaway
+          // narration ("I'll take a look"). Everything the model writes between
+          // later tool calls is real commentary and stays in the live preview,
+          // which is what the T3 thread shows too.
+          if (toolSteps === 1) writer?.reset("⏳ Работаю…");
         },
       );
       if (writer && !writer.text && answer) writer.append(answer);
@@ -1892,6 +1889,27 @@ export class OperatorDaemon {
                 "rich",
                 {
                   text: `**${this.store.getThread(threadId)?.title ?? "Работа"}**\n\n${event.summary}`,
+                  options: destination,
+                  threadId,
+                  correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`),
+                  messageType: "worker_progress",
+                  anchor: {
+                    threadId,
+                    messageTypes: ["worker_started", "worker_started_degraded", "worker_group_started", "t3_dispatch_deferred"],
+                  },
+                },
+              );
+              await this.flushTelegramOutbox();
+            } else if (event.type === "agent_message") {
+              // The worker's own words, exactly as the T3 thread shows them.
+              // Generic activity summaries stay throttled; real narration does
+              // not — it is low-volume and the only informative progress there is.
+              this.enqueueTelegramOutbox(
+                `telegram:say:${threadId}:${stableTextHash(event.text)}`,
+                chatId,
+                "rich",
+                {
+                  text: `**${this.store.getThread(threadId)?.title ?? "Работа"}**\n\n${safeExcerpt(event.text, 2_500)}`,
                   options: destination,
                   threadId,
                   correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`),
@@ -5211,23 +5229,6 @@ function parseMemoryMaintenancePlan(value: string):
   } catch {
     return undefined;
   }
-}
-
-/** Human-readable Russian label for a live tool step shown in the draft. */
-function describeOperatorTool(tool: string): string {
-  const name = tool.replace(/^mcp__operator__/, "");
-  if (name === "Bash") return "Выполняю команду";
-  if (["Read", "Glob", "Grep"].includes(name)) return "Читаю файлы";
-  if (name === "WebSearch" || name === "utility_web_search") return "Ищу в вебе";
-  if (name === "WebFetch") return "Читаю страницу";
-  if (name.startsWith("t3_")) return "Работаю с T3";
-  if (name.startsWith("telegram_")) return "Пишу в чат";
-  if (name.startsWith("memory_")) return "Смотрю память";
-  if (name.startsWith("artifacts_")) return "Разбираю вложение";
-  if (name.startsWith("scheduler_")) return "Настраиваю расписание";
-  if (name.startsWith("calendar_") || name.startsWith("email_")) return "Смотрю коннекторы";
-  if (name.startsWith("utility_")) return "Считаю";
-  return "Работаю";
 }
 
 function fallbackWorkerResult(result: string): WorkerResult {

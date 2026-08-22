@@ -766,6 +766,12 @@ class ThreadSubscriptionProjection {
   private readonly assistantMessages = new Map<string, string>();
   private readonly seenActivities = new Set<string>();
   private lastCompletedAssistant = "";
+  /**
+   * The most recent finished assistant message, held back by one: if another
+   * message or a terminal state follows, this one was intermediate narration
+   * worth showing live; if the turn ends here, it is the result instead.
+   */
+  private pendingAssistant: { id: string; text: string } | undefined;
   private lastProgress = "";
   private lastSequence = -1;
   private startedEmitted = false;
@@ -844,7 +850,7 @@ class ThreadSubscriptionProjection {
         this.pushStarted(events);
         break;
       case "thread.message-sent":
-        this.applyMessage(payload);
+        events.push(...this.applyMessage(payload));
         break;
       case "thread.session-set": {
         if (!isRecord(payload.session) || typeof payload.session.status !== "string") break;
@@ -857,17 +863,20 @@ class ThreadSubscriptionProjection {
           break;
         }
         if (status === "error") {
+          this.pendingAssistant = undefined;
           const error = typeof session.lastError === "string" ? session.lastError : "T3 worker failed";
           this.store.updateThreadStatus(this.threadId, "failed", { result: error });
           events.push({ type: "failed", threadId: this.threadId, error });
           break;
         }
         if (status === "interrupted" || status === "stopped") {
+          this.pendingAssistant = undefined;
           this.store.updateThreadStatus(this.threadId, "cancelled");
           events.push({ type: "cancelled", threadId: this.threadId });
           break;
         }
         if ((status === "ready" || status === "idle") && this.turnObserved) {
+          this.pendingAssistant = undefined;
           const result = this.lastCompletedAssistant || "Worker completed.";
           this.store.updateThreadStatus(this.threadId, "completed", { result });
           events.push({ type: "completed", threadId: this.threadId, result });
@@ -890,14 +899,30 @@ class ThreadSubscriptionProjection {
     return events;
   }
 
-  private applyMessage(payload: Record<string, unknown>): void {
-    if (payload.role !== "assistant" || typeof payload.messageId !== "string") return;
+  private applyMessage(payload: Record<string, unknown>): WorkerEvent[] {
+    if (payload.role !== "assistant" || typeof payload.messageId !== "string") return [];
+    const messageId = payload.messageId;
     const incoming = typeof payload.text === "string" ? payload.text : "";
-    const existing = this.assistantMessages.get(payload.messageId) ?? "";
+    const existing = this.assistantMessages.get(messageId) ?? "";
     const streaming = payload.streaming === true;
     const text = streaming ? `${existing}${incoming}` : incoming || existing;
-    this.assistantMessages.set(payload.messageId, text);
-    if (!streaming) this.lastCompletedAssistant = text;
+    this.assistantMessages.set(messageId, text);
+    if (streaming) return [];
+    this.lastCompletedAssistant = text;
+    const events: WorkerEvent[] = [];
+    if (this.pendingAssistant && this.pendingAssistant.id !== messageId) {
+      events.push(...this.releasePendingAssistant());
+    }
+    if (text.trim()) this.pendingAssistant = { id: messageId, text };
+    return events;
+  }
+
+  /** Emit the held-back message: something followed it, so it was narration. */
+  private releasePendingAssistant(): WorkerEvent[] {
+    const pending = this.pendingAssistant;
+    this.pendingAssistant = undefined;
+    if (!pending?.text.trim()) return [];
+    return [{ type: "agent_message", threadId: this.threadId, text: pending.text }];
   }
 
   private applyActivity(activity: Record<string, unknown>): WorkerEvent[] {
@@ -966,6 +991,7 @@ class ThreadSubscriptionProjection {
         kind === "runtime.warning")
     ) {
       const events: WorkerEvent[] = [];
+      events.push(...this.releasePendingAssistant());
       this.pushProgress(events, summary);
       return events;
     }
@@ -973,6 +999,10 @@ class ThreadSubscriptionProjection {
   }
 
   private terminalForState(state: ThreadStatus, error?: string): WorkerEvent | undefined {
+    // Whatever is still held back is the final answer, delivered as the result.
+    if (state === "completed" || state === "failed" || state === "cancelled") {
+      this.pendingAssistant = undefined;
+    }
     if (state === "completed") {
       const result = this.lastCompletedAssistant || "Worker completed.";
       this.store.updateThreadStatus(this.threadId, "completed", { result });
