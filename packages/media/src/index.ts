@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import type { Logger } from "pino";
@@ -18,6 +18,12 @@ export interface MediaProcessorConfig {
   ffprobeBin: string;
   timeoutMs: number;
   maxInputBytes: number;
+  /** Upload ceiling of the remote STT endpoints (OpenAI/OpenRouter ~25 MB). */
+  sttMaxUploadBytes: number;
+  /** Segment length used when a recording is still too large after re-encoding. */
+  sttSegmentSeconds: number;
+  /** Deadline for long recordings, which outlive the interactive media budget. */
+  longTimeoutMs: number;
   openrouter?: { apiKey: string; model: string } | undefined;
   docling?: {
     endpoint: string;
@@ -107,7 +113,12 @@ export class MediaProcessor {
       return { artifacts: [] };
     }
     const startedAt = Date.now();
-    const deadline = startedAt + this.config.timeoutMs;
+    // A one-hour recording cannot be re-encoded, segmented, and transcribed
+    // inside the interactive media budget; long inputs get the long deadline.
+    const longInput =
+      (attachment.durationSeconds ?? 0) > 300 ||
+      original.sizeBytes > this.config.sttMaxUploadBytes;
+    const deadline = startedAt + (longInput ? this.config.longTimeoutMs : this.config.timeoutMs);
     const derived: Artifact[] = [];
     let transcriptionInput = original;
     let temporaryDirectory: string | undefined;
@@ -159,7 +170,19 @@ export class MediaProcessor {
         });
         derived.push(...frames);
       }
-      const transcription = await this.transcribe(transcriptionInput, deadline);
+      if (transcriptionInput.sizeBytes > this.config.sttMaxUploadBytes) {
+        temporaryDirectory ??= await mkdtemp(join(tmpdir(), "t3-media-in-"));
+        transcriptionInput = await this.compactForTranscription(
+          transcriptionInput,
+          temporaryDirectory,
+          deadline,
+        );
+        if (transcriptionInput.id !== original.id) derived.push(transcriptionInput);
+      }
+      const transcription =
+        transcriptionInput.sizeBytes > this.config.sttMaxUploadBytes
+          ? await this.transcribeInSegments(transcriptionInput, deadline)
+          : await this.transcribe(transcriptionInput, deadline);
       this.store.appendEvent("media.transcription.completed", {
         payload: {
           artifactId: original.id,
@@ -729,6 +752,114 @@ export class MediaProcessor {
     });
     this.binaryCache.set(binary, available);
     return available;
+  }
+
+  /**
+   * Re-encode an oversized recording to mono 16 kHz Opus, which is what the
+   * speech models consume anyway: an hour of meeting audio lands around 8 MB
+   * instead of 30 MB, so it fits one upload and one request.
+   */
+  private async compactForTranscription(
+    artifact: Artifact,
+    directory: string,
+    deadline: number,
+  ): Promise<Artifact> {
+    const target = join(directory, `${artifact.id}-stt.ogg`);
+    try {
+      await this.runFfmpeg(
+        ["-y", "-i", artifact.localPath, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "16k", target],
+        remaining(deadline),
+      );
+      const compacted = await this.artifacts.ingestDerivedFile({
+        path: target,
+        filename: `${stem(extensionBearingFilename(artifact))}-stt.ogg`,
+        mimeType: "audio/ogg",
+        derivedFromArtifactId: artifact.id,
+      });
+      this.store.appendEvent("media.transcription.compacted", {
+        payload: {
+          artifactId: artifact.id,
+          derivedArtifactId: compacted.id,
+          originalBytes: artifact.sizeBytes,
+          compactedBytes: compacted.sizeBytes,
+        },
+      });
+      return compacted;
+    } catch (error) {
+      this.logger.warn(
+        { artifactId: artifact.id, error: safeError(error) },
+        "Transcription re-encode failed; using the original audio",
+      );
+      return artifact;
+    }
+  }
+
+  /**
+   * Cut a still-oversized recording into fixed segments and transcribe each in
+   * order. One failed segment must not lose the rest, so it is marked inline.
+   */
+  private async transcribeInSegments(
+    artifact: Artifact,
+    deadline: number,
+  ): Promise<{ text: string; provider: string }> {
+    const directory = await mkdtemp(join(tmpdir(), "t3-stt-seg-"));
+    try {
+      const pattern = join(directory, "segment-%03d.ogg");
+      await this.runFfmpeg(
+        [
+          "-y",
+          "-i",
+          artifact.localPath,
+          "-vn",
+          "-ac",
+          "1",
+          "-ar",
+          "16000",
+          "-c:a",
+          "libopus",
+          "-b:a",
+          "16k",
+          "-f",
+          "segment",
+          "-segment_time",
+          String(this.config.sttSegmentSeconds),
+          pattern,
+        ],
+        remaining(deadline),
+      );
+      const names = (await readdir(directory)).filter((name) => name.endsWith(".ogg")).sort();
+      if (!names.length) throw new Error("segmenting produced no audio");
+      const parts: string[] = [];
+      let provider = "";
+      for (const [index, name] of names.entries()) {
+        const segment: Artifact = {
+          ...artifact,
+          id: `${artifact.id}-seg-${index}`,
+          localPath: join(directory, name),
+          filename: name,
+          mimeType: "audio/ogg",
+          sizeBytes: (await stat(join(directory, name))).size,
+        };
+        try {
+          const result = await this.transcribe(segment, deadline);
+          provider ||= result.provider;
+          parts.push(result.text);
+        } catch (error) {
+          this.logger.warn(
+            { artifactId: artifact.id, segment: name, error: safeError(error) },
+            "Segment transcription failed",
+          );
+          parts.push(`[фрагмент ${index + 1} не расшифрован]`);
+        }
+      }
+      this.store.appendEvent("media.transcription.segmented", {
+        payload: { artifactId: artifact.id, segments: names.length, provider },
+      });
+      if (!provider) throw new Error("all transcription segments failed");
+      return { text: parts.join("\n\n"), provider: `${provider} (${names.length} segments)` };
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 
   private async transcribe(

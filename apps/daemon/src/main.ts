@@ -21,7 +21,11 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config.logLevel);
   const store = new OperatorStore(config.operator.databasePath);
-  const artifacts = new ArtifactRegistry(config.operator.artifactDir, store);
+  const artifacts = new ArtifactRegistry(
+    config.operator.artifactDir,
+    store,
+    config.media.maxInputBytes,
+  );
   const claudeRuntime = new ClaudeCliOperatorRuntime({
     binary: config.operator.claudeBin,
     cwd: config.operator.runtimeDir,
@@ -57,6 +61,9 @@ async function main(): Promise<void> {
     { users: config.telegram.users, allowGroups: config.telegram.allowGroups },
     config.telegram.pollTimeoutSeconds,
     logger,
+    config.telegram.apiBase,
+    undefined,
+    config.telegram.localFiles,
   );
   const media = new MediaProcessor(config.media, artifacts, store, logger);
   const connectors = new GoogleWorkspaceConnectors({

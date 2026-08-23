@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import pino from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -7,6 +9,7 @@ import {
   TelegramBotTransport,
 } from "../packages/telegram/src/index.js";
 import type { TelegramMessageInbound } from "../packages/telegram/src/index.js";
+import { tempDirectory } from "./helpers.js";
 
 const logger = pino({ level: "silent" });
 
@@ -197,6 +200,70 @@ describe("grammY Telegram transport", () => {
     await vi.runAllTimersAsync();
     await expect(delivery).resolves.toEqual([{ chatId: 7, messageId: 105 }]);
     expect(calls.map((call) => call.method)).toEqual(["sendRichMessage", "sendRichMessage"]);
+  });
+});
+
+describe("local Bot API file downloads", () => {
+  it("reads an absolute local-server path off disk instead of fetching it back", async () => {
+    const root = tempDirectory("local-botapi-");
+    const relative = "1234:token/music/file_1.m4a";
+    const target = join(root, relative);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "meeting-audio-bytes");
+    let fileFetches = 0;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/file/")) {
+        fileFetches += 1;
+        return new Response("should not be used", { status: 200 });
+      }
+      void init;
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          // A --local server answers with its own absolute filesystem path.
+          result: { file_id: "f", file_unique_id: "u", file_path: `/var/lib/telegram-bot-api/${relative}` },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const transport = new TelegramBotTransport(
+      "test-token",
+      42,
+      1,
+      logger,
+      "http://127.0.0.1:8081",
+      fetchImpl,
+      { serverRoot: "/var/lib/telegram-bot-api", hostRoot: root },
+    );
+
+    const bytes = await transport.downloadFile("f");
+
+    expect(Buffer.from(bytes).toString()).toBe("meeting-audio-bytes");
+    expect(fileFetches).toBe(0);
+  });
+
+  it("refuses a local-server path that escapes the configured root", async () => {
+    const root = tempDirectory("local-botapi-escape-");
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          result: { file_id: "f", file_unique_id: "u", file_path: "/etc/shadow" },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const transport = new TelegramBotTransport(
+      "test-token",
+      42,
+      1,
+      logger,
+      "http://127.0.0.1:8081",
+      fetchImpl,
+      { serverRoot: "/var/lib/telegram-bot-api", hostRoot: root },
+    );
+
+    await expect(transport.downloadFile("f")).rejects.toThrow(/outside the configured root/);
   });
 });
 

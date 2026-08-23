@@ -80,6 +80,44 @@ IDs with `/team set <user-id> <role>`.
 
 For a locally trusted T3 environment, `T3_BEARER_TOKEN` may be unnecessary. For a paired/remote environment, provide an access token with `orchestration:read orchestration:operate` scopes.
 
+### Large files: local Bot API server
+
+The cloud Bot API refuses to hand a bot any file over 20 MB (`400: file is too
+big`), which silently caps inbound meeting recordings. Running
+[`telegram-bot-api`](https://github.com/tdlib/telegram-bot-api) locally lifts
+that limit. It needs an `api_id`/`api_hash` from my.telegram.org, and the bot
+must be logged out of the cloud server once (`POST /botTOKEN/logOut`) before it
+can be used locally:
+
+```bash
+docker run -d --name telegram-bot-api --restart unless-stopped \
+  -p 127.0.0.1:8081:8081 \
+  -v ~/.operator/telegram-bot-api:/var/lib/telegram-bot-api \
+  -e TELEGRAM_API_ID=... -e TELEGRAM_API_HASH=... -e TELEGRAM_LOCAL=1 \
+  aiogram/telegram-bot-api:latest
+```
+
+```dotenv
+TELEGRAM_API_BASE=http://127.0.0.1:8081
+TELEGRAM_LOCAL_FILE_ROOT=/var/lib/telegram-bot-api
+TELEGRAM_LOCAL_HOST_ROOT=/home/you/.operator/telegram-bot-api
+MEDIA_MAX_INPUT_BYTES=524288000
+```
+
+In local mode `getFile` returns an absolute path inside the server's working
+directory instead of a URL, so the daemon reads the file straight off the
+mounted host root (path-escape checked) rather than streaming it back over
+HTTP. The server writes files as its own user, so the daemon's account needs
+read access to that directory — e.g.
+`setfacl -R -m u:you:rX -m d:u:you:rX ~/.operator/telegram-bot-api`. The server
+never deletes what it downloads; prune that directory on a schedule.
+
+Long recordings exceed the STT upload ceiling (~25 MB at OpenAI/OpenRouter), so
+oversized audio is re-encoded to mono 16 kHz Opus and, when that is still too
+large, transcribed in `MEDIA_STT_SEGMENT_SECONDS` segments whose transcripts are
+stitched; a failed segment is marked inline instead of losing the recording.
+`MEDIA_LONG_TIMEOUT_MS` covers recordings past five minutes.
+
 For voice transcription, configure at least one STT adapter. OpenAI, Groq,
 Deepgram, and a local Whisper CLI are supported and tried in that order. With
 no adapter, the original is still retained and the Operator receives an

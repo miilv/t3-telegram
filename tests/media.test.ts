@@ -70,6 +70,116 @@ describe("MediaProcessor", () => {
     store.close();
   });
 
+  it("re-encodes an oversized recording into one upload that fits the STT limit", async () => {
+    if (!hasFfmpeg) throw new Error("ffmpeg is required for the product media test");
+    const home = tempDirectory("media-long-audio-");
+    const source = `${home}/meeting.ogg`;
+    generateVoice(source, "libopus", 30);
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    await artifacts.initialize();
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(source),
+      filename: "meeting.m4a",
+      mimeType: "audio/mpeg",
+      telegramFileId: "meeting_file",
+      chatId: 7,
+      messageId: 11,
+    });
+    const uploads: Array<{ name: string; size: number }> = [];
+    const processor = new MediaProcessor(
+      // Force the oversize path: the generated clip is far above this ceiling.
+      mediaConfig({
+        sttMaxUploadBytes: 2_048,
+        openai: { apiKey: "test-key", model: "gpt-4o-mini-transcribe" },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+      async (_url, init) => {
+        const file = (init?.body as FormData).get("file") as File;
+        uploads.push({ name: file.name, size: file.size });
+        return new Response(JSON.stringify({ text: "итоги встречи" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    );
+
+    const result = await processor.enrichInbound(
+      { ...voiceAttachment(), type: "audio", durationSeconds: 30 },
+      original,
+    );
+
+    expect(result.transcript).toContain("итоги встречи");
+    // The original stays intact and the compacted copy is a derived artifact.
+    expect(artifacts.resolve(original.id).sha256).toBe(original.sha256);
+    const compacted = store.db
+      .prepare("SELECT payload_json FROM daemon_events WHERE event_type='media.transcription.compacted'")
+      .get() as { payload_json: string } | undefined;
+    expect(compacted).toBeDefined();
+    const payload = JSON.parse(compacted!.payload_json) as {
+      originalBytes: number;
+      compactedBytes: number;
+    };
+    expect(payload.compactedBytes).toBeLessThan(payload.originalBytes);
+    expect(uploads.every((upload) => upload.name.endsWith(".ogg"))).toBe(true);
+    store.close();
+  });
+
+  it("splits a recording that is still oversized after re-encoding and stitches the transcript", async () => {
+    if (!hasFfmpeg) throw new Error("ffmpeg is required for the product media test");
+    const home = tempDirectory("media-segmented-");
+    const source = `${home}/long.ogg`;
+    generateVoice(source, "libopus", 12);
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    await artifacts.initialize();
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(source),
+      filename: "long.m4a",
+      mimeType: "audio/mpeg",
+      telegramFileId: "long_file",
+      chatId: 7,
+      messageId: 12,
+    });
+    let call = 0;
+    const processor = new MediaProcessor(
+      // 1 byte keeps even the re-encoded copy "too large", forcing segments.
+      mediaConfig({
+        sttMaxUploadBytes: 1,
+        sttSegmentSeconds: 5,
+        openai: { apiKey: "test-key", model: "gpt-4o-mini-transcribe" },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+      async () => {
+        call += 1;
+        // The middle segment fails: the rest of the meeting must survive.
+        if (call === 2) return new Response("boom", { status: 500 });
+        return new Response(JSON.stringify({ text: `часть ${call}` }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    );
+
+    const result = await processor.enrichInbound(
+      { ...voiceAttachment(), type: "audio", durationSeconds: 720 },
+      original,
+    );
+
+    expect(result.transcript).toContain("часть 1");
+    expect(result.transcriptionProvider).toMatch(/segments/);
+    const segmented = store.db
+      .prepare("SELECT payload_json FROM daemon_events WHERE event_type='media.transcription.segmented'")
+      .get() as { payload_json: string } | undefined;
+    expect(segmented).toBeDefined();
+    expect(JSON.parse(segmented!.payload_json).segments).toBeGreaterThan(1);
+    store.close();
+  });
+
   it("extracts a video-note audio artifact and durable JPEG keyframes before transcription", async () => {
     if (!hasFfmpeg) throw new Error("ffmpeg is required for the product media test");
     const home = tempDirectory("media-video-note-");
@@ -381,6 +491,9 @@ function mediaConfig(overrides: Partial<MediaProcessorConfig> = {}): MediaProces
     ffprobeBin: "ffprobe",
     timeoutMs: 45_000,
     maxInputBytes: 20 * 1024 * 1024,
+    sttMaxUploadBytes: 20 * 1024 * 1024,
+    sttSegmentSeconds: 900,
+    longTimeoutMs: 1_800_000,
     ...overrides,
   };
 }
@@ -395,12 +508,12 @@ function voiceAttachment(): TelegramAttachment {
   };
 }
 
-function generateVoice(path: string, codec = "libopus"): void {
+function generateVoice(path: string, codec = "libopus", durationSeconds = 1): void {
   runFfmpeg([
     "-f",
     "lavfi",
     "-i",
-    "sine=frequency=440:duration=1",
+    `sine=frequency=440:duration=${durationSeconds}`,
     "-c:a",
     codec,
     "-y",

@@ -37,12 +37,40 @@ const envSchema = z.object({
   OPERATOR_HOME: z.string().min(1).default("~/.operator"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   TELEGRAM_POLL_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(50).default(30),
+  // A local Bot API server (telegram-bot-api --local) lifts the cloud 20 MB
+  // download cap. In that mode getFile returns an absolute path inside the
+  // server's working directory instead of a URL path, so the daemon reads the
+  // file straight off disk; the two roots map container path -> host path.
+  TELEGRAM_API_BASE: z.string().url().default("https://api.telegram.org"),
+  TELEGRAM_LOCAL_FILE_ROOT: z.string().default(""),
+  TELEGRAM_LOCAL_HOST_ROOT: z.string().default(""),
   T3_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(30_000).default(1500),
   APPROVAL_AUTO_ALLOW: z.string().default("safe-read"),
   FFMPEG_BIN: z.string().min(1).default("ffmpeg"),
   FFPROBE_BIN: z.string().min(1).default("ffprobe"),
   MEDIA_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(180_000).default(45_000),
-  MEDIA_MAX_INPUT_BYTES: z.coerce.number().int().min(1_024).max(50 * 1024 * 1024).default(20 * 1024 * 1024),
+  MEDIA_MAX_INPUT_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1_024)
+    .max(2 * 1024 * 1024 * 1024)
+    .default(20 * 1024 * 1024),
+  // Remote speech-to-text endpoints cap the upload (OpenAI/OpenRouter ~25 MB).
+  // Longer recordings are re-encoded to mono Opus and, when still too large,
+  // transcribed in overlapping ffmpeg-cut segments.
+  MEDIA_STT_MAX_UPLOAD_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1_024 * 1024)
+    .max(200 * 1024 * 1024)
+    .default(20 * 1024 * 1024),
+  MEDIA_STT_SEGMENT_SECONDS: z.coerce.number().int().min(60).max(3_600).default(900),
+  MEDIA_LONG_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(60_000)
+    .max(3 * 3_600_000)
+    .default(1_800_000),
   OPENROUTER_API_KEY: z.string().min(1).optional(),
   OPENROUTER_TRANSCRIPTION_MODEL: z.string().min(1).default("openai/whisper-large-v3-turbo"),
   OCR_ENABLED: z.enum(["true", "false"]).default("true"),
@@ -136,6 +164,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       users: Object.fromEntries(telegramUsers),
       allowGroups: parsed.TELEGRAM_ALLOW_GROUPS === "true",
       pollTimeoutSeconds: parsed.TELEGRAM_POLL_TIMEOUT_SECONDS,
+      apiBase: parsed.TELEGRAM_API_BASE.replace(/\/$/, ""),
+      ...(parsed.TELEGRAM_LOCAL_FILE_ROOT
+        ? {
+            localFiles: {
+              serverRoot: parsed.TELEGRAM_LOCAL_FILE_ROOT,
+              hostRoot: parsed.TELEGRAM_LOCAL_HOST_ROOT || parsed.TELEGRAM_LOCAL_FILE_ROOT,
+            },
+          }
+        : {}),
     },
     t3: {
       baseUrl: parsed.T3_BASE_URL.replace(/\/$/, ""),
@@ -180,6 +217,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       ffprobeBin: parsed.FFPROBE_BIN,
       timeoutMs: parsed.MEDIA_TIMEOUT_MS,
       maxInputBytes: parsed.MEDIA_MAX_INPUT_BYTES,
+      sttMaxUploadBytes: parsed.MEDIA_STT_MAX_UPLOAD_BYTES,
+      sttSegmentSeconds: parsed.MEDIA_STT_SEGMENT_SECONDS,
+      longTimeoutMs: parsed.MEDIA_LONG_TIMEOUT_MS,
       openrouter: parsed.OPENROUTER_API_KEY
         ? { apiKey: parsed.OPENROUTER_API_KEY, model: parsed.OPENROUTER_TRANSCRIPTION_MODEL }
         : undefined,

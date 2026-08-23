@@ -1,5 +1,5 @@
-import { realpath, stat } from "node:fs/promises";
-import { extname } from "node:path";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { extname, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Logger } from "pino";
@@ -186,6 +186,7 @@ export class TelegramBotTransport implements TelegramTransport {
     private readonly logger: Logger,
     private readonly apiBase = "https://api.telegram.org",
     private readonly fetchImpl: typeof fetch = globalThis.fetch,
+    private readonly localFiles?: { serverRoot: string; hostRoot: string },
   ) {
     this.bot = new Bot(token, {
       client: {
@@ -539,9 +540,31 @@ export class TelegramBotTransport implements TelegramTransport {
   async downloadFile(fileId: string): Promise<Uint8Array> {
     const file = await this.bot.api.getFile(fileId);
     if (!file.file_path) throw new Error("Telegram did not return a file path");
+    // A local Bot API server has already written the file to its working
+    // directory and returns that absolute path; read it instead of asking the
+    // server to stream its own file back over HTTP.
+    const local = this.localFilePath(file.file_path);
+    if (local) return new Uint8Array(await readFile(local));
     const response = await this.fetchImpl(`${this.apiBase}/file/bot${this.token}/${file.file_path}`);
     if (!response.ok) throw new Error(`Telegram file download failed: ${response.status} ${response.statusText}`);
     return new Uint8Array(await response.arrayBuffer());
+  }
+
+  /** Map a local server's absolute file path onto the daemon's filesystem. */
+  private localFilePath(filePath: string): string | undefined {
+    if (!this.localFiles || !filePath.startsWith("/")) return undefined;
+    const { serverRoot, hostRoot } = this.localFiles;
+    const relative = filePath.startsWith(serverRoot)
+      ? filePath.slice(serverRoot.length).replace(/^\/+/, "")
+      : undefined;
+    if (relative === undefined) {
+      throw new Error("Local Bot API returned a file outside the configured root");
+    }
+    const resolved = resolve(hostRoot, relative);
+    if (resolved !== resolve(hostRoot) && !resolved.startsWith(`${resolve(hostRoot)}/`)) {
+      throw new Error("Local Bot API file path escaped the configured root");
+    }
+    return resolved;
   }
 
   async react(chatId: number, messageId: number, emoji: string): Promise<void> {

@@ -1693,6 +1693,7 @@ function config(home: string): Config {
       users: { 42: "owner" },
       allowGroups: false,
       pollTimeoutSeconds: 1,
+      apiBase: "https://api.telegram.org",
     },
     t3: {
       baseUrl: "http://127.0.0.1:1",
@@ -1731,6 +1732,9 @@ function config(home: string): Config {
       ffprobeBin: "ffprobe",
       timeoutMs: 45_000,
       maxInputBytes: 20 * 1024 * 1024,
+      sttMaxUploadBytes: 20 * 1024 * 1024,
+      sttSegmentSeconds: 900,
+      longTimeoutMs: 1_800_000,
       openrouter: undefined,
       docling: undefined,
       ocr: {

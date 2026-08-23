@@ -22,6 +22,8 @@ export class ArtifactRegistry {
   constructor(
     private readonly root: string,
     private readonly store: OperatorStore,
+    /** Inbound ceiling; raised past 50 MiB only with a local Bot API server. */
+    private readonly maxInboundBytes: number = MAX_INBOUND_BYTES,
   ) {}
 
   async initialize(): Promise<void> {
@@ -36,7 +38,11 @@ export class ArtifactRegistry {
     chatId: number;
     messageId: number;
   }): Promise<Artifact> {
-    if (input.bytes.byteLength > MAX_INBOUND_BYTES) throw new Error("Attachment exceeds 50 MiB limit");
+    if (input.bytes.byteLength > this.maxInboundBytes) {
+      throw new Error(
+        `Attachment exceeds the ${Math.round(this.maxInboundBytes / (1024 * 1024))} MiB inbound limit`,
+      );
+    }
     const existing = this.store.findTelegramArtifact(
       input.chatId,
       input.messageId,
