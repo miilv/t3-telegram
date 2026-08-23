@@ -274,7 +274,7 @@ export interface ProviderDescriptor {
 }
 
 export type WorkerEvent =
-  | { type: "started"; threadId: string }
+  | { type: "started"; threadId: string; turnId?: string }
   | { type: "progress"; threadId: string; summary: string }
   | { type: "agent_message"; threadId: string; text: string }
   | {

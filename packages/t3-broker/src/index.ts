@@ -776,6 +776,7 @@ class ThreadSubscriptionProjection {
   private lastSequence = -1;
   private startedEmitted = false;
   private turnObserved = false;
+  private lastTurnId: string | undefined;
 
   constructor(
     private readonly threadId: string,
@@ -798,7 +799,7 @@ class ThreadSubscriptionProjection {
     const state = statusFromWire(thread);
     if (state === "running" || state === "queued") {
       this.turnObserved = true;
-      this.pushStarted(events);
+      this.pushStarted(events, thread.latestTurn?.turnId);
     }
     if (thread.planProgress?.step) this.pushProgress(events, thread.planProgress.step);
     const resolvedRequestIds = new Set(
@@ -844,11 +845,18 @@ class ThreadSubscriptionProjection {
     const events: WorkerEvent[] = [];
 
     switch (event.type) {
-      case "thread.turn-start-requested":
+      case "thread.turn-start-requested": {
         this.turnObserved = true;
         this.store.updateThreadStatus(this.threadId, "queued");
-        this.pushStarted(events);
+        const requestedTurnId =
+          typeof payload.turnId === "string"
+            ? payload.turnId
+            : isRecord(payload.turn) && typeof payload.turn.turnId === "string"
+              ? payload.turn.turnId
+              : undefined;
+        this.pushStarted(events, requestedTurnId);
         break;
+      }
       case "thread.message-sent":
         events.push(...this.applyMessage(payload));
         break;
@@ -1017,10 +1025,15 @@ class ThreadSubscriptionProjection {
     return undefined;
   }
 
-  private pushStarted(events: WorkerEvent[]): void {
-    if (this.startedEmitted) return;
+  private pushStarted(events: WorkerEvent[], turnId?: string): void {
+    // A known, different turn id means a NEW turn began inside a live
+    // subscription (e.g. someone continued the thread from the T3 UI); it must
+    // surface even though this subscription already emitted a start.
+    const newTurn = Boolean(turnId && turnId !== this.lastTurnId);
+    if (this.startedEmitted && !newTurn) return;
     this.startedEmitted = true;
-    events.push({ type: "started", threadId: this.threadId });
+    if (turnId) this.lastTurnId = turnId;
+    events.push({ type: "started", threadId: this.threadId, ...(turnId ? { turnId } : {}) });
   }
 
   private pushProgress(events: WorkerEvent[], summary: string): void {

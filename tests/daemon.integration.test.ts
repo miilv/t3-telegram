@@ -1254,6 +1254,57 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("marks a turn started from the T3 UI and stops mirroring it into Telegram", async () => {
+    const home = tempDirectory("daemon-external-turn-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /implement/u, title: "Collab work" }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1", turnId: "turn_own" },
+      { type: "agent_message", threadId: "th_1", text: "Начинаю свою часть работы." },
+      { type: "started", threadId: "th_1", turnId: "turn_external" },
+      { type: "agent_message", threadId: "th_1", text: "Шаг коллаборатора из T3 UI." },
+      { type: "completed", threadId: "th_1", result: "Collaborative turn finished in the UI." },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement the collaborative pilot analysis"));
+    await waitFor(() =>
+      telegram.sent.some((entry) => entry.text.includes("тред продолжили напрямую в T3")),
+    );
+    await waitFor(() => store.getThread("th_1")?.status === "completed");
+
+    // The daemon's own turn is mirrored; the external turn is announced once
+    // and its narration and result stay out of the chat.
+    expect(telegram.sent.some((entry) => entry.text.includes("Начинаю свою часть работы."))).toBe(true);
+    expect(telegram.sent.some((entry) => entry.text.includes("Шаг коллаборатора"))).toBe(false);
+    expect(telegram.sent.some((entry) => entry.text.includes("Collaborative turn finished"))).toBe(false);
+    expect(telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу"))).toBe(false);
+    expect(
+      telegram.sent.filter((entry) => entry.text.includes("тред продолжили напрямую в T3")),
+    ).toHaveLength(1);
+    expect(store.getRuntimeState("thread_completion_delivered:th_1")).toBeTruthy();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("never turns forwarded material into worker tasks", async () => {
     const home = tempDirectory("daemon-forward-data-");
     const store = tempStore();

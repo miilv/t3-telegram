@@ -472,13 +472,22 @@ export class OperatorToolServer {
             return { threadId: input.threadId, queued: true, reason: "thread is busy; the follow-up dispatches after the current turn" };
           }
         }
-        const handle = await this.options.broker.sendTurn({
-          threadId: input.threadId,
-          text: input.text,
-          ...(artifacts.length ? { artifacts } : {}),
-          ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
-          ...(input.model ? { model: input.model } : {}),
-        });
+        // Mark the dispatch as our own so the daemon's monitor can tell it
+        // apart from turns started directly in the T3 UI.
+        this.options.store.setRuntimeState(`thread_own_dispatch_pending:${input.threadId}`, nowIso());
+        let handle;
+        try {
+          handle = await this.options.broker.sendTurn({
+            threadId: input.threadId,
+            text: input.text,
+            ...(artifacts.length ? { artifacts } : {}),
+            ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
+            ...(input.model ? { model: input.model } : {}),
+          });
+        } catch (error) {
+          this.options.store.setRuntimeState(`thread_own_dispatch_pending:${input.threadId}`, "");
+          throw error;
+        }
         await this.options.onThreadStarted?.(started);
         return { threadId: handle.threadId, commandId: handle.commandId, status: "queued" };
       },

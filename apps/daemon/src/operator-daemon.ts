@@ -861,6 +861,10 @@ export class OperatorDaemon {
             });
             if (event.type === "started") {
               this.store.updateThreadStatus(threadId, "running");
+              await this.observeTurnOwnership(threadId, chatId, event.turnId, destination);
+            } else if (this.isExternalTurn(threadId) && (event.type === "progress" || event.type === "agent_message")) {
+              // A collaborator is driving this thread directly in the T3 UI;
+              // mirroring their own steps back into Telegram is noise.
             } else if (event.type === "progress" && Date.now() - lastProgressAt > this.getPolicy().progressIntervalMs) {
               lastProgressAt = Date.now();
               this.enqueueTelegramOutbox(
@@ -964,6 +968,7 @@ export class OperatorDaemon {
       (payload) => payload.threadId === threadId,
     );
     if (!job) return undefined;
+    this.store.setRuntimeState(`thread_own_dispatch_pending:${threadId}`, nowIso());
     try {
       await this.broker.sendTurn({
         threadId,
@@ -979,6 +984,7 @@ export class OperatorDaemon {
           : {}),
       });
     } catch (error) {
+      this.store.setRuntimeState(`thread_own_dispatch_pending:${threadId}`, "");
       const detail = safeExcerpt(error instanceof Error ? error.message : String(error), 1_000);
       const gaveUp = this.store.retryBackgroundJob(job.id, detail);
       if (gaveUp) {
@@ -1397,6 +1403,50 @@ export class OperatorDaemon {
     );
   }
 
+  /**
+   * Decide whether a newly observed turn was dispatched by this daemon or
+   * started externally (T3 UI, collaborator). Own dispatches raise a pending
+   * flag just before broker.sendTurn; anything else on a NEW turn id is
+   * external — announced once, then its steps and result are not mirrored.
+   * Without a server-advertised turn id the previous ownership state is kept,
+   * so servers that do not expose turn identity retain the old behavior.
+   */
+  private async observeTurnOwnership(
+    threadId: string,
+    chatId: number,
+    turnId: string | undefined,
+    destination: TelegramDestination,
+  ): Promise<void> {
+    const pendingKey = `thread_own_dispatch_pending:${threadId}`;
+    const own = Boolean(this.store.getRuntimeState(pendingKey));
+    if (!turnId) {
+      if (own) {
+        this.store.setRuntimeState(pendingKey, "");
+        this.store.setRuntimeState(`thread_turn_external:${threadId}`, "");
+      }
+      return;
+    }
+    const seenKey = `thread_seen_turn:${threadId}`;
+    if (this.store.getRuntimeState(seenKey) === turnId) return;
+    this.store.setRuntimeState(seenKey, turnId);
+    if (own) this.store.setRuntimeState(pendingKey, "");
+    this.store.setRuntimeState(`thread_turn_external:${threadId}`, own ? "" : "1");
+    if (own) return;
+    this.store.appendEvent("worker.external_turn", { threadId, payload: { turnId } });
+    this.enqueueTelegramOutbox(`telegram:external:${threadId}:${turnId}`, chatId, "rich", {
+      text: `**${escapeMarkdownText(this.store.getThread(threadId)?.title ?? threadId)}** — тред продолжили напрямую в T3. Шаги и результат этого turn не дублирую в чат.`,
+      options: destination,
+      threadId,
+      messageType: "worker_external_turn",
+      correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`),
+    });
+    await this.flushTelegramOutbox();
+  }
+
+  private isExternalTurn(threadId: string): boolean {
+    return this.store.getRuntimeState(`thread_turn_external:${threadId}`) === "1";
+  }
+
   // A per-thread delivery epoch distinguishes terminal events of successive
   // turns on a reused thread. The outbox dedupe key includes it so retries of
   // one terminal event stay idempotent while the next turn delivers again.
@@ -1418,6 +1468,14 @@ export class OperatorDaemon {
     destination: TelegramDestination = {},
   ): Promise<void> {
     if (this.store.getRuntimeState(`thread_completion_delivered:${event.threadId}`)) return;
+    if (this.isExternalTurn(event.threadId)) {
+      this.store.updateThreadStatus(event.threadId, "completed", {
+        result: safeExcerpt(event.result, 4_000),
+      });
+      this.persistThreadSummary(event.threadId);
+      this.store.setRuntimeState(`thread_completion_delivered:${event.threadId}`, nowIso());
+      return;
+    }
     const thread = this.store.getThread(event.threadId);
     const normalized = await this.normalizeWorkerResult(thread?.title ?? event.threadId, event.result);
     const result = normalized.result;
@@ -1628,6 +1686,11 @@ export class OperatorDaemon {
   ): Promise<boolean> {
     const classified = classifyOperationalError(error, "provider");
     metrics.increment("provider_errors_total", { code: classified.code });
+    if (this.isExternalTurn(threadId)) {
+      this.store.updateThreadStatus(threadId, "failed", { result: classified.safeMessage });
+      this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, nowIso());
+      return false;
+    }
     const recovered = await this.tryRecoverFailedWorker(threadId, classified);
     if (recovered) return true;
     const result: WorkerResult = {
@@ -1659,6 +1722,11 @@ export class OperatorDaemon {
     threadId: string,
     destination: TelegramDestination,
   ): Promise<void> {
+    if (this.isExternalTurn(threadId)) {
+      this.store.updateThreadStatus(threadId, "cancelled");
+      this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, nowIso());
+      return;
+    }
     const result: WorkerResult = {
       summary: "Worker was cancelled before completing its scope.",
       status: "failed",
@@ -3059,6 +3127,7 @@ export class OperatorDaemon {
 
   private async processT3Dispatch(job: BackgroundJob<DurableT3Dispatch>): Promise<boolean> {
     const payload = job.payload;
+    this.store.setRuntimeState(`thread_own_dispatch_pending:${payload.threadId}`, nowIso());
     try {
       await this.broker.sendTurn({
         threadId: payload.threadId,
@@ -3109,6 +3178,7 @@ export class OperatorDaemon {
       );
       return true;
     } catch (error) {
+      this.store.setRuntimeState(`thread_own_dispatch_pending:${payload.threadId}`, "");
       const classified = classifyOperationalError(error, "t3");
       const gaveUp = this.store.retryBackgroundJob(job.id, classified.code);
       if (gaveUp) {
