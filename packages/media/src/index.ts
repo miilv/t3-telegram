@@ -24,6 +24,8 @@ export interface MediaProcessorConfig {
   sttSegmentSeconds: number;
   /** Deadline for long recordings, which outlive the interactive media budget. */
   longTimeoutMs: number;
+  /** Telegram upload ceiling: 50 MiB on the cloud API, up to 2000 MiB locally. */
+  maxUploadBytes?: number | undefined;
   openrouter?: { apiKey: string; model: string } | undefined;
   docling?: {
     endpoint: string;
@@ -1047,8 +1049,11 @@ export class MediaProcessor {
   }
 
   private assertOutboundSize(artifact: Artifact): void {
-    if (artifact.sizeBytes > TELEGRAM_MAX_UPLOAD_BYTES) {
-      throw new Error("Telegram media exceeds the 50 MiB upload limit");
+    const limit = this.config.maxUploadBytes ?? TELEGRAM_MAX_UPLOAD_BYTES;
+    if (artifact.sizeBytes > limit) {
+      throw new Error(
+        `Telegram media exceeds the ${Math.round(limit / (1024 * 1024))} MiB upload limit`,
+      );
     }
   }
 }

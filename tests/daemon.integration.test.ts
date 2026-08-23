@@ -1694,6 +1694,8 @@ function config(home: string): Config {
       allowGroups: false,
       pollTimeoutSeconds: 1,
       apiBase: "https://api.telegram.org",
+      maxUploadBytes: 50 * 1024 * 1024,
+      localFileRetentionMs: 24 * 60 * 60 * 1_000,
     },
     t3: {
       baseUrl: "http://127.0.0.1:1",
@@ -1714,6 +1716,7 @@ function config(home: string): Config {
       home,
       runtimeDir: `${home}/runtime`,
       artifactDir: `${home}/artifacts`,
+      artifactRetentionMs: 30 * 24 * 60 * 60 * 1_000,
       databasePath: `${home}/operator.db`,
       codex: undefined,
     },

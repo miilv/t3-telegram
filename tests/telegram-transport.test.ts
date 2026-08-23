@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import pino from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import {
   mergeInboundBatch,
   mergeTelegramAlbum,
   normalizeTelegramUpdate,
+  pruneLocalBotApiFiles,
   TelegramBotTransport,
 } from "../packages/telegram/src/index.js";
 import type { TelegramMessageInbound } from "../packages/telegram/src/index.js";
@@ -264,6 +265,36 @@ describe("local Bot API file downloads", () => {
     );
 
     await expect(transport.downloadFile("f")).rejects.toThrow(/outside the configured root/);
+  });
+});
+
+describe("local Bot API file pruning", () => {
+  it("removes aged media but never the server's own state files", async () => {
+    const root = tempDirectory("local-botapi-prune-");
+    const token = join(root, "1234:token");
+    const media = join(token, "music");
+    mkdirSync(media, { recursive: true });
+    const stale = join(media, "file_1.m4a");
+    const fresh = join(media, "file_2.m4a");
+    const queue = join(root, "tqueue.binlog");
+    const tokenState = join(token, "webhooks.binlog");
+    for (const path of [stale, fresh, queue, tokenState]) writeFileSync(path, "x");
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1_000);
+    utimesSync(stale, old, old);
+    utimesSync(queue, old, old);
+    utimesSync(tokenState, old, old);
+
+    const pruned = await pruneLocalBotApiFiles({
+      root,
+      olderThanMs: 24 * 60 * 60 * 1_000,
+    });
+
+    expect(pruned.removedFiles).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    // Deleting a binlog would lose the server's update queue.
+    expect(existsSync(queue)).toBe(true);
+    expect(existsSync(tokenState)).toBe(true);
   });
 });
 

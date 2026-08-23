@@ -25,6 +25,8 @@ async function main(): Promise<void> {
     config.operator.artifactDir,
     store,
     config.media.maxInputBytes,
+    config.telegram.maxUploadBytes,
+    config.operator.artifactRetentionMs,
   );
   const claudeRuntime = new ClaudeCliOperatorRuntime({
     binary: config.operator.claudeBin,
@@ -64,8 +66,14 @@ async function main(): Promise<void> {
     config.telegram.apiBase,
     undefined,
     config.telegram.localFiles,
+    config.telegram.maxUploadBytes,
   );
-  const media = new MediaProcessor(config.media, artifacts, store, logger);
+  const media = new MediaProcessor(
+    { ...config.media, maxUploadBytes: config.telegram.maxUploadBytes },
+    artifacts,
+    store,
+    logger,
+  );
   const connectors = new GoogleWorkspaceConnectors({
     ...(config.connectors.google.accessToken
       ? { accessToken: config.connectors.google.accessToken }

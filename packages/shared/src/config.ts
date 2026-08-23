@@ -44,6 +44,17 @@ const envSchema = z.object({
   TELEGRAM_API_BASE: z.string().url().default("https://api.telegram.org"),
   TELEGRAM_LOCAL_FILE_ROOT: z.string().default(""),
   TELEGRAM_LOCAL_HOST_ROOT: z.string().default(""),
+  // The local server keeps every file it downloads forever; the daemon prunes
+  // that directory on its maintenance tick.
+  TELEGRAM_LOCAL_FILE_RETENTION_HOURS: z.coerce.number().int().min(1).max(720).default(24),
+  // Cloud Bot API caps uploads at 50 MB; a local server raises it to 2000 MB.
+  TELEGRAM_MAX_UPLOAD_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1024 * 1024)
+    .max(2000 * 1024 * 1024)
+    .default(50 * 1024 * 1024),
+  ARTIFACT_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   T3_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(30_000).default(1500),
   APPROVAL_AUTO_ALLOW: z.string().default("safe-read"),
   FFMPEG_BIN: z.string().min(1).default("ffmpeg"),
@@ -165,6 +176,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       allowGroups: parsed.TELEGRAM_ALLOW_GROUPS === "true",
       pollTimeoutSeconds: parsed.TELEGRAM_POLL_TIMEOUT_SECONDS,
       apiBase: parsed.TELEGRAM_API_BASE.replace(/\/$/, ""),
+      maxUploadBytes: parsed.TELEGRAM_MAX_UPLOAD_BYTES,
+      localFileRetentionMs: parsed.TELEGRAM_LOCAL_FILE_RETENTION_HOURS * 60 * 60 * 1_000,
       ...(parsed.TELEGRAM_LOCAL_FILE_ROOT
         ? {
             localFiles: {
@@ -193,6 +206,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       home: operatorHome,
       runtimeDir: resolve(operatorHome, "runtime"),
       artifactDir: resolve(operatorHome, "artifacts"),
+      artifactRetentionMs: parsed.ARTIFACT_RETENTION_DAYS * 24 * 60 * 60 * 1_000,
       databasePath: resolve(operatorHome, "operator.db"),
       codex: parsed.OPERATOR_CODEX_ENABLED === "true"
         ? {

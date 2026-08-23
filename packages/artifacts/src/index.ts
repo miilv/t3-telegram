@@ -24,7 +24,16 @@ export class ArtifactRegistry {
     private readonly store: OperatorStore,
     /** Inbound ceiling; raised past 50 MiB only with a local Bot API server. */
     private readonly maxInboundBytes: number = MAX_INBOUND_BYTES,
+    /** Outbound ceiling; the cloud Bot API caps uploads at 50 MiB. */
+    private readonly maxOutboundBytes: number = MAX_OUTBOUND_BYTES,
+    private readonly retentionMs: number = INBOUND_RETENTION_MS,
   ) {}
+
+  private outboundLimitError(kind: string): Error {
+    return new Error(
+      `${kind} exceeds the ${Math.round(this.maxOutboundBytes / (1024 * 1024))} MiB outbound limit`,
+    );
+  }
 
   async initialize(): Promise<void> {
     await mkdir(this.root, { recursive: true, mode: 0o700 });
@@ -67,7 +76,7 @@ export class ArtifactRegistry {
       telegramChatId: input.chatId,
       telegramMessageId: input.messageId,
       createdAt: nowIso(),
-      expiresAt: new Date(Date.now() + INBOUND_RETENTION_MS).toISOString(),
+      expiresAt: new Date(Date.now() + this.retentionMs).toISOString(),
     };
     this.store.saveArtifact(artifact);
     this.store.appendEvent("artifact.received", { payload: { artifactId: id, sizeBytes: artifact.sizeBytes } });
@@ -143,7 +152,7 @@ export class ArtifactRegistry {
     if (existing) return existing;
     const metadata = await stat(input.path);
     if (!metadata.isFile()) throw new Error("Derived artifact must be a regular file");
-    if (metadata.size > MAX_OUTBOUND_BYTES) throw new Error("Derived artifact exceeds 50 MiB limit");
+    if (metadata.size > this.maxOutboundBytes) throw this.outboundLimitError("Derived artifact");
     const id = newId("art");
     const directory = join(this.root, id);
     const localPath = join(directory, safeName);
@@ -186,7 +195,7 @@ export class ArtifactRegistry {
   }): Promise<Artifact> {
     const metadata = await stat(input.path);
     if (!metadata.isFile()) throw new Error("Generated artifact must be a regular file");
-    if (metadata.size > MAX_OUTBOUND_BYTES) throw new Error("Generated artifact exceeds 50 MiB limit");
+    if (metadata.size > this.maxOutboundBytes) throw this.outboundLimitError("Generated artifact");
     const id = newId("art");
     const safeName = sanitizeFilename(input.filename);
     const directory = join(this.root, id);
@@ -204,7 +213,7 @@ export class ArtifactRegistry {
       source: "operator_generated",
       createdAt: nowIso(),
       expiresAt:
-        input.expiresAt ?? new Date(Date.now() + INBOUND_RETENTION_MS).toISOString(),
+        input.expiresAt ?? new Date(Date.now() + this.retentionMs).toISOString(),
     };
     this.store.saveArtifact(artifact);
     this.store.appendEvent("artifact.generated", {
@@ -225,7 +234,7 @@ export class ArtifactRegistry {
     if (secretPattern.test(basename(resolvedPath))) throw new Error("Secret-like files cannot be sent");
     const metadata = await stat(resolvedPath);
     if (!metadata.isFile()) throw new Error("Outbound artifact must be a regular file");
-    if (metadata.size > MAX_OUTBOUND_BYTES) throw new Error("Outbound artifact exceeds 50 MiB limit");
+    if (metadata.size > this.maxOutboundBytes) throw this.outboundLimitError("Outbound artifact");
     return {
       localPath: resolvedPath,
       filename: basename(resolvedPath),

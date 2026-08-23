@@ -187,6 +187,7 @@ export class TelegramBotTransport implements TelegramTransport {
     private readonly apiBase = "https://api.telegram.org",
     private readonly fetchImpl: typeof fetch = globalThis.fetch,
     private readonly localFiles?: { serverRoot: string; hostRoot: string },
+    private readonly maxUploadBytes: number = MAX_FILE_BYTES,
   ) {
     this.bot = new Bot(token, {
       client: {
@@ -326,7 +327,7 @@ export class TelegramBotTransport implements TelegramTransport {
     caption = "",
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
-    const file = await validateUpload(path, MAX_FILE_BYTES);
+    const file = await validateUpload(path, this.maxUploadBytes);
     const message = await this.outbound(chatId, () =>
       this.bot.api.sendDocument(chatId, new InputFile(file.path, file.name), {
         ...messageOptions(options),
@@ -342,7 +343,7 @@ export class TelegramBotTransport implements TelegramTransport {
     caption = "",
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
-    const file = await validateUpload(path, MAX_FILE_BYTES);
+    const file = await validateUpload(path, this.maxUploadBytes);
     if (file.size > MAX_PHOTO_BYTES || !PHOTO_EXTENSIONS.has(extname(file.path).toLowerCase())) {
       return this.sendDocument(chatId, file.path, caption, options);
     }
@@ -872,7 +873,7 @@ export class TelegramBotTransport implements TelegramTransport {
     caption: string,
     options: TelegramSendOptions,
   ): Promise<SentMessage> {
-    const file = await validateUpload(path, MAX_FILE_BYTES);
+    const file = await validateUpload(path, this.maxUploadBytes);
     const common = {
       ...messageOptions(options),
       ...(caption ? { caption: caption.slice(0, CAPTION_LIMIT) } : {}),

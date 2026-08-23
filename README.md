@@ -102,6 +102,9 @@ TELEGRAM_API_BASE=http://127.0.0.1:8081
 TELEGRAM_LOCAL_FILE_ROOT=/var/lib/telegram-bot-api
 TELEGRAM_LOCAL_HOST_ROOT=/home/you/.operator/telegram-bot-api
 MEDIA_MAX_INPUT_BYTES=524288000
+TELEGRAM_MAX_UPLOAD_BYTES=2097152000
+TELEGRAM_LOCAL_FILE_RETENTION_HOURS=24
+ARTIFACT_RETENTION_DAYS=14
 ```
 
 In local mode `getFile` returns an absolute path inside the server's working
@@ -109,8 +112,17 @@ directory instead of a URL, so the daemon reads the file straight off the
 mounted host root (path-escape checked) rather than streaming it back over
 HTTP. The server writes files as its own user, so the daemon's account needs
 read access to that directory — e.g.
-`setfacl -R -m u:you:rX -m d:u:you:rX ~/.operator/telegram-bot-api`. The server
-never deletes what it downloads; prune that directory on a schedule.
+`setfacl -R -m u:you:rX -m d:u:you:rX ~/.operator/telegram-bot-api`.
+
+The server never deletes what it downloads, so every file is stored twice: once
+by the server and once in the artifact registry. The maintenance tick prunes the
+server's copies older than `TELEGRAM_LOCAL_FILE_RETENTION_HOURS`, leaving its
+`*.binlog`/`*.sqlite` state untouched, and `ARTIFACT_RETENTION_DAYS` bounds the
+registry's own copies.
+
+A local server also raises the *upload* ceiling from 50 MB to 2000 MB; set
+`TELEGRAM_MAX_UPLOAD_BYTES` to match, since the daemon's own guards default to
+the cloud limit.
 
 Long recordings exceed the STT upload ceiling (~25 MB at OpenAI/OpenRouter), so
 oversized audio is re-encoded to mono 16 kHz Opus and, when that is still too

@@ -44,7 +44,13 @@ import type {
   TelegramSendOptions,
   TelegramTransport,
 } from "../../../packages/telegram/src/index.js";
-import { classifyTelegramDeliveryError, compactCallbackToken, delay, DraftWriter } from "../../../packages/telegram/src/index.js";
+import {
+  classifyTelegramDeliveryError,
+  compactCallbackToken,
+  delay,
+  DraftWriter,
+  pruneLocalBotApiFiles,
+} from "../../../packages/telegram/src/index.js";
 import {
   mayAutoApprove,
   OPERATOR_SYSTEM_PROMPT,
@@ -395,6 +401,7 @@ export class OperatorDaemon {
       this.logger.warn({ err: error }, "Expired artifact cleanup failed");
       return 0;
     });
+    const prunedLocalFiles = await this.pruneLocalBotApiFiles();
     this.refreshStructuredThreadSummaries();
 
     const lastCompaction = this.store.getRuntimeState("last_compaction_at");
@@ -423,10 +430,34 @@ export class OperatorDaemon {
         reason,
         expiredNotes,
         expiredArtifacts,
+        prunedLocalFiles: prunedLocalFiles.removedFiles,
+        freedLocalBytes: prunedLocalFiles.freedBytes,
         scheduledAutomations,
         durationMs: Date.now() - startedAt,
       },
     });
+  }
+
+  /**
+   * A local Bot API server never deletes what it downloads, so its working
+   * directory grows without bound next to the artifact store's own copy.
+   */
+  private async pruneLocalBotApiFiles(): Promise<{ removedFiles: number; freedBytes: number }> {
+    const root = this.config.telegram.localFiles?.hostRoot;
+    if (!root) return { removedFiles: 0, freedBytes: 0 };
+    try {
+      const pruned = await pruneLocalBotApiFiles({
+        root,
+        olderThanMs: this.config.telegram.localFileRetentionMs,
+      });
+      if (pruned.removedFiles) {
+        this.store.appendEvent("telegram.local_files.pruned", { payload: pruned });
+      }
+      return pruned;
+    } catch (error) {
+      this.logger.warn({ err: error }, "Local Bot API file pruning failed");
+      return { removedFiles: 0, freedBytes: 0 };
+    }
   }
 
   private async handleUpdate(update: TelegramInbound, processExisting = false): Promise<void> {
