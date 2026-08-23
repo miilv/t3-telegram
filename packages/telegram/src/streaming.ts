@@ -39,6 +39,9 @@ export class DraftWriter {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const text = this.buffer;
+    // Nothing streamed: pushing an empty preview would blank a placeholder the
+    // heartbeat just wrote, and costs an API call for no content.
+    if (!text) return;
     // Draft previews are best-effort. Never let a transient preview error prevent
     // the persistent final message from being attempted.
     this.chain = this.chain
@@ -64,6 +67,16 @@ export class DraftWriter {
   }
 
   /** Stop preview updates so a caller can deliver the final through a durable outbox. */
+  /**
+   * Re-send the current preview. Telegram drops a rich draft that stops being
+   * updated, so a tool-heavy turn with no narration must still touch it.
+   */
+  refresh(placeholder: string): void {
+    if (this.closed) return;
+    const text = this.buffer.trim() ? this.buffer : placeholder;
+    this.chain = this.chain.then(() => this.transport.updateDraft(this.draft, text)).catch(() => undefined);
+  }
+
   async closePreview(): Promise<void> {
     if (this.closed) return;
     this.flush();

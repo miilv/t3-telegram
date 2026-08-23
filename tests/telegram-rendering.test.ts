@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { markdownToTelegramHtml, splitRichText } from "../packages/telegram/src/index.js";
+import { DraftWriter, markdownToTelegramHtml, splitRichText } from "../packages/telegram/src/index.js";
 
 describe("Telegram rich rendering", () => {
   it("renders headings, emphasis, code and links to supported HTML", () => {
@@ -47,5 +47,47 @@ describe("Telegram rich rendering", () => {
     expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThanOrEqual(3800);
     expect(chunks.join("")).toBe(blob);
     expect(chunks.every((chunk) => chunk.length > 0)).toBe(true);
+  });
+});
+
+describe("DraftWriter keep-alive", () => {
+  function fakeTransport() {
+    const updates: string[] = [];
+    return {
+      updates,
+      transport: {
+        updateDraft: async (_draft: unknown, text: string) => {
+          updates.push(text);
+        },
+        finalizeDraft: async () => [],
+      } as unknown as ConstructorParameters<typeof DraftWriter>[0],
+    };
+  }
+
+  it("refreshes a silent preview with the placeholder", async () => {
+    const { updates, transport } = fakeTransport();
+    const writer = new DraftWriter(transport, { mode: "rich-draft", chatId: 7, draftId: 1, text: "…" } as never);
+    // A tool-heavy turn writes no deltas at all; without a refresh Telegram
+    // drops the draft and the preview disappears from the chat.
+    writer.refresh("⏳ Работаю… 30 с, шагов: 4");
+    await writer.closePreview();
+    expect(updates).toEqual(["⏳ Работаю… 30 с, шагов: 4"]);
+  });
+
+  it("refreshes with the model's own commentary when it exists", async () => {
+    const { updates, transport } = fakeTransport();
+    const writer = new DraftWriter(transport, { mode: "rich-draft", chatId: 7, draftId: 2, text: "…" } as never);
+    writer.append("Смотрю логи авторизации.");
+    writer.refresh("⏳ Работаю…");
+    await writer.closePreview();
+    expect(updates.at(-1)).toBe("Смотрю логи авторизации.");
+  });
+
+  it("stays silent once the preview is closed", async () => {
+    const { updates, transport } = fakeTransport();
+    const writer = new DraftWriter(transport, { mode: "rich-draft", chatId: 7, draftId: 3, text: "…" } as never);
+    await writer.closePreview();
+    writer.refresh("⏳ Работаю…");
+    expect(updates).toEqual([]);
   });
 });

@@ -761,6 +761,15 @@ export class OperatorDaemon {
       .join("\n\n");
     const operatorStartedAt = Date.now();
     let toolSteps = 0;
+    // Keep the ephemeral draft alive while the model works silently; without
+    // this the preview vanishes from the chat mid-turn.
+    const heartbeat = setInterval(() => {
+      if (!toolSteps) return;
+      const seconds = Math.round((Date.now() - operatorStartedAt) / 1000);
+      const elapsed = seconds < 90 ? `${seconds} с` : `${Math.round(seconds / 60)} мин`;
+      writer?.refresh(`⏳ Работаю… ${elapsed}, шагов: ${toolSteps}`);
+    }, 15_000);
+    heartbeat.unref();
     let observedFirstToken = false;
     let finalText: string;
     let messageType = "operator_answer";
@@ -801,6 +810,7 @@ export class OperatorDaemon {
         payload: { operatorTurnId, errorCode: classified.code },
       });
     } finally {
+      clearInterval(heartbeat);
       await writer?.closePreview().catch((error) => {
         this.logger.debug(
           { errorCode: classifyOperationalError(error, "telegram").code },
