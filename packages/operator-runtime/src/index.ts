@@ -25,6 +25,8 @@ export interface CodexCliRuntimeOptions {
   cwd: string;
   model: string;
   effort: "low" | "medium" | "high" | "xhigh";
+  /** Absolute wall-clock cap per turn; a hung CLI must not stall daemon queues. */
+  turnTimeoutMs?: number;
 }
 
 export class SwitchableOperatorRuntime implements OperatorRuntime {
@@ -177,6 +179,18 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
         ].join("\n\n")
       : input.prompt;
     child.stdin.end(prompt);
+
+    // Same watchdog as the Claude path: without it a hung Codex process blocks
+    // the serial operatorRuntimeQueue forever and every answer silently stalls
+    // (bug №10).
+    let timedOut = false;
+    const timeoutMs = this.options.turnTimeoutMs ?? 600_000;
+    const watchdog = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    watchdog.unref();
+
     let stderr = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => (stderr += chunk));
@@ -239,10 +253,15 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
         queue.fail(new Error(detail));
       }
     };
-    child.once("error", (error) => queue.fail(error));
+    child.once("error", (error) => {
+      clearTimeout(watchdog);
+      queue.fail(error);
+    });
     child.once("close", (code) => {
+      clearTimeout(watchdog);
       if (buffer.trim()) parseCodexLine(buffer);
-      if (code === 0) queue.end();
+      if (timedOut) queue.fail(new Error(`Codex CLI turn timed out after ${timeoutMs}ms and was killed`));
+      else if (code === 0) queue.end();
       else queue.fail(new Error(`Codex CLI exited ${code}: ${stderr.slice(-1_200)}`));
     });
     try {
@@ -250,6 +269,7 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
       this.newSessions.delete(input.sessionId);
       this.systemPrompts.delete(input.sessionId);
     } finally {
+      clearTimeout(watchdog);
       this.active = undefined;
     }
   }
