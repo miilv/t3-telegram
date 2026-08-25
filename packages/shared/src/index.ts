@@ -363,8 +363,22 @@ export interface OperatorRuntime {
     allowBuiltInSlashCommands?: boolean;
   }): AsyncIterable<OperatorEvent>;
   interrupt(): Promise<void>;
-  compact(reason?: string): Promise<{ sessionId: string; summary?: string }>;
-  resume(sessionId: string, providerId?: string): Promise<void>;
+  compact(reason?: string): Promise<{
+    sessionId: string;
+    summary?: string;
+    /** Post-compaction context usage as reported by the confirmed compact turn. */
+    usage?: { contextTokens: number; contextWindow?: number; percentUsed?: number };
+  }>;
+  /**
+   * `options.systemPrompt` lets a restarted daemon hand the authoritative
+   * policy back to runtimes that need it for future fresh sessions (bug №25:
+   * Codex compacts into a new session seeded from its stored default prompt).
+   */
+  resume(
+    sessionId: string,
+    providerId?: string,
+    options?: { systemPrompt?: string },
+  ): Promise<void>;
   /**
    * Cheap side-channel call outside the main Operator session: no resume, no
    * MCP, small budget. Used for interaction mediation; must never touch the

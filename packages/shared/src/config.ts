@@ -15,6 +15,10 @@ const envSchema = z.object({
     .enum(["approval-required", "auto-accept-edits", "auto", "full-access"])
     .default("approval-required"),
   CLAUDE_BIN: z.string().min(1).default("claude"),
+  // Owner personalization: the Operator system prompt gets an owner block so
+  // the agent knows who it works for without waiting for accumulated notes.
+  OWNER_NAME: z.string().default(""),
+  OWNER_LANGUAGE: z.string().min(1).default("ru"),
   OPERATOR_PROVIDER: z.enum(["claude", "codex"]).default("claude"),
   OPERATOR_MODEL: z.string().min(1).default("opus"),
   OPERATOR_EFFORT: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high"),
@@ -174,6 +178,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     throw new Error("OPERATOR_PROVIDER=codex requires OPERATOR_CODEX_ENABLED=true");
   }
   return {
+    owner: {
+      name: parsed.OWNER_NAME.trim(),
+      language: parsed.OWNER_LANGUAGE.trim() || "ru",
+    },
     telegram: {
       token: parsed.TELEGRAM_BOT_TOKEN,
       allowedUserId: parsed.TELEGRAM_ALLOWED_USER_ID,

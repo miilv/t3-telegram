@@ -961,6 +961,31 @@ export class OperatorStore {
     });
   }
 
+  /**
+   * Undo an obsolete mark (bug №42): reactivates the note and rebuilds its
+   * search and vector rows, which markOperatorNoteObsolete removed.
+   */
+  restoreOperatorNote(id: string): boolean {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare("SELECT * FROM operator_notes WHERE id=? AND status='obsolete'")
+        .get(id) as Row | undefined;
+      if (!row) return false;
+      const now = nowIso();
+      this.db
+        .prepare("UPDATE operator_notes SET status='active',updated_at=? WHERE id=?")
+        .run(now, id);
+      const category = String(row.category);
+      const content = String(row.content);
+      this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
+      this.db
+        .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
+        .run(id, category, content);
+      this.upsertNoteVector(id, `${category} ${content}`, now);
+      return true;
+    });
+  }
+
   expireOperatorNotes(at = nowIso()): number {
     return this.transaction(() => {
       const rows = this.db
@@ -1052,6 +1077,15 @@ export class OperatorStore {
       this.db
         .prepare("SELECT * FROM artifacts WHERE thread_id=? ORDER BY created_at DESC")
         .all(threadId) as Row[]
+    ).map(rowToArtifact);
+  }
+
+  /** Most recent artifacts first; the compaction snapshot carries their ids. */
+  listRecentArtifacts(limit = 20): Artifact[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM artifacts ORDER BY created_at DESC, id DESC LIMIT ?")
+        .all(Math.max(1, Math.min(limit, 100))) as Row[]
     ).map(rowToArtifact);
   }
 

@@ -173,6 +173,69 @@ process.stdin.on("end", () => {
     expect(args).toContain("--strict-mcp-config");
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
   });
+
+  it("sends /compact as one line and reports the confirmed post-compact usage (bug №29)", async () => {
+    const directory = tempDirectory("fake-claude-compact-line-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  console.log(JSON.stringify({
+    type: "result",
+    result: JSON.stringify({ prompt: input }),
+    session_id: "compact-session",
+    modelUsage: { opus: { inputTokens: 2000, cacheReadInputTokens: 0, contextWindow: 20000 } }
+  }));
+});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+    });
+    await runtime.start({ systemPrompt: "system" });
+    const result = await runtime.compact("threshold 86%");
+    const { prompt } = JSON.parse(result.summary ?? "{}") as { prompt: string };
+    // A slash command only parses with its argument on the same line.
+    expect(prompt.startsWith("/compact Preserve focus")).toBe(true);
+    expect(prompt).not.toContain("\n");
+    expect(prompt).toContain("Reason: threshold 86%");
+    expect(result.usage).toEqual({ contextTokens: 2_000, contextWindow: 20_000, percentUsed: 10 });
+  });
+
+  it("rejects a compaction whose turn never confirmed a result (bug №29)", async () => {
+    const directory = tempDirectory("fake-claude-compact-dead-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+process.stdin.resume();
+// Exits cleanly without ever emitting a result event: the caller must keep
+// its usage counters so the threshold trigger stays armed.
+process.stdin.on("end", () => {});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+    });
+    await runtime.start({ systemPrompt: "system" });
+    await expect(runtime.compact("dead turn")).rejects.toThrow(
+      "compaction turn ended without a confirmed result",
+    );
+  });
 });
 
 describe("CodexCliOperatorRuntime", () => {
@@ -309,6 +372,53 @@ setInterval(() => {}, 1_000);
       })(),
     ).rejects.toThrow(/timed out/);
   });
+
+  it("restores the default system prompt on resume so a post-restart compact keeps the policy (bug №25)", async () => {
+    const directory = tempDirectory("fake-codex-resume-");
+    const binary = join(directory, "codex");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  if (process.argv.includes("--version")) {
+    console.log("codex-cli-test 1.0");
+    return;
+  }
+  const args = process.argv.slice(2);
+  const resumed = args[1] === "resume";
+  console.log(JSON.stringify({ type: "thread.started", thread_id: resumed ? args[args.length - 2] : "codex-fresh-session" }));
+  console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ prompt: input }) } }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } }));
+});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    // A freshly constructed runtime models the daemon restart: the in-memory
+    // default system prompt is gone until resume() hands it back.
+    const runtime = new CodexCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "gpt-test",
+      effort: "high",
+    });
+    await runtime.resume("codex-existing-session", undefined, {
+      systemPrompt: "restored authoritative policy",
+    });
+    const compacted = await runtime.compact("post-restart compaction");
+    let freshPrompt = "";
+    for await (const event of runtime.sendTurn({ sessionId: compacted.sessionId, prompt: "next turn" })) {
+      if (event.type === "result") {
+        freshPrompt = (JSON.parse(event.text) as { prompt: string }).prompt;
+      }
+    }
+    expect(freshPrompt).toContain("<operator_system_policy>");
+    expect(freshPrompt).toContain("restored authoritative policy");
+    expect(freshPrompt).toContain("next turn");
+  });
 });
 
 describe("SwitchableOperatorRuntime", () => {
@@ -316,9 +426,11 @@ describe("SwitchableOperatorRuntime", () => {
     const claude = new StubRuntime("claude");
     const codex = new StubRuntime("codex");
     const runtime = new SwitchableOperatorRuntime({ claude, codex }, "claude");
-    await runtime.resume("codex-existing", "codex");
+    await runtime.resume("codex-existing", "codex", { systemPrompt: "restored policy" });
     expect(runtime.currentProvider()).toBe("codex");
     expect(codex.resumed).toEqual(["codex-existing"]);
+    // The restored policy travels down to the concrete runtime (bug №25).
+    expect(codex.resumeOptions).toEqual([{ systemPrompt: "restored policy" }]);
     const session = await runtime.switchProvider("claude", { systemPrompt: "policy" });
     expect(runtime.currentProvider()).toBe("claude");
     expect(session.id).toBe("claude-session-1");
@@ -329,6 +441,7 @@ describe("SwitchableOperatorRuntime", () => {
 
 class StubRuntime implements OperatorRuntime {
   resumed: string[] = [];
+  resumeOptions: Array<{ systemPrompt?: string } | undefined> = [];
   prompts: string[] = [];
   interrupted = 0;
 
@@ -351,8 +464,13 @@ class StubRuntime implements OperatorRuntime {
     return { sessionId: `${this.id}-compact`, summary: "handoff" };
   }
 
-  async resume(sessionId: string): Promise<void> {
+  async resume(
+    sessionId: string,
+    _providerId?: string,
+    options?: { systemPrompt?: string },
+  ): Promise<void> {
     this.resumed.push(sessionId);
+    this.resumeOptions.push(options);
   }
 
   async health(): Promise<{ healthy: boolean }> {

@@ -64,7 +64,7 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
     return this.current().interrupt();
   }
 
-  compact(reason?: string): Promise<{ sessionId: string; summary?: string }> {
+  compact(reason?: string): ReturnType<OperatorRuntime["compact"]> {
     return this.current().compact(reason);
   }
 
@@ -76,12 +76,16 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
     return current.oneShot(input);
   }
 
-  async resume(sessionId: string, providerId?: string): Promise<void> {
+  async resume(
+    sessionId: string,
+    providerId?: string,
+    options?: { systemPrompt?: string },
+  ): Promise<void> {
     if (providerId) {
       if (!this.providers[providerId]) throw new Error(`configured Operator provider is unavailable: ${providerId}`);
       this.providerId = providerId;
     }
-    await this.current().resume(sessionId);
+    await this.current().resume(sessionId, undefined, options);
   }
 
   health() {
@@ -290,20 +294,33 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
     const sessionId = this.currentSessionId;
     if (!sessionId) throw new Error("No Operator session to compact");
     let summary = "";
+    let confirmed = false;
     for await (const event of this.sendTurn({
       sessionId,
       prompt: `Return a compact handoff summary of stable context, active work references, decisions, and open loops. Do not start work. Reason: ${reason}`,
     })) {
-      if (event.type === "result") summary = event.text;
+      if (event.type === "result") {
+        summary = event.text;
+        confirmed = true;
+      }
     }
+    if (!confirmed) throw new Error("Codex compaction turn ended without a confirmed result");
     const replacement = await this.start({ systemPrompt: this.defaultSystemPrompt });
     return { sessionId: replacement.id, ...(summary ? { summary } : {}) };
   }
 
-  async resume(sessionId: string): Promise<void> {
+  async resume(
+    sessionId: string,
+    _providerId?: string,
+    options?: { systemPrompt?: string },
+  ): Promise<void> {
     await this.prepareRuntimeDirectory();
     this.currentSessionId = sessionId;
     this.newSessions.delete(sessionId);
+    // Bug №25: without re-seeding the default policy here, the first compact
+    // after a daemon restart starts its replacement session with an empty
+    // system prompt and the Operator silently loses its entire policy.
+    if (options?.systemPrompt) this.defaultSystemPrompt = options.systemPrompt;
   }
 
   async health(): Promise<{
@@ -543,21 +560,39 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     });
   }
 
-  async compact(reason = "scheduled daily compaction"): Promise<{ sessionId: string; summary?: string }> {
+  async compact(reason = "scheduled daily compaction"): Promise<{
+    sessionId: string;
+    summary?: string;
+    usage?: { contextTokens: number; contextWindow?: number; percentUsed?: number };
+  }> {
     const sessionId = this.currentSessionId;
     if (!sessionId) throw new Error("No Operator session to compact");
     let summary = "";
+    let confirmed = false;
+    let usage: { contextTokens: number; contextWindow?: number; percentUsed?: number } | undefined;
+    // Bug №29: the CLI parses a slash command with its argument on ONE line;
+    // `/compact\n...` degrades into a plain prompt and no compaction happens.
+    const instruction = sanitizeCompactionInstruction(
+      `Preserve focus, active workers, pending approvals, open loops, and project/thread references. Reason: ${reason}`,
+    );
     for await (const event of this.sendTurn({
       sessionId,
-      prompt: `/compact\nPreserve focus, active workers, pending approvals, open loops, and project/thread references. Reason: ${reason}`,
+      prompt: `/compact ${instruction}`,
       allowBuiltInSlashCommands: true,
     })) {
-      if (event.type === "result") summary = event.text;
+      if (event.type === "result") {
+        summary = event.text;
+        usage = event.usage;
+        confirmed = true;
+      }
     }
-    return { sessionId, ...(summary ? { summary } : {}) };
+    // The caller only resets its usage threshold on a confirmed turn result;
+    // a died/killed CLI must keep the old percentage so the trigger stays armed.
+    if (!confirmed) throw new Error("Claude compaction turn ended without a confirmed result");
+    return { sessionId, ...(summary ? { summary } : {}), ...(usage ? { usage } : {}) };
   }
 
-  async resume(sessionId: string): Promise<void> {
+  async resume(sessionId: string, _providerId?: string, _options?: { systemPrompt?: string }): Promise<void> {
     await this.prepareRuntimeDirectory();
     this.currentSessionId = sessionId;
     this.newSessions.delete(sessionId);
@@ -704,6 +739,11 @@ function parseCodexUsage(usage: Record<string, unknown>): { contextTokens: numbe
   // context contribution.
   const contextTokens = input + output;
   return contextTokens ? { contextTokens } : undefined;
+}
+
+/** A slash-command argument must stay on the command's own line. */
+function sanitizeCompactionInstruction(instruction: string): string {
+  return instruction.replaceAll(/\s*\n\s*/g, " ").trim();
 }
 
 function tomlString(value: string): string {
