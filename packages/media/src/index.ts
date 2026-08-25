@@ -467,7 +467,6 @@ export class MediaProcessor {
           structuredJson = converted.json;
           provider = "docling";
         } catch (error) {
-          this.doclingActiveConversions = Math.max(0, this.doclingActiveConversions - 1);
           this.logger.warn(
             { artifactId: original.id, error: safeError(error) },
             "Docling conversion failed; falling back to local OCR",
@@ -596,45 +595,51 @@ export class MediaProcessor {
    */
   private async doclingConvert(original: Artifact): Promise<{ markdown: string; json?: string }> {
     const docling = this.config.docling!;
-    await this.ensureDoclingRunning();
-    this.doclingLastUsedAt = Date.now();
+    // Balance the in-flight counter exactly once per conversion (bug №45): a
+    // second decrement on a failure path let stopIdleDocling kill the
+    // container while another conversion was still running inside it.
     this.doclingActiveConversions += 1;
-    this.scheduleDoclingIdleStop();
-    const bytes = await readFile(original.localPath);
-    const form = new FormData();
-    form.append(
-      "files",
-      new Blob([bytes], { type: original.mimeType ?? "application/octet-stream" }),
-      extensionBearingFilename(original),
-    );
-    form.append("to_formats", "md");
-    form.append("to_formats", "json");
-    form.append("table_mode", "accurate");
-    form.append("image_export_mode", "placeholder");
-    form.append("ocr_preset", docling.ocrPreset);
-    form.append("ocr_lang", docling.ocrLang);
-    const response = await this.fetchImpl(`${docling.endpoint}/v1/convert/file`, {
-      method: "POST",
-      body: form,
-      signal: AbortSignal.timeout(docling.convertTimeoutMs),
-    });
-    this.doclingActiveConversions -= 1;
-    if (!response.ok) throw httpFailure("docling", response.status);
-    const payload = (await response.json()) as {
-      document?: { md_content?: unknown; json_content?: unknown };
-      status?: unknown;
-    };
-    const markdown = payload.document?.md_content;
-    if (typeof markdown !== "string" || !markdown.trim()) {
-      throw new Error(`docling returned no markdown (status ${String(payload.status)})`);
+    try {
+      await this.ensureDoclingRunning();
+      this.doclingLastUsedAt = Date.now();
+      this.scheduleDoclingIdleStop();
+      const bytes = await readFile(original.localPath);
+      const form = new FormData();
+      form.append(
+        "files",
+        new Blob([bytes], { type: original.mimeType ?? "application/octet-stream" }),
+        extensionBearingFilename(original),
+      );
+      form.append("to_formats", "md");
+      form.append("to_formats", "json");
+      form.append("table_mode", "accurate");
+      form.append("image_export_mode", "placeholder");
+      form.append("ocr_preset", docling.ocrPreset);
+      form.append("ocr_lang", docling.ocrLang);
+      const response = await this.fetchImpl(`${docling.endpoint}/v1/convert/file`, {
+        method: "POST",
+        body: form,
+        signal: AbortSignal.timeout(docling.convertTimeoutMs),
+      });
+      if (!response.ok) throw httpFailure("docling", response.status);
+      const payload = (await response.json()) as {
+        document?: { md_content?: unknown; json_content?: unknown };
+        status?: unknown;
+      };
+      const markdown = payload.document?.md_content;
+      if (typeof markdown !== "string" || !markdown.trim()) {
+        throw new Error(`docling returned no markdown (status ${String(payload.status)})`);
+      }
+      return {
+        markdown,
+        ...(payload.document?.json_content !== undefined
+          ? { json: JSON.stringify(payload.document.json_content) }
+          : {}),
+      };
+    } finally {
+      this.doclingActiveConversions -= 1;
+      this.doclingLastUsedAt = Date.now();
     }
-    this.doclingLastUsedAt = Date.now();
-    return {
-      markdown,
-      ...(payload.document?.json_content !== undefined
-        ? { json: JSON.stringify(payload.document.json_content) }
-        : {}),
-    };
   }
 
   /**
