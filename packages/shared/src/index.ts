@@ -509,51 +509,16 @@ export function ownDispatchPendingCount(store: RuntimeStateStore, threadId: stri
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 1;
 }
 
-/**
- * Provenance labels for structurally fenced content. `inbound` is the owner's
- * own message, `worker` is raw worker output, `tool` is anything a tool result
- * carried in from outside (web pages, mailboxes, calendars, files on disk).
- */
-export type UntrustedLabel = "inbound" | "worker" | "tool";
-
-/**
- * Bug №9 / roadmap 0.5: structural fencing for untrusted content that reaches
- * an LLM prompt. The random per-call suffix means fenced content can never
- * forge its own closing marker and promote itself from data to instructions.
- *
- * `openFence` hands back a reusable wrapper so every untrusted field of ONE
- * tool result shares ONE unpredictable marker: the model sees a single fence
- * vocabulary per call, and a field cannot close a sibling field's fence.
- */
-export function openFence(label: UntrustedLabel): (content: string) => string {
-  const nonce = [...crypto.getRandomValues(new Uint8Array(4))]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-  return (content: string) => `<<<${label}:${nonce}>>>\n${content}\n<<<end:${nonce}>>>`;
-}
-
-/** Single-shot fence for one standalone blob. */
-export function fenceUntrusted(content: string, label: UntrustedLabel): string {
-  return openFence(label)(content);
-}
-
-const FENCE_OPEN_PATTERN = /<<<(?:inbound|worker|tool):([0-9a-f]{8})>>>/g;
-
-/**
- * Truncation must never eat a closing marker: a fenced blob that loses its
- * terminator lets its own tail run on as if it were prompt again — exactly the
- * promotion the fence exists to prevent. Any marker opened in `text` without a
- * matching close gets one appended.
- */
-export function closeDanglingFences(text: string): string {
-  const dangling = unique(
-    [...text.matchAll(FENCE_OPEN_PATTERN)]
-      .map((match) => match[1] as string)
-      .filter((nonce) => !text.includes(`<<<end:${nonce}>>>`)),
-  );
-  if (dangling.length === 0) return text;
-  return [text, ...dangling.map((nonce) => `<<<end:${nonce}>>>`)].join("\n");
-}
+export {
+  closeDanglingFences,
+  defangMarkers,
+  fenceUntrusted,
+  knownFenceNonces,
+  openFence,
+  truncateFenceAware,
+  UNTRUSTED_LABELS,
+} from "./fencing.js";
+export type { Fence, UntrustedLabel } from "./fencing.js";
 
 export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
