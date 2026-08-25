@@ -230,6 +230,35 @@ describe("OperatorToolServer", () => {
       expect(telegram.edits).toEqual([{ chatId: 777, messageId: sentMessageId, text: "Still working" }]);
       expect(telegram.reactions).toEqual([{ chatId: 777, messageId: 92, emoji: "👍" }]);
 
+      const asked = await callJson(client, "telegram.ask_choices", {
+        question: "Какой регион деплоя выбрать?",
+        options: ["EU", "US"],
+      }) as { sent: Array<{ messageId: number }> };
+      expect(telegram.choices).toHaveLength(1);
+      expect(telegram.choices[0]).toMatchObject({
+        chatId: 777,
+        text: "Какой регион деплоя выбрать?",
+        labels: ["EU", "US"],
+        options: { messageThreadId: 12 },
+      });
+      const choiceId = telegram.choices[0]!.choiceId;
+      expect(choiceId).toMatch(/^pick_[\w-]+$/);
+      expect(Buffer.byteLength(`route:${choiceId}:5`, "utf8")).toBeLessThanOrEqual(64);
+      const choiceRecord = JSON.parse(store.getRuntimeState(`choice_prompt:${choiceId}`)!) as Record<string, unknown>;
+      expect(choiceRecord).toMatchObject({
+        chatId: 777,
+        messageId: asked.sent[0]!.messageId,
+        ownerId: "42",
+        question: "Какой регион деплоя выбрать?",
+        labels: ["EU", "US"],
+        messageThreadId: 12,
+      });
+      const badChoices = await client.callTool({
+        name: "telegram.ask_choices",
+        arguments: { question: "?", options: ["only one"] },
+      });
+      expect(badChoices.isError).toBe(true);
+
       const denied = await client.callTool({
         name: "telegram.edit",
         arguments: { messageId: 999_999, text: "not allowed" },
@@ -344,6 +373,13 @@ class ToolTelegram {
   readonly edits: Array<{ chatId: number; messageId: number; text: string }> = [];
   readonly reactions: Array<{ chatId: number; messageId: number; emoji: string }> = [];
   readonly documents: Array<{ chatId: number; path: string }> = [];
+  readonly choices: Array<{
+    chatId: number;
+    text: string;
+    choiceId: string;
+    labels: string[];
+    options: TelegramSendOptions;
+  }> = [];
   readonly voices: Array<{ chatId: number; path: string }> = [];
   readonly videoNotes: Array<{ chatId: number; path: string }> = [];
   private nextMessageId = 1_000;
@@ -359,6 +395,17 @@ class ToolTelegram {
 
   async react(chatId: number, messageId: number, emoji: string): Promise<void> {
     this.reactions.push({ chatId, messageId, emoji });
+  }
+
+  async sendChoices(
+    chatId: number,
+    text: string,
+    choiceId: string,
+    labels: string[],
+    options: TelegramSendOptions = {},
+  ): Promise<SentMessage> {
+    this.choices.push({ chatId, text, choiceId, labels, options });
+    return { chatId, messageId: this.nextMessageId++ };
   }
 
   async sendDocument(chatId: number, path: string): Promise<SentMessage> {
@@ -388,6 +435,6 @@ function destinationOnly(options: TelegramSendOptions): TelegramDestination {
 // this tool server; the production constructor receives the full transport.
 const _telegramShapeCheck: Pick<
   TelegramTransport,
-  "sendRich" | "editRich" | "react" | "sendDocument" | "sendVoice" | "sendVideoNote"
+  "sendRich" | "editRich" | "react" | "sendChoices" | "sendDocument" | "sendVoice" | "sendVideoNote"
 > = new ToolTelegram();
 void _telegramShapeCheck;
