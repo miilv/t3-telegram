@@ -1404,11 +1404,11 @@ describe("OperatorDaemon product flow", () => {
     const questionNonces = fenceNonces(questionPrompt);
     expect(questionNonces.size).toBe(1);
     const questionNonce = [...questionNonces][0]!;
-    expect(questionPrompt.split(`<<<tool:${questionNonce}>>>`)).toHaveLength(3);
+    expect(questionPrompt.split(`<<<worker:${questionNonce}>>>`)).toHaveLength(3);
     expect(questionPrompt.split(`<<<end:${questionNonce}>>>`)).toHaveLength(3);
     expect(questionPrompt).toContain("Which deployment strategy should be used?");
     // The instructions to the mediator stay OUTSIDE the fence.
-    expect(questionPrompt.slice(0, questionPrompt.indexOf("<<<tool:"))).toContain("оркестратор");
+    expect(questionPrompt.slice(0, questionPrompt.indexOf("<<<worker:"))).toContain("оркестратор");
 
     const approvalPrompt = runtime.oneShotPrompts.find((entry) => entry.includes("Запрос воркера"))!;
     const approvalNonces = fenceNonces(approvalPrompt);
@@ -3438,7 +3438,7 @@ describe("OperatorDaemon product flow", () => {
 
 /** Every distinct fence marker opened in a prompt (roadmap 0.5). */
 function fenceNonces(prompt: string): Set<string> {
-  return new Set([...prompt.matchAll(/<<<tool:([0-9a-f]{8})>>>/g)].map((match) => match[1]!));
+  return new Set([...prompt.matchAll(/<<<worker:([0-9a-f]{8})>>>/g)].map((match) => match[1]!));
 }
 
 function config(home: string): Config {
