@@ -144,12 +144,24 @@ export function markdownToTelegramHtml(markdown: string): string {
     return token;
   });
   value = escapeHtml(value)
+    .replace(/(?<!\\)`((?:[^`\n\\]|\\[^`\n])+)`/g, (_match, code: string) => {
+      // Inline code is literal content: protect it from the markdown
+      // replacements below and from GFM backslash unescaping alike.
+      const token = `@@CODEBLOCK${codeBlocks.length}@@`;
+      codeBlocks.push(`<code>${code}</code>`);
+      return token;
+    })
     .replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>")
     .replace(/^&gt;\s?(.+)$/gm, "<blockquote>$1</blockquote>")
     .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
     .replace(/__(.+?)__/g, "<b>$1</b>")
-    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
     .replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
+  // The legacy fallback receives the same GFM the rich path shows verbatim, so
+  // backslash-escaped punctuation («Готово\.») must render without the
+  // backslash here too (bug №23). Runs after the markdown replacements so an
+  // escaped marker (\*\*) stays literal text instead of turning into <b>, and
+  // covers the HTML-entity forms escapeHtml produced (\&gt; etc.).
+  value = value.replace(/\\(&(?:amp|lt|gt|quot);|[!-/:-@[-`{-~])/g, "$1");
   codeBlocks.forEach((block, index) => {
     value = value.replace(`@@CODEBLOCK${index}@@`, block);
   });
