@@ -758,30 +758,58 @@ function numeric(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
-// Bug №43: with OPERATOR_FULL_ACCESS the CLI's Bash tool sees the whole daemon
-// environment, and a fixed blocklist misses every credential added after it was
-// written (OPENROUTER_API_KEY and friends). Strip anything whose *name* looks
-// like a credential instead. Benign variables (PATH, HOME, NODE_*, LANG, LC_*,
-// TERM, TMPDIR, XDG_*, …) never match the pattern and pass through untouched.
-const SECRET_LIKE_ENVIRONMENT_NAME = /TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|BEARER/i;
-// The CLI's own authentication is the one credential family the spawned
-// process legitimately needs (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN and
-// their endpoint overrides); everything else credential-shaped stays home.
-const CLI_AUTH_ENVIRONMENT_PREFIXES = ["ANTHROPIC_", "CLAUDE_"];
-// The per-turn MCP capability is injected explicitly after sanitizing; a value
-// inherited from the daemon's own environment must never reach a child.
-const NEVER_INHERITED_ENVIRONMENT_NAMES = new Set(["T3_OPERATOR_MCP_CAPABILITY"]);
+// Allowlist, not denylist: a name-shaped denylist always leaks the variable
+// nobody thought of (SSH_AUTH_SOCK, DATABASE_URL, SENTRY_DSN, *_WEBHOOK_URL)
+// while stripping credentials the child legitimately needs (OPENAI_API_KEY for
+// the Codex provider). Everything not named here stays in the daemon.
+const OPERATOR_ENV_ALLOWED_NAMES = new Set([
+  "PATH",
+  "HOME",
+  "LANG",
+  "TZ",
+  "TERM",
+  "USER",
+  "SHELL",
+  "TMPDIR",
+  // Only NODE_ENV: NODE_OPTIONS/NODE_PATH/NODE_REPL_EXTERNAL_MODULE all inject
+  // attacker-chosen code or module resolution into the child process.
+  "NODE_ENV",
+  "BASH_DEFAULT_TIMEOUT_MS",
+  "BASH_MAX_TIMEOUT_MS",
+]);
+
+const OPERATOR_ENV_ALLOWED_PREFIXES = ["LC_", "ANTHROPIC_", "CLAUDE_", "OPENAI_"];
+
+// Hard denials: never inheritable, not even through OPERATOR_ENV_PASSTHROUGH.
+const OPERATOR_ENV_NEVER_INHERITED = new Set([
+  "T3_OPERATOR_MCP_CAPABILITY",
+  "OPERATOR_ENV_PASSTHROUGH",
+  "NODE_OPTIONS",
+]);
+
+function operatorEnvPassthroughPatterns(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function isInheritableEnvName(key: string, passthrough: string[]): boolean {
+  if (OPERATOR_ENV_NEVER_INHERITED.has(key)) return false;
+  if (OPERATOR_ENV_ALLOWED_NAMES.has(key)) return true;
+  if (OPERATOR_ENV_ALLOWED_PREFIXES.some((prefix) => key.startsWith(prefix))) return true;
+  return passthrough.some((pattern) =>
+    pattern.endsWith("*") ? key.startsWith(pattern.slice(0, -1)) : pattern === key,
+  );
+}
 
 function sanitizedEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // Cap individual Bash tool commands: one runaway scan must not consume the
   // whole turn budget (the per-turn watchdog is the outer bound).
   env = { ...env, BASH_DEFAULT_TIMEOUT_MS: env.BASH_DEFAULT_TIMEOUT_MS ?? "300000", BASH_MAX_TIMEOUT_MS: env.BASH_MAX_TIMEOUT_MS ?? "300000" };
+  const passthrough = operatorEnvPassthroughPatterns(env.OPERATOR_ENV_PASSTHROUGH);
   return Object.fromEntries(
-    Object.entries(env).filter(([key]) => {
-      if (NEVER_INHERITED_ENVIRONMENT_NAMES.has(key)) return false;
-      if (!SECRET_LIKE_ENVIRONMENT_NAME.test(key)) return true;
-      return CLI_AUTH_ENVIRONMENT_PREFIXES.some((prefix) => key.startsWith(prefix));
-    }),
+    Object.entries(env).filter(([key]) => isInheritableEnvName(key, passthrough)),
   );
 }
 

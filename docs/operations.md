@@ -39,6 +39,19 @@ environment-variable bearer reference in an inline, isolated MCP config; the
 token itself never appears in argv. Codex user/project rules and user config are
 ignored, and its shell/edit/image tool paths are disabled.
 
+Provider subprocesses inherit an environment allowlist, not a denylist: `PATH`,
+`HOME`, `LANG`, `LC_*`, `TZ`, `TERM`, `USER`, `SHELL`, `TMPDIR`, `NODE_ENV`,
+`ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` (the Codex credential), and
+`BASH_DEFAULT_TIMEOUT_MS` / `BASH_MAX_TIMEOUT_MS`, which are injected at
+`300000` when unset so a single Bash command cannot eat the whole turn budget.
+Everything else stays in the daemon — daemon secrets, but also ambient
+credential carriers such as `SSH_AUTH_SOCK`, `DATABASE_URL`, `SENTRY_DSN` and
+`*_WEBHOOK_URL`. `NODE_OPTIONS` is never inherited: it injects code into the
+child. Extra names a workflow needs (proxies, tool credentials) go into
+`OPERATOR_ENV_PASSTHROUGH` as a comma-separated list, where a trailing `*`
+matches by prefix; that variable itself and `T3_OPERATOR_MCP_CAPABILITY` are
+never passed down, and passthrough cannot re-enable a hard denial.
+
 Provider identity and native session ID are stored together. A switch first
 refreshes structured memory, compacts the current runtime, starts a new native
 session, and restores a bounded daemon snapshot. A failed start rolls back to

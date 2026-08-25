@@ -20,7 +20,7 @@ let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
-  if (process.env.TELEGRAM_BOT_TOKEN || process.env.T3_BEARER_TOKEN || process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY || process.env.DEEPGRAM_API_KEY || process.env.ELEVENLABS_API_KEY) process.exit(9);
+  if (process.env.TELEGRAM_BOT_TOKEN || process.env.T3_BEARER_TOKEN || process.env.SSH_AUTH_SOCK || process.env.GROQ_API_KEY || process.env.DEEPGRAM_API_KEY || process.env.ELEVENLABS_API_KEY) process.exit(9);
   const sessionIndex = process.argv.indexOf("--session-id");
   const session = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : "resumed";
   console.log(JSON.stringify({ type: "system", session_id: session }));
@@ -40,7 +40,7 @@ process.stdin.on("end", () => {
     const secretKeys = [
       "TELEGRAM_BOT_TOKEN",
       "T3_BEARER_TOKEN",
-      "OPENAI_API_KEY",
+      "SSH_AUTH_SOCK",
       "GROQ_API_KEY",
       "DEEPGRAM_API_KEY",
       "ELEVENLABS_API_KEY",
@@ -307,6 +307,107 @@ process.stdin.on("end", () => {});
   });
 });
 
+describe("child environment allowlist", () => {
+  async function childEnvironment(): Promise<Record<string, string>> {
+    const directory = tempDirectory("fake-claude-env-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const sessionIndex = process.argv.indexOf("--session-id");
+  console.log(JSON.stringify({ type: "result", result: JSON.stringify(process.env), session_id: process.argv[sessionIndex + 1] }));
+});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+    let captured: Record<string, string> = {};
+    for await (const event of runtime.sendTurn({ sessionId: session.id, prompt: "env" })) {
+      if (event.type === "result") captured = JSON.parse(event.text) as Record<string, string>;
+    }
+    return captured;
+  }
+
+  it("passes only allowlisted names, honours passthrough patterns, and never leaks the capability", async () => {
+    const overrides: Record<string, string> = {
+      // Credential-shaped values a name-based denylist used to miss.
+      SSH_AUTH_SOCK: "/tmp/agent.sock",
+      DATABASE_URL: "postgres://user:pw@host/db",
+      SENTRY_DSN: "https://key@sentry.example/1",
+      SLACK_WEBHOOK_URL: "https://hooks.example/x",
+      TELEGRAM_BOT_TOKEN: "must-not-leak",
+      // Code injection into the child process.
+      NODE_OPTIONS: "--require /tmp/evil.js",
+      NODE_ENV: "production",
+      // Provider credentials the child legitimately needs.
+      OPENAI_API_KEY: "codex-credential",
+      ANTHROPIC_API_KEY: "claude-credential",
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8192",
+      LC_ALL: "en_US.UTF-8",
+      // Opt-in user workflow variables.
+      WORKFLOW_PROFILE: "release",
+      WF_REGION: "eu",
+      WF_BUCKET: "artifacts",
+      UNLISTED_VAR: "nope",
+      // A hard denial must survive being named in the passthrough list.
+      T3_OPERATOR_MCP_CAPABILITY: "capability-token",
+      OPERATOR_ENV_PASSTHROUGH: "WORKFLOW_PROFILE, WF_*, T3_OPERATOR_MCP_CAPABILITY, NODE_OPTIONS",
+    };
+    const previous = Object.fromEntries(
+      Object.keys(overrides).map((key) => [key, process.env[key]] as const),
+    );
+    Object.assign(process.env, overrides);
+    try {
+      const environment = await childEnvironment();
+
+      for (const blocked of [
+        "SSH_AUTH_SOCK",
+        "DATABASE_URL",
+        "SENTRY_DSN",
+        "SLACK_WEBHOOK_URL",
+        "TELEGRAM_BOT_TOKEN",
+        "NODE_OPTIONS",
+        "UNLISTED_VAR",
+        "T3_OPERATOR_MCP_CAPABILITY",
+        "OPERATOR_ENV_PASSTHROUGH",
+      ]) {
+        expect(environment[blocked], blocked).toBeUndefined();
+      }
+
+      expect(environment.OPENAI_API_KEY).toBe("codex-credential");
+      expect(environment.ANTHROPIC_API_KEY).toBe("claude-credential");
+      expect(environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe("8192");
+      expect(environment.LC_ALL).toBe("en_US.UTF-8");
+      expect(environment.NODE_ENV).toBe("production");
+      expect(environment.PATH).toBe(process.env.PATH);
+      expect(environment.HOME).toBe(process.env.HOME);
+
+      // Passthrough: exact name and `*` prefix match.
+      expect(environment.WORKFLOW_PROFILE).toBe("release");
+      expect(environment.WF_REGION).toBe("eu");
+      expect(environment.WF_BUCKET).toBe("artifacts");
+
+      // Bash ceilings are still injected when unset.
+      expect(environment.BASH_DEFAULT_TIMEOUT_MS).toBe("300000");
+      expect(environment.BASH_MAX_TIMEOUT_MS).toBe("300000");
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+});
+
 describe("CodexCliOperatorRuntime", () => {
   it("uses isolated config, process-scoped MCP, native resume, and JSONL usage", async () => {
     const directory = tempDirectory("fake-codex-");
@@ -318,8 +419,9 @@ let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
-  const blocked = ["TELEGRAM_BOT_TOKEN", "T3_BEARER_TOKEN", "OPENAI_API_KEY", "GOOGLE_WORKSPACE_ACCESS_TOKEN"];
+  const blocked = ["TELEGRAM_BOT_TOKEN", "T3_BEARER_TOKEN", "DATABASE_URL", "GOOGLE_WORKSPACE_ACCESS_TOKEN"];
   if (blocked.some(key => process.env[key])) process.exit(9);
+  if (process.env.OPENAI_API_KEY !== "codex-credential") process.exit(8);
   if (process.argv.includes("--version")) {
     console.log("codex-cli-test 1.0");
     return;
@@ -339,11 +441,14 @@ process.stdin.on("end", () => {
     const secretKeys = [
       "TELEGRAM_BOT_TOKEN",
       "T3_BEARER_TOKEN",
-      "OPENAI_API_KEY",
+      "DATABASE_URL",
       "GOOGLE_WORKSPACE_ACCESS_TOKEN",
+      "OPENAI_API_KEY",
     ] as const;
     const previous = Object.fromEntries(secretKeys.map((key) => [key, process.env[key]]));
     for (const key of secretKeys) process.env[key] = "must-not-leak";
+    // The Codex provider needs its own credential: the allowlist passes OPENAI_*.
+    process.env.OPENAI_API_KEY = "codex-credential";
     try {
       const runtime = new CodexCliOperatorRuntime({
         binary,
