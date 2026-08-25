@@ -271,27 +271,53 @@ describe("OperatorStore", () => {
     store.retryTelegramOutbox(head.id, "TELEGRAM_RATE_LIMIT", "flood wait", 300_000);
     expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(0);
 
-    const behind = store.enqueueTelegramOutbox({
+    store.enqueueTelegramOutbox({
       dedupeKey: "message:behind",
       chatId: 7,
       operation: "rich",
       payload: { text: "второй" },
     });
+    // Freshly failed: the chat has only just gone quiet.
+    expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(0);
+    store.db
+      .prepare("UPDATE telegram_outbox SET updated_at=? WHERE id=?")
+      .run(new Date(Date.now() - 90_000).toISOString(), head.id);
     const blocked = store.listBlockedTelegramOutboxHeads();
     expect(blocked).toHaveLength(1);
     expect(blocked[0]).toMatchObject({ id: head.id, lastErrorCode: "TELEGRAM_RATE_LIMIT" });
 
     // A payload write (chunk progress, delivery-alert markers) must not push
-    // detection away: staleness is read off next_attempt_at, not updated_at.
+    // detection away by forging the last-change timestamp.
     store.updateTelegramOutboxPayload(head.id, { text: "первый", sentChunkCount: 1 });
     expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(1);
+    store.close();
+  });
 
-    // A short backoff is not a jam: the chat goes quiet for seconds, not minutes.
+  it("detects a blocked head on the ordinary capped backoff, not just on an explicit flood wait", () => {
+    const store = tempStore();
+    const head = store.enqueueTelegramOutbox({
+      dedupeKey: "message:capped-head",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "первый" },
+    });
+    store.enqueueTelegramOutbox({
+      dedupeKey: "message:capped-behind",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "второй" },
+    });
+    // Nine attempts burned, then a plain 429 with no retry_after: the backoff
+    // lands on its 60 s cap, which is the everyday case and must be detected.
+    store.db.prepare("UPDATE telegram_outbox SET attempts=9 WHERE id=?").run(head.id);
+    store.retryTelegramOutbox(head.id, "TELEGRAM_RATE_LIMIT", "rate limited");
     store.db
-      .prepare("UPDATE telegram_outbox SET next_attempt_at=? WHERE id=?")
-      .run(new Date(Date.now() + 5_000).toISOString(), head.id);
-    expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(0);
-    expect(behind.status).toBe("pending");
+      .prepare("UPDATE telegram_outbox SET updated_at=? WHERE id=?")
+      .run(new Date(Date.now() - 61_000).toISOString(), head.id);
+
+    const blocked = store.listBlockedTelegramOutboxHeads();
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ id: head.id, attempts: 10 });
     store.close();
   });
 

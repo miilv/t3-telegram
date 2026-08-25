@@ -1506,16 +1506,19 @@ export class OperatorStore {
 
   /**
    * Chat-head outbox items parked in retry backoff, with other pending messages
-   * queued up behind them and at least `waitingMs` of silence still to come.
+   * queued up behind them after at least `waitingMs` of silence.
    * Delivery order is a deliberate trade-off (bug №37): the queue is not
    * reordered, but the blockage must be visible.
    *
-   * "Parked long" is measured on `next_attempt_at` alone — how much longer this
-   * chat stays silent. `updated_at` cannot answer that: any payload write used
-   * to push it forward and delay detection indefinitely.
+   * "Parked long" means: still waiting for its next attempt, and the last
+   * delivery attempt failed at least `waitingMs` ago. Measuring the remaining
+   * wait instead would find nothing in the common case — the retry backoff caps
+   * at exactly 60 s, so `next_attempt_at` is never a full window away.
+   * `updated_at` is trustworthy again now that payload writes leave it alone.
    */
   listBlockedTelegramOutboxHeads<T>(waitingMs = 60_000, limit = 20): TelegramOutboxItem<T>[] {
-    const cutoff = new Date(Date.now() + waitingMs).toISOString();
+    const now = nowIso();
+    const cutoff = new Date(Date.now() - waitingMs).toISOString();
     const boundedLimit = Math.max(1, Math.min(limit, 100));
     return (
       this.db
@@ -1523,7 +1526,8 @@ export class OperatorStore {
           SELECT head.* FROM telegram_outbox head
           WHERE head.status='pending'
             AND head.next_attempt_at IS NOT NULL
-            AND head.next_attempt_at>=?
+            AND head.next_attempt_at>?
+            AND head.updated_at<=?
             AND NOT EXISTS (
               SELECT 1 FROM telegram_outbox earlier
               WHERE earlier.chat_id=head.chat_id
@@ -1539,7 +1543,7 @@ export class OperatorStore {
           ORDER BY head.created_at
           LIMIT ?
         `)
-        .all(cutoff, boundedLimit) as Row[]
+        .all(now, cutoff, boundedLimit) as Row[]
     ).map((row) => rowToTelegramOutbox<T>(row));
   }
 

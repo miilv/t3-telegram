@@ -3727,8 +3727,13 @@ export class OperatorDaemon {
           );
           return;
         }
-        payload.deliveryAlertSent = true;
-        this.store.updateTelegramOutboxPayload(item.id, payload);
+        // Re-read instead of writing back the payload captured before the send:
+        // a chunked retry may have recorded `sentChunkCount`/`sentMessageIds`
+        // while this alert was in flight, and a stale write would resend chunks.
+        const current = this.store.getTelegramOutbox<DurableTelegramPayload>(item.id);
+        if (!current) return;
+        current.payload.deliveryAlertSent = true;
+        this.store.updateTelegramOutboxPayload(item.id, current.payload);
         onSent?.();
       })
       .catch((error: unknown) => {
@@ -3856,30 +3861,35 @@ export class OperatorDaemon {
     failures: number,
     reason: string,
   ): Promise<void> {
-    // Same out-of-band path as delivery alerts (package 0.7): a direct
-    // `sendRich` here could sit in the per-chat lock behind the very backlog
-    // that paused the automation, and it is not worth a durable queue slot.
-    try {
-      const sent = await this.telegram.sendAlert(
-        automation.chatId,
-        [
-          `Автоматизация «${automation.name}» приостановлена после ${failures} ошибок подряд: ${reason}`,
-          `Возобновить: /automation resume ${automation.id}`,
+    // Durable, not best-effort: this is an addressed, actionable message (it
+    // carries the resume command), so it must survive a jam rather than being
+    // dropped like a delivery signal. A chat that stays blocked is covered by
+    // the stall alert instead (package 0.7). The dedupe key is the pause event,
+    // so a retried dispatch cycle cannot repeat it.
+    this.enqueueTelegramOutbox(
+      `telegram:automation:${automation.id}:paused:${failures}`,
+      automation.chatId,
+      "rich",
+      {
+        text: [
+          `Автоматизация **${escapeMarkdownText(automation.name)}** приостановлена после ${failures} ошибок подряд: ${escapeMarkdownText(reason)}`,
+          `Возобновить: \`/automation resume ${automation.id}\``,
         ].join("\n\n"),
-        {
+        options: {
           ...(automation.messageThreadId ? { messageThreadId: automation.messageThreadId } : {}),
           ...(automation.directMessagesTopicId
             ? { directMessagesTopicId: automation.directMessagesTopicId }
             : {}),
         },
-      );
-      if (!sent) {
-        this.logger.warn({ automationId: automation.id }, "Automation pause notification was dropped");
-      }
+        messageType: "automation_paused",
+      },
+    );
+    try {
+      await this.flushTelegramOutbox();
     } catch (error) {
       this.logger.warn(
         { err: error, automationId: automation.id },
-        "Automation pause notification failed",
+        "Automation pause notification flush failed; the outbox will retry",
       );
     }
   }

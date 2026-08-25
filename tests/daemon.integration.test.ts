@@ -522,9 +522,9 @@ describe("OperatorDaemon product flow", () => {
       await daemon.maintain(`test dispatch failure ${attempt}`);
     }
     expect(store.getAutomation(broken.id)).toMatchObject({ status: "paused", consecutiveFailures: 5 });
-    // The pause notice takes the out-of-band alert path (package 0.7), not the
-    // per-chat send lock it might have queued behind.
-    const pauseNotice = telegram.alerts.find((entry) => entry.text.includes("приостановлена"));
+    // The pause notice is durable: it carries an actionable resume command, so
+    // it goes through the outbox rather than the best-effort alert path.
+    const pauseNotice = telegram.sent.find((entry) => entry.text.includes("приостановлена"));
     expect(pauseNotice?.text).toContain("Broken brief");
     expect(pauseNotice?.text).toContain(`/automation resume ${broken.id}`);
     expect(
@@ -2418,16 +2418,14 @@ describe("OperatorDaemon product flow", () => {
       operation: "rich",
       payload: { text: "Второй ответ.", options: { messageThreadId: 9 }, messageType: "operator_answer" },
     });
-    // The head is parked in a long flood wait, so nothing in this chat can move
-    // and the user sees pure silence. Detection reads next_attempt_at only, so a
-    // later payload write cannot postpone it.
+    // An everyday 429 with no retry_after: nine attempts burned, so the backoff
+    // lands on its 60 s cap and nothing in this chat can move. The clock is
+    // wound back to make that minute of silence already elapsed.
+    store.db.prepare("UPDATE telegram_outbox SET attempts=9 WHERE id=?").run(head.id);
+    store.retryTelegramOutbox(head.id, "TELEGRAM_RATE_LIMIT", "rate limited");
     store.db
-      .prepare(`
-        UPDATE telegram_outbox
-        SET attempts=3,next_attempt_at=?,last_error_code='TELEGRAM_RATE_LIMIT'
-        WHERE id=?
-      `)
-      .run(new Date(Date.now() + 300_000).toISOString(), head.id);
+      .prepare("UPDATE telegram_outbox SET updated_at=? WHERE id=?")
+      .run(new Date(Date.now() - 61_000).toISOString(), head.id);
 
     await daemon.initialize();
     const run = daemon.run();

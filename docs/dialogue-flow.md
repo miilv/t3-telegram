@@ -508,9 +508,11 @@ row does not report the days it spent `dead`.
 `claimNextTelegramOutbox` refuses any candidate with an earlier
 `pending|sending` row in the same chat. Head-of-line blocking is by design; the
 log warning is joined by an alert `Доставка в этот чат застряла…`.
-`listBlockedTelegramOutboxHeads` measures the jam on `next_attempt_at` only —
-`updated_at` is not evidence, and `updateTelegramOutboxPayload` no longer
-touches it.
+`listBlockedTelegramOutboxHeads` reports a head that is still waiting for its
+next attempt and whose last attempt failed over a minute ago. It reads
+`updated_at`, which is evidence again now that `updateTelegramOutboxPayload`
+leaves it alone; the remaining wait cannot be used instead, because the retry
+backoff caps at exactly 60 s and would never clear a 60 s window.
 
 Both alerts share one payload marker, `deliveryAlertSent`: two ways of noticing
 the same jam produce one complaint, and a revive clears it with the payload.
@@ -523,7 +525,14 @@ choking chat itself, and topic ids travel only when those coincide. Dispatch is
 fire-and-forget — the reliability pump also drains ingress and must not wait on
 a Telegram round trip. The 60 s per-recipient throttle is spent on the attempt,
 the marker only on success: a dropped alert is offered again a window later.
-`notifyAutomationPaused` uses the same path.
+Since the recipient is almost always the same owner chat, that throttle is
+effectively global — 20 simultaneous jams are reported over 20 minutes. This is
+deliberate: the alerts are a signal that something is stuck, and the durable
+messages themselves are never dropped, only delayed.
+
+`notifyAutomationPaused` does **not** use this path — it is an addressed,
+actionable message (`/automation resume <id>`) and goes through the durable
+outbox, where a jam delays it instead of losing it.
 
 Chunk-level resume: `sentChunkCount` is written back after every chunk, and a
 retry skips what already went out.
