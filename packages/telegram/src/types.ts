@@ -44,6 +44,8 @@ export interface TelegramReplyContext {
   messageId: number;
   userId?: number;
   username?: string;
+  /** Package 1.4: the quoted message was written by a bot — usually us. */
+  fromBot?: boolean;
   text?: string;
   attachments: TelegramAttachment[];
   forwardOrigin?: TelegramForwardOrigin;

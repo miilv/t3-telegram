@@ -83,6 +83,7 @@ const ALLOWED_REACTIONS = new Set([
 
 interface RawUser {
   id: number;
+  is_bot?: boolean;
   username?: string;
   first_name: string;
   last_name?: string;
@@ -1494,6 +1495,7 @@ function normalizeReply(message: RawMessage): TelegramReplyContext {
   return {
     messageId: message.message_id,
     ...(message.from?.id ? { userId: message.from.id } : {}),
+    ...(message.from?.is_bot ? { fromBot: true } : {}),
     ...(message.from?.username ? { username: message.from.username } : {}),
     ...(message.text || message.caption ? { text: sanitizeUserText(message.text ?? message.caption ?? "").slice(0, 4000) } : {}),
     attachments: normalizeAttachments(message),

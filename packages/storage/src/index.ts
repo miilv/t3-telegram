@@ -838,6 +838,22 @@ export class OperatorStore {
       .run(chatId, messageId, threadId, relation);
   }
 
+  /**
+   * Package 1.4: every thread link of one message WITH its relation, readable
+   * even when `telegram_messages` has no row for it (a worker question card is
+   * linked but never saved as a message row, so `getReplyContext` alone made a
+   * reply to an already-answered question resolve to nothing).
+   */
+  getMessageThreadLinks(chatId: number, messageId: number): Array<{ threadId: string; relation: string }> {
+    return (
+      this.db
+        .prepare(
+          "SELECT thread_id, relation FROM message_thread_links WHERE chat_id=? AND message_id=? ORDER BY relation",
+        )
+        .all(chatId, messageId) as Row[]
+    ).map((link) => ({ threadId: String(link.thread_id), relation: String(link.relation) }));
+  }
+
   getReplyContext(chatId: number, messageId: number): ReplyContext | undefined {
     const row = this.db
       .prepare("SELECT * FROM telegram_messages WHERE chat_id=? AND message_id=?")
