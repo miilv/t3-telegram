@@ -32,7 +32,7 @@ import type {
   TelegramTransport,
 } from "../../telegram/src/index.js";
 import type { GoogleWorkspaceConnectors } from "../../connectors/src/index.js";
-import { createAutomation, firstAutomationRun } from "../../automations/src/index.js";
+import { createAutomation, resumeAutomationRun } from "../../automations/src/index.js";
 
 const CAPABILITY_TTL_MS = 2 * 60 * 60 * 1_000;
 const MAX_TOOL_RESULT_CHARS = 16_000;
@@ -732,14 +732,26 @@ export class OperatorToolServer {
           this.requireTeamMutation(capability, `${action} automations`);
           const automation = this.requireAutomationAccess(capability, automationId);
           const status = action === "pause" ? "paused" : action === "delete" ? "deleted" : "active";
-          if (action === "resume" && !automation.nextRunAt) {
-            automation.nextRunAt = firstAutomationRun(automation.schedule);
+          if (action === "resume") {
+            // Interval/daily schedules restart from "now"; a stale next_run_at
+            // must not fire a surprise catch-up run (bug №34).
+            const resumed = resumeAutomationRun(automation.schedule, automation.nextRunAt);
+            automation.nextRunAt = resumed.nextRunAt;
             automation.status = "active";
+            automation.consecutiveFailures = 0;
             automation.updatedAt = nowIso();
             this.options.store.saveAutomation(automation);
-          } else {
-            this.options.store.updateAutomationStatus(automationId, status);
+            return {
+              automationId,
+              status,
+              nextRunAt: resumed.nextRunAt,
+              runsImmediately: resumed.immediate,
+              ...(resumed.immediate
+                ? { note: "The scheduled moment is already in the past; the automation will run now." }
+                : {}),
+            };
           }
+          this.options.store.updateAutomationStatus(automationId, status);
           return { automationId, status };
         },
       });

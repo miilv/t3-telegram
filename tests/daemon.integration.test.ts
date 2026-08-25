@@ -482,6 +482,126 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("backs off failing automation dispatches, pauses with an owner notice, and resumes without stale catch-up runs", async () => {
+    const home = tempDirectory("daemon-automation-backoff-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const broken = createAutomation({
+      ownerId: "42",
+      name: "Broken brief",
+      prompt: "daily digest",
+      schedule: { type: "daily", timeOfDay: "09:00", timeZone: "Europe/Moscow" },
+      chatId: 7,
+    });
+    // A corrupted timezone makes every dispatch throw, like a persistent T3 outage would.
+    broken.schedule = { type: "daily", timeOfDay: "09:00", timeZone: "Not/AZone" };
+    broken.nextRunAt = "2020-01-01T00:00:00.000Z";
+    store.saveAutomation(broken);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    for (let attempt = 0; attempt < 6 && store.getAutomation(broken.id)?.status !== "paused"; attempt += 1) {
+      store.db
+        .prepare("UPDATE automations SET next_run_at=? WHERE id=? AND status='active'")
+        .run("2020-01-01T00:00:00.000Z", broken.id);
+      await daemon.maintain(`test dispatch failure ${attempt}`);
+    }
+    expect(store.getAutomation(broken.id)).toMatchObject({ status: "paused", consecutiveFailures: 5 });
+    const pauseNotice = telegram.sent.find((entry) => entry.text.includes("приостановлена"));
+    expect(pauseNotice?.text).toContain("Broken brief");
+    expect(pauseNotice?.text).toContain(`/automation resume ${broken.id}`);
+    expect(
+      store.db
+        .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='automation.dispatch.failed'")
+        .get(),
+    ).toMatchObject({ count: 5 });
+
+    const stale = createAutomation({
+      ownerId: "42",
+      name: "Hourly sync",
+      prompt: "sync",
+      schedule: { type: "interval", intervalMinutes: 60 },
+      chatId: 7,
+    });
+    stale.status = "paused";
+    stale.nextRunAt = "2020-01-01T00:00:00.000Z";
+    store.saveAutomation(stale);
+    const resumeStartedAt = Date.now();
+    telegram.push(messageAs(11, `/automation resume ${stale.id}`, 42));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Hourly sync") && entry.text.includes("active")));
+    const resumed = store.getAutomation(stale.id);
+    expect(resumed?.status).toBe("active");
+    expect(Date.parse(resumed!.nextRunAt!)).toBeGreaterThanOrEqual(resumeStartedAt + 59 * 60_000);
+    expect(telegram.sent.at(-1)?.text).toContain("Следующий запуск");
+
+    const pastOnce = createAutomation({
+      ownerId: "42",
+      name: "One shot",
+      prompt: "single run",
+      schedule: { type: "once", runAt: "2020-01-02T00:00:00.000Z" },
+      chatId: 7,
+      now: new Date("2020-01-01T00:00:00.000Z"),
+    });
+    pastOnce.status = "paused";
+    store.saveAutomation(pastOnce);
+    telegram.push(messageAs(12, `/automation resume ${pastOnce.id}`, 42));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("One shot") && entry.text.includes("сработает сейчас")));
+    expect(store.getAutomation(pastOnce.id)?.nextRunAt).toBe("2020-01-02T00:00:00.000Z");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("prunes aged journals on the daily maintenance gate and checkpoints the WAL", async () => {
+    const home = tempDirectory("daemon-retention-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const daysAgo = (days: number) => new Date(Date.now() - days * 24 * 60 * 60 * 1_000).toISOString();
+    const staleEvent = store.appendEvent("legacy.event");
+    store.db.prepare("UPDATE daemon_events SET created_at=? WHERE id=?").run(daysAgo(31), staleEvent);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // Startup maintenance runs the first retention pass.
+    expect(store.db.prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='legacy.event'").get())
+      .toMatchObject({ count: 0 });
+    expect(store.getRuntimeState("last_journal_retention_at")).toBeDefined();
+    expect(store.db.prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='journals.pruned'").get())
+      .toMatchObject({ count: 1 });
+
+    // Within the same day the per-minute maintenance tick leaves journals alone.
+    const nextStale = store.appendEvent("legacy.event");
+    store.db.prepare("UPDATE daemon_events SET created_at=? WHERE id=?").run(daysAgo(31), nextStale);
+    await daemon.maintain("same day");
+    expect(store.db.prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='legacy.event'").get())
+      .toMatchObject({ count: 1 });
+
+    // Once the gate ages past 24h the next tick prunes again.
+    store.setRuntimeState("last_journal_retention_at", daysAgo(2));
+    await daemon.maintain("next day");
+    expect(store.db.prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='legacy.event'").get())
+      .toMatchObject({ count: 0 });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("keeps a completed direct answer in the durable outbox until its draft edit succeeds", async () => {
     const home = tempDirectory("daemon-direct-outbox-");
     const store = tempStore();
