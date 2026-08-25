@@ -42,6 +42,11 @@ const envSchema = z.object({
   OPERATOR_COMPACT_THRESHOLD_PERCENT: z.coerce.number().min(50).max(95).default(80),
   OPERATOR_TURN_TIMEOUT_MS: z.coerce.number().int().min(30_000).max(3_600_000).default(600_000),
   /**
+   * Package 1.1: grace between the SIGINT of an interrupted turn and the
+   * SIGKILL that guarantees the single turn slot is actually released.
+   */
+  OPERATOR_INTERRUPT_GRACE_MS: z.coerce.number().int().min(500).max(60_000).default(8_000),
+  /**
    * Extra environment names inherited by provider subprocesses on top of the
    * runtime allowlist. Comma-separated; a trailing `*` matches by prefix.
    */
@@ -290,6 +295,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       fullAccess: parsed.OPERATOR_FULL_ACCESS === "true",
       compactThresholdPercent: parsed.OPERATOR_COMPACT_THRESHOLD_PERCENT,
       turnTimeoutMs: parsed.OPERATOR_TURN_TIMEOUT_MS,
+      interruptGraceMs: parsed.OPERATOR_INTERRUPT_GRACE_MS,
       envPassthrough,
       mediationTimeoutMs: parsed.OPERATOR_MEDIATION_TIMEOUT_MS,
       home: operatorHome,

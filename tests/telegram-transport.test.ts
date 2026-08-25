@@ -893,10 +893,11 @@ describe("Telegram inbound normalization", () => {
     const methods = calls.filter((call) => call.method !== "getMe").map((call) => call.method);
     expect(methods).toEqual(["sendRichMessageDraft", "sendMessageDraft", "deleteMessage"]);
     // Nothing half-written survives: both ephemeral modes are overwritten with
-    // a neutral dash rather than left on screen until Telegram expires them.
+    // an ellipsis (reads as "still going", not as a content-bearing answer)
+    // rather than left on screen until Telegram expires them.
     const rich = calls.find((call) => call.method === "sendRichMessageDraft")!;
-    expect((rich.body.rich_message as { markdown: string }).markdown).toBe("—");
-    expect(calls.find((call) => call.method === "sendMessageDraft")!.body.text).toBe("—");
+    expect((rich.body.rich_message as { markdown: string }).markdown).toBe("…");
+    expect(calls.find((call) => call.method === "sendMessageDraft")!.body.text).toBe("…");
     expect(calls.find((call) => call.method === "deleteMessage")!.body.message_id).toBe(99);
   });
 

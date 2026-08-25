@@ -220,10 +220,19 @@ const DELIVERY_ALERT_THROTTLE_MS = 60_000;
 interface ActiveOperatorTurn {
   chatId: number;
   userId: number;
+  /** Chat + user + topic: the conversation this turn belongs to (package 1.1). */
+  conversationKey: string;
   /** Durable ingress job this turn is processing, for the supersede audit trail. */
   ingressJobId: string;
   operatorTurnId?: string;
   superseded: boolean;
+  /**
+   * Package 1.1: the superseded-message handoff this turn put in its envelope.
+   * It stays in `chat_pending` until this turn actually delivers a final — a
+   * turn that is itself superseded (or retried after a provider error) must not
+   * be the reason the next turn is told "no durable work was dispatched".
+   */
+  issuedPending?: { messageIds: number[]; threadIds: string[] } | undefined;
 }
 
 export class OperatorDaemon {
@@ -370,6 +379,10 @@ export class OperatorDaemon {
     await this.drainT3Dispatches();
     // Startup replay is background work: nothing else can be queued yet, and if
     // a live message beats it to the queue that message goes first by design.
+    // The watermark is seeded FIRST: several messages the owner sent before the
+    // crash must produce one answer to the newest, not a burst of answers to
+    // questions they already replaced.
+    this.seedInboundWatermarkFromPendingJobs();
     await this.operatorInputQueue.run("background", () => this.drainTelegramIngress());
     await this.recoverPendingInteractions();
     await this.recoverWorkers();
@@ -1186,6 +1199,7 @@ export class OperatorDaemon {
     const turnOrigin: ActiveOperatorTurn = {
       chatId: update.chatId,
       userId: update.userId,
+      conversationKey: this.conversationKey(update),
       ingressJobId: telegramIngressJobId(update),
       superseded: false,
     };
@@ -1270,26 +1284,45 @@ export class OperatorDaemon {
   }
 
   /**
-   * Package 1.1 — the preemption watermark: the newest real message id seen
-   * from this owner in this chat. Keyed by chat AND user on purpose. "I may
-   * stop your turn" (the cancel-word ACL, which lets an administrator in) is
-   * not "my message replaces yours": in a group, an admin writing must never
-   * discard a member's answer. Only your own newer message supersedes your turn.
+   * Package 1.1 — the conversation a preemption belongs to: chat, user AND
+   * topic.
+   *
+   * Chat+user, because "I may stop your turn" (the cancel-word ACL, which lets
+   * an administrator in) is not "my message replaces yours" — in a group, an
+   * admin writing must never discard a member's answer. Plus topic, because a
+   * forum topic or a direct-messages topic is a separate conversation: a
+   * message the owner sends in topic B must not kill the turn they are waiting
+   * on in topic A.
    */
-  private inboundWatermarkKey(chatId: number, userId: number): string {
-    return `${chatId}:${userId}`;
+  private conversationKey(scope: {
+    chatId: number;
+    userId: number;
+    messageThreadId?: number;
+    directMessagesTopicId?: number;
+  }): string {
+    return [
+      scope.chatId,
+      scope.userId,
+      scope.messageThreadId ?? 0,
+      scope.directMessagesTopicId ?? 0,
+    ].join(":");
+  }
+
+  /** Package 1.1: the superseded-message handoff, per chat and topic. */
+  private chatPendingKey(update: Extract<TelegramInbound, { type: "message" }>): string {
+    return `chat_pending:${update.chatId}:${update.messageThreadId ?? 0}:${update.directMessagesTopicId ?? 0}`;
   }
 
   /**
    * Package 1.1 — preemption. Single-voice: the owner's newest message is the
    * conversation, so ANY message of theirs supersedes their own turn in that
-   * chat. Two things happen here, and they cover different windows:
+   * conversation. Two things happen here, and they cover different windows:
    *
    *  - the watermark moves, which supersedes turns that have not reached the
    *    provider yet — one still queued behind the drain, or one spending
    *    seconds on OCR/transcription before it ever registers as in-flight;
-   *  - every in-flight turn of this user in this chat is flagged and its
-   *    provider call interrupted, which covers the turn already streaming.
+   *  - every in-flight turn of that conversation is flagged and its provider
+   *    call interrupted, which covers the turn already streaming.
    *
    * It fires on the RAW message, before the 2 s batch window closes, so the
    * first message of a burst frees the turn slot while the rest of the burst is
@@ -1301,29 +1334,33 @@ export class OperatorDaemon {
    * the next turn is told about it (see `chat_pending:`).
    */
   private noteInboundMessage(signal: InboundMessageSignal): void {
-    const key = this.inboundWatermarkKey(signal.chatId, signal.userId);
-    // An edit reuses an old message id: it must never move a watermark
-    // backwards, and it must never look newer than the message it edits.
-    if (!signal.edited) {
-      const previous = this.inboundWatermark.get(key) ?? 0;
-      if (signal.messageId > previous) this.inboundWatermark.set(key, signal.messageId);
-    }
-    this.preemptOperatorTurn(signal.chatId, signal.userId);
+    // An edit is not a new message: it reuses an old id, so it can neither move
+    // the watermark nor preempt. Fixing a typo in an old line must not kill the
+    // turn that is answering the newest one.
+    if (signal.edited) return;
+    const key = this.conversationKey(signal);
+    const previous = this.inboundWatermark.get(key) ?? 0;
+    if (signal.messageId > previous) this.inboundWatermark.set(key, signal.messageId);
+    this.preemptOperatorTurn(key);
   }
 
-  private preemptOperatorTurn(chatId: number, userId: number): void {
+  private preemptOperatorTurn(conversationKey: string): void {
     const turns = [...this.activeOperatorTurns].filter(
-      (turn) => turn.chatId === chatId && turn.userId === userId && !turn.superseded,
+      (turn) => turn.conversationKey === conversationKey && !turn.superseded,
     );
-    if (!turns.length) return;
     for (const turn of turns) {
+      // A turn registers before `answerDirect` stamps its id. Interrupting on
+      // an unnamed turn would fall back to the unconditional interrupt and
+      // could hit mediation or maintenance, so a turn without an id is only
+      // flagged here — the watermark check inside the turn still stops it.
       this.markTurnSuperseded(turn, "owner_message");
       // Per turn, not per preemption: N turns superseded must count as N.
       metrics.increment("operator_turns_superseded_total");
+      if (!turn.operatorTurnId) continue;
+      // Named so a preemption that lost its race cannot kill whatever call took
+      // the runtime slot next — maintenance, mediation, memory work.
+      this.interruptQuietly(turn.operatorTurnId);
     }
-    // Named so a preemption that lost its race cannot kill whatever call took
-    // the runtime slot next — maintenance, mediation, memory work.
-    for (const turn of turns) this.interruptQuietly(turn.operatorTurnId);
   }
 
   private markTurnSuperseded(turn: ActiveOperatorTurn, reason: string): void {
@@ -1348,13 +1385,35 @@ export class OperatorDaemon {
    *
    * Synthetic updates (automation runs, choice answers) never come through the
    * transport and carry negative ids, so they are out of scope; an edit reuses
-   * an old id and is compared by the in-flight flag alone.
+   * an old id and is never judged by the watermark either.
    */
   private inboundSupersedes(update: Extract<TelegramInbound, { type: "message" }>): boolean {
     if (update.synthetic || update.edited) return false;
-    const newest = this.inboundWatermark.get(this.inboundWatermarkKey(update.chatId, update.userId));
+    const newest = this.inboundWatermark.get(this.conversationKey(update));
     if (newest === undefined) return false;
     return newest > Math.max(...update.messageIds);
+  }
+
+  /**
+   * Package 1.1: after a restart the watermark is empty while the durable queue
+   * may still hold several messages the owner sent before the crash. Replaying
+   * all of them would answer, one after another, questions that were already
+   * replaced — the exact opposite of single voice. Seeding the mark from the
+   * pending jobs themselves makes the ordinary rule do the work: every job but
+   * the newest of each conversation is superseded at the top of its turn, and
+   * anything they had already dispatched travels forward in `chat_pending`.
+   */
+  private seedInboundWatermarkFromPendingJobs(): void {
+    for (const status of ["pending", "running"]) {
+      for (const job of this.store.listBackgroundJobs<DurableTelegramIngress>("telegram_ingress", status)) {
+        const update = job.payload?.update;
+        if (!update || update.type !== "message" || update.synthetic || update.edited) continue;
+        if (!update.messageIds?.length) continue;
+        const key = this.conversationKey(update);
+        const newest = Math.max(...update.messageIds);
+        if (newest > (this.inboundWatermark.get(key) ?? 0)) this.inboundWatermark.set(key, newest);
+      }
+    }
   }
 
   private async answerDirect(
@@ -1382,7 +1441,7 @@ export class OperatorDaemon {
       this.markTurnSuperseded(turn, "newer_owner_message");
     }
     if (turn?.superseded) {
-      this.recordSupersededTurn(update, operatorTurnId, correlationId, 0);
+      this.recordSupersededTurn(update, operatorTurnId, correlationId, 0, turn);
       return;
     }
     this.store.appendEvent("operator.turn.started", {
@@ -1423,7 +1482,7 @@ export class OperatorDaemon {
         ? { directMessagesTopicId: update.directMessagesTopicId }
         : {}),
     });
-    const supersededNote = this.consumeSupersededNote(update);
+    const supersededNote = this.consumeSupersededNote(update, turn);
     const replyThread = replyThreadId ? this.store.getThread(replyThreadId) : undefined;
     const replyProject = replyThread ? this.store.getProject(replyThread.projectId) : undefined;
     const focusThread = focus.primary?.threadId ? this.store.getThread(focus.primary.threadId) : undefined;
@@ -1577,7 +1636,7 @@ export class OperatorDaemon {
       this.markTurnSuperseded(turn, "newer_owner_message");
     }
     if (turn?.superseded) {
-      this.recordSupersededTurn(update, operatorTurnId, correlationId, attempt);
+      this.recordSupersededTurn(update, operatorTurnId, correlationId, attempt, turn);
       await this.discardDraft(writer);
       return;
     }
@@ -1595,6 +1654,8 @@ export class OperatorDaemon {
         : {}),
       messageType,
     });
+    // The answer is durable now, so the handoff this turn carried is spent.
+    this.clearIssuedChatPending(update, turn);
     await this.flushTelegramOutbox();
 
     if (retryDelayMs !== undefined && !this.shutdown.signal.aborted) {
@@ -1623,6 +1684,7 @@ export class OperatorDaemon {
     operatorTurnId: string,
     correlationId: string,
     attempt: number,
+    turn?: ActiveOperatorTurn,
   ): void {
     this.store.appendEvent("operator.turn.dropped", {
       correlationId,
@@ -1632,17 +1694,54 @@ export class OperatorDaemon {
     const dispatched = (this.store.getRuntimeState(`job_thread:${ingressJobId}`) ?? "")
       .split(",")
       .filter(Boolean);
-    const existing = this.readChatPending(update.chatId);
-    // Two supersessions in a row must not lose the first one's threads.
-    const threadIds = [...new Set([...(existing?.threadIds ?? []), ...dispatched])];
+    const existing = this.readChatPending(update);
+    // Two supersessions in a row must not lose the first one's threads — nor
+    // may a note this turn merely *showed* be lost, since it never delivered.
+    const threadIds = [
+      ...new Set([
+        ...(existing?.threadIds ?? []),
+        ...(turn?.issuedPending?.threadIds ?? []),
+        ...dispatched,
+      ]),
+    ];
     this.store.setRuntimeState(
-      `chat_pending:${update.chatId}`,
+      this.chatPendingKey(update),
       JSON.stringify({ messageIds: update.messageIds, threadIds }),
     );
   }
 
-  private readChatPending(chatId: number): { messageIds: number[]; threadIds: string[] } | undefined {
-    const raw = this.store.getRuntimeState(`chat_pending:${chatId}`);
+  /**
+   * Package 1.1: the handoff is consumed by DELIVERY, not by being shown. A
+   * turn that was itself superseded, or that failed and is about to replay,
+   * leaves the note in place for whoever finally answers.
+   */
+  private clearIssuedChatPending(
+    update: Extract<TelegramInbound, { type: "message" }>,
+    turn: ActiveOperatorTurn | undefined,
+  ): void {
+    const issued = turn?.issuedPending;
+    if (!issued) return;
+    turn.issuedPending = undefined;
+    const current = this.readChatPending(update);
+    if (!current) return;
+    const remaining = current.threadIds.filter((threadId) => !issued.threadIds.includes(threadId));
+    const sameMessages =
+      current.messageIds.length === issued.messageIds.length &&
+      current.messageIds.every((id) => issued.messageIds.includes(id));
+    if (!remaining.length && sameMessages) {
+      this.store.setRuntimeState(this.chatPendingKey(update), "");
+      return;
+    }
+    this.store.setRuntimeState(
+      this.chatPendingKey(update),
+      JSON.stringify({ messageIds: current.messageIds, threadIds: remaining }),
+    );
+  }
+
+  private readChatPending(
+    update: Extract<TelegramInbound, { type: "message" }>,
+  ): { messageIds: number[]; threadIds: string[] } | undefined {
+    const raw = this.store.getRuntimeState(this.chatPendingKey(update));
     if (!raw) return undefined;
     try {
       const parsed: unknown = JSON.parse(raw);
@@ -1662,14 +1761,19 @@ export class OperatorDaemon {
    * re-dispatch work that is already running, and does not treat a dangling
    * reference in the new message as coming out of nowhere.
    */
-  private consumeSupersededNote(update: Extract<TelegramInbound, { type: "message" }>): string | undefined {
-    const pending = this.readChatPending(update.chatId);
+  private consumeSupersededNote(
+    update: Extract<TelegramInbound, { type: "message" }>,
+    turn: ActiveOperatorTurn | undefined,
+  ): string | undefined {
+    const pending = this.readChatPending(update);
     if (!pending) return undefined;
     // The record belongs to this very update (a replay of the superseded job):
     // the ordinary recovery note already covers that case.
     const sameMessage = pending.messageIds.some((id) => update.messageIds.includes(id));
     if (sameMessage) return undefined;
-    this.store.setRuntimeState(`chat_pending:${update.chatId}`, "");
+    // Held, not cleared: `clearIssuedChatPending` releases it once this turn
+    // has actually enqueued a final.
+    if (turn) turn.issuedPending = pending;
     const threads = pending.threadIds
       .map((threadId) => {
         const thread = this.store.getThread(threadId);

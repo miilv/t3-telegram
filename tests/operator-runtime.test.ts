@@ -626,6 +626,71 @@ process.stdin.on("end", () => {
 });
 
 describe("CodexCliOperatorRuntime", () => {
+  it("resumes a Codex session whose first turn was interrupted (package 1.1)", async () => {
+    const directory = tempDirectory("fake-codex-interrupted-");
+    const binary = join(directory, "codex");
+    const argvLog = join(directory, "argv.log");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(args) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const resumed = args[1] === "resume";
+  console.log(JSON.stringify({ type: "thread.started", thread_id: resumed ? args[args.length - 2] : "codex-native-session" }));
+  console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "partial" } }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 1 } }));
+  // The first (new-session) invocation then hangs, so the preemption's SIGINT
+  // lands after the result the provider already accepted.
+  if (!resumed) setTimeout(() => {}, 60_000);
+});
+process.on("SIGINT", () => process.exit(130));
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new CodexCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "gpt-5",
+      effort: "high",
+      interruptGraceMs: 50,
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+
+    await expect(
+      (async () => {
+        for await (const event of runtime.sendTurn({
+          sessionId: session.id,
+          prompt: "первый",
+          turnToken: "turn-1",
+        })) {
+          if (event.type === "result") void runtime.interrupt("turn-1");
+        }
+      })(),
+    ).rejects.toThrow(/exited/);
+
+    // The SAME session id the runtime handed out: whether this turn resumes or
+    // opens a second Codex session is decided purely by the new-session
+    // bookkeeping the interrupted turn left behind.
+    for await (const _event of runtime.sendTurn({ sessionId: session.id, prompt: "второй" })) {
+      // drain
+    }
+
+    const invocations = readFileSync(argvLog, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(invocations).toHaveLength(2);
+    expect(invocations[0]![1]).not.toBe("resume");
+    // Before package 1.1 the interrupted first turn left the session flagged
+    // new, and this one would have opened a second Codex session.
+    expect(invocations[1]![1]).toBe("resume");
+    expect(invocations[1]).toContain(session.id);
+  });
+
   it("uses isolated config, process-scoped MCP, native resume, and JSONL usage", async () => {
     const directory = tempDirectory("fake-codex-");
     const binary = join(directory, "codex");

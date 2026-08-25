@@ -211,6 +211,9 @@ export interface InboundMessageSignal {
   messageId: number;
   /** An edit reuses an old message id, so it must not move the watermark. */
   edited: boolean;
+  /** Forum topic / direct-messages topic: a separate conversation in one chat. */
+  messageThreadId?: number;
+  directMessagesTopicId?: number;
 }
 
 export interface TelegramTransport {

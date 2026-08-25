@@ -23,11 +23,17 @@ const DEFAULT_INTERRUPT_GRACE_MS = 8_000;
 function interruptChild(
   child: ChildProcessWithoutNullStreams | undefined,
   graceMs = DEFAULT_INTERRUPT_GRACE_MS,
+  logger?: Logger,
 ): void {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGINT");
   const escalation = setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (child.exitCode === null && child.signalCode === null) {
+      // Not routine: a provider CLI that ignores SIGINT is a bug worth seeing
+      // in the log, because every escalation is a turn that ended abruptly.
+      logger?.warn({ pid: child.pid, graceMs }, "Operator turn ignored SIGINT; escalating to SIGKILL");
+      child.kill("SIGKILL");
+    }
   }, graceMs);
   escalation.unref();
   child.once("close", () => clearTimeout(escalation));
@@ -357,7 +363,7 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
 
   async interrupt(turnToken?: string): Promise<void> {
     if (turnToken !== undefined && turnToken !== this.activeTurnToken) return;
-    interruptChild(this.active, this.options.interruptGraceMs);
+    interruptChild(this.active, this.options.interruptGraceMs, this.options.logger);
   }
 
   async compact(reason = "scheduled compaction"): Promise<{ sessionId: string; summary?: string }> {
@@ -584,7 +590,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
 
   async interrupt(turnToken?: string): Promise<void> {
     if (turnToken !== undefined && turnToken !== this.activeTurnToken) return;
-    interruptChild(this.active, this.options.interruptGraceMs);
+    interruptChild(this.active, this.options.interruptGraceMs, this.options.logger);
   }
 
   /**

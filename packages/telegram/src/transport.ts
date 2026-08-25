@@ -54,8 +54,13 @@ const ALBUM_WINDOW_MS = 650;
 const MAX_ALBUM_WAIT_MS = 5_000;
 /** Quiet period that closes an inbound batch when no more pages are pending. */
 const BATCH_WINDOW_MS = 2_000;
-/** Package 1.1: what a superseded turn's preview is overwritten with. */
-const DISCARDED_DRAFT_TEXT = "—";
+/**
+ * Package 1.1: what a superseded turn's preview is overwritten with. An
+ * ellipsis reads as "still going" while the replacement turn spins up; a dash
+ * reads as a deliberate, content-bearing answer, which is exactly the wrong
+ * impression for a turn whose output is being thrown away.
+ */
+const DISCARDED_DRAFT_TEXT = "…";
 /** Hard ceiling so a pathological flood can never hold a batch open forever. */
 const MAX_BATCH_WAIT_MS = 180_000;
 /** Telegram never returns more than this many updates per getUpdates call. */
@@ -858,6 +863,10 @@ export class TelegramBotTransport implements TelegramTransport {
           userId: normalized.userId,
           messageId: normalized.messageId,
           edited: normalized.edited,
+          ...(normalized.messageThreadId ? { messageThreadId: normalized.messageThreadId } : {}),
+          ...(normalized.directMessagesTopicId
+            ? { directMessagesTopicId: normalized.directMessagesTopicId }
+            : {}),
         });
       } catch (error) {
         this.logger.warn({ err: error }, "Inbound message observer failed");

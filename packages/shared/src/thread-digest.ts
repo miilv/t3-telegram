@@ -192,9 +192,18 @@ export class ThreadEventDigest {
       }
       collapsed += existing.collapsed;
       firstAt = Math.min(firstAt, existing.firstAt);
-      // Where this frame sat among the survivors; the LAST eviction wins, so
-      // the completion lands where the thread last spoke, not where it started.
+      // Where this frame sat among the survivors. The LAST eviction wins.
       position = kept.length;
+    }
+    // …but that index is only the position of the evicted frame, and survivors
+    // of the SAME thread may sit after it: `progress → agent_message →
+    // completion` (the commonest shape there is) evicted the progress at index
+    // 0 and would have put the completion before the message that followed it.
+    // Walk past everything this thread still has in the digest.
+    if (position >= 0) {
+      for (let index = position; index < kept.length; index += 1) {
+        if (kept[index]!.threadId === event.threadId) position = index + 1;
+      }
     }
     this.items.length = 0;
     this.items.push(...kept);

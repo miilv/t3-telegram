@@ -3724,8 +3724,147 @@ describe("OperatorDaemon product flow", () => {
     expect(envelope).toContain("previous message was superseded");
     expect(envelope).toContain("threadId th_1");
     expect(envelope).toContain("Answer only the current message");
-    // Consumed once: it is a handoff, not a standing instruction.
-    expect(store.getRuntimeState("chat_pending:7")).toBe("");
+    // Released by DELIVERY, not by being shown: once this turn's final is
+    // durable the handoff is spent.
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Ответ на второй вопрос")));
+    expect(store.getRuntimeState("chat_pending:7:0:0")).toBe("");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("carries the superseded-work note across a second supersession (package 1.1)", async () => {
+    const home = tempDirectory("daemon-preempt-chain-");
+    const store = tempStore();
+    const runtime = new ChainPreemptibleRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // A dispatches durable work, then is superseded by B.
+    telegram.push(message(1, "жди A"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("жди A")));
+    store.setRuntimeState("job_thread:telegram-ingress:7:1", "th_1");
+    await broker.createThread({ projectId: "p_1", title: "Работа из хода A" });
+
+    telegram.push(message(2, "жди B"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("жди B")));
+    const envelopeB = runtime.prompts.find((prompt) => prompt.includes("жди B"))!;
+    expect(envelopeB).toContain("threadId th_1");
+
+    // B was shown the note but never answered — it is superseded in turn.
+    telegram.push(message(3, "жди C"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("жди C")));
+
+    const envelopeC = runtime.prompts.find((prompt) => prompt.includes("жди C"))!;
+    // The lie this guards against: "No durable work was dispatched for it"
+    // while th_1 is very much alive, inviting a duplicate dispatch.
+    expect(envelopeC).toContain("threadId th_1");
+    expect(envelopeC).not.toContain("No durable work was dispatched");
+
+    runtime.releaseAll();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("answers only the newest of the messages a crash left queued (package 1.1)", async () => {
+    const home = tempDirectory("daemon-restart-burst-");
+    const store = tempStore();
+    store.migrate();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    // Three messages the owner sent before the crash, each its own durable job.
+    for (const [messageId, text] of [
+      [1, "первый вопрос"],
+      [2, "второй вопрос"],
+      [3, "столица Франции?"],
+    ] as const) {
+      store.enqueueBackgroundJob(
+        "telegram_ingress",
+        { update: message(messageId, text), processExisting: false },
+        undefined,
+        { id: `telegram-ingress:7:${messageId}`, dedupeKey: `telegram-ingress:7:${messageId}` },
+      );
+    }
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+
+    // One provider turn, one answer — to the newest question. Answering all
+    // three would be three answers to questions the owner already replaced.
+    const envelopes = runtime.prompts.filter((prompt) => prompt.includes("User message"));
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0]).toContain("столица Франции?");
+    expect(telegram.sent.filter((sent) => sent.text === "Париж.")).toHaveLength(1);
+    expect(store.listBackgroundJobs("telegram_ingress", "pending")).toHaveLength(0);
+    expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(3);
+
+    await daemon.stop();
+  });
+
+  it("scopes preemption to one topic and ignores edits of old messages (package 1.1)", async () => {
+    const home = tempDirectory("daemon-preempt-topic-");
+    const store = tempStore();
+    const runtime = new PreemptibleRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push({ ...message(1, "первый вопрос про архитектуру"), messageThreadId: 11 });
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("первый вопрос")));
+
+    // Another topic is another conversation: it must not discard this one.
+    telegram.push({ ...message(2, "вопрос в другом топике"), messageThreadId: 22 });
+    // An edit reuses an old message id — fixing a typo is not a new message.
+    telegram.push({ ...message(3, "первый вопрос про архитектуру!"), messageThreadId: 11, edited: true });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(runtime.interrupts).toBe(0);
+
+    // The same topic does preempt.
+    telegram.push({ ...message(4, "второй вопрос, забудь предыдущий"), messageThreadId: 11 });
+    await waitFor(() => runtime.interrupts === 1);
 
     telegram.finish();
     await run;
@@ -4845,6 +4984,7 @@ function config(home: string): Config {
       effort: "high",
       compactThresholdPercent: 80,
       turnTimeoutMs: 600_000,
+      interruptGraceMs: 8_000,
       envPassthrough: [],
       mediationTimeoutMs: 250,
       fullAccess: false,
@@ -5551,6 +5691,10 @@ class FakeTelegram implements TelegramTransport {
         userId: update.userId,
         messageId: Math.max(...update.messageIds),
         edited: update.edited,
+        ...(update.messageThreadId ? { messageThreadId: update.messageThreadId } : {}),
+        ...(update.directMessagesTopicId
+          ? { directMessagesTopicId: update.directMessagesTopicId }
+          : {}),
       });
     }
     this.queue.push(update);
@@ -5804,6 +5948,40 @@ class PreemptibleRuntime extends FakeRuntime {
       return;
     }
     yield* super.sendTurn(input);
+  }
+}
+
+/**
+ * Package 1.1: blocks on every question containing "жди", releasing them one by
+ * one when interrupted, so a chain of preemptions can be driven from a test.
+ */
+class ChainPreemptibleRuntime extends FakeRuntime {
+  interrupts = 0;
+  private readonly gates: Array<() => void> = [];
+
+  override async interrupt(): Promise<void> {
+    this.interrupts += 1;
+    this.gates.shift()?.();
+  }
+
+  /** Let every still-blocked turn finish, so shutdown is not held up. */
+  releaseAll(): void {
+    while (this.gates.length) this.gates.shift()?.();
+  }
+
+  override async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (!input.prompt.includes("жди")) {
+      yield* super.sendTurn(input);
+      return;
+    }
+    this.prompts.push(input.prompt);
+    yield { type: "text_delta", text: "начал" };
+    await new Promise<void>((resolve) => this.gates.push(resolve));
+    yield { type: "result", text: "недописанное", sessionId: input.sessionId };
   }
 }
 

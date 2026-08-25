@@ -243,10 +243,13 @@ cancel word needed:
 transport.setInboundObserver(chatId, userId, messageId, edited)
                                         fires on the ACCEPTED raw message,
                                         before the 2 s batch window closes
-   └─ scope: the turn's OWN initiator, in THIS chat. Deliberately NARROWER than
-             path A: an administrator may STOP a member's turn with a cancel
-             word, but an admin writing in a group does not replace a member's
-             conversation.
+   └─ scope: chat + user + TOPIC — the turn's OWN initiator, in this very
+             conversation. Deliberately NARROWER than path A: an administrator
+             may STOP a member's turn with a cancel word, but an admin writing
+             in a group does not replace a member's conversation, and a message
+             in forum topic B does not discard the turn running in topic A.
+             An edit reuses an old message id, so it neither moves the mark nor
+             preempts: fixing a typo is not a new message.
    └─ two effects, covering two different windows:
         · the watermark `chatId:userId → newest real messageId` moves. A turn
           still queued behind the drain, or spending seconds on OCR/STT before
@@ -257,7 +260,8 @@ transport.setInboundObserver(chatId, userId, messageId, edited)
           so a preemption that lost its race cannot kill the maintenance,
           mediation or memory call that took the slot next. `interrupt()` with
           no token stays the unconditional hatch used by path A.
-   └─ interrupt = SIGINT, then SIGKILL after `interruptGraceMs` (8 s default):
+   └─ interrupt = SIGINT, then SIGKILL after `OPERATOR_INTERRUPT_GRACE_MS`
+             (8 s default, logged as a warning when it escalates):
              a CLI that ignores SIGINT would hold the single turn slot forever,
              leaving BOTH messages unanswered.
    └─ the superseded turn: no final enqueued (checked at the top of the turn and
@@ -272,16 +276,27 @@ transport.setInboundObserver(chatId, userId, messageId, edited)
              (memory-design §1).
    └─ synthetic updates (automation runs, button answers) never travel through a
              transport, so they neither move the watermark nor are judged by it.
+   └─ ON RESTART the mark is seeded from the pending ingress jobs themselves,
+             before the startup replay: a crash that left three of the owner's
+             messages queued produces ONE answer, to the newest, instead of
+             three answers to questions they had already replaced.
 ```
 
 **The daemon stays silent about it, but the turn may not have been.** A
 superseded turn can already have sent something through `telegram.send_message`
 or dispatched durable work before it was cut off. That is why the threads it
-started are re-keyed from `job_thread:<ingressJobId>` to `chat_pending:<chatId>`
-and handed to the NEXT turn as one envelope line: the owner's previous message
-was superseded, work X is already running, answer only the current message. It
-is explicitly not "answer the old one too" — that would be two answers to one
-voice.
+started are re-keyed from `job_thread:<ingressJobId>` to
+`chat_pending:<chatId>:<topic>` and handed to the NEXT turn as one envelope
+line: the owner's previous message was superseded, work X is already running,
+answer only the current message. It is explicitly not "answer the old one too" —
+that would be two answers to one voice.
+
+The handoff is released by **delivery**, not by being shown. A turn that put the
+line in its envelope and was then superseded itself — or that failed and is
+about to replay — leaves it in place, and `recordSupersededTurn` folds its own
+threads in. Without that, the third message of a chain would be told "no durable
+work was dispatched" while the thread was still running, and would dispatch it
+twice.
 
 The message itself takes the ordinary path: batching, durable ingress job, and a
 new turn on the `user` lane. The first message of a burst frees the turn slot

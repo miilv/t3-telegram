@@ -128,6 +128,22 @@ describe("ThreadEventDigest (package 1.1)", () => {
     ]);
   });
 
+  it("keeps a completion after the message that preceded it (progress → message → done)", async () => {
+    const sink = collector();
+    const digest = new ThreadEventDigest({ onFlush: sink.onFlush });
+    // The commonest shape there is: the worker reports progress, writes a line
+    // about what it found, then finishes.
+    digest.push({ kind: "progress", threadId: "th_1", text: "50%" });
+    digest.push({ kind: "agent_message", threadId: "th_1", text: "починил парсер" });
+    digest.push({ kind: "completion", threadId: "th_1", outcome: "completed", text: "готово" });
+
+    await digest.flush();
+    expect(sink.digests[0]!.map((item) => [item.kind, item.text])).toEqual([
+      ["agent_message", "починил парсер"],
+      ["completion", "готово"],
+    ]);
+  });
+
   it("dedupes a replayed agent message even when progress interleaves it", async () => {
     const sink = collector();
     const digest = new ThreadEventDigest({ onFlush: sink.onFlush });
