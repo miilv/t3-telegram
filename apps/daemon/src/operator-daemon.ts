@@ -337,7 +337,9 @@ export class OperatorDaemon {
                 metrics.observe("telegram_update_latency_ms", Date.now() - receivedAt, {
                   direction: "ingress_to_completion",
                 });
-              });
+              })
+              // .finally() hands back a fresh promise; nothing may float off it.
+              .catch(() => {});
             return;
           }
           await this.handleUpdate(update);
@@ -347,7 +349,9 @@ export class OperatorDaemon {
           metrics.observe("telegram_update_latency_ms", Date.now() - receivedAt, {
             direction: "ingress_accept",
           });
-        });
+        })
+        // .finally() hands back a fresh promise; nothing may float off it.
+        .catch(() => {});
     }
   }
 
