@@ -27,6 +27,7 @@ import type {
 import {
   nowIso,
   raiseOwnDispatchPending,
+  redactSecretsDeep,
   releaseOwnDispatchPending,
 } from "../../shared/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
@@ -1275,6 +1276,7 @@ export class OperatorToolServer {
     token: string,
     spec: RegisteredToolInput<T>,
   ): void {
+    const mutating = spec.readOnly !== true;
     const callback = async (input: Record<string, unknown>): Promise<ToolResult> => {
       const startedAt = Date.now();
       try {
@@ -1282,14 +1284,35 @@ export class OperatorToolServer {
         const value = await spec.handler(input as z.infer<T>, capability);
         this.options.store.appendEvent("operator.tool.completed", {
           correlationId: capability.context.operatorTurnId,
-          payload: { tool: spec.name, durationMs: Date.now() - startedAt },
+          payload: {
+            tool: spec.name,
+            durationMs: Date.now() - startedAt,
+            // Duplicates correlation_id on purpose: the secretary reads
+            // payload_json on its own, without the surrounding columns.
+            opturn: capability.context.operatorTurnId,
+            ...(mutating
+              ? {
+                  args: journalSnippet(input, JOURNAL_ARGS_LIMIT),
+                  result: journalSnippet(journalResultValue(value), JOURNAL_RESULT_LIMIT),
+                }
+              : {}),
+          },
         });
         return compactResult(value);
       } catch (error) {
         const capability = this.getCapability(token);
         this.options.store.appendEvent("operator.tool.failed", {
           ...(capability ? { correlationId: capability.context.operatorTurnId } : {}),
-          payload: { tool: spec.name, durationMs: Date.now() - startedAt },
+          payload: {
+            tool: spec.name,
+            durationMs: Date.now() - startedAt,
+            ...(capability ? { opturn: capability.context.operatorTurnId } : {}),
+            ...(mutating && capability ? { args: journalSnippet(input, JOURNAL_ARGS_LIMIT) } : {}),
+            error: journalSnippet(
+              error instanceof Error ? error.message : String(error),
+              JOURNAL_RESULT_LIMIT,
+            ),
+          },
         });
         return toolError(error);
       }
@@ -1536,6 +1559,37 @@ function compactResult(value: unknown): ToolResult {
   return { resultType: "complete", content: [{ type: "text", text: boundedJson(value) }] };
 }
 
+/** Journal budgets: enough to reconstruct a turn narrative, never a transcript. */
+const JOURNAL_ARGS_LIMIT = 500;
+const JOURNAL_RESULT_LIMIT = 300;
+
+/**
+ * Serialise a value for the durable journal within a hard budget.
+ *
+ * Redaction runs on the *structure*, before serialisation and truncation: key
+ * rules (`{"token":"plain"}`) only exist while the object is an object, and a
+ * multi-line secret such as a PEM block survives a cut that separates it from
+ * its own `-----END …-----` terminator. `appendEvent` redacts again on write —
+ * that second layer catches payloads assembled elsewhere, it is not this one.
+ */
+function journalSnippet(value: unknown, limit: number): string {
+  const redacted = redactSecretsDeep(value);
+  if (typeof redacted === "string") return boundedText(redacted, limit);
+  // The whole snippet is capped at `limit`, so no single string inside it can
+  // usefully exceed that — capping per string keeps megabyte inputs
+  // (artifacts.write_text, t3.send_turn) from being serialised in full.
+  return boundedText(boundedJsonText(redacted, limit), limit, true);
+}
+
+/** Base64 image payloads are journalled by their metadata, never their bytes. */
+function journalResultValue(value: unknown): unknown {
+  if (!isImageToolPayload(value)) return value;
+  return {
+    metadata: value.metadata,
+    image: { mimeType: value.image.mimeType, bytes: value.image.data.length },
+  };
+}
+
 function toolError(error: unknown): ToolResult {
   const message = error instanceof Error ? error.message : String(error);
   return {
@@ -1571,14 +1625,57 @@ function resolveJournalInstant(value: string, now: Date): string {
 }
 
 function boundedJson(value: unknown): string {
-  const json = JSON.stringify(value, jsonReplacer);
+  const json = boundedJsonText(value, 8_000);
   if (json.length <= MAX_TOOL_RESULT_CHARS) return json;
-  return JSON.stringify({ truncated: true, preview: json.slice(0, MAX_TOOL_RESULT_CHARS - 100) });
+  return JSON.stringify({
+    truncated: true,
+    preview: safeSlice(json, MAX_TOOL_RESULT_CHARS - 100, true),
+  });
 }
 
-function jsonReplacer(_key: string, value: unknown): unknown {
-  if (typeof value === "string" && value.length > 8_000) return `${value.slice(0, 8_000)}…`;
-  return value;
+/** JSON serialisation with a per-string cap, shared by tool results and the journal. */
+function boundedJsonText(value: unknown, stringLimit: number): string {
+  try {
+    return (
+      JSON.stringify(value, (_key, item: unknown) =>
+        typeof item === "string" && item.length > stringLimit
+          ? boundedText(item, stringLimit)
+          : item,
+      ) ?? String(value)
+    );
+  } catch {
+    return String(value);
+  }
+}
+
+/** Truncate to `limit` code units inclusive of the ellipsis marker. */
+function boundedText(value: string, limit: number, json = false): string {
+  if (value.length <= limit) return value;
+  return `${safeSlice(value, limit - 1, json)}…`;
+}
+
+/**
+ * Cut without producing garbage: never split a surrogate pair, and — when the
+ * text is JSON — never end on a half-written `\uXXXX` or a lone backslash, so
+ * the stored snippet stays readable and re-serialisable.
+ */
+function safeSlice(value: string, limit: number, json = false): string {
+  if (value.length <= limit) return value;
+  let end = limit;
+  const lastUnit = value.charCodeAt(end - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) end -= 1;
+  const cut = value.slice(0, end);
+  return json ? trimDanglingEscape(cut) : cut;
+}
+
+function trimDanglingEscape(text: string): string {
+  const dangling = /\\u[0-9a-fA-F]{0,3}$|\\$/.exec(text);
+  if (!dangling) return text;
+  // Only an odd run of preceding backslashes means this one is itself escaped
+  // (and therefore complete); an even run means it opens a broken escape.
+  let preceding = 0;
+  while (text[dangling.index - 1 - preceding] === "\\") preceding += 1;
+  return preceding % 2 === 0 ? text.slice(0, dangling.index) : text;
 }
 
 function xmlValue(xml: string, tag: string): string {

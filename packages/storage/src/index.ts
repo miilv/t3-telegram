@@ -24,7 +24,7 @@ import type {
   WorkerResult,
   WorkThread,
 } from "../../shared/src/index.js";
-import { newId, nowIso, redactSecrets } from "../../shared/src/index.js";
+import { newId, nowIso, redactSecrets, redactSecretsDeep } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
 
@@ -215,7 +215,7 @@ export class OperatorStore {
   }
 
   addProjectAlias(projectId: string, alias: string, source = "manual"): string {
-    const normalized = redactStoredText(alias).normalize("NFKC").trim().replace(/\s+/g, " ").slice(0, 160);
+    const normalized = redactSecrets(alias).normalize("NFKC").trim().replace(/\s+/g, " ").slice(0, 160);
     if (normalized.length < 2) throw new Error("project alias is too short");
     if (!this.getProject(projectId)) throw new Error("project not found");
     this.db
@@ -693,8 +693,8 @@ export class OperatorStore {
     const updatedAt = nowIso();
     const summary: ThreadSummary = {
       threadId: input.threadId,
-      purpose: redactStoredText(input.purpose).trim().slice(0, 4_000),
-      currentState: redactStoredText(input.currentState).trim().slice(0, 4_000),
+      purpose: redactSecrets(input.purpose).trim().slice(0, 4_000),
+      currentState: redactSecrets(input.currentState).trim().slice(0, 4_000),
       importantDecisions: boundedStrings(input.importantDecisions),
       files: boundedStrings(input.files),
       openIssues: boundedStrings(input.openIssues),
@@ -862,7 +862,7 @@ export class OperatorStore {
     source?: OperatorNote["source"];
     expiresAt?: string;
   }): OperatorNote {
-    const content = redactStoredText(input.content).trim().slice(0, 8_000);
+    const content = redactSecrets(input.content).trim().slice(0, 8_000);
     if (!content) throw new Error("Operator note cannot be empty");
     const category = (input.category?.trim() || "general").slice(0, 80);
     const existing = this.db
@@ -1804,7 +1804,9 @@ export class OperatorStore {
         input.correlationId ?? null,
         input.projectId ?? null,
         input.threadId ?? null,
-        JSON.stringify(input.payload ?? {}),
+        // Redaction-at-write: daemon_events is durable and read back by the
+        // journal/secretary, so secrets never enter payload_json.
+        JSON.stringify(redactSecretsDeep(input.payload ?? {})),
         nowIso(),
       );
     return id;
@@ -2085,14 +2087,10 @@ function boundedStrings(values: string[], limit = 50): string[] {
     ...new Set(
       values
         .filter((value): value is string => typeof value === "string")
-        .map((value) => redactStoredText(value).trim().slice(0, 2_000))
+        .map((value) => redactSecrets(value).trim().slice(0, 2_000))
         .filter(Boolean),
     ),
   ].slice(0, limit);
-}
-
-function redactStoredText(value: string): string {
-  return redactSecrets(value);
 }
 
 function parseStringArray(value: unknown): string[] {

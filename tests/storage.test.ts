@@ -380,6 +380,88 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("redacts secrets in daemon event payloads at write time", () => {
+    const store = tempStore();
+    store.appendEvent("operator.tool.completed", {
+      correlationId: "opturn_redaction",
+      payload: {
+        tool: "t3.send_turn",
+        opturn: "opturn_redaction",
+        args: '{"prompt":"deploy with authorization: hunter2","apiKey":"sk-live_abcdefghijklmno"}',
+        token: "ghp_abcdefghijklmnopqrst",
+        nested: { note: "curl -H Bearer abcdefghij https://example.com", durationMs: 12 },
+      },
+    });
+    const row = store.db
+      .prepare("SELECT payload_json FROM daemon_events WHERE correlation_id='opturn_redaction'")
+      .get() as { payload_json: string };
+    expect(row.payload_json).not.toContain("hunter2");
+    expect(row.payload_json).not.toContain("ghp_abcdefghijklmnopqrst");
+    expect(row.payload_json).not.toContain("sk-live_abcdefghijklmno");
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      tool: "t3.send_turn",
+      opturn: "opturn_redaction",
+      token: "[REDACTED]",
+      nested: { note: "curl -H Bearer [REDACTED] https://example.com", durationMs: 12 },
+    });
+    expect(payload.args).toContain("[REDACTED]");
+    store.close();
+  });
+
+  it("drops values under secret-shaped keys regardless of key casing or separators", () => {
+    const store = tempStore();
+    store.appendEvent("connector.call.failed", {
+      correlationId: "opturn_keys",
+      payload: {
+        token: "hunter2plain",
+        accessToken: "camelCasePlainValue",
+        client_secret: "snakeCasePlainValue",
+        "X-Api-Key": "headerStylePlainValue",
+        privateKey: "pemlessPlainValue",
+        cookie: "sessionCookiePlainValue",
+        sessionid: "sessionIdPlainValue",
+        nested: { refresh_token: "nestedPlainValue" },
+        durationMs: 7,
+      },
+    });
+    const row = store.db
+      .prepare("SELECT payload_json FROM daemon_events WHERE correlation_id='opturn_keys'")
+      .get() as { payload_json: string };
+    expect(row.payload_json).not.toContain("PlainValue");
+    expect(row.payload_json).not.toContain("hunter2plain");
+    expect(JSON.parse(row.payload_json)).toEqual({
+      token: "[REDACTED]",
+      accessToken: "[REDACTED]",
+      client_secret: "[REDACTED]",
+      "X-Api-Key": "[REDACTED]",
+      privateKey: "[REDACTED]",
+      cookie: "[REDACTED]",
+      sessionid: "[REDACTED]",
+      nested: { refresh_token: "[REDACTED]" },
+      durationMs: 7,
+    });
+    store.close();
+  });
+
+  it("cannot recover a key rule once the payload has been serialised", () => {
+    // Why journalling redacts the structure first: the key rule needs keys, and
+    // a plain value under `token` has no secret-shaped substring to match.
+    const store = tempStore();
+    store.appendEvent("operator.tool.completed", {
+      correlationId: "opturn_order",
+      payload: { structured: { token: "hunter2plain" }, serialised: '{"token":"hunter2plain"}' },
+    });
+    const payload = JSON.parse(
+      (store.db
+        .prepare("SELECT payload_json FROM daemon_events WHERE correlation_id='opturn_order'")
+        .get() as { payload_json: string }).payload_json,
+    ) as { structured: { token: string }; serialised: string };
+    expect(payload.structured.token).toBe("[REDACTED]");
+    expect(payload.serialised).toContain("hunter2plain");
+    store.close();
+  });
+
   it("persists project aliases for durable human-friendly routing", () => {
     const store = tempStore();
     const timestamp = nowIso();

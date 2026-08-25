@@ -291,6 +291,64 @@ describe("OperatorToolServer", () => {
       expect(denied.isError).toBe(true);
       expect(textResult(denied)).toContain("not sent by this turn capability");
 
+      // Journal: mutating calls carry truncated args/result and the turn id;
+      // read-only calls stay at {tool, durationMs, opturn}.
+      await callJson(client, "memory.remember", { category: "decision", content: "ф".repeat(900) });
+      // A PEM longer than the journal budget: redaction has to run before the
+      // cut, otherwise truncation separates the block from its own -----END-----
+      // terminator and the key body is journalled verbatim.
+      const pem = [
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "MIIEowIBAAKCAQEA".repeat(40),
+        "-----END RSA PRIVATE KEY-----",
+      ].join("\n");
+      expect(pem.length).toBeGreaterThan(500);
+      await callJson(client, "memory.remember", { content: `deploy key ${pem}` });
+      const journalled = journalEvents(store);
+      const pemEvent = journalled.findLast(
+        (event) => event.eventType === "operator.tool.completed" && event.payload.tool === "memory.remember",
+      );
+      // Astral characters straddling the budget must not leave a lone surrogate.
+      await callJson(client, "memory.remember", { content: `emoji ${"😀".repeat(400)}` });
+      const emojiEvent = journalEvents(store).findLast(
+        (event) => String(event.payload.args ?? "").includes("emoji"),
+      );
+      const emojiArgs = emojiEvent?.payload.args as string;
+      expect(emojiArgs.length).toBeLessThanOrEqual(500);
+      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emojiArgs)).toBe(false);
+
+      expect(pemEvent?.payload.args).toContain("[REDACTED PRIVATE KEY]");
+      expect(pemEvent?.payload.args).not.toContain("MIIEowIBAAKCAQEA");
+      expect(pemEvent?.payload.result).not.toContain("MIIEowIBAAKCAQEA");
+      const remembered = journalled.find(
+        (event) =>
+          event.eventType === "operator.tool.completed" &&
+          event.payload.tool === "memory.remember" &&
+          String(event.payload.args).includes("ффф"),
+      );
+      expect(remembered?.correlationId).toBe("opturn_1");
+      expect(remembered?.payload.opturn).toBe("opturn_1");
+      expect(typeof remembered?.payload.durationMs).toBe("number");
+      const args = remembered?.payload.args as string;
+      expect(args.length).toBe(500);
+      expect(args.endsWith("…")).toBe(true);
+      expect(args.startsWith('{"content":"ффф')).toBe(true);
+      expect((remembered?.payload.result as string).length).toBeLessThanOrEqual(300);
+      const readOnly = journalled.find(
+        (event) => event.eventType === "operator.tool.completed" && event.payload.tool === "utility.time",
+      );
+      expect(readOnly?.payload).toEqual({
+        tool: "utility.time",
+        durationMs: expect.any(Number),
+        opturn: "opturn_1",
+      });
+      const failed = journalled.find(
+        (event) => event.eventType === "operator.tool.failed" && event.payload.tool === "telegram.edit",
+      );
+      expect(failed?.payload.opturn).toBe("opturn_1");
+      expect(failed?.payload.error).toContain("not sent by this turn capability");
+      expect(failed?.payload.args).toContain("999999");
+
       store.grantProjectAccess(project.id, "11", "viewer");
       const viewerLease = server.issue({
         chatId: 777,
@@ -422,6 +480,23 @@ describe("OperatorToolServer", () => {
     }
   });
 });
+
+function journalEvents(store: { db: { prepare(sql: string): { all(): unknown[] } } }): Array<{
+  eventType: string;
+  correlationId?: string;
+  payload: Record<string, unknown>;
+}> {
+  const rows = store.db
+    .prepare(
+      "SELECT event_type,correlation_id,payload_json FROM daemon_events WHERE event_type LIKE 'operator.tool.%'",
+    )
+    .all() as Array<{ event_type: string; correlation_id: string | null; payload_json: string }>;
+  return rows.map((row) => ({
+    eventType: row.event_type,
+    ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
+    payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+  }));
+}
 
 async function callJson(
   client: Client,

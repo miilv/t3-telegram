@@ -596,7 +596,10 @@ runs with **no MCP tools at all**.
 Result shaping: `MAX_TOOL_RESULT_CHARS = 16 000`, over which the payload becomes
 `{"truncated":true,"preview":…}`; any string over 8 000 chars is cut inside the
 JSON; errors become `{"error": message.slice(0,2000)}`. Tool journaling records
-only `{tool, durationMs}` — the failure message is lost from the durable record.
+`{tool, durationMs, opturn}` for every call, plus truncated `args` (≤500) and
+`result` (≤300) for mutating (non-`readOnly`) tools and the `error` message
+(≤300) for every failure. Payloads are redacted structurally before they are
+serialised and truncated (roadmap 0.2).
 
 Refusal guards: `Operator tool capability is invalid or expired` ·
 `<action> requires owner or admin role` · `<action> is not available to viewer
@@ -774,8 +777,11 @@ files, refresh thread summaries, the compaction gate, the journal-retention gate
 - **`hashChatId` reads `OBSERVABILITY_HASH_SALT` straight from `process.env`** —
   it is not in the zod schema. Unset, the salt is per-process, so chat
   pseudonyms are not comparable across restarts.
-- **`daemon_events.payload_json` is written with no redaction**, and outbound
-  Telegram text is never redacted. Pino redacts `prompt`, `transcript`,
+- **`daemon_events.payload_json` is redacted at write** (roadmap 0.2):
+  `appendEvent` runs the payload through `redactSecretsDeep`, and the operator
+  tool journal redacts the structure before serialising it. Outbound
+  Telegram text is still never redacted. Pino keeps its own third copy of the
+  secret-key list (TODO in `createLogger`) and redacts `prompt`, `transcript`,
   `providerResponse`, `detail`, `payload.text`, `payload.prompt`, `*.token`,
   `*.apiKey`, and runs error message/stack/cause through `redactSecrets`.
 - **Google connectors die roughly an hour after the token was minted** —

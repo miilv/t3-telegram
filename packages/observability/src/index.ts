@@ -171,6 +171,10 @@ export function createLogger(level = "info", destination?: DestinationStream): L
     {
       level,
       base: { service: "t3-telegram-operator" },
+      // TODO: third independent copy of the secret-key list. The canonical one
+      // is SECRET_KEY_PATTERN in packages/shared/src/index.ts (used by
+      // redactSecretsDeep); these pino paths should be generated from it so a
+      // new secret-shaped key cannot be covered in storage but leak in logs.
       redact: {
         paths: [
           "token",
