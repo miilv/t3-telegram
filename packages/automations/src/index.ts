@@ -1,5 +1,5 @@
 import type { Automation, AutomationSchedule } from "../../shared/src/index.js";
-import { newId } from "../../shared/src/index.js";
+import { newId, ownerLocalParts, resolveTimeZone } from "../../shared/src/index.js";
 
 export function createAutomation(input: {
   ownerId: string;
@@ -95,20 +95,24 @@ export function parseAutomationSchedule(input: string): AutomationSchedule {
   }
   const daily = /^daily\s+([01]\d|2[0-3]):([0-5]\d)(?:\s+(.+))?$/iu.exec(normalized);
   if (daily) {
-    const timeZone = daily[3]?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-    assertTimeZone(timeZone);
+    // No zone given means UTC, not the host's zone: the daemon's clock is an
+    // accident of the machine, and a schedule silently pinned to it would move
+    // when the daemon moves. The owner's zone belongs in owner.timezone.
+    const timeZone = resolveTimeZone(daily[3]);
     return { type: "daily", timeOfDay: `${daily[1]}:${daily[2]}`, timeZone };
   }
   throw new Error("schedule must be `once <ISO>`, `every <minutes>`, or `daily HH:MM [IANA timezone]`");
 }
 
-function nextDailyOccurrence(timeOfDay: string, timeZone: string, after: Date): Date {
-  assertTimeZone(timeZone);
+function nextDailyOccurrence(timeOfDay: string, rawTimeZone: string, after: Date): Date {
+  // Stored schedules predate validation and may carry a blank zone; resolving
+  // (rather than asserting) keeps such a record running, on UTC.
+  const timeZone = resolveTimeZone(rawTimeZone);
   const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(timeOfDay);
   if (!match) throw new Error("daily time must use HH:MM");
   const hour = Number(match[1]);
   const minute = Number(match[2]);
-  const local = zonedParts(after, timeZone);
+  const local = ownerLocalParts(after, timeZone);
   let candidate = zonedDateToUtc(local.year, local.month, local.day, hour, minute, timeZone);
   if (candidate.getTime() <= after.getTime()) {
     const noon = new Date(Date.UTC(local.year, local.month - 1, local.day, 12));
@@ -145,47 +149,9 @@ function zonedDateToUtc(
 }
 
 function timeZoneOffsetMs(date: Date, timeZone: string): number {
-  const parts = zonedParts(date, timeZone);
+  const parts = ownerLocalParts(date, timeZone);
   return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second) -
     Math.floor(date.getTime() / 1_000) * 1_000;
-}
-
-function zonedParts(date: Date, timeZone: string): {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-} {
-  const values = Object.fromEntries(
-    new Intl.DateTimeFormat("en-CA", {
-      timeZone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      hourCycle: "h23",
-      minute: "2-digit",
-      second: "2-digit",
-    }).formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]),
-  );
-  return {
-    year: Number(values.year),
-    month: Number(values.month),
-    day: Number(values.day),
-    hour: Number(values.hour),
-    minute: Number(values.minute),
-    second: Number(values.second),
-  };
-}
-
-function assertTimeZone(timeZone: string): void {
-  try {
-    new Intl.DateTimeFormat("en", { timeZone }).format(new Date());
-  } catch {
-    throw new Error("invalid IANA timezone");
-  }
 }
 
 export function automationScheduleLabel(schedule: AutomationSchedule): string {

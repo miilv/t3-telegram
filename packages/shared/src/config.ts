@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { z } from "zod";
+import { isValidTimeZone } from "./time.js";
 
 const envSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().min(1),
@@ -19,6 +20,15 @@ const envSchema = z.object({
   // the agent knows who it works for without waiting for accumulated notes.
   OWNER_NAME: z.string().default(""),
   OWNER_LANGUAGE: z.string().min(1).default("ru"),
+  // Owner's IANA zone (memory-design §2.7): the secretary window, human dates,
+  // the pause classifier and the 03:00 day boundary are all local-time notions.
+  // Unset is legal — consumers fall back to UTC.
+  OWNER_TIMEZONE: z
+    .string()
+    .default("")
+    .refine((value) => !value.trim() || isValidTimeZone(value.trim()), {
+      message: "OWNER_TIMEZONE must be a valid IANA time zone, e.g. Europe/Moscow",
+    }),
   OPERATOR_PROVIDER: z.enum(["claude", "codex"]).default("claude"),
   OPERATOR_MODEL: z.string().min(1).default("opus"),
   OPERATOR_EFFORT: z.enum(["low", "medium", "high", "xhigh", "max"]).default("high"),
@@ -240,6 +250,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     owner: {
       name: parsed.OWNER_NAME.trim(),
       language: parsed.OWNER_LANGUAGE.trim() || "ru",
+      /** IANA zone or undefined; consumers must fall back to UTC. */
+      timezone: parsed.OWNER_TIMEZONE.trim() || undefined,
     },
     telegram: {
       token: parsed.TELEGRAM_BOT_TOKEN,
