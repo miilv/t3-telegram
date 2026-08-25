@@ -16,6 +16,25 @@ describe("Telegram rich rendering", () => {
     expect(html).toContain("1 &lt; 2");
   });
 
+  it("drops GFM backslash escapes in the legacy fallback while keeping code literal (bug №23)", () => {
+    const html = markdownToTelegramHtml(
+      "Готово\\. Файлы\\: \\- src/x\\.ts \\(обновлён\\)\n\nЗапусти `pnpm vitest run tests/x\\.test\\.ts` \\> лог\\.",
+    );
+    expect(html).toContain("Готово. Файлы: - src/x.ts (обновлён)");
+    expect(html).toContain(" &gt; лог.");
+    expect(html).not.toContain("Готово\\.");
+    expect(html).not.toContain("\\(обновлён\\)");
+    // Inline code is literal: the backslash the user typed there survives.
+    expect(html).toContain("<code>pnpm vitest run tests/x\\.test\\.ts</code>");
+  });
+
+  it("keeps escaped markdown markers as literal text instead of formatting them", () => {
+    const html = markdownToTelegramHtml("Имя файла: \\*\\*important\\*\\*\\.md и \\`backtick\\`");
+    expect(html).toContain("**important**.md");
+    expect(html).not.toContain("<b>important</b>");
+    expect(html).toContain("`backtick`");
+  });
+
   it("splits long output below Telegram-safe limits", () => {
     const chunks = splitRichText(Array.from({ length: 200 }, (_, index) => `Paragraph ${index}: ${"x".repeat(40)}`).join("\n\n"), 500);
     expect(chunks.length).toBeGreaterThan(1);

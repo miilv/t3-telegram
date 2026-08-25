@@ -100,6 +100,11 @@ export interface OperatorToolTurnContext extends TelegramDestination {
   originMessageId: number;
   allowedMessageIds?: number[];
   operatorTurnId: string;
+  /**
+   * The durable ingress job this turn processes. Threads dispatched under it
+   * are recorded so a crash-replay of the job continues them (bug №28).
+   */
+  ingressJobId?: string;
   teamRole: TeamRole;
   allowedArtifactIds?: string[];
 }

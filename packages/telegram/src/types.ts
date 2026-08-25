@@ -60,6 +60,14 @@ export interface TelegramSendOptions extends TelegramDestination {
   protectContent?: boolean;
 }
 
+/** One original message inside a merged batch envelope (bug №35). */
+export interface TelegramInboundBatchPart {
+  messageId: number;
+  text: string;
+  replyToMessageId?: number;
+  forwarded?: boolean;
+}
+
 export interface TelegramMessageInbound extends TelegramDestination {
   type: "message";
   updateId: number;
@@ -91,6 +99,12 @@ export interface TelegramMessageInbound extends TelegramDestination {
    */
   textIsMediaPlaceholder?: boolean;
   attachments: TelegramAttachment[];
+  /**
+   * Per-message breakdown of a merged batch (present when the 2 s window glued
+   * several messages together). Lets the daemon route a reply-to-worker answer
+   * by its own message only instead of the whole glued text (bug №35).
+   */
+  parts?: TelegramInboundBatchPart[];
   /** Daemon-created proactive ingress; never passed through Telegram normalization. */
   synthetic?: boolean;
   automationRunId?: string;
