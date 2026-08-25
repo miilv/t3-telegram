@@ -108,6 +108,23 @@ export interface TelegramMessageInbound extends TelegramDestination {
   /** Daemon-created proactive ingress; never passed through Telegram normalization. */
   synthetic?: boolean;
   automationRunId?: string;
+  /**
+   * Package 1.2: this synthetic update carries digested worker events instead
+   * of words from a human. `text` is the ready envelope (already fenced); the
+   * refs are the bookkeeping the delivery side needs — which threads the turn
+   * speaks for, and which of them ended, so a terminal that the Operator did
+   * relay stops waiting for the degraded fallback.
+   */
+  threadEvents?: TelegramThreadEventRef[];
+}
+
+export interface TelegramThreadEventRef {
+  threadId: string;
+  title: string;
+  /** Present only for the event that ended the work. */
+  terminal?: "completed" | "failed" | "cancelled";
+  /** Terminal delivery epoch of that thread — the idempotency key of the notice. */
+  epoch?: string;
 }
 
 export interface TelegramCallbackInbound extends TelegramDestination {

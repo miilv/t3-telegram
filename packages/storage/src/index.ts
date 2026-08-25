@@ -1921,6 +1921,27 @@ export class OperatorStore {
     return row ? String(row.value) : undefined;
   }
 
+  /**
+   * Package 1.2: every runtime-state row under one key prefix. Sweeps that ask
+   * "what is still waiting?" (the degraded voice fallback) need the set, not a
+   * key they already know. Empty values are skipped — a cleared row is how the
+   * rest of the daemon expresses "gone".
+   */
+  listRuntimeState(prefix: string): Array<{ key: string; value: string; updatedAt: string }> {
+    const escaped = prefix.replace(/[\\%_]/gu, (character) => `\\${character}`);
+    return (
+      this.db
+        .prepare("SELECT key,value,updated_at FROM runtime_state WHERE key LIKE ? ESCAPE '\\' ORDER BY key")
+        .all(`${escaped}%`) as Row[]
+    )
+      .map((row) => ({ key: String(row.key), value: String(row.value), updatedAt: String(row.updated_at) }))
+      .filter((entry) => entry.value !== "");
+  }
+
+  deleteRuntimeState(key: string): void {
+    this.db.prepare("DELETE FROM runtime_state WHERE key=?").run(key);
+  }
+
   saveCompaction(sessionId: string, reason: string, summary?: string): void {
     this.db
       .prepare(

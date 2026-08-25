@@ -2,6 +2,7 @@ export { LaneQueue, OPERATOR_LANES } from "./lane-queue.js";
 export type { OperatorLane } from "./lane-queue.js";
 export { ThreadEventDigest } from "./thread-digest.js";
 export type {
+  ThreadDigestContext,
   ThreadDigestEvent,
   ThreadDigestItem,
   ThreadDigestKind,

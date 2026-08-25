@@ -54,6 +54,19 @@ const envSchema = z.object({
   // Budget for the out-of-session mediation pass over worker questions and
   // approvals (bug №49). On timeout the raw prompt is shown directly.
   OPERATOR_MEDIATION_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
+  /**
+   * Package 1.2: how long a finished work may wait for the Operator to relay it
+   * in their own words before the daemon sends the degraded template notice
+   * instead. Only terminal events have this deadline — progress simply keeps
+   * accumulating in the digest while the provider is down.
+   */
+  OPERATOR_VOICE_FALLBACK_MINUTES: z.coerce.number().int().min(1).max(1_440).default(5),
+  /**
+   * Package 1.2: quiet window before digested worker events wake the Operator.
+   * Long enough that a chatty worker does not spend a turn per frame, short
+   * enough that a finished work is relayed while the owner still cares.
+   */
+  THREAD_DIGEST_WINDOW_MS: z.coerce.number().int().min(0).max(600_000).default(3_000),
   MAX_PARALLEL_WORKERS: z.coerce.number().int().min(2).max(4).default(4),
   PROGRESS_INTERVAL_MS: z.coerce.number().int().min(5_000).max(600_000).default(60_000),
   PROVIDER_OPTIMIZATION_ENABLED: z.enum(["true", "false"]).default("true"),
@@ -298,6 +311,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       interruptGraceMs: parsed.OPERATOR_INTERRUPT_GRACE_MS,
       envPassthrough,
       mediationTimeoutMs: parsed.OPERATOR_MEDIATION_TIMEOUT_MS,
+      voiceFallbackMs: parsed.OPERATOR_VOICE_FALLBACK_MINUTES * 60_000,
+      threadDigestWindowMs: parsed.THREAD_DIGEST_WINDOW_MS,
       home: operatorHome,
       runtimeDir: resolve(operatorHome, "runtime"),
       artifactDir: resolve(operatorHome, "artifacts"),
