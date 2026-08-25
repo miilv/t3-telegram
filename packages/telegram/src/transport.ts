@@ -27,6 +27,7 @@ import type {
   TelegramReactionInbound,
   TelegramReplyContext,
   TelegramSendOptions,
+  TelegramSendProgress,
   TelegramTopicInbound,
   TelegramTransport,
   TelegramUserInputChoice,
@@ -42,6 +43,11 @@ const BATCH_WINDOW_MS = 2_000;
 const MAX_BATCH_WAIT_MS = 180_000;
 /** Telegram never returns more than this many updates per getUpdates call. */
 const UPDATE_PAGE_SIZE = 100;
+/**
+ * While buffered updates hold back the getUpdates offset, Telegram re-serves
+ * them instantly; pause briefly between such polls instead of spinning.
+ */
+const HELD_OFFSET_REPOLL_DELAY_MS = 200;
 const MAX_FLOOD_WAIT_SECONDS = 30;
 const MAX_SAFE_ATTEMPTS = 3;
 const PHOTO_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -140,11 +146,15 @@ interface RawUpdate {
 
 interface AlbumBuffer {
   messages: TelegramMessageInbound[];
+  /** Raw update ids still unconfirmed to Telegram while this buffer is open. */
+  updateIds: number[];
   timer: NodeJS.Timeout;
 }
 
 interface InboundBatch {
   messages: TelegramMessageInbound[];
+  /** Raw update ids still unconfirmed to Telegram while this buffer is open. */
+  updateIds: number[];
   timer: NodeJS.Timeout;
   openedAt: number;
 }
@@ -173,6 +183,15 @@ export class TelegramBotTransport implements TelegramTransport {
    */
   private morePagesPending = false;
   private pollOffset: number | undefined;
+  /**
+   * Update ids currently sitting in the in-memory album/batch buffers. They
+   * hold back the confirmed getUpdates offset: if the process dies before a
+   * buffer is flushed to the consumer, Telegram re-delivers those updates on
+   * the next start instead of silently dropping them.
+   */
+  private readonly heldUpdateIds = new Set<number>();
+  /** Highest update id already accepted, so re-served held updates are skipped. */
+  private lastAcceptedUpdateId: number | undefined;
   private polling = false;
   private nextDraftId = Math.max(1, Date.now() % 2_000_000_000);
   private richDraftAvailable: boolean | undefined;
@@ -224,12 +243,23 @@ export class TelegramBotTransport implements TelegramTransport {
     }
   }
 
-  async sendRich(chatId: number, text: string, options: TelegramSendOptions = {}): Promise<SentMessage[]> {
+  async sendRich(
+    chatId: number,
+    text: string,
+    options: TelegramSendOptions = {},
+    progress?: TelegramSendProgress,
+  ): Promise<SentMessage[]> {
     const richChunks = splitRichText(text || "…", RICH_SAFE_LIMIT);
+    // A retried multi-chunk delivery resumes after the chunks a previous
+    // attempt already delivered instead of duplicating them.
+    const completedChunks = Math.min(progress?.completedChunks ?? 0, richChunks.length);
     const sent: SentMessage[] = [];
     for (const [index, chunk] of richChunks.entries()) {
+      if (index < completedChunks) continue;
       const chunkOptions = index === 0 ? options : withoutReply(options);
-      sent.push(...(await this.sendRichChunk(chatId, chunk, chunkOptions)));
+      const chunkSent = await this.sendRichChunk(chatId, chunk, chunkOptions);
+      sent.push(...chunkSent);
+      progress?.onChunkSent?.(index + 1, chunkSent);
     }
     return sent;
   }
@@ -615,9 +645,10 @@ export class TelegramBotTransport implements TelegramTransport {
     onReady();
     this.logger.info({ username: me.username }, "Telegram polling started");
     while (!signal?.aborted) {
+      const offset = this.confirmableOffset();
       const updates = await this.bot.api.getUpdates(
         {
-          ...(this.pollOffset !== undefined ? { offset: this.pollOffset } : {}),
+          ...(offset !== undefined ? { offset } : {}),
           limit: UPDATE_PAGE_SIZE,
           timeout: this.pollTimeoutSeconds,
           allowed_updates: ["message", "edited_message", "callback_query", "message_reaction"],
@@ -626,15 +657,36 @@ export class TelegramBotTransport implements TelegramTransport {
       );
       if (signal?.aborted) return;
       this.morePagesPending = updates.length >= UPDATE_PAGE_SIZE;
+      let accepted = 0;
       for (const update of updates) {
         this.pollOffset = Math.max(this.pollOffset ?? 0, update.update_id + 1);
+        // Held-back offsets make Telegram re-serve updates that are already
+        // sitting in the album/batch buffers; accept each update only once.
+        if (this.lastAcceptedUpdateId !== undefined && update.update_id <= this.lastAcceptedUpdateId) continue;
+        this.lastAcceptedUpdateId = update.update_id;
+        accepted += 1;
         try {
           this.acceptUpdate(update as unknown as RawUpdate);
         } catch (error) {
           this.logger.error({ err: error, updateId: update.update_id }, "Telegram update handling failed");
         }
       }
+      if (updates.length > 0 && accepted === 0) {
+        await delay(HELD_OFFSET_REPOLL_DELAY_MS, signal).catch(() => undefined);
+      }
     }
+  }
+
+  /**
+   * The offset Telegram may treat as confirmed: everything below the oldest
+   * update still buffered in memory stays unacknowledged, so a crash between
+   * receipt and flush re-delivers instead of losing the messages (bug №5).
+   */
+  private confirmableOffset(): number | undefined {
+    if (!this.heldUpdateIds.size) return this.pollOffset;
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const updateId of this.heldUpdateIds) oldest = Math.min(oldest, updateId);
+    return this.pollOffset === undefined ? oldest : Math.min(this.pollOffset, oldest);
   }
 
   private acceptUpdate(update: RawUpdate): void {
@@ -649,20 +701,23 @@ export class TelegramBotTransport implements TelegramTransport {
     // first, then let the collapsed envelope join the chat-level batch.
     if (normalized.mediaGroupId) {
       const key = `${normalized.chatId}:${normalized.mediaGroupId}`;
+      this.heldUpdateIds.add(normalized.updateId);
       const existing = this.albums.get(key);
       if (existing) {
         clearTimeout(existing.timer);
         existing.messages.push(normalized);
+        existing.updateIds.push(normalized.updateId);
         existing.timer = setTimeout(() => this.flushAlbum(key), ALBUM_WINDOW_MS);
         return;
       }
       this.albums.set(key, {
         messages: [normalized],
+        updateIds: [normalized.updateId],
         timer: setTimeout(() => this.flushAlbum(key), ALBUM_WINDOW_MS),
       });
       return;
     }
-    this.enqueueBatched(normalized);
+    this.enqueueBatched(normalized, [normalized.updateId]);
   }
 
   /**
@@ -670,35 +725,47 @@ export class TelegramBotTransport implements TelegramTransport {
    * quick lines — is one intent. Collect per chat until the sender pauses AND
    * Telegram has no further pages queued, then emit a single envelope.
    */
-  private enqueueBatched(message: TelegramMessageInbound): void {
+  private enqueueBatched(message: TelegramMessageInbound, updateIds: number[]): void {
     const key = String(message.chatId);
+    for (const updateId of updateIds) this.heldUpdateIds.add(updateId);
     const existing = this.batches.get(key);
     if (existing) {
       clearTimeout(existing.timer);
       existing.messages.push(message);
-      existing.timer = this.scheduleBatchFlush(key);
+      existing.updateIds.push(...updateIds);
+      existing.timer = this.scheduleBatchFlush(key, existing.openedAt);
       return;
     }
+    const openedAt = Date.now();
     this.batches.set(key, {
       messages: [message],
-      openedAt: Date.now(),
-      timer: this.scheduleBatchFlush(key),
+      updateIds: [...updateIds],
+      openedAt,
+      timer: this.scheduleBatchFlush(key, openedAt),
     });
   }
 
-  private scheduleBatchFlush(key: string): NodeJS.Timeout {
+  private scheduleBatchFlush(key: string, openedAt: number): NodeJS.Timeout {
+    // The 180 s ceiling must hold even while messages keep arriving: every
+    // reschedule caps the quiet timer to whatever remains of the ceiling, so a
+    // steady trickle can never extend the window forever (bug №4).
+    const remainingMs = Math.max(0, openedAt + MAX_BATCH_WAIT_MS - Date.now());
     const timer = setTimeout(() => {
       const batch = this.batches.get(key);
       if (!batch) return;
       const heldFor = Date.now() - batch.openedAt;
-      if (this.morePagesPending && heldFor < MAX_BATCH_WAIT_MS) {
+      if (heldFor >= MAX_BATCH_WAIT_MS) {
+        this.flushBatch(key);
+        return;
+      }
+      if (this.morePagesPending) {
         // A full page means the rest of the burst is still on Telegram's side;
         // the gap between pages is a network round trip, not a user pause.
-        batch.timer = this.scheduleBatchFlush(key);
+        batch.timer = this.scheduleBatchFlush(key, batch.openedAt);
         return;
       }
       this.flushBatch(key);
-    }, BATCH_WINDOW_MS);
+    }, Math.min(BATCH_WINDOW_MS, remainingMs));
     timer.unref();
     return timer;
   }
@@ -710,13 +777,16 @@ export class TelegramBotTransport implements TelegramTransport {
     this.inbound.push(
       batch.messages.length === 1 ? batch.messages[0]! : mergeInboundBatch(batch.messages),
     );
+    // Only now may the getUpdates offset move past these updates: they left
+    // the volatile buffers and were handed to the durable consumer.
+    for (const updateId of batch.updateIds) this.heldUpdateIds.delete(updateId);
   }
 
   private flushAlbum(key: string): void {
     const album = this.albums.get(key);
     if (!album) return;
     this.albums.delete(key);
-    this.enqueueBatched(mergeTelegramAlbum(album.messages));
+    this.enqueueBatched(mergeTelegramAlbum(album.messages), album.updateIds);
   }
 
   private async sendRichChunk(chatId: number, chunk: string, options: TelegramSendOptions): Promise<SentMessage[]> {

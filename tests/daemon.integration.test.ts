@@ -1421,6 +1421,70 @@ describe("OperatorDaemon product flow", () => {
     verify.close();
   });
 
+  it("requeues an uncertain delivery once, escalates the second failure, and revives a dead terminal on re-emission", async () => {
+    const home = tempDirectory("daemon-uncertain-outbox-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new AmbiguousSendTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+
+    store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:operator:chat7:answer",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "Ответ готов.", options: {}, messageType: "operator_answer" },
+    });
+    store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:thread:th_uncertain:terminal:0",
+      chatId: 8,
+      operation: "rich",
+      payload: { text: "Терминальный результат.", options: {}, messageType: "worker_completed" },
+    });
+    // Chat 7: the network dies once mid-send, the controlled requeue delivers.
+    telegram.failuresByChat.set(7, 1);
+    // Chat 8: the requeue also fails, so the item must die loudly, not hang.
+    telegram.failuresByChat.set(8, 2);
+
+    await daemon.initialize();
+    const run = daemon.run();
+
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.startsWith("Ответ готов.") && entry.text.includes("Повторная отправка")),
+      15_000,
+    );
+    expect(store.getTelegramOutbox("telegram:operator:chat7:answer")?.status).toBe("delivered");
+
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Не смог доставить предыдущий ответ")),
+      15_000,
+    );
+    expect(store.getTelegramOutbox("telegram:thread:th_uncertain:terminal:0")?.status).toBe("dead");
+    expect(telegram.sent.filter((entry) => entry.text.startsWith("Терминальный результат."))).toHaveLength(0);
+
+    // Bug №3: a re-emitted terminal event with the same dedupe key must revive
+    // the dead row and reach the chat instead of dying in DO NOTHING.
+    store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:thread:th_uncertain:terminal:0",
+      chatId: 8,
+      operation: "rich",
+      payload: { text: "Терминальный результат (повтор).", options: {}, messageType: "worker_completed" },
+    });
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text === "Терминальный результат (повтор)."),
+      15_000,
+    );
+    expect(store.getTelegramOutbox("telegram:thread:th_uncertain:terminal:0")?.status).toBe("delivered");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 60_000);
+
   it("resumes a durably accepted Telegram request after mapping-time crash without creating a second worker", async () => {
     const home = tempDirectory("daemon-ingress-restart-");
     const databasePath = `${home}/operator.db`;
@@ -2333,6 +2397,20 @@ class FlakyEditTelegram extends FakeTelegram {
       throw new Error("connection reset after request write");
     }
     await super.editRich(chatId, messageId, text);
+  }
+}
+
+class AmbiguousSendTelegram extends FakeTelegram {
+  /** Remaining ambiguous network failures per chat before sends succeed. */
+  readonly failuresByChat = new Map<number, number>();
+
+  override async sendRich(chatId: number, text: string): Promise<SentMessage[]> {
+    const remaining = this.failuresByChat.get(chatId) ?? 0;
+    if (remaining > 0) {
+      this.failuresByChat.set(chatId, remaining - 1);
+      throw new TypeError("connection reset after upload");
+    }
+    return super.sendRich(chatId, text);
   }
 }
 

@@ -112,6 +112,12 @@ interface DurableTelegramPayload {
   anchor?: { threadId: string; messageTypes: string[] };
   completionThreadIds?: string[];
   correlationId?: string | undefined;
+  /** Rich chunks a previous attempt already delivered; retries resume after them (bug №22). */
+  sentChunkCount?: number;
+  /** Telegram message ids of those already-delivered chunks. */
+  sentMessageIds?: number[];
+  /** Set when an uncertain delivery was requeued once; a second failure goes dead (bug №2). */
+  uncertainRequeued?: boolean;
 }
 
 export class OperatorDaemon {
@@ -123,6 +129,8 @@ export class OperatorDaemon {
   private readonly outboxQueue = new SerialQueue();
   private readonly t3DispatchQueue = new SerialQueue();
   private readonly monitors = new Map<string, AbortController>();
+  /** Rate-limits the bug-№37 head-of-line warnings per outbox item. */
+  private readonly blockedOutboxWarnedAt = new Map<string, number>();
   private readonly monitorTasks = new Set<Promise<void>>();
   private readonly shutdown = new AbortController();
   private reliabilityTask: Promise<void> | undefined;
@@ -2782,7 +2790,9 @@ export class OperatorDaemon {
   private async reliabilityLoop(): Promise<void> {
     while (!this.shutdown.signal.aborted) {
       try {
+        this.requeueUncertainTelegramOutbox();
         await this.flushTelegramOutbox();
+        this.warnBlockedTelegramOutboxHeads();
         await this.drainT3Dispatches();
         await this.operatorInputQueue.run(() => this.drainTelegramIngress());
       } catch (error) {
@@ -2792,6 +2802,85 @@ export class OperatorDaemon {
         );
       }
       await delay(1_000, this.shutdown.signal);
+    }
+  }
+
+  /**
+   * One controlled retry for ambiguous deliveries (bug №2): an `uncertain`
+   * outbox item is requeued exactly once, with a visible warning that the
+   * previous attempt may have reached the chat. If that retry also ends
+   * uncertain, the item goes dead and the chat gets an explicit failure note
+   * instead of silence.
+   */
+  private requeueUncertainTelegramOutbox(): void {
+    for (const item of this.store.listTelegramOutbox<DurableTelegramPayload>(["uncertain"], 50)) {
+      const payload = item.payload;
+      if (!payload.uncertainRequeued) {
+        payload.uncertainRequeued = true;
+        // Chunk progress means part of the answer definitely arrived and the
+        // retry only continues it, so the duplicate warning would mislead.
+        if (item.operation === "rich" && payload.text && !payload.sentChunkCount) {
+          payload.text = `${payload.text}\n\n⚠️ _Повторная отправка — возможно, предыдущее сообщение уже дошло._`;
+        }
+        this.store.updateTelegramOutboxPayload(item.id, payload);
+        this.store.retryTelegramOutbox(
+          item.id,
+          item.lastErrorCode ?? "TELEGRAM_AMBIGUOUS",
+          "Requeued once after an ambiguous delivery failure",
+        );
+        this.store.appendEvent("telegram.outbox.requeued", {
+          correlationId: payload.correlationId ?? item.dedupeKey,
+          ...(payload.threadId ? { threadId: payload.threadId } : {}),
+          payload: { outboxId: item.id, errorCode: item.lastErrorCode },
+        });
+        continue;
+      }
+      this.store.markTelegramOutboxFailed(
+        item.id,
+        "dead",
+        item.lastErrorCode ?? "TELEGRAM_AMBIGUOUS",
+        "The controlled retry after an ambiguous failure also failed",
+      );
+      this.store.appendEvent("telegram.outbox.dead", {
+        correlationId: payload.correlationId ?? item.dedupeKey,
+        ...(payload.threadId ? { threadId: payload.threadId } : {}),
+        payload: { outboxId: item.id, errorCode: item.lastErrorCode, messageType: payload.messageType },
+      });
+      // Never escalate an escalation: a failed failure-note just dies.
+      if (payload.messageType === "delivery_failed") continue;
+      this.enqueueTelegramOutbox(`telegram:outbox:${item.id}:undeliverable`, item.chatId, "rich", {
+        text: "⚠️ Не смог доставить предыдущий ответ: Telegram дважды оборвал отправку. Возможно, сообщение частично дошло — проверьте чат и попросите повторить при необходимости.",
+        options: {},
+        messageType: "delivery_failed",
+        ...(payload.threadId ? { threadId: payload.threadId } : {}),
+        correlationId: payload.correlationId ?? item.dedupeKey,
+      });
+    }
+  }
+
+  /**
+   * Bug №37: per-chat delivery order is a deliberate trade-off, so a head item
+   * parked in a long flood-wait backoff silently delays everything behind it.
+   * Surface that state with the real error code instead of hiding it.
+   */
+  private warnBlockedTelegramOutboxHeads(): void {
+    for (const item of this.store.listBlockedTelegramOutboxHeads<DurableTelegramPayload>(60_000)) {
+      const warnedAt = this.blockedOutboxWarnedAt.get(item.id) ?? 0;
+      if (Date.now() - warnedAt < 60_000) continue;
+      if (this.blockedOutboxWarnedAt.size > 200) this.blockedOutboxWarnedAt.clear();
+      this.blockedOutboxWarnedAt.set(item.id, Date.now());
+      this.logger.warn(
+        {
+          outboxId: item.id,
+          chat: hashChatId(item.chatId),
+          errorCode: item.lastErrorCode,
+          attempts: item.attempts,
+          nextAttemptAt: item.nextAttemptAt,
+          waitedMs: Date.now() - Date.parse(item.updatedAt),
+          messageType: item.payload.messageType,
+        },
+        "Outbox head item has been waiting for its retry for over a minute; later messages in this chat are blocked behind it",
+      );
     }
   }
 
@@ -2923,10 +3012,10 @@ export class OperatorDaemon {
             const disposition = classifyTelegramDeliveryError(error);
             if (disposition.code !== "TELEGRAM_BAD_REQUEST" || disposition.ambiguous) throw error;
             // Telegram explicitly rejected the edit (deleted/non-editable anchor), so a new send cannot duplicate it.
-            sent = await this.telegram.sendRich(item.chatId, payload.text, payload.options);
+            sent = await this.sendDurableRich(item, payload);
           }
         } else {
-          sent = await this.telegram.sendRich(item.chatId, payload.text, payload.options);
+          sent = await this.sendDurableRich(item, payload);
         }
       } else if (item.operation === "photo") {
         if (!payload.path) throw new Error("Durable photo has no path");
@@ -2997,6 +3086,35 @@ export class OperatorDaemon {
       );
       return false;
     }
+  }
+
+  /**
+   * Multi-chunk rich delivery with durable resume state: every delivered chunk
+   * is recorded in the outbox payload, so a retried item continues from the
+   * first undelivered chunk instead of resending the whole answer (bug №22).
+   */
+  private async sendDurableRich(
+    item: TelegramOutboxItem<DurableTelegramPayload>,
+    payload: DurableTelegramPayload,
+  ): Promise<SentMessage[]> {
+    if (!payload.text) throw new Error("Durable rich message has no text");
+    const previouslySent: SentMessage[] = (payload.sentMessageIds ?? []).map((messageId) => ({
+      chatId: item.chatId,
+      messageId,
+      ...destinationFromOptions(payload.options),
+    }));
+    const sent = await this.telegram.sendRich(item.chatId, payload.text, payload.options, {
+      completedChunks: payload.sentChunkCount ?? 0,
+      onChunkSent: (completedChunks, chunkMessages) => {
+        payload.sentChunkCount = completedChunks;
+        payload.sentMessageIds = [
+          ...(payload.sentMessageIds ?? []),
+          ...chunkMessages.map((message) => message.messageId),
+        ];
+        this.store.updateTelegramOutboxPayload(item.id, payload);
+      },
+    });
+    return [...previouslySent, ...sent];
   }
 
   private recordDurableOutgoing(messages: SentMessage[], payload: DurableTelegramPayload): void {
