@@ -32,6 +32,42 @@ export interface GoogleWorkspaceConnectorOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * One calendar event as the tool layer sees it. Declared rather than
+ * `Record<string, unknown>` so the fencing call site names real fields: a typo
+ * in the fenced-field list is then a compile error, not a silent hole.
+ * Prose fields (`title`, `description`, `location`) are written by whoever
+ * could put an entry on the calendar and must be fenced before an LLM sees
+ * them; ids, times and URLs stay machine-readable.
+ */
+export interface CalendarEventRow {
+  id: string;
+  title: string;
+  start?: string | undefined;
+  end?: string | undefined;
+  location?: string | undefined;
+  description?: string | undefined;
+  url?: string | undefined;
+}
+
+/**
+ * One Gmail message as the tool layer sees it. Address and display name are
+ * split deliberately: `fromAddress`/`toAddress` are validated bare addresses
+ * (raw, reusable by email.send), `fromName`/`toName`/`subject`/`snippet` are
+ * attacker-written prose and must be fenced. `date` is normalized to ISO.
+ */
+export interface EmailMessageRow {
+  id: string;
+  threadId?: string | undefined;
+  fromAddress?: string;
+  fromName?: string;
+  toAddress?: string;
+  toName?: string;
+  subject?: string;
+  date?: string;
+  snippet?: string;
+}
+
 export class GoogleWorkspaceConnectors {
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
@@ -53,7 +89,7 @@ export class GoogleWorkspaceConnectors {
     timeMax?: string;
     query?: string;
     limit?: number;
-  }): Promise<Array<Record<string, unknown>>> {
+  }): Promise<CalendarEventRow[]> {
     this.requireCalendar();
     const url = new URL(
       `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(this.options.calendarId!)}/events`,
@@ -105,7 +141,7 @@ export class GoogleWorkspaceConnectors {
     return { id: event.id, title: event.summary, start: event.start.dateTime, end: event.end.dateTime, url: event.htmlLink };
   }
 
-  async searchEmail(input: { query: string; limit?: number }): Promise<Array<Record<string, unknown>>> {
+  async searchEmail(input: { query: string; limit?: number }): Promise<EmailMessageRow[]> {
     this.requireEmail();
     const limit = Math.min(10, Math.max(1, input.limit ?? 5));
     const listUrl = new URL(
@@ -124,14 +160,23 @@ export class GoogleWorkspaceConnectors {
       const headers = Object.fromEntries(
         (message.payload?.headers ?? []).map((header) => [header.name.toLocaleLowerCase(), header.value.slice(0, 1_000)]),
       );
+      // The whole header is attacker-written. Split each address header into a
+      // bare validated address (machine-readable, safe to feed back to
+      // email.send) and a display name (free prose, fenced by the tool layer),
+      // and normalize the date instead of forwarding up to 1 000 raw characters.
+      const from = splitAddressHeader(headers.from);
+      const to = splitAddressHeader(headers.to);
+      const date = normalizeHeaderDate(headers.date, message.internalDate);
       return {
         id: message.id,
         threadId: message.threadId,
-        from: headers.from,
-        to: headers.to,
-        subject: headers.subject,
-        date: headers.date ?? (message.internalDate ? new Date(Number(message.internalDate)).toISOString() : undefined),
-        snippet: message.snippet?.slice(0, 2_000),
+        ...(from.address ? { fromAddress: from.address } : {}),
+        ...(from.name ? { fromName: from.name } : {}),
+        ...(to.address ? { toAddress: to.address } : {}),
+        ...(to.name ? { toName: to.name } : {}),
+        ...(headers.subject ? { subject: headers.subject } : {}),
+        ...(date ? { date } : {}),
+        ...(message.snippet ? { snippet: message.snippet.slice(0, 2_000) } : {}),
       };
     }));
   }
@@ -188,6 +233,46 @@ export class GoogleWorkspaceConnectors {
     if (!response.ok) throw new Error(`Google Workspace request failed (${response.status})`);
     return response.json();
   }
+}
+
+/**
+ * Split `"Ада Лавлейс" <ada@example.com>` into a bare address and a display
+ * name. The address is validated, so it stays raw and machine-readable and can
+ * be handed straight back to email.send; the name is free prose an outsider
+ * chose, and the tool layer fences it. An unparseable header yields no address
+ * and keeps the whole string as the name, which is the safe direction.
+ */
+function splitAddressHeader(header: string | undefined): { address?: string; name?: string } {
+  const value = (header ?? "").trim();
+  if (!value) return {};
+  const angled = /^(.*)<([^<>]+)>\s*$/s.exec(value);
+  const candidate = (angled?.[2] ?? value).trim();
+  const name = (angled?.[1] ?? "").trim().replace(/^"(.*)"$/s, "$1").trim();
+  let address: string | undefined;
+  try {
+    address = validateEmail(candidate);
+  } catch {
+    address = undefined;
+  }
+  return {
+    ...(address ? { address } : {}),
+    // Without a parsed address the raw header is all the caller gets; label it
+    // as the name so it travels through the fenced path rather than the raw one.
+    ...(name ? { name } : address ? {} : { name: value }),
+  };
+}
+
+/**
+ * Header dates are attacker-written strings. Normalize to ISO, and drop the
+ * field entirely when it does not parse rather than forwarding raw prose.
+ */
+function normalizeHeaderDate(header: string | undefined, internalDate: string | undefined): string | undefined {
+  for (const candidate of [header, internalDate ? Number(internalDate) : undefined]) {
+    if (candidate === undefined || candidate === "") continue;
+    const parsed = new Date(candidate);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  }
+  return undefined;
 }
 
 function validateEmail(value: string): string {
