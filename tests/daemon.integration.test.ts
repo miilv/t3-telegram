@@ -701,6 +701,127 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("skips a cloud-API oversize file without retries and tells the agent why", async () => {
+    const home = tempDirectory("daemon-oversize-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    let downloads = 0;
+    telegram.downloadFile = async () => {
+      downloads += 1;
+      return new Uint8Array([1, 2, 3]);
+    };
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // The cloud Bot API refuses getFile above 20 MB permanently; the old path
+    // burned ~2 minutes of retries and answered with a generic failure.
+    telegram.push({
+      ...message(1, "глянь запись встречи"),
+      attachments: [
+        {
+          type: "document",
+          fileId: "document_big",
+          filename: "meeting.mp4",
+          mimeType: "video/mp4",
+          sizeBytes: 25 * 1024 * 1024,
+        },
+        {
+          type: "document",
+          fileId: "document_small",
+          filename: "notes.txt",
+          mimeType: "text/plain",
+          sizeBytes: 512,
+        },
+      ],
+    });
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    // Only the small attachment was downloaded and ingested.
+    expect(downloads).toBe(1);
+    const prompt = runtime.prompts.at(-1)!;
+    expect(prompt).toContain(
+      "[файл meeting.mp4 (25.0 MB) превышает лимит облачного Bot API 20 MB — недоступен]",
+    );
+    expect(prompt).toContain("глянь запись встречи");
+    const mapping = store.db
+      .prepare("SELECT artifact_ids_json FROM telegram_messages WHERE chat_id=? AND message_id=?")
+      .get(7, 1) as { artifact_ids_json: string };
+    expect(JSON.parse(mapping.artifact_ids_json)).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("downloads the same oversize file when a local Bot API server lifts the cap", async () => {
+    const home = tempDirectory("daemon-oversize-local-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    let downloads = 0;
+    telegram.downloadFile = async () => {
+      downloads += 1;
+      return new Uint8Array([1, 2, 3]);
+    };
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    const localConfig: Config = {
+      ...config(home),
+      telegram: {
+        ...config(home).telegram,
+        localFiles: { serverRoot: "/var/lib/telegram-bot-api", hostRoot: home },
+      },
+    };
+    daemon = new OperatorDaemon(localConfig, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push({
+      ...message(1, "глянь запись встречи"),
+      attachments: [
+        {
+          type: "document",
+          fileId: "document_big",
+          filename: "meeting.mp4",
+          mimeType: "video/mp4",
+          sizeBytes: 25 * 1024 * 1024,
+        },
+      ],
+    });
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    expect(downloads).toBe(1);
+    expect(runtime.prompts.at(-1)).not.toContain("превышает лимит");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("returns a requested worker artifact through one validated Telegram document send", async () => {
     const home = tempDirectory("daemon-document-out-");
     const workspaceRoot = `${home}/acme-files`;
