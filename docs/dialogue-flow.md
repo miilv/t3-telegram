@@ -184,9 +184,29 @@ Nine lines, `undefined` filtered, joined by blank lines:
 <<<end:a3f9c1e2>>>
 ```
 
-`fenceUntrusted(content, label)` uses `randomBytes(4).toString("hex")` per turn,
-so fenced content cannot forge its own closing marker. Applied at exactly two
-sites: the inbound user text and the raw worker result. Grep confirms no third.
+`fenceUntrusted(content, label)` draws a fresh 4-byte random nonce per call, so
+fenced content cannot forge its own closing marker. It lives in
+`packages/shared`; `openFence(label)` hands back a reusable wrapper when several
+fields of ONE call must share ONE marker.
+
+Labels: `inbound` (the owner's message), `worker` (raw worker result), `tool`
+(anything a tool result carried in from outside). Applied at these sites:
+
+| Site | What is fenced |
+| --- | --- |
+| daemon turn envelope | the inbound user text |
+| daemon `normalizeWorkerResult` | the raw worker result |
+| daemon `mediateUserInput` / `mediateApproval` | the worker's questions, approval request, and the narration-derived thread context — the worker's intermediate words on their way into the operator LLM (the Telegram delivery path is untouched) |
+| `utility.web_search` | each result's `title` and `snippet` (`url` stays raw) |
+| `email.search` | each message's `subject` and `snippet` (addresses stay raw, the Operator reuses them when replying) |
+| `calendar.list_events` | each event's `title`, `description`, `location` |
+| `artifacts.read_text` | the file body in `content` (the counters keep describing the raw window) |
+
+Fencing is deliberately per-field, not applied at `compactResult`: structural
+JSON (`t3.list_projects` and friends) is not fenced, since a fence around ids
+and timestamps is noise. Truncation is fence-aware — `closeDanglingFences`
+re-closes any marker that a length cap cut short, so a clipped blob can never
+run on as prompt.
 
 **Daemon owns** the reply→thread mapping, durable focus, forwarded/own split,
 artifact registration, OCR and transcript glue, role, destination, and the fence.
