@@ -1,5 +1,6 @@
 import { chmodSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { Logger } from "pino";
 import { describe, expect, it } from "vitest";
 import {
   ClaudeCliOperatorRuntime,
@@ -144,7 +145,7 @@ process.stdin.on("end", () => {
     });
   });
 
-  it("strips credential-shaped variables by name while keeping the CLI's own auth (bug №43)", async () => {
+  it("never inherits credential-shaped or daemon-only variables, keeping the CLI's own auth (bug №43)", async () => {
     const directory = tempDirectory("fake-claude-env-");
     const binary = join(directory, "claude");
     writeFileSync(
@@ -174,7 +175,8 @@ process.stdin.on("end", () => {
       // The CLI's own auth family must keep working.
       ANTHROPIC_API_KEY: "cli-owned",
       CLAUDE_CODE_OAUTH_TOKEN: "cli-owned",
-      // Benign names never match the credential pattern.
+      // Daemon-only knob: benign, but the child has no use for it and the
+      // allowlist keeps it home.
       OPERATOR_HOME: directory,
     };
     const previous = Object.fromEntries(Object.keys(injected).map((key) => [key, process.env[key]]));
@@ -199,10 +201,11 @@ process.stdin.on("end", () => {
         "SOME_CREDENTIAL_BLOB",
         "TELEGRAM_BOT_TOKEN",
         "T3_OPERATOR_MCP_CAPABILITY",
+        "OPERATOR_HOME",
       ]) {
         expect(visible).not.toContain(stripped);
       }
-      for (const kept of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPERATOR_HOME", "PATH"]) {
+      for (const kept of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "PATH"]) {
         expect(visible).toContain(kept);
       }
     } finally {
@@ -308,7 +311,7 @@ process.stdin.on("end", () => {});
 });
 
 describe("child environment allowlist", () => {
-  async function childEnvironment(): Promise<Record<string, string>> {
+  it("passes only allowlisted names, honours passthrough, and denies daemon secrets", async () => {
     const directory = tempDirectory("fake-claude-env-");
     const binary = join(directory, "claude");
     writeFileSync(
@@ -320,65 +323,90 @@ process.stdin.on("end", () => {
   console.log(JSON.stringify({ type: "result", result: JSON.stringify(process.env), session_id: process.argv[sessionIndex + 1] }));
 });
 `,
-      { mode: 0o700 },
     );
     chmodSync(binary, 0o700);
-    const runtime = new ClaudeCliOperatorRuntime({
-      binary,
-      cwd: directory,
-      model: "opus",
-      effort: "high",
-    });
-    const session = await runtime.start({ systemPrompt: "system" });
-    let captured: Record<string, string> = {};
-    for await (const event of runtime.sendTurn({ sessionId: session.id, prompt: "env" })) {
-      if (event.type === "result") captured = JSON.parse(event.text) as Record<string, string>;
-    }
-    return captured;
-  }
-
-  it("passes only allowlisted names, honours passthrough patterns, and never leaks the capability", async () => {
     const overrides: Record<string, string> = {
       // Credential-shaped values a name-based denylist used to miss.
       SSH_AUTH_SOCK: "/tmp/agent.sock",
       DATABASE_URL: "postgres://user:pw@host/db",
       SENTRY_DSN: "https://key@sentry.example/1",
       SLACK_WEBHOOK_URL: "https://hooks.example/x",
-      TELEGRAM_BOT_TOKEN: "must-not-leak",
+      UNLISTED_VAR: "nope",
       // Code injection into the child process.
       NODE_OPTIONS: "--require /tmp/evil.js",
       NODE_ENV: "production",
+      // Daemon secrets from the config schema: denied even though the
+      // passthrough list below tries to walk them back in by prefix.
+      TELEGRAM_BOT_TOKEN: "must-not-leak",
+      GROQ_API_KEY: "must-not-leak",
+      GOOGLE_WORKSPACE_ACCESS_TOKEN: "must-not-leak",
       // Provider credentials the child legitimately needs.
       OPENAI_API_KEY: "codex-credential",
       ANTHROPIC_API_KEY: "claude-credential",
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8192",
+      // Locale, session and egress plumbing.
       LC_ALL: "en_US.UTF-8",
+      LOGNAME: "operator",
+      XDG_RUNTIME_DIR: "/run/user/1000",
+      HTTPS_PROXY: "http://proxy.internal:3128",
+      https_proxy: "http://proxy.internal:3128",
+      NO_PROXY: "127.0.0.1",
+      no_proxy: "127.0.0.1",
+      ALL_PROXY: "socks5://proxy.internal:1080",
+      all_proxy: "socks5://proxy.internal:1080",
+      SSL_CERT_FILE: "/etc/ssl/corp.pem",
+      SSL_CERT_DIR: "/etc/ssl/certs",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/corp.pem",
+      CURL_CA_BUNDLE: "/etc/ssl/corp.pem",
+      REQUESTS_CA_BUNDLE: "/etc/ssl/corp.pem",
       // Opt-in user workflow variables.
       WORKFLOW_PROFILE: "release",
       WF_REGION: "eu",
       WF_BUCKET: "artifacts",
-      UNLISTED_VAR: "nope",
       // A hard denial must survive being named in the passthrough list.
-      T3_OPERATOR_MCP_CAPABILITY: "capability-token",
-      OPERATOR_ENV_PASSTHROUGH: "WORKFLOW_PROFILE, WF_*, T3_OPERATOR_MCP_CAPABILITY, NODE_OPTIONS",
+      T3_OPERATOR_MCP_CAPABILITY: "ambient-leak",
     };
     const previous = Object.fromEntries(
       Object.keys(overrides).map((key) => [key, process.env[key]] as const),
     );
     Object.assign(process.env, overrides);
+    const logged: { fields: Record<string, unknown>; message: string }[] = [];
+    const logger = {
+      info: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
+    } as unknown as Logger;
     try {
-      const environment = await childEnvironment();
+      const runtime = new ClaudeCliOperatorRuntime({
+        binary,
+        cwd: directory,
+        model: "opus",
+        effort: "high",
+        logger,
+        envPassthrough: [
+          "WORKFLOW_PROFILE",
+          "WF_*",
+          "T3_OPERATOR_MCP_CAPABILITY",
+          "NODE_OPTIONS",
+          "GROQ_*",
+          "TELEGRAM_*",
+        ],
+      });
+      const session = await runtime.start({ systemPrompt: "system" });
+      let environment: Record<string, string> = {};
+      for await (const event of runtime.sendTurn({ sessionId: session.id, prompt: "env" })) {
+        if (event.type === "result") environment = JSON.parse(event.text) as Record<string, string>;
+      }
 
       for (const blocked of [
         "SSH_AUTH_SOCK",
         "DATABASE_URL",
         "SENTRY_DSN",
         "SLACK_WEBHOOK_URL",
-        "TELEGRAM_BOT_TOKEN",
-        "NODE_OPTIONS",
         "UNLISTED_VAR",
+        "NODE_OPTIONS",
+        "TELEGRAM_BOT_TOKEN",
+        "GROQ_API_KEY",
+        "GOOGLE_WORKSPACE_ACCESS_TOKEN",
         "T3_OPERATOR_MCP_CAPABILITY",
-        "OPERATOR_ENV_PASSTHROUGH",
       ]) {
         expect(environment[blocked], blocked).toBeUndefined();
       }
@@ -386,10 +414,29 @@ process.stdin.on("end", () => {
       expect(environment.OPENAI_API_KEY).toBe("codex-credential");
       expect(environment.ANTHROPIC_API_KEY).toBe("claude-credential");
       expect(environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe("8192");
-      expect(environment.LC_ALL).toBe("en_US.UTF-8");
       expect(environment.NODE_ENV).toBe("production");
       expect(environment.PATH).toBe(process.env.PATH);
       expect(environment.HOME).toBe(process.env.HOME);
+
+      // Locale, session and egress plumbing, both proxy spellings.
+      for (const inherited of [
+        "LC_ALL",
+        "LOGNAME",
+        "XDG_RUNTIME_DIR",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+        "CURL_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+      ] as const) {
+        expect(environment[inherited], inherited).toBe(overrides[inherited]);
+      }
 
       // Passthrough: exact name and `*` prefix match.
       expect(environment.WORKFLOW_PROFILE).toBe("release");
@@ -399,6 +446,15 @@ process.stdin.on("end", () => {
       // Bash ceilings are still injected when unset.
       expect(environment.BASH_DEFAULT_TIMEOUT_MS).toBe("300000");
       expect(environment.BASH_MAX_TIMEOUT_MS).toBe("300000");
+
+      // One diagnostic line, names only, no values anywhere in it.
+      expect(logged).toHaveLength(1);
+      const filtered = logged[0]?.fields.filtered as string[];
+      expect(filtered).toContain("SSH_AUTH_SOCK");
+      expect(filtered).toContain("TELEGRAM_BOT_TOKEN");
+      expect(filtered).not.toContain("PATH");
+      expect(JSON.stringify(logged[0])).not.toContain("must-not-leak");
+      expect(JSON.stringify(logged[0])).not.toContain("/tmp/agent.sock");
     } finally {
       for (const [key, value] of Object.entries(previous)) {
         if (value === undefined) delete process.env[key];
@@ -444,11 +500,14 @@ process.stdin.on("end", () => {
       "DATABASE_URL",
       "GOOGLE_WORKSPACE_ACCESS_TOKEN",
       "OPENAI_API_KEY",
+      "T3_OPERATOR_MCP_CAPABILITY",
     ] as const;
     const previous = Object.fromEntries(secretKeys.map((key) => [key, process.env[key]]));
     for (const key of secretKeys) process.env[key] = "must-not-leak";
     // The Codex provider needs its own credential: the allowlist passes OPENAI_*.
     process.env.OPENAI_API_KEY = "codex-credential";
+    // An ambient capability in the daemon must not shadow the per-turn token.
+    process.env.T3_OPERATOR_MCP_CAPABILITY = "ambient-leak";
     try {
       const runtime = new CodexCliOperatorRuntime({
         binary,
@@ -485,6 +544,7 @@ process.stdin.on("end", () => {
       expect(details.args.join(" ")).toContain("utility.time");
       expect(details.args.join(" ")).not.toContain("ephemeral-capability");
       expect(details.capability).toBe("ephemeral-capability");
+      expect(details.capability).not.toBe("ambient-leak");
       expect(details.prompt).toContain("authoritative policy");
       expect(details.prompt).toContain("do bounded work");
       expect(usage).toEqual({ contextTokens: 125 });

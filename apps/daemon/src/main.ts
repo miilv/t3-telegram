@@ -35,6 +35,8 @@ async function main(): Promise<void> {
     effort: config.operator.effort,
     turnTimeoutMs: config.operator.turnTimeoutMs,
     fullAccess: config.operator.fullAccess,
+    envPassthrough: config.operator.envPassthrough,
+    logger,
   });
   const providers: Record<string, OperatorRuntime> = { claude: claudeRuntime };
   if (config.operator.codex) {
@@ -44,6 +46,8 @@ async function main(): Promise<void> {
       model: config.operator.codex.model,
       effort: config.operator.codex.effort,
       turnTimeoutMs: config.operator.turnTimeoutMs,
+      envPassthrough: config.operator.envPassthrough,
+      logger,
     });
   }
   const runtime = new SwitchableOperatorRuntime(providers, config.operator.provider);

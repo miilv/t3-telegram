@@ -242,17 +242,35 @@ The full-access branch exists (`--permission-mode bypassPermissions`,
 
 ### Environment filter
 
-`sanitizedEnvironment` drops any name matching
-`/TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|BEARER/i` unless it starts with
-`ANTHROPIC_` or `CLAUDE_`, and never inherits `T3_OPERATOR_MCP_CAPABILITY`.
+`sanitizedEnvironment(env, passthrough)` is an allowlist. A name-shaped denylist
+was the previous design and failed in both directions: it stripped
+`OPENAI_API_KEY` (so a Codex child was spawned without its credential) while
+passing `DATABASE_URL`, `SSH_AUTH_SOCK`, `SENTRY_DSN` and `*_WEBHOOK_URL` — and
+with full access that child has Bash.
 
-Two consequences of it being name-based:
+Inherited now, and nothing else:
 
-- **`OPENAI_API_KEY` is stripped.** It matches `KEY` and no exempt prefix, so a
-  Codex child is spawned without its credential.
-- **Credential-shaped values that don't say key/token/secret pass through**:
-  `DATABASE_URL` (embedded password), `SSH_AUTH_SOCK` (the user's whole SSH
-  agent), `SENTRY_DSN`, `*_WEBHOOK_URL`. With full access that child has Bash.
+- **Session and locale**: `PATH`, `HOME`, `PWD`, `LANG`, `LC_*`, `TZ`, `TERM`,
+  `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `XDG_*`.
+- **Egress**: `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` in both
+  spellings (undici and curl read the lowercase names), `SSL_CERT_FILE`,
+  `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`.
+- **Provider auth**: `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`.
+- **Node**: `NODE_ENV` only. `NODE_OPTIONS` is a hard denial (it injects code);
+  `NODE_PATH` and `NODE_REPL_EXTERNAL_MODULE` are simply not on the list.
+
+Three hard denials are checked *before* the allowlist and before any passthrough
+match: `T3_OPERATOR_MCP_CAPABILITY` (injected explicitly per turn — an ambient
+value must never shadow it), `NODE_OPTIONS`, and every secret the daemon reads
+for itself. That last set is derived from the config schema
+(`DAEMON_SECRET_ENV_NAMES`: `*_TOKEN`, `*_API_KEY`, `*_SECRET`, `*_SALT`, minus
+the provider credential prefixes), so a new credential is denied to children the
+moment it is declared, and no passthrough prefix can walk one back in.
+
+`OPERATOR_ENV_PASSTHROUGH` (parsed in `loadConfig`, handed to the runtime as
+`envPassthrough: string[]`) adds names on top: exact, or a trailing `*` for
+prefix match. A bare `*` or an empty prefix throws at config load. On its first
+turn each runtime logs one `info` line naming what it filtered out — names only.
 
 It also injects `BASH_DEFAULT_TIMEOUT_MS` / `BASH_MAX_TIMEOUT_MS = "300000"`
 when unset — the "~5 minutes" the system prompt promises is an env-level hard

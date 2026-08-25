@@ -40,17 +40,35 @@ token itself never appears in argv. Codex user/project rules and user config are
 ignored, and its shell/edit/image tool paths are disabled.
 
 Provider subprocesses inherit an environment allowlist, not a denylist: `PATH`,
-`HOME`, `LANG`, `LC_*`, `TZ`, `TERM`, `USER`, `SHELL`, `TMPDIR`, `NODE_ENV`,
-`ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` (the Codex credential), and
-`BASH_DEFAULT_TIMEOUT_MS` / `BASH_MAX_TIMEOUT_MS`, which are injected at
+`HOME`, `PWD`, `LANG`, `LC_*`, `TZ`, `TERM`, `USER`, `LOGNAME`, `SHELL`,
+`TMPDIR`, `XDG_*`, `NODE_ENV`, `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` (the Codex
+credential), the proxy and CA-bundle variables in both spellings (`HTTP_PROXY` /
+`http_proxy`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`,
+`SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`),
+and `BASH_DEFAULT_TIMEOUT_MS` / `BASH_MAX_TIMEOUT_MS`, which are injected at
 `300000` when unset so a single Bash command cannot eat the whole turn budget.
-Everything else stays in the daemon — daemon secrets, but also ambient
-credential carriers such as `SSH_AUTH_SOCK`, `DATABASE_URL`, `SENTRY_DSN` and
-`*_WEBHOOK_URL`. `NODE_OPTIONS` is never inherited: it injects code into the
-child. Extra names a workflow needs (proxies, tool credentials) go into
-`OPERATOR_ENV_PASSTHROUGH` as a comma-separated list, where a trailing `*`
-matches by prefix; that variable itself and `T3_OPERATOR_MCP_CAPABILITY` are
-never passed down, and passthrough cannot re-enable a hard denial.
+Everything else stays in the daemon — ambient credential carriers such as
+`SSH_AUTH_SOCK`, `DATABASE_URL`, `SENTRY_DSN` and `*_WEBHOOK_URL` included.
+`NODE_OPTIONS` is never inherited: it injects code into the child.
+(`NODE_EXTRA_CA_CERTS` only adds a trust anchor and executes nothing, so it is
+allowed.) The runtime logs one `info` line on its first turn listing the names
+it filtered out — names only, no values — so "the variable is missing" and "the
+filter ate it" stay distinguishable.
+
+Extra names a workflow needs go into `OPERATOR_ENV_PASSTHROUGH` as a
+comma-separated list, where a trailing `*` matches by prefix. Two limits are
+worth knowing before you reach for a prefix. Secrets the daemon reads for itself
+are derived from the config schema (`TELEGRAM_BOT_TOKEN`, `T3_BEARER_TOKEN`,
+`OPENROUTER_API_KEY`, `GOOGLE_WORKSPACE_ACCESS_TOKEN`, and every other
+`*_TOKEN` / `*_API_KEY` / `*_SECRET` / `*_SALT` in it) and are checked before
+any passthrough match, so no pattern — `TELEGRAM_*` included — brings them back,
+and a credential added to the schema later is denied the moment it is declared.
+But a prefix stays a blunt instrument for everything the schema does not know
+about: `WB_*` will hand over `WB_SELLER_SECRET` sitting in your shell just as
+happily as `WB_REGION`. Prefer exact names; use a prefix only over a namespace
+you own end to end. A bare `*` and an empty prefix are rejected at startup.
+`T3_OPERATOR_MCP_CAPABILITY` is never passed down either — the per-turn
+capability is injected explicitly, and an ambient value must not shadow it.
 
 Provider identity and native session ID are stored together. A switch first
 refreshes structured memory, compacts the current runtime, starts a new native
