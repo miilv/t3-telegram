@@ -224,6 +224,25 @@ export interface UserInputQuestion {
   multiSelect: boolean;
 }
 
+export interface MediatedQuestion {
+  id: string;
+  /** The worker's question re-asked in the owner's language with context. */
+  question?: string;
+  /** Translated display labels, index-aligned with the original options. */
+  optionLabels?: string[];
+}
+
+/**
+ * A light out-of-session LLM pass over a worker interaction (bug №49): the
+ * question or approval re-told in the owner's language with task context.
+ * Submission always uses the worker's original labels; this only shapes display.
+ */
+export interface InteractionMediation {
+  intro: string;
+  questions?: MediatedQuestion[];
+  recommendation?: string;
+}
+
 export type ApprovalRiskCategory =
   | "safe-read"
   | "safe-write-in-project"
@@ -346,6 +365,12 @@ export interface OperatorRuntime {
   interrupt(): Promise<void>;
   compact(reason?: string): Promise<{ sessionId: string; summary?: string }>;
   resume(sessionId: string, providerId?: string): Promise<void>;
+  /**
+   * Cheap side-channel call outside the main Operator session: no resume, no
+   * MCP, small budget. Used for interaction mediation; must never touch the
+   * serialized main-session turn queue.
+   */
+  oneShot?(input: { prompt: string; timeoutMs?: number }): Promise<string>;
   health(): Promise<{
     healthy: boolean;
     detail?: string;

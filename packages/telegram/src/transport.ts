@@ -1443,9 +1443,9 @@ function userInputKeyboard(
       callback_data: callback(`o${index}`),
     },
   ]);
-  inline_keyboard.push([{ text: "Write another answer", callback_data: callback("c") }]);
+  inline_keyboard.push([{ text: "Ответить своим текстом", callback_data: callback("c") }]);
   if (multiSelect) {
-    inline_keyboard.push([{ text: "Submit selected", callback_data: callback("s") }]);
+    inline_keyboard.push([{ text: "Отправить выбранное", callback_data: callback("s") }]);
   }
   return { inline_keyboard };
 }
@@ -1617,10 +1617,10 @@ function approvalKeyboard(approvalId: string) {
   return {
     inline_keyboard: [
       [
-        { text: "Allow once", callback_data: `a:${token}:1` },
-        { text: "Allow session", callback_data: `a:${token}:s` },
+        { text: "Разрешить", callback_data: `a:${token}:1` },
+        { text: "Разрешить на сессию", callback_data: `a:${token}:s` },
       ],
-      [{ text: "Deny", callback_data: `a:${token}:0` }],
+      [{ text: "Отклонить", callback_data: `a:${token}:0` }],
     ],
   };
 }

@@ -7,6 +7,8 @@ import type {
   ArtifactRef,
   ApprovalRiskCategory,
   Automation,
+  InteractionMediation,
+  MediatedQuestion,
   OperatorEvent,
   OperatorNote,
   OperatorPolicySettings,
@@ -19,6 +21,7 @@ import type {
   TelegramMessageRecord,
   ThreadSummary,
   TeamRole,
+  UserInputQuestion,
   WorkThread,
   WorkerResult,
   WorkerEvent,
@@ -44,6 +47,7 @@ import type {
   TelegramInbound,
   TelegramSendOptions,
   TelegramTransport,
+  TelegramUserInputChoice,
 } from "../../../packages/telegram/src/index.js";
 import {
   classifyTelegramDeliveryError,
@@ -1268,14 +1272,18 @@ export class OperatorDaemon {
         );
       }
     }
-    const approvalText = [
-        `Worker **${escapeMarkdownText(thread?.title ?? event.threadId)}** запрашивает разрешение:`,
-        "",
-        escapeMarkdownText(safeSummary),
-        ...(safeDetail ? ["", `_${escapeMarkdownText(safeDetail)}_`] : []),
-        "",
-        `Risk category: **${risk}**`,
-      ].join("\n");
+    const mediation = await this.mediateApproval(event, thread?.title, risk);
+    if (mediation) {
+      const saved = this.store.getApproval(id);
+      if (saved && isRecord(saved.payload)) {
+        this.store.updateApprovalPayload(id, { ...saved.payload, mediation });
+      }
+    }
+    const savedApproval = this.store.getApproval(id);
+    const approvalText = renderApprovalPrompt(
+      savedApproval && isRecord(savedApproval.payload) ? savedApproval.payload : {},
+      thread?.title ?? event.threadId,
+    );
     const anchor = this.interactionAnchor(event.threadId, chatId);
     const sent = anchor
       ? (await this.telegram.editApproval(chatId, anchor.messageId, approvalText, id), {
@@ -1321,6 +1329,10 @@ export class OperatorDaemon {
       questions: event.questions,
       chatId,
     });
+    // Mediation runs before the first render and its result is cached on the
+    // pending record, so recovery and redraw never call the LLM again (№49).
+    const mediation = await this.mediateUserInput(event);
+    if (mediation) this.store.updateUserInput(id, { mediation });
     const pending = this.store.getUserInput(id)!;
     const question = pending.questions[0]!;
     const inputText = renderUserInputPrompt(pending, this.store.getThread(event.threadId)?.title);
@@ -1332,7 +1344,7 @@ export class OperatorDaemon {
           inputText,
           id,
           0,
-          question.options,
+          userInputDisplayChoices(pending),
           question.multiSelect,
         ), { chatId, messageId: anchor.messageId })
       : await this.telegram.sendUserInput(
@@ -1340,7 +1352,7 @@ export class OperatorDaemon {
           inputText,
           id,
           0,
-          question.options,
+          userInputDisplayChoices(pending),
           question.multiSelect,
           { ...destination, ...(originMessageId ? { replyToMessageId: originMessageId } : {}) },
         );
@@ -1351,6 +1363,91 @@ export class OperatorDaemon {
       payload: { inputId: id, questionCount: event.questions.length },
     });
     this.store.completeEvent(eventKey);
+  }
+
+  /**
+   * The light out-of-session LLM pass of bug №49. It deliberately bypasses
+   * operatorRuntimeQueue: a busy main Operator turn must never delay a worker
+   * question, and mediation must never occupy the main session.
+   */
+  private async runMediation(prompt: string, context: string): Promise<string | undefined> {
+    if (!this.runtime.oneShot) return undefined;
+    const timeoutMs = this.config.operator.mediationTimeoutMs;
+    let budget: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        this.runtime.oneShot({ prompt, timeoutMs }),
+        new Promise<never>((_, reject) => {
+          budget = setTimeout(
+            () => reject(new Error(`mediation exceeded its ${timeoutMs}ms budget`)),
+            timeoutMs,
+          );
+          budget.unref();
+        }),
+      ]);
+    } catch (error) {
+      this.logger.warn(
+        { errorCode: classifyOperationalError(error).code, context },
+        "Interaction mediation failed; showing the worker prompt directly",
+      );
+      return undefined;
+    } finally {
+      clearTimeout(budget);
+    }
+  }
+
+  private mediationThreadContext(threadId: string): Record<string, unknown> {
+    const thread = this.store.getThread(threadId);
+    const summary = this.store.getThreadSummary(threadId);
+    const focus = this.store.getFocus(String(this.config.telegram.allowedUserId));
+    return {
+      ...(thread?.title ? { title: thread.title } : {}),
+      ...(thread?.lastUserIntent ? { userIntent: thread.lastUserIntent } : {}),
+      ...(summary?.purpose ? { purpose: summary.purpose } : {}),
+      ...(summary?.currentState ? { currentState: summary.currentState } : {}),
+      ...(summary?.nextActions.length ? { nextActions: summary.nextActions } : {}),
+      ...(focus.primary?.threadId === threadId ? { ownerFocus: focus.primary.topic } : {}),
+    };
+  }
+
+  private async mediateUserInput(
+    event: Extract<WorkerEvent, { type: "user_input_required" }>,
+  ): Promise<InteractionMediation | undefined> {
+    const prompt = [
+      "Ты — оркестратор рабочих агентов владельца в Telegram. Рабочий агент (воркер) задал пользователю вопрос.",
+      "Переформулируй его по-русски и добавь контекст: что это за задача и зачем воркер спрашивает. Смысл, порядок и число вариантов менять нельзя.",
+      `Контекст задачи (JSON): ${JSON.stringify(this.mediationThreadContext(event.threadId))}`,
+      `Вопросы воркера (JSON): ${JSON.stringify(event.questions)}`,
+      "Ответь ТОЛЬКО валидным JSON без пояснений и без markdown-ограждений:",
+      '{"intro": "1-2 предложения: что за задача и зачем воркер спрашивает", "questions": [{"id": "<id вопроса>", "question": "вопрос по-русски", "optionLabels": ["перевод label каждого варианта, строго в исходном порядке"]}], "recommendation": "необязательная рекомендация с коротким обоснованием"}',
+      "Число элементов optionLabels обязано точно совпадать с числом options соответствующего вопроса.",
+    ].join("\n\n");
+    const raw = await this.runMediation(prompt, `user-input:${event.threadId}:${event.requestId}`);
+    return raw ? parseInteractionMediation(raw, event.questions) : undefined;
+  }
+
+  private async mediateApproval(
+    event: Extract<WorkerEvent, { type: "approval_required" }>,
+    threadTitle: string | undefined,
+    risk: ApprovalRiskCategory,
+  ): Promise<InteractionMediation | undefined> {
+    const request = {
+      summary: safeExcerpt(event.summary, 1_200),
+      ...(event.detail ? { detail: safeExcerpt(event.detail, 1_200) } : {}),
+      ...(event.requestKind ? { requestKind: event.requestKind } : {}),
+      ...(event.requestType ? { requestType: event.requestType } : {}),
+      risk,
+    };
+    const prompt = [
+      "Ты — оркестратор рабочих агентов владельца в Telegram. Рабочий агент (воркер) просит у пользователя разрешение на действие.",
+      `Объясни по-русски одним-двумя предложениями: воркер по задаче «${threadTitle ?? "без названия"}» просит разрешение на что и почему. Не преуменьшай риск.`,
+      `Контекст задачи (JSON): ${JSON.stringify(this.mediationThreadContext(event.threadId))}`,
+      `Запрос воркера (JSON): ${JSON.stringify(request)}`,
+      "Ответь ТОЛЬКО валидным JSON без пояснений и без markdown-ограждений:",
+      '{"intro": "воркер по задаче X просит разрешение на Y, потому что Z", "recommendation": "необязательная рекомендация (разрешить/отклонить) с коротким обоснованием"}',
+    ].join("\n\n");
+    const raw = await this.runMediation(prompt, `approval:${event.threadId}:${event.approvalId}`);
+    return raw ? parseInteractionMediation(raw) : undefined;
   }
 
   private async reconcileApprovalResolution(
@@ -1401,6 +1498,80 @@ export class OperatorDaemon {
     }
   }
 
+  /**
+   * A pressed telegram.ask_choices button becomes an ordinary inbound user
+   * message ("выбрал: X") for the Operator's next turn — the same durable
+   * ingress path real messages take, so restarts cannot lose the pick.
+   */
+  private async handleChoiceCallback(
+    update: Extract<TelegramInbound, { type: "callback" }>,
+    choiceId: string,
+    optionIndex: number,
+  ): Promise<void> {
+    const stateKey = `choice_prompt:${choiceId}`;
+    const rawRecord = this.store.getRuntimeState(stateKey);
+    let record: Record<string, unknown> | undefined;
+    try {
+      record = rawRecord ? (JSON.parse(rawRecord) as Record<string, unknown>) : undefined;
+    } catch {
+      record = undefined;
+    }
+    const labels = Array.isArray(record?.labels)
+      ? record.labels.filter((label): label is string => typeof label === "string")
+      : [];
+    if (!record || record.answeredAt || Number(record.chatId) !== update.chatId) {
+      await this.telegram.answerCallback(update.callbackId, "Этот выбор уже не активен");
+      return;
+    }
+    const label = labels[optionIndex];
+    if (label === undefined) {
+      await this.telegram.answerCallback(update.callbackId, "Вариант не найден");
+      return;
+    }
+    this.store.setRuntimeState(
+      stateKey,
+      JSON.stringify({ ...record, answeredAt: nowIso(), answer: label, answeredBy: update.userId }),
+    );
+    this.enqueueKeyboardCleanup(update.chatId, update.messageId, "", `choice:${choiceId}`);
+    await this.telegram.answerCallback(update.callbackId, "Принято");
+    const question = typeof record.question === "string" ? record.question : "";
+    const syntheticId = -Math.max(
+      1,
+      Number.parseInt(createHash("sha256").update(`choice:${choiceId}`).digest("hex").slice(0, 7), 16),
+    );
+    const synthetic: Extract<TelegramInbound, { type: "message" }> = {
+      type: "message",
+      updateId: syntheticId,
+      edited: false,
+      synthetic: true,
+      chatId: update.chatId,
+      chatType: "private",
+      userId: update.userId,
+      messageId: syntheticId,
+      messageIds: [syntheticId],
+      date: Math.floor(Date.now() / 1_000),
+      text: `Пользователь выбрал вариант «${label}»${question ? ` на вопрос: ${question}` : ""}`,
+      attachments: [],
+      ...(Number.isSafeInteger(Number(record.messageThreadId)) && Number(record.messageThreadId)
+        ? { messageThreadId: Number(record.messageThreadId) }
+        : {}),
+      ...(Number.isSafeInteger(Number(record.directMessagesTopicId)) && Number(record.directMessagesTopicId)
+        ? { directMessagesTopicId: Number(record.directMessagesTopicId) }
+        : {}),
+    };
+    const jobId = `choice-answer:${choiceId}`;
+    this.store.enqueueBackgroundJob<DurableTelegramIngress>(
+      "telegram_ingress",
+      { update: synthetic, processExisting: false },
+      undefined,
+      { id: jobId, dedupeKey: jobId },
+    );
+    await this.flushTelegramOutbox();
+    void this.operatorInputQueue
+      .run(() => this.drainTelegramIngress())
+      .catch((error) => this.logUpdateFailure(error, update.updateId));
+  }
+
   private async handleUserInputCallback(
     update: Extract<TelegramInbound, { type: "callback" }>,
     inputId: string,
@@ -1414,20 +1585,20 @@ export class OperatorDaemon {
       pending.chatId !== update.chatId ||
       pending.messageId !== update.messageId
     ) {
-      await this.telegram.answerCallback(update.callbackId, "This question is no longer pending");
+      await this.telegram.answerCallback(update.callbackId, "Этот вопрос уже не активен");
       return;
     }
     if (questionIndex !== pending.currentQuestion) {
-      await this.telegram.answerCallback(update.callbackId, "This question has already advanced");
+      await this.telegram.answerCallback(update.callbackId, "Этот вопрос уже переключился дальше");
       return;
     }
     if (action === "c") {
-      await this.telegram.answerCallback(update.callbackId, "Reply to this message with your answer");
+      await this.telegram.answerCallback(update.callbackId, "Ответьте на это сообщение своим текстом");
       return;
     }
     const question = pending.questions[questionIndex];
     if (!question) {
-      await this.telegram.answerCallback(update.callbackId, "Question not found");
+      await this.telegram.answerCallback(update.callbackId, "Вопрос не найден");
       return;
     }
     const draft = pending.draftAnswers[question.id] ?? {};
@@ -1435,7 +1606,7 @@ export class OperatorDaemon {
       const optionIndex = Number(action.slice(1));
       const option = question.options[optionIndex];
       if (!Number.isInteger(optionIndex) || !option) {
-        await this.telegram.answerCallback(update.callbackId, "Option not found");
+        await this.telegram.answerCallback(update.callbackId, "Вариант не найден");
         return;
       }
       const selected = draft.selectedOptionLabels ?? [];
@@ -1452,20 +1623,20 @@ export class OperatorDaemon {
       const updated = this.store.getUserInput(inputId)!;
       if (!question.multiSelect) {
         await this.advanceOrSubmitUserInput(updated);
-        await this.telegram.answerCallback(update.callbackId, "Saved");
+        await this.telegram.answerCallback(update.callbackId, "Принято");
         return;
       }
       await this.refreshUserInputMessage(updated);
-      await this.telegram.answerCallback(update.callbackId, "Selection updated");
+      await this.telegram.answerCallback(update.callbackId, "Выбор обновлён");
       return;
     }
     if (action === "s") {
       if (!question.multiSelect || !resolveUserInputAnswer(question.multiSelect, draft)) {
-        await this.telegram.answerCallback(update.callbackId, "Select at least one option");
+        await this.telegram.answerCallback(update.callbackId, "Выберите хотя бы один вариант");
         return;
       }
       await this.advanceOrSubmitUserInput(pending);
-      await this.telegram.answerCallback(update.callbackId, "Submitted");
+      await this.telegram.answerCallback(update.callbackId, "Отправлено");
     }
   }
 
@@ -1558,17 +1729,13 @@ export class OperatorDaemon {
     if (pending.chatId === undefined || pending.messageId === undefined) return;
     const question = pending.questions[pending.currentQuestion];
     if (!question) return;
-    const selected = pending.draftAnswers[question.id]?.selectedOptionLabels ?? [];
     await this.telegram.editUserInput(
       pending.chatId,
       pending.messageId,
       renderUserInputPrompt(pending, this.store.getThread(pending.threadId)?.title),
       pending.id,
       pending.currentQuestion,
-      question.options.map((option) => ({
-        label: option.label,
-        ...(selected.includes(option.label) ? { selected: true } : {}),
-      })),
+      userInputDisplayChoices(pending),
       question.multiSelect,
     );
   }
@@ -1922,6 +2089,12 @@ export class OperatorDaemon {
   private async handleCallback(update: Extract<TelegramInbound, { type: "callback" }>): Promise<void> {
     const eventKey = `telegram-callback:${update.callbackId}`;
     if (!this.store.beginEvent(eventKey)) return;
+    const choiceMatch = /^route:([\w-]+):(\d+)$/.exec(update.data);
+    if (choiceMatch) {
+      await this.handleChoiceCallback(update, choiceMatch[1]!, Number(choiceMatch[2]));
+      this.store.completeEvent(eventKey);
+      return;
+    }
     const userInputMatch = /^ui:([^:]+):(\d+):(o\d+|s|c)$/.exec(update.data);
     if (userInputMatch) {
       const pending = this.store.getUserInput(userInputMatch[1]!);
@@ -2944,15 +3117,12 @@ export class OperatorDaemon {
     approval: NonNullable<ReturnType<OperatorStore["getApproval"]>>,
   ): Promise<void> {
     const payload = isRecord(approval.payload) ? approval.payload : {};
-    const text = [
-        `Worker **${escapeMarkdownText(this.store.getThread(approval.threadId)?.title ?? approval.threadId)}** запрашивает разрешение:`,
-        "",
-        escapeMarkdownText(
-          typeof payload.summary === "string" ? payload.summary : "T3 requires approval.",
-        ),
-        "",
-        `Risk category: **${typeof payload.risk === "string" ? payload.risk : "destructive"}**`,
-      ].join("\n");
+    // The cached mediation (if any) rides inside the payload, so recovery
+    // renders the same mediated text without another LLM call.
+    const text = renderApprovalPrompt(
+      payload,
+      this.store.getThread(approval.threadId)?.title ?? approval.threadId,
+    );
     const anchor = approval.messageId !== undefined
       ? { messageId: approval.messageId }
       : this.interactionAnchor(approval.threadId, approval.chatId!);
@@ -2985,7 +3155,7 @@ export class OperatorDaemon {
           text,
           pending.id,
           pending.currentQuestion,
-          question.options,
+          userInputDisplayChoices(pending),
           question.multiSelect,
         ), { chatId: pending.chatId!, messageId: anchor.messageId })
       : await this.telegram.sendUserInput(
@@ -2993,7 +3163,7 @@ export class OperatorDaemon {
           text,
           pending.id,
           pending.currentQuestion,
-          question.options,
+          userInputDisplayChoices(pending),
           question.multiSelect,
           this.recoveredDestination(pending.threadId),
         );
@@ -4020,22 +4190,133 @@ function replyOptions(update: Extract<TelegramInbound, { type: "message" }>): Te
 
 function renderUserInputPrompt(pending: PendingUserInput, threadTitle?: string): string {
   const question = pending.questions[pending.currentQuestion];
-  if (!question) return "Worker requested input, but the question payload was empty.";
-  const options = question.options.flatMap((option) => [
-    `- **${escapeMarkdownText(option.label)}** — ${escapeMarkdownText(option.description)}`,
+  if (!question) return "Worker запросил ввод, но не прислал ни одного вопроса.";
+  const mediated = pending.mediation?.questions?.find((entry) => entry.id === question.id);
+  const options = question.options.flatMap((option, index) => [
+    `- **${escapeMarkdownText(mediated?.optionLabels?.[index] ?? option.label)}** — ${escapeMarkdownText(option.description)}`,
   ]);
+  // The worker's untranslated question is folded into a closing blockquote so
+  // mediation never loses information.
+  const originalQuote = pending.mediation
+    ? [
+        `Оригинал вопроса: ${question.question}`,
+        ...question.options.map((option) => `${option.label} — ${option.description}`),
+      ].map((line) => `> ${escapeMarkdownText(line)}`)
+    : [];
   return [
-    `**${escapeMarkdownText(threadTitle ?? "Worker")} needs your input**`,
+    `**Вопрос по работе «${escapeMarkdownText(threadTitle ?? "Worker")}»**`,
     "",
     `_${escapeMarkdownText(question.header)} · ${pending.currentQuestion + 1}/${pending.questions.length}_`,
-    escapeMarkdownText(question.question),
+    ...(pending.mediation ? [escapeMarkdownText(pending.mediation.intro), ""] : []),
+    escapeMarkdownText(mediated?.question ?? question.question),
     ...(options.length ? ["", ...options] : []),
+    ...(pending.mediation?.recommendation
+      ? ["", `Рекомендация: ${escapeMarkdownText(pending.mediation.recommendation)}`]
+      : []),
     "",
     question.multiSelect
-      ? "Select one or more options, then press **Submit selected**."
-      : "Choose one option.",
-    "You can also reply to this message with a custom answer.",
+      ? "Отметьте нужные варианты и нажмите **Отправить выбранное**."
+      : "Выберите один вариант.",
+    "Можно ответить и своим текстом — просто ответьте на это сообщение.",
+    ...(originalQuote.length ? ["", ...originalQuote] : []),
   ].join("\n");
+}
+
+/**
+ * Buttons show mediated (translated) labels, but callbacks stay index-based and
+ * submission always resolves the worker's original labels from the pending
+ * questions, so a translated button never changes the submitted answer.
+ */
+function userInputDisplayChoices(pending: PendingUserInput): TelegramUserInputChoice[] {
+  const question = pending.questions[pending.currentQuestion];
+  if (!question) return [];
+  const mediated = pending.mediation?.questions?.find((entry) => entry.id === question.id);
+  const selected = pending.draftAnswers[question.id]?.selectedOptionLabels ?? [];
+  return question.options.map((option, index) => ({
+    label: mediated?.optionLabels?.[index] ?? option.label,
+    ...(selected.includes(option.label) ? { selected: true } : {}),
+  }));
+}
+
+function renderApprovalPrompt(payload: Record<string, unknown>, threadTitle: string): string {
+  const summary = typeof payload.summary === "string" ? payload.summary : "T3 требует подтверждения.";
+  const detail = typeof payload.detail === "string" ? payload.detail : undefined;
+  const risk = typeof payload.risk === "string" ? payload.risk : "destructive";
+  const mediation =
+    isRecord(payload.mediation) && typeof payload.mediation.intro === "string"
+      ? (payload.mediation as unknown as InteractionMediation)
+      : undefined;
+  const originalQuote = mediation
+    ? [`Оригинал запроса: ${summary}`, ...(detail ? [detail] : [])].map(
+        (line) => `> ${escapeMarkdownText(line)}`,
+      )
+    : [];
+  return [
+    `**Запрос разрешения — «${escapeMarkdownText(threadTitle)}»**`,
+    "",
+    ...(mediation
+      ? [
+          escapeMarkdownText(mediation.intro),
+          ...(mediation.recommendation
+            ? ["", `Рекомендация: ${escapeMarkdownText(mediation.recommendation)}`]
+            : []),
+        ]
+      : [
+          escapeMarkdownText(summary),
+          ...(detail ? ["", `_${escapeMarkdownText(detail)}_`] : []),
+        ]),
+    "",
+    `Категория риска: **${risk}**`,
+    ...(originalQuote.length ? ["", ...originalQuote] : []),
+  ].join("\n");
+}
+
+/** Parses and validates the mediation JSON; any malformed field is dropped. */
+function parseInteractionMediation(
+  raw: string,
+  questions?: UserInputQuestion[],
+): InteractionMediation | undefined {
+  const unfenced = raw.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "");
+  let value: unknown;
+  try {
+    value = JSON.parse(unfenced);
+  } catch {
+    const embedded = /\{[\s\S]*\}/u.exec(unfenced);
+    if (!embedded) return undefined;
+    try {
+      value = JSON.parse(embedded[0]);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!isRecord(value) || typeof value.intro !== "string" || !value.intro.trim()) return undefined;
+  const mediation: InteractionMediation = { intro: safeExcerpt(value.intro.trim(), 1_500) };
+  if (typeof value.recommendation === "string" && value.recommendation.trim()) {
+    mediation.recommendation = safeExcerpt(value.recommendation.trim(), 600);
+  }
+  if (questions?.length && Array.isArray(value.questions)) {
+    const entries = value.questions.filter(isRecord);
+    const mediatedQuestions: MediatedQuestion[] = [];
+    for (const question of questions) {
+      const entry = entries.find((item) => item.id === question.id);
+      if (!entry) continue;
+      const mediated: MediatedQuestion = { id: question.id };
+      if (typeof entry.question === "string" && entry.question.trim()) {
+        mediated.question = safeExcerpt(entry.question.trim(), 1_000);
+      }
+      const labels = Array.isArray(entry.optionLabels) ? entry.optionLabels : undefined;
+      if (
+        labels &&
+        labels.length === question.options.length &&
+        labels.every((label) => typeof label === "string" && label.trim())
+      ) {
+        mediated.optionLabels = labels.map((label) => safeExcerpt(String(label).trim(), 60));
+      }
+      if (mediated.question || mediated.optionLabels) mediatedQuestions.push(mediated);
+    }
+    if (mediatedQuestions.length) mediation.questions = mediatedQuestions;
+  }
+  return mediation;
 }
 
 function resolveUserInputAnswer(

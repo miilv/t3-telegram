@@ -71,6 +71,7 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "telegram.send_message",
   "telegram.reply",
   "telegram.edit",
+  "telegram.ask_choices",
   "telegram.send_document",
   "telegram.send_photo",
   "telegram.send_audio",
@@ -1064,6 +1065,47 @@ export class OperatorToolServer {
           destination(capability.context),
         );
         return { messageId, edited: true };
+      },
+    });
+
+    this.addTool(server, token, {
+      name: "telegram.ask_choices",
+      description:
+        "Ask the user a question with 2-6 inline choice buttons in the current chat. The picked option arrives as the user's next message; use it when the answer is a pick between a few short options, not for open-ended questions.",
+      schema: z.object({
+        question: z.string().trim().min(1).max(3_000),
+        options: z.array(z.string().trim().min(1).max(60)).min(2).max(6),
+      }),
+      handler: async ({ question, options }, capability) => {
+        this.requireTeamMutation(capability, "ask Telegram choice questions");
+        const choiceId = `pick_${randomBytes(9).toString("base64url")}`;
+        const sent = await this.options.telegram.sendChoices(
+          capability.context.chatId,
+          question,
+          choiceId,
+          options,
+          destination(capability.context),
+        );
+        // The daemon resolves the callback (`route:<id>:<index>`) against this
+        // durable record and replays the pick as a normal inbound message.
+        this.options.store.setRuntimeState(
+          `choice_prompt:${choiceId}`,
+          JSON.stringify({
+            chatId: capability.context.chatId,
+            messageId: sent.messageId,
+            ownerId: capability.context.ownerId,
+            question,
+            labels: options,
+            createdAt: nowIso(),
+            ...(capability.context.messageThreadId
+              ? { messageThreadId: capability.context.messageThreadId }
+              : {}),
+            ...(capability.context.directMessagesTopicId
+              ? { directMessagesTopicId: capability.context.directMessagesTopicId }
+              : {}),
+          }),
+        );
+        return this.recordSent([sent], capability, "operator_tool_choices");
       },
     });
 

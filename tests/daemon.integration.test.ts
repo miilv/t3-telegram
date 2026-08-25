@@ -36,6 +36,7 @@ import type {
   StreamDraft,
   TelegramInbound,
   TelegramTransport,
+  TelegramUserInputChoice,
 } from "../packages/telegram/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
 
@@ -1071,6 +1072,239 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("mediates worker questions and approvals out of session and submits original labels for translated buttons", async () => {
+    const home = tempDirectory("daemon-mediation-");
+    const store = tempStore();
+    const runtime = new MediatingRuntime(
+      delegatingScript({ workPattern: /deploy/u, title: "Auth deploy" }),
+      async (prompt) =>
+        prompt.includes("Вопросы воркера")
+          ? JSON.stringify({
+              intro: "Воркер деплоит auth-сервис и уточняет стратегию выката.",
+              questions: [
+                {
+                  id: "strategy",
+                  question: "Какую стратегию деплоя использовать?",
+                  optionLabels: ["Синий-зелёный", "Поэтапный"],
+                },
+              ],
+              recommendation: "Рекомендую blue-green: мгновенный откат.",
+            })
+          : JSON.stringify({
+              intro: "Воркер по задаче Auth deploy просит разрешение удалить старую БД, потому что она мешает деплою.",
+              recommendation: "Лучше отклонить и проверить бэкап.",
+            }),
+    );
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      {
+        type: "user_input_required",
+        threadId: "th_1",
+        requestId: "t3_input_1",
+        questions: [
+          {
+            id: "strategy",
+            header: "Deploy strategy",
+            question: "Which deployment strategy should be used?",
+            options: [
+              { label: "Blue-green", description: "two environments" },
+              { label: "Rolling", description: "gradual rollout" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      {
+        type: "approval_required",
+        threadId: "th_1",
+        approvalId: "delete_1",
+        summary: "Delete legacy database",
+        requestKind: "command",
+        requestType: "command_execution_approval",
+        detail: "rm -rf data",
+      },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "deploy auth service"));
+    await waitFor(() => telegram.userInputs.length === 1 && telegram.approvals.length === 1);
+    const prompt = telegram.userInputs[0]!;
+    // The mediated Russian re-ask with context, translated buttons, and the
+    // untranslated original folded into a closing blockquote.
+    expect(prompt.text).toContain("Воркер деплоит auth\\-сервис");
+    expect(prompt.text).toContain("Какую стратегию деплоя использовать?");
+    expect(prompt.text).toContain("Рекомендация: Рекомендую blue\\-green");
+    expect(prompt.text).toContain("Оригинал вопроса: Which deployment strategy should be used?");
+    expect(prompt.labels).toEqual(["Синий-зелёный", "Поэтапный"]);
+    // The cached result lives on the pending record: redraw uses it without a
+    // second LLM call.
+    const mediationCalls = runtime.oneShotPrompts.filter((entry) => entry.includes("Вопросы воркера")).length;
+    expect(store.listPendingUserInputs()[0]?.mediation?.intro).toContain("Воркер деплоит auth-сервис");
+    expect(mediationCalls).toBe(1);
+
+    expect(telegram.approvals[0]?.text).toContain("просит разрешение удалить старую БД");
+    expect(telegram.approvals[0]?.text).toContain("Рекомендация: Лучше отклонить");
+    expect(telegram.approvals[0]?.text).toContain("Оригинал запроса: Delete legacy database");
+    expect(telegram.approvals[0]?.text).toContain("Категория риска: **destructive**");
+
+    // Pressing the translated button submits the worker's ORIGINAL label.
+    telegram.push(callback(2, "cb_strategy", prompt.messageId, `ui:${prompt.inputId}:0:o0`));
+    await waitFor(() => broker.userInputResponses.length === 1);
+    expect(broker.userInputResponses[0]).toMatchObject({
+      threadId: "th_1",
+      requestId: "t3_input_1",
+      answers: { strategy: "Blue-green" },
+    });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("falls back to the direct russified prompt when mediation exceeds its budget", async () => {
+    const home = tempDirectory("daemon-mediation-fallback-");
+    const store = tempStore();
+    const runtime = new MediatingRuntime(
+      delegatingScript({ workPattern: /deploy/u, title: "Auth deploy" }),
+      // Never resolves inside the 250ms test budget: the worker prompt must
+      // still reach the chat directly.
+      () => new Promise<string>(() => {}),
+    );
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      {
+        type: "user_input_required",
+        threadId: "th_1",
+        requestId: "t3_input_1",
+        questions: [
+          {
+            id: "strategy",
+            header: "Deploy strategy",
+            question: "Which deployment strategy should be used?",
+            options: [
+              { label: "Blue-green", description: "two environments" },
+              { label: "Rolling", description: "gradual rollout" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "deploy auth service"));
+    await waitFor(() => telegram.userInputs.length === 1);
+    const prompt = telegram.userInputs[0]!;
+    expect(runtime.oneShotPrompts.length).toBeGreaterThan(0);
+    // Direct fallback: the original question with russified wrapper, original
+    // button labels, and no mediation artifacts.
+    expect(prompt.text).toContain("Which deployment strategy should be used?");
+    expect(prompt.text).toContain("Выберите один вариант.");
+    expect(prompt.text).not.toContain("Оригинал вопроса");
+    expect(prompt.labels).toEqual(["Blue-green", "Rolling"]);
+    expect(store.listPendingUserInputs()[0]?.mediation).toBeUndefined();
+
+    telegram.push(callback(2, "cb_strategy", prompt.messageId, `ui:${prompt.inputId}:0:o1`));
+    await waitFor(() => broker.userInputResponses.length === 1);
+    expect(broker.userInputResponses[0]?.answers).toEqual({ strategy: "Rolling" });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("replays a pressed ask_choices button as the user's next Operator message", async () => {
+    const home = tempDirectory("daemon-choices-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.setRuntimeState(
+      "choice_prompt:pick_test",
+      JSON.stringify({
+        chatId: 7,
+        messageId: 555,
+        ownerId: "42",
+        question: "Какой регион деплоя выбрать?",
+        labels: ["EU", "US"],
+        createdAt: nowIso(),
+      }),
+    );
+    const run = daemon.run();
+
+    telegram.push(callback(1, "cb_choice", 555, "route:pick_test:1"));
+    await waitFor(() =>
+      runtime.prompts.some((entry) => entry.includes("Пользователь выбрал вариант «US»")),
+    );
+    const record = JSON.parse(store.getRuntimeState("choice_prompt:pick_test")!) as {
+      answer?: string;
+    };
+    expect(record.answer).toBe("US");
+    expect(telegram.keyboardClears).toContain(555);
+
+    // A second press of the same keyboard is refused instead of re-fired.
+    telegram.push(callback(2, "cb_choice_again", 555, "route:pick_test:0"));
+    await waitFor(() => {
+      const processed = store.db
+        .prepare("SELECT status FROM processed_events WHERE dedupe_key=?")
+        .get("telegram-callback:cb_choice_again") as { status?: string } | undefined;
+      return processed?.status === "completed";
+    });
+    expect(
+      runtime.prompts.filter((entry) => entry.includes("Пользователь выбрал вариант")).length,
+    ).toBe(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("auto-approves only policy-allowed risk and requires Telegram confirmation for destructive work", async () => {
     const home = tempDirectory("daemon-approval-");
     const store = tempStore();
@@ -1118,7 +1352,7 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() => broker.approvalResponses.length === 1 && telegram.approvals.length === 1);
     expect(broker.approvalResponses[0]).toMatchObject({ approvalId: "read_1", decision: "accept" });
     expect(broker.approvalResponses[0]?.commandId).toBe("approval:auto:th_1:read_1");
-    expect(telegram.approvals[0]?.text).toContain("Risk category: **destructive**");
+    expect(telegram.approvals[0]?.text).toContain("Категория риска: **destructive**");
     telegram.push(
       callback(
         2,
@@ -1197,7 +1431,7 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(message(1, "run a policy classification test"));
     await waitFor(() => telegram.approvals.length === cases.length);
     for (const [index, entry] of cases.entries()) {
-      expect(telegram.approvals[index]?.text).toContain(`Risk category: **${entry.expected}**`);
+      expect(telegram.approvals[index]?.text).toContain(`Категория риска: **${entry.expected}**`);
     }
 
     telegram.finish();
@@ -2198,6 +2432,7 @@ function config(home: string): Config {
       effort: "high",
       compactThresholdPercent: 80,
       turnTimeoutMs: 600_000,
+      mediationTimeoutMs: 250,
       fullAccess: false,
       home,
       runtimeDir: `${home}/runtime`,
@@ -2521,6 +2756,23 @@ function delegatingScript(options: {
   };
 }
 
+/** DelegatingRuntime plus the out-of-session mediation side channel. */
+class MediatingRuntime extends DelegatingRuntime {
+  readonly oneShotPrompts: string[] = [];
+
+  constructor(
+    script: OperatorScript,
+    private readonly respond: (prompt: string) => Promise<string>,
+  ) {
+    super(script);
+  }
+
+  async oneShot(input: { prompt: string; timeoutMs?: number }): Promise<string> {
+    this.oneShotPrompts.push(input.prompt);
+    return this.respond(input.prompt);
+  }
+}
+
 class BlockingRuntime extends FakeRuntime {
   turnStarted = false;
   turnReleased = false;
@@ -2759,8 +3011,14 @@ function testProviderDescriptor(): ProviderDescriptor {
 class FakeTelegram implements TelegramTransport {
   readonly sent: Array<{ messageId: number; text: string; at: number }> = [];
   readonly visible: Array<{ kind: "draft" | "message"; at: number }> = [];
-  readonly userInputs: Array<{ messageId: number; inputId: string; questionIndex: number }> = [];
-  readonly userInputEdits: Array<{ messageId: number; questionIndex: number }> = [];
+  readonly userInputs: Array<{
+    messageId: number;
+    inputId: string;
+    questionIndex: number;
+    text: string;
+    labels: string[];
+  }> = [];
+  readonly userInputEdits: Array<{ messageId: number; questionIndex: number; text: string; labels: string[] }> = [];
   readonly keyboardClears: number[] = [];
   readonly approvals: Array<{ messageId: number; text: string; approvalId: string }> = [];
   readonly sentDocuments: Array<{ path: string; caption?: string }> = [];
@@ -2853,25 +3111,28 @@ class FakeTelegram implements TelegramTransport {
   }
   async sendUserInput(
     _chatId: number,
-    _text: string,
+    text: string,
     inputId: string,
     questionIndex: number,
+    choices: TelegramUserInputChoice[] = [],
   ): Promise<SentMessage> {
     const messageId = this.nextMessageId++;
-    this.userInputs.push({ messageId, inputId, questionIndex });
+    this.userInputs.push({ messageId, inputId, questionIndex, text, labels: choices.map((choice) => choice.label) });
     return { chatId: 7, messageId };
   }
   async editUserInput(
     _chatId: number,
     messageId: number,
-    _text: string,
+    text: string,
     inputId: string,
     questionIndex: number,
+    choices: TelegramUserInputChoice[] = [],
   ): Promise<void> {
+    const labels = choices.map((choice) => choice.label);
     if (!this.userInputs.some((entry) => entry.messageId === messageId)) {
-      this.userInputs.push({ messageId, inputId, questionIndex });
+      this.userInputs.push({ messageId, inputId, questionIndex, text, labels });
     }
-    this.userInputEdits.push({ messageId, questionIndex });
+    this.userInputEdits.push({ messageId, questionIndex, text, labels });
   }
   async clearInlineKeyboard(_chatId: number, messageId: number): Promise<void> {
     this.keyboardClears.push(messageId);

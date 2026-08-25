@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS pending_user_inputs (
   thread_id TEXT NOT NULL,
   questions_json TEXT NOT NULL,
   draft_answers_json TEXT NOT NULL,
+  mediation_json TEXT,
   current_question INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   telegram_chat_id INTEGER,
