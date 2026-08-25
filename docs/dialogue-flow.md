@@ -184,29 +184,47 @@ Nine lines, `undefined` filtered, joined by blank lines:
 <<<end:a3f9c1e2>>>
 ```
 
-`fenceUntrusted(content, label)` draws a fresh 4-byte random nonce per call, so
-fenced content cannot forge its own closing marker. It lives in
-`packages/shared`; `openFence(label)` hands back a reusable wrapper when several
-fields of ONE call must share ONE marker.
+The fencing core lives in `packages/shared/src/fencing.ts` and rests on three
+properties, each a separate defence:
 
-Labels: `inbound` (the owner's message), `worker` (raw worker result), `tool`
-(anything a tool result carried in from outside). Applied at these sites:
+1. **Unpredictable terminator.** `openFence(label)` draws a fresh 4-byte nonce
+   from Web Crypto per call, so content cannot forge its own close. The returned
+   wrapper is reusable: every field of ONE call shares ONE marker rather than
+   scattering a fence vocabulary per row.
+2. **Content cannot speak fence.** Every marker-shaped sequence inside fenced
+   content is defanged (a zero-width non-joiner between the angles). Without
+   this, an attacker's *opening* marker survives our close and everything after
+   it reads as a fence they opened.
+3. **Truncation cannot drop a terminator.** `truncateFenceAware(text, limit,
+   knownNonces)` is the single truncation path. It re-closes only the nonces we
+   issued — closing an attacker's marker would hand them a terminator in the
+   trusted zone — and reserves the repair budget from the limit up front, so a
+   marker-stuffed payload cannot inflate a result past its cap.
 
-| Site | What is fenced |
-| --- | --- |
-| daemon turn envelope | the inbound user text |
-| daemon `normalizeWorkerResult` | the raw worker result |
-| daemon `mediateUserInput` / `mediateApproval` | the worker's questions, approval request, and the narration-derived thread context — the worker's intermediate words on their way into the operator LLM (the Telegram delivery path is untouched) |
-| `utility.web_search` | each result's `title` and `snippet` (`url` stays raw) |
-| `email.search` | each message's `subject` and `snippet` (addresses stay raw, the Operator reuses them when replying) |
-| `calendar.list_events` | each event's `title`, `description`, `location` |
-| `artifacts.read_text` | the file body in `content` (the counters keep describing the raw window) |
+Labels are part of the contract with the model: `inbound` (the owner's message),
+`worker` (anything a T3 worker wrote), `tool` (anything a tool carried in from
+outside). All three are described in the Operator system prompt, and a test
+asserts every member of `UntrustedLabel` appears there — a new label cannot ship
+without being explained to the model.
+
+| Site | What is fenced | Label |
+| --- | --- | --- |
+| daemon turn envelope | the inbound user text | `inbound` |
+| daemon `normalizeWorkerResult` | the raw worker result | `worker` |
+| daemon `mediateUserInput` / `mediateApproval` | the worker's questions, approval request, and thread context — its intermediate words on the way into the operator LLM (the Telegram delivery path is untouched) | `worker` |
+| daemon `buildOperatorMemorySnapshot` | thread titles, short summaries, and every prose field of the structured summaries, under one marker for the whole snapshot | `worker` |
+| `t3.get_thread_status` / `get_thread_summary` / `get_thread` / `search_threads` / `memory.search` | worker-written titles and summary prose | `worker` |
+| `utility.web_search` | each result's `title` and `snippet` (`url` stays raw) | `tool` |
+| `email.search` | `subject`, `snippet`, and the display names; the connector splits a bare validated `fromAddress`/`toAddress` out of each header and normalizes `date` to ISO, so those stay raw and reusable | `tool` |
+| `calendar.list_events` | each event's `title`, `description`, `location` | `tool` |
+| `artifacts.read_text` | the file body in `content` (the counters keep describing the raw window) | `tool` |
 
 Fencing is deliberately per-field, not applied at `compactResult`: structural
 JSON (`t3.list_projects` and friends) is not fenced, since a fence around ids
-and timestamps is noise. Truncation is fence-aware — `closeDanglingFences`
-re-closes any marker that a length cap cut short, so a clipped blob can never
-run on as prompt.
+and timestamps is noise. Where a shape cannot be fenced as expected, the tool
+layer throws rather than returning the text unfenced — a security control that
+degrades silently is worse than none, because the call site keeps claiming the
+text was fenced.
 
 **Daemon owns** the reply→thread mapping, durable focus, forwarded/own split,
 artifact registration, OCR and transcript glue, role, destination, and the fence.
@@ -818,9 +836,10 @@ files, refresh thread summaries, the compaction gate, the journal-retention gate
 
 ## Three decisions worth keeping
 
-1. **Structural fencing with a per-turn random marker.** Untrusted content
-   cannot forge its own closing marker, and the rule covers both directions —
-   inbound user text and raw worker output.
+1. **Structural fencing with a random per-call marker.** Untrusted content can
+   neither forge its own closing marker nor open one, and the rule covers every
+   direction — inbound user text, worker output and summaries, and everything
+   the tools carry in from the web, mailboxes, calendars and files.
 2. **A locked-down default runtime.** No shell, no filesystem, two web tools and
    one process-scoped MCP. Everything substantial is delegated to a T3 thread
    that has its own workspace and its own approval surface.
