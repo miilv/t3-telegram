@@ -19,6 +19,7 @@ import type {
   TelegramCallbackInbound,
   TelegramChatAction,
   TelegramDestination,
+  TelegramFileRef,
   TelegramForwardOrigin,
   TelegramGalleryItem,
   TelegramHealth,
@@ -588,16 +589,22 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   async downloadFile(fileId: string): Promise<Uint8Array> {
+    const fetched = await this.fetchFile(fileId);
+    if ("bytes" in fetched) return fetched.bytes;
+    return new Uint8Array(await readFile(fetched.localPath));
+  }
+
+  async fetchFile(fileId: string): Promise<TelegramFileRef> {
     const file = await this.bot.api.getFile(fileId);
     if (!file.file_path) throw new Error("Telegram did not return a file path");
     // A local Bot API server has already written the file to its working
-    // directory and returns that absolute path; read it instead of asking the
-    // server to stream its own file back over HTTP.
+    // directory and returns that absolute path; hand the path back so the
+    // caller can stream/copy from disk instead of buffering the whole file.
     const local = this.localFilePath(file.file_path);
-    if (local) return new Uint8Array(await readFile(local));
+    if (local) return { localPath: local };
     const response = await this.fetchImpl(`${this.apiBase}/file/bot${this.token}/${file.file_path}`);
     if (!response.ok) throw new Error(`Telegram file download failed: ${response.status} ${response.statusText}`);
-    return new Uint8Array(await response.arrayBuffer());
+    return { bytes: new Uint8Array(await response.arrayBuffer()) };
   }
 
   /** Map a local server's absolute file path onto the daemon's filesystem. */

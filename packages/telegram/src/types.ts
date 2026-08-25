@@ -187,6 +187,9 @@ export interface TelegramSendProgress {
   onChunkSent?: (completedChunks: number, sent: SentMessage[]) => void;
 }
 
+/** An inbound Telegram file: either already on the daemon's disk or buffered. */
+export type TelegramFileRef = { localPath: string } | { bytes: Uint8Array };
+
 export interface TelegramTransport {
   updates(signal?: AbortSignal): AsyncIterable<TelegramInbound>;
   sendRich(
@@ -248,6 +251,13 @@ export interface TelegramTransport {
   clearInlineKeyboard(chatId: number, messageId: number): Promise<void>;
   answerCallback(callbackId: string, text?: string): Promise<void>;
   downloadFile(fileId: string): Promise<Uint8Array>;
+  /**
+   * Fetch a file as a host-filesystem path when a local Bot API server already
+   * wrote it to disk (so large media never has to pass through daemon memory),
+   * or as buffered bytes from the cloud Bot API otherwise. Optional so plain
+   * cloud transports and test fakes can keep exposing downloadFile alone.
+   */
+  fetchFile?: ((fileId: string) => Promise<TelegramFileRef>) | undefined;
   react(chatId: number, messageId: number, emoji: string): Promise<void>;
   sendChatAction(chatId: number, action: TelegramChatAction, destination?: TelegramDestination): Promise<void>;
   health(): Promise<TelegramHealth>;

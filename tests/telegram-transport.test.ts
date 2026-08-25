@@ -423,6 +423,54 @@ describe("local Bot API file downloads", () => {
     expect(fileFetches).toBe(0);
   });
 
+  it("fetchFile hands back the host path locally and buffered bytes from the cloud (bug №24)", async () => {
+    const root = tempDirectory("local-botapi-fetchfile-");
+    const relative = "1234:token/videos/file_2.mp4";
+    const target = join(root, relative);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "big-video-bytes");
+    const localFetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          result: { file_id: "f", file_unique_id: "u", file_path: `/var/lib/telegram-bot-api/${relative}` },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const local = new TelegramBotTransport(
+      "test-token",
+      42,
+      1,
+      logger,
+      "http://127.0.0.1:8081",
+      localFetch,
+      { serverRoot: "/var/lib/telegram-bot-api", hostRoot: root },
+    );
+    expect(await local.fetchFile("f")).toEqual({ localPath: target });
+
+    const cloudFetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/file/")) return new Response("cloud-bytes", { status: 200 });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          result: { file_id: "f", file_unique_id: "u", file_path: "documents/file_3.pdf" },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const cloud = new TelegramBotTransport(
+      "test-token",
+      42,
+      1,
+      logger,
+      "https://api.telegram.org",
+      cloudFetch,
+    );
+    const fetched = await cloud.fetchFile("f");
+    expect("bytes" in fetched && Buffer.from(fetched.bytes).toString()).toBe("cloud-bytes");
+  });
+
   it("refuses a local-server path that escapes the configured root", async () => {
     const root = tempDirectory("local-botapi-escape-");
     const fetchImpl = (async () =>
