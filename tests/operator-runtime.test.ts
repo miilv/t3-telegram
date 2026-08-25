@@ -144,6 +144,75 @@ process.stdin.on("end", () => {
     });
   });
 
+  it("strips credential-shaped variables by name while keeping the CLI's own auth (bug №43)", async () => {
+    const directory = tempDirectory("fake-claude-env-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const sessionIndex = process.argv.indexOf("--session-id");
+  const session = process.argv[sessionIndex + 1];
+  const names = Object.keys(process.env).sort();
+  console.log(JSON.stringify({ type: "result", result: JSON.stringify(names), session_id: session }));
+});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const injected: Record<string, string> = {
+      // Never in the historical blocklist: the pattern must still catch them.
+      OPENROUTER_API_KEY: "must-not-leak",
+      MY_SERVICE_BEARER: "must-not-leak",
+      DB_PASSWORD: "must-not-leak",
+      WB_SELLER_SECRET: "must-not-leak",
+      SOME_CREDENTIAL_BLOB: "must-not-leak",
+      TELEGRAM_BOT_TOKEN: "must-not-leak",
+      // Explicitly injected per turn only; the inherited value must not pass.
+      T3_OPERATOR_MCP_CAPABILITY: "stale-capability",
+      // The CLI's own auth family must keep working.
+      ANTHROPIC_API_KEY: "cli-owned",
+      CLAUDE_CODE_OAUTH_TOKEN: "cli-owned",
+      // Benign names never match the credential pattern.
+      OPERATOR_HOME: directory,
+    };
+    const previous = Object.fromEntries(Object.keys(injected).map((key) => [key, process.env[key]]));
+    Object.assign(process.env, injected);
+    try {
+      const runtime = new ClaudeCliOperatorRuntime({
+        binary,
+        cwd: directory,
+        model: "opus",
+        effort: "high",
+      });
+      const session = await runtime.start({ systemPrompt: "system" });
+      let visible: string[] = [];
+      for await (const event of runtime.sendTurn({ sessionId: session.id, prompt: "env" })) {
+        if (event.type === "result") visible = JSON.parse(event.text) as string[];
+      }
+      for (const stripped of [
+        "OPENROUTER_API_KEY",
+        "MY_SERVICE_BEARER",
+        "DB_PASSWORD",
+        "WB_SELLER_SECRET",
+        "SOME_CREDENTIAL_BLOB",
+        "TELEGRAM_BOT_TOKEN",
+        "T3_OPERATOR_MCP_CAPABILITY",
+      ]) {
+        expect(visible).not.toContain(stripped);
+      }
+      for (const kept of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPERATOR_HOME", "PATH"]) {
+        expect(visible).toContain(kept);
+      }
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("keeps ambient slash commands disabled except for the built-in compaction turn", async () => {
     const directory = tempDirectory("fake-claude-compact-");
     const binary = join(directory, "claude");
