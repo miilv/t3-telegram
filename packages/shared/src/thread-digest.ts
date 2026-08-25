@@ -15,9 +15,10 @@
  *     survives; only an exact re-emission of the thread's latest one is dropped
  *     (the broker replays on resubscribe).
  *
- * Ordering: a coalesced item keeps the position of the FIRST event of its run,
- * so the digest reads in the order the threads spoke, and per-thread order is
- * never reordered.
+ * Ordering is the contract: progress only ever merges into the thread's LAST
+ * item (so `progress → agent_message → progress` keeps the fresh frame after
+ * the message it followed), and a completion takes the place of the LAST frame
+ * it evicted. Per-thread order is therefore never rewritten.
  *
  * The accumulator owns no delivery and no I/O: it hands finished digests to
  * `onFlush`, which the daemon runs on the `thread-events` lane of its LaneQueue.
@@ -83,11 +84,7 @@ export class ThreadEventDigest {
     this.arm();
   }
 
-  /** Pending items, in digest order. Reading does not consume them. */
-  peek(): ThreadDigestItem[] {
-    return this.items.map((item) => ({ ...item }));
-  }
-
+  /** Pending item count — introspection for tests and for 1.2's flush gate. */
   size(): number {
     return this.items.length;
   }
@@ -101,12 +98,16 @@ export class ThreadEventDigest {
 
   /** Hand the pending digest over immediately, bypassing the quiet window. */
   async flush(): Promise<void> {
-    // A flush already in flight owns the items it took; anything pushed since
-    // belongs to the next window, so serialize rather than interleave.
+    // The snapshot is taken SYNCHRONOUSLY. Taking it inside the chained
+    // continuation instead let an event that arrived between the timer firing
+    // and the take() be carried off by the previous window — while the timer it
+    // armed stayed pending over an empty queue.
+    const items = this.take();
+    if (!items.length) return;
+    // Deliveries are serialized: a digest still in flight owns its items, and
+    // the next window waits rather than interleaving with it.
     const previous = this.flushing ?? Promise.resolve();
     const run = previous.then(async () => {
-      const items = this.take();
-      if (!items.length) return;
       try {
         await this.options.onFlush(items);
       } catch (error) {
@@ -133,24 +134,41 @@ export class ThreadEventDigest {
     }, this.windowMs);
   }
 
+  private lastOf(threadId: string): ThreadDigestItem | undefined {
+    for (let index = this.items.length - 1; index >= 0; index -= 1) {
+      const item = this.items[index]!;
+      if (item.threadId === threadId) return item;
+    }
+    return undefined;
+  }
+
   private pushProgress(threadId: string, text: string, at: number): void {
-    const existing = this.items.find((item) => item.threadId === threadId && item.kind === "progress");
-    if (existing) {
-      existing.text = text;
-      existing.collapsed += 1;
-      existing.lastAt = at;
+    const last = this.lastOf(threadId);
+    // Merge only into a progress frame that is still the thread's last word.
+    // Merging into an older one would float a fresh frame above the message
+    // that came after it.
+    if (last?.kind === "progress") {
+      last.text = text;
+      last.collapsed += 1;
+      last.lastAt = at;
       return;
     }
-    // A completion already in the digest means this thread is done as far as
-    // the digest is concerned; a late progress frame is stale by construction.
-    if (this.items.some((item) => item.threadId === threadId && item.kind === "completion")) return;
+    // The thread already finished as far as this window is concerned; a late
+    // progress frame is stale by construction.
+    if (last?.kind === "completion") return;
     this.items.push({ kind: "progress", threadId, text, collapsed: 1, firstAt: at, lastAt: at });
   }
 
   private pushAgentMessage(threadId: string, text: string, at: number): void {
-    const latest = [...this.items].reverse().find((item) => item.threadId === threadId);
-    if (latest?.kind === "agent_message" && latest.text === text) {
-      latest.lastAt = at;
+    // A broker replay can interleave progress with the messages it repeats, so
+    // the duplicate check spans every message this thread wrote in the window,
+    // not just its latest item.
+    const duplicate = this.items.find(
+      (item) => item.threadId === threadId && item.kind === "agent_message" && item.text === text,
+    );
+    if (duplicate) {
+      duplicate.lastAt = at;
+      duplicate.collapsed += 1;
       return;
     }
     this.items.push({ kind: "agent_message", threadId, text, collapsed: 1, firstAt: at, lastAt: at });
@@ -163,16 +181,23 @@ export class ThreadEventDigest {
     let collapsed = 1;
     let firstAt = at;
     let position = -1;
-    for (let index = this.items.length - 1; index >= 0; index -= 1) {
-      const item = this.items[index]!;
-      if (item.threadId !== event.threadId) continue;
-      if (item.kind === "progress" || item.kind === "completion") {
-        collapsed += item.collapsed;
-        firstAt = Math.min(firstAt, item.firstAt);
-        position = index;
-        this.items.splice(index, 1);
+    const kept: ThreadDigestItem[] = [];
+    for (const existing of this.items) {
+      const evicted =
+        existing.threadId === event.threadId &&
+        (existing.kind === "progress" || existing.kind === "completion");
+      if (!evicted) {
+        kept.push(existing);
+        continue;
       }
+      collapsed += existing.collapsed;
+      firstAt = Math.min(firstAt, existing.firstAt);
+      // Where this frame sat among the survivors; the LAST eviction wins, so
+      // the completion lands where the thread last spoke, not where it started.
+      position = kept.length;
     }
+    this.items.length = 0;
+    this.items.push(...kept);
     const item: ThreadDigestItem = {
       kind: "completion",
       threadId: event.threadId,
@@ -182,8 +207,6 @@ export class ThreadEventDigest {
       firstAt,
       lastAt: at,
     };
-    // Take the place of the frames it replaced, so a thread that has been
-    // talking keeps its slot in the digest instead of jumping to the end.
     if (position >= 0) this.items.splice(position, 0, item);
     else this.items.push(item);
   }

@@ -59,6 +59,7 @@ import {
 } from "./lifecycle.js";
 import type { ArtifactRegistry } from "../../../packages/artifacts/src/index.js";
 import type {
+  InboundMessageSignal,
   SentMessage,
   TelegramAttachment,
   TelegramDestination,
@@ -258,6 +259,16 @@ export class OperatorDaemon {
   private readonly monitorRoutes = new Map<string, MonitorRoute>();
   /** Chat/initiator of each in-flight direct Operator turn (bug №1, package 1.1). */
   private readonly activeOperatorTurns = new Set<ActiveOperatorTurn>();
+  /**
+   * Package 1.1: newest real inbound message id per `chatId:userId`. Telegram
+   * numbers messages monotonically per chat, so "there is something newer than
+   * what I am answering" is a comparison, not a clock. In-memory by design: a
+   * restart replays the pending jobs and the first message of the new run
+   * re-establishes the mark.
+   */
+  private readonly inboundWatermark = new Map<string, number>();
+  /** Package 1.1: a background ingress drain is queued; queueing a second is pointless. */
+  private backgroundDrainQueued = false;
   /** Rate-limits the bug-№37 head-of-line warnings per outbox item. */
   private readonly blockedOutboxWarnedAt = new Map<string, number>();
   /** Shared throttle for out-of-band delivery alerts, keyed by recipient chat (package 0.7). */
@@ -286,9 +297,7 @@ export class OperatorDaemon {
   ) {
     // Package 1.1: wired in the constructor, not in initialize(), so preemption
     // is live for any consumer that starts run() on its own.
-    this.telegram.onInboundMessage?.((message) =>
-      this.preemptOperatorTurn(message.chatId, message.userId),
-    );
+    this.telegram.setInboundObserver?.((message) => this.noteInboundMessage(message));
   }
 
   async initialize(): Promise<void> {
@@ -432,9 +441,9 @@ export class OperatorDaemon {
    * `interrupt()` is not declared async — it can throw synchronously as well as
    * reject. A user typing a cancel word must never be able to kill the daemon.
    */
-  private interruptQuietly(): void {
+  private interruptQuietly(turnToken?: string): void {
     try {
-      void Promise.resolve(this.runtime.interrupt()).catch((error: unknown) => {
+      void Promise.resolve(this.runtime.interrupt(turnToken)).catch((error: unknown) => {
         this.logger.warn({ err: error }, "Operator interrupt failed");
       });
     } catch (error) {
@@ -1261,36 +1270,91 @@ export class OperatorDaemon {
   }
 
   /**
+   * Package 1.1 — the preemption watermark: the newest real message id seen
+   * from this owner in this chat. Keyed by chat AND user on purpose. "I may
+   * stop your turn" (the cancel-word ACL, which lets an administrator in) is
+   * not "my message replaces yours": in a group, an admin writing must never
+   * discard a member's answer. Only your own newer message supersedes your turn.
+   */
+  private inboundWatermarkKey(chatId: number, userId: number): string {
+    return `${chatId}:${userId}`;
+  }
+
+  /**
    * Package 1.1 — preemption. Single-voice: the owner's newest message is the
-   * conversation, so ANY message of theirs arriving while a turn of theirs runs
-   * in this chat wins. The running turn is marked superseded (it will neither
-   * deliver its half-written final nor replay), the provider gets an interrupt,
-   * and the message itself continues down the ordinary ingress path — durable
-   * job, batching, new turn. Nothing is said in the chat about it.
+   * conversation, so ANY message of theirs supersedes their own turn in that
+   * chat. Two things happen here, and they cover different windows:
    *
-   * This fires on the RAW message, before the 2 s batch window closes, so the
+   *  - the watermark moves, which supersedes turns that have not reached the
+   *    provider yet — one still queued behind the drain, or one spending
+   *    seconds on OCR/transcription before it ever registers as in-flight;
+   *  - every in-flight turn of this user in this chat is flagged and its
+   *    provider call interrupted, which covers the turn already streaming.
+   *
+   * It fires on the RAW message, before the 2 s batch window closes, so the
    * first message of a burst frees the turn slot while the rest of the burst is
    * still being glued into the one job that will replace it.
    *
    * Worker threads are untouched: this is `runtime.interrupt()`, never
-   * `broker.interruptThread`.
+   * `broker.interruptThread`. Nothing is said in the chat by the daemon — but
+   * the superseded turn may already have sent something through its tools, so
+   * the next turn is told about it (see `chat_pending:`).
    */
+  private noteInboundMessage(signal: InboundMessageSignal): void {
+    const key = this.inboundWatermarkKey(signal.chatId, signal.userId);
+    // An edit reuses an old message id: it must never move a watermark
+    // backwards, and it must never look newer than the message it edits.
+    if (!signal.edited) {
+      const previous = this.inboundWatermark.get(key) ?? 0;
+      if (signal.messageId > previous) this.inboundWatermark.set(key, signal.messageId);
+    }
+    this.preemptOperatorTurn(signal.chatId, signal.userId);
+  }
+
   private preemptOperatorTurn(chatId: number, userId: number): void {
-    const turns = this.interruptibleTurns(chatId, userId).filter((turn) => !turn.superseded);
+    const turns = [...this.activeOperatorTurns].filter(
+      (turn) => turn.chatId === chatId && turn.userId === userId && !turn.superseded,
+    );
     if (!turns.length) return;
     for (const turn of turns) {
-      turn.superseded = true;
-      this.store.appendEvent("operator.turn.superseded", {
-        correlationId: turn.operatorTurnId ?? `chat:${chatId}`,
-        payload: {
-          ...(turn.operatorTurnId ? { operatorTurnId: turn.operatorTurnId } : {}),
-          ingressJobId: turn.ingressJobId,
-          reason: "owner_message",
-        },
-      });
+      this.markTurnSuperseded(turn, "owner_message");
+      // Per turn, not per preemption: N turns superseded must count as N.
+      metrics.increment("operator_turns_superseded_total");
     }
-    metrics.increment("operator_turns_superseded_total");
-    this.interruptQuietly();
+    // Named so a preemption that lost its race cannot kill whatever call took
+    // the runtime slot next — maintenance, mediation, memory work.
+    for (const turn of turns) this.interruptQuietly(turn.operatorTurnId);
+  }
+
+  private markTurnSuperseded(turn: ActiveOperatorTurn, reason: string): void {
+    // One turn, one supersede record: the watermark check runs twice per turn
+    // and the observer may have flagged it already.
+    if (turn.superseded) return;
+    turn.superseded = true;
+    this.store.appendEvent("operator.turn.superseded", {
+      correlationId: turn.operatorTurnId ?? `chat:${turn.chatId}`,
+      payload: {
+        ...(turn.operatorTurnId ? { operatorTurnId: turn.operatorTurnId } : {}),
+        ingressJobId: turn.ingressJobId,
+        reason,
+      },
+    });
+  }
+
+  /**
+   * Package 1.1: has the owner spoken again since the message this turn is
+   * answering? Checked at the top of `answerDirect` and again before the final
+   * is enqueued, so a queued turn and a running turn are governed by ONE rule.
+   *
+   * Synthetic updates (automation runs, choice answers) never come through the
+   * transport and carry negative ids, so they are out of scope; an edit reuses
+   * an old id and is compared by the in-flight flag alone.
+   */
+  private inboundSupersedes(update: Extract<TelegramInbound, { type: "message" }>): boolean {
+    if (update.synthetic || update.edited) return false;
+    const newest = this.inboundWatermark.get(this.inboundWatermarkKey(update.chatId, update.userId));
+    if (newest === undefined) return false;
+    return newest > Math.max(...update.messageIds);
   }
 
   private async answerDirect(
@@ -1310,6 +1374,17 @@ export class OperatorDaemon {
       return;
     }
     const correlationId = correlationForUpdate(update);
+    // Package 1.1: the owner has already moved on — a newer message of theirs
+    // was accepted while this one waited in the queue, or while its media were
+    // being downloaded and transcribed. Running the turn would answer a
+    // question that no longer stands and burn the single turn slot doing it.
+    if (turn && !turn.superseded && this.inboundSupersedes(update)) {
+      this.markTurnSuperseded(turn, "newer_owner_message");
+    }
+    if (turn?.superseded) {
+      this.recordSupersededTurn(update, operatorTurnId, correlationId, 0);
+      return;
+    }
     this.store.appendEvent("operator.turn.started", {
       correlationId,
       payload: { operatorTurnId },
@@ -1348,6 +1423,7 @@ export class OperatorDaemon {
         ? { directMessagesTopicId: update.directMessagesTopicId }
         : {}),
     });
+    const supersededNote = this.consumeSupersededNote(update);
     const replyThread = replyThreadId ? this.store.getThread(replyThreadId) : undefined;
     const replyProject = replyThread ? this.store.getProject(replyThread.projectId) : undefined;
     const focusThread = focus.primary?.threadId ? this.store.getThread(focus.primary.threadId) : undefined;
@@ -1373,6 +1449,7 @@ export class OperatorDaemon {
       focus.primary
         ? `Current durable work focus: ${focus.primary.topic}${focusThread ? ` (thread "${focusThread.title}", threadId ${focusThread.id})` : ""}. Follow-ups refer to it; do not change it for unrelated side questions.`
         : "No current durable work focus.",
+      supersededNote,
       priorJobThreads.length
         ? `Recovery note: a previous attempt of THIS SAME request already dispatched work to thread(s) ${priorJobThreads
             .map((threadId) => {
@@ -1413,8 +1490,14 @@ export class OperatorDaemon {
     let finalText: string;
     let messageType = "operator_answer";
     let retryDelayMs: number | undefined;
-    const runTurn = () =>
-      this.askOperator(
+    const runTurn = async (): Promise<string> => {
+      // Package 1.1: the preemption can land in the gap between the entry check
+      // and the provider call — `startDraft` is a network round trip. The
+      // interrupt token would find nothing to interrupt there, so the turn
+      // would run to completion only to be dropped, with the owner's new turn
+      // waiting behind it. Spend no provider turn on an undeliverable answer.
+      if (turn?.superseded) return "";
+      return this.askOperator(
         prompt,
         (delta) => {
           if (!observedFirstToken) {
@@ -1434,15 +1517,20 @@ export class OperatorDaemon {
           // which is what the T3 thread shows too.
           if (toolSteps === 1) writer?.reset("⏳ Работаю…");
         },
+        operatorTurnId,
       );
+    };
     try {
       const answer = await runTurn();
       if (writer && !writer.text && answer) writer.append(answer);
       finalText = answer || writer?.text || "Не смог сформировать ответ.";
-      this.store.appendEvent("operator.turn.completed", {
-        correlationId,
-        payload: { operatorTurnId, attempt },
-      });
+      // A superseded turn is not a completed one; it gets `dropped` below.
+      if (!turn?.superseded) {
+        this.store.appendEvent("operator.turn.completed", {
+          correlationId,
+          payload: { operatorTurnId, attempt },
+        });
+      }
     } catch (error) {
       // A faceless «Не удалось ответить…» explains nothing; classify the
       // failure into human terms and give transient classes (rate limit,
@@ -1480,15 +1568,16 @@ export class OperatorDaemon {
     // Package 1.1: preemption. A newer owner message replaced this turn while
     // it ran, so whatever the interrupted provider left behind is not an answer
     // to anything the owner is still waiting for — it must not be delivered and
-    // must not be replayed. The check sits between the runtime and the outbox
-    // on purpose: once the final row exists the answer is durable and a later
-    // message only starts the next turn (memory-design §1 — preemption after
-    // send never rolls back what the session already accepted).
+    // must not be replayed. The same rule as the entry check, applied again
+    // because the message may have landed mid-turn. It sits between the runtime
+    // and the outbox on purpose: once the final row exists the answer is
+    // durable and a later message only starts the next turn (memory-design §1 —
+    // preemption after send never rolls back what the session accepted).
+    if (turn && !turn.superseded && this.inboundSupersedes(update)) {
+      this.markTurnSuperseded(turn, "newer_owner_message");
+    }
     if (turn?.superseded) {
-      this.store.appendEvent("operator.turn.dropped", {
-        correlationId,
-        payload: { operatorTurnId, attempt, reason: "superseded" },
-      });
+      this.recordSupersededTurn(update, operatorTurnId, correlationId, attempt);
       await this.discardDraft(writer);
       return;
     }
@@ -1519,6 +1608,81 @@ export class OperatorDaemon {
         await this.answerDirect(update, focus, artifacts, replyThreadId, attempt + 1, turn);
       }
     }
+  }
+
+  /**
+   * Package 1.1: close the books on a superseded turn. Besides the audit
+   * event, it hands the NEXT turn in this chat the one fact it cannot derive:
+   * a message of the owner's went unanswered, and any durable work that turn
+   * had already dispatched is still running. `job_thread:` is keyed by ingress
+   * job, and the superseding message is a different job — so the note is
+   * re-keyed per chat here and consumed once, by the next turn.
+   */
+  private recordSupersededTurn(
+    update: Extract<TelegramInbound, { type: "message" }>,
+    operatorTurnId: string,
+    correlationId: string,
+    attempt: number,
+  ): void {
+    this.store.appendEvent("operator.turn.dropped", {
+      correlationId,
+      payload: { operatorTurnId, attempt, reason: "superseded" },
+    });
+    const ingressJobId = telegramIngressJobId(update);
+    const dispatched = (this.store.getRuntimeState(`job_thread:${ingressJobId}`) ?? "")
+      .split(",")
+      .filter(Boolean);
+    const existing = this.readChatPending(update.chatId);
+    // Two supersessions in a row must not lose the first one's threads.
+    const threadIds = [...new Set([...(existing?.threadIds ?? []), ...dispatched])];
+    this.store.setRuntimeState(
+      `chat_pending:${update.chatId}`,
+      JSON.stringify({ messageIds: update.messageIds, threadIds }),
+    );
+  }
+
+  private readChatPending(chatId: number): { messageIds: number[]; threadIds: string[] } | undefined {
+    const raw = this.store.getRuntimeState(`chat_pending:${chatId}`);
+    if (!raw) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!isRecord(parsed)) return undefined;
+      const messageIds = Array.isArray(parsed.messageIds) ? parsed.messageIds.filter((id): id is number => typeof id === "number") : [];
+      const threadIds = Array.isArray(parsed.threadIds) ? parsed.threadIds.filter((id): id is string => typeof id === "string") : [];
+      return { messageIds, threadIds };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Package 1.1: one envelope line telling the agent that the owner's previous
+   * message was replaced by this one. Deliberately NOT "answer it too" — that
+   * would be two answers to one voice; it exists so the agent does not
+   * re-dispatch work that is already running, and does not treat a dangling
+   * reference in the new message as coming out of nowhere.
+   */
+  private consumeSupersededNote(update: Extract<TelegramInbound, { type: "message" }>): string | undefined {
+    const pending = this.readChatPending(update.chatId);
+    if (!pending) return undefined;
+    // The record belongs to this very update (a replay of the superseded job):
+    // the ordinary recovery note already covers that case.
+    const sameMessage = pending.messageIds.some((id) => update.messageIds.includes(id));
+    if (sameMessage) return undefined;
+    this.store.setRuntimeState(`chat_pending:${update.chatId}`, "");
+    const threads = pending.threadIds
+      .map((threadId) => {
+        const thread = this.store.getThread(threadId);
+        return thread ? `"${thread.title}" (threadId ${threadId})` : `threadId ${threadId}`;
+      })
+      .join(", ");
+    return [
+      "The owner's previous message was superseded by this one and never answered.",
+      threads
+        ? `Durable work it had already started is still running in thread(s) ${threads} — do NOT dispatch it again.`
+        : "No durable work was dispatched for it.",
+      "Answer only the current message; do not produce a separate answer to the earlier one.",
+    ].join(" ");
   }
 
   /**
@@ -4063,9 +4227,7 @@ export class OperatorDaemon {
         await this.flushTelegramOutbox();
         this.warnBlockedTelegramOutboxHeads();
         await this.drainT3Dispatches();
-        // The 1 s safety pump is background: it exists to catch what the user
-        // lane already tried, so it must never sit in front of a live message.
-        await this.operatorInputQueue.run("background", () => this.drainTelegramIngress());
+        this.queueBackgroundIngressDrain();
       } catch (error) {
         this.logger.warn(
           { errorCode: classifyOperationalError(error).code },
@@ -4074,6 +4236,32 @@ export class OperatorDaemon {
       }
       await delay(1_000, this.shutdown.signal);
     }
+  }
+
+  /**
+   * Package 1.1: hand a safety drain to the background lane WITHOUT waiting for
+   * it. Awaiting the lane from the reliability pump made the whole pump hostage
+   * to the chat: while the user lane kept winning, `requeueUncertain`,
+   * `flushTelegramOutbox`, the head-of-line warnings and the T3 dispatch drain
+   * all stopped running. The flag keeps one drain in flight at a time and is
+   * cleared as the task starts, so a request that arrives while it runs queues
+   * the next one.
+   */
+  private queueBackgroundIngressDrain(): void {
+    if (this.backgroundDrainQueued) return;
+    this.backgroundDrainQueued = true;
+    void this.operatorInputQueue
+      .run("background", async () => {
+        this.backgroundDrainQueued = false;
+        await this.drainTelegramIngress();
+      })
+      .catch((error: unknown) => {
+        this.backgroundDrainQueued = false;
+        this.logger.warn(
+          { errorCode: classifyOperationalError(error).code },
+          "Background ingress drain failed; durable jobs remain pending",
+        );
+      });
   }
 
   /**
@@ -4779,6 +4967,12 @@ export class OperatorDaemon {
     onDelta?: (delta: string) => void,
     toolAccess?: OperatorToolAccess,
     onToolStarted?: (tool: string) => void,
+    /**
+     * Package 1.1: names this turn inside the runtime, so a preemption that
+     * arrives after the turn released the slot cannot kill the maintenance,
+     * mediation or memory call that took it next.
+     */
+    turnToken?: string,
   ): Promise<string> {
     return this.operatorRuntimeQueue.run(async () => {
       let streamed = "";
@@ -4802,6 +4996,7 @@ export class OperatorDaemon {
           sessionId: this.operatorSessionId,
           prompt,
           ...(toolAccess ? { toolAccess } : {}),
+          ...(turnToken ? { turnToken } : {}),
         })) {
           if (event.type === "text_delta") {
             streamed += event.text;
@@ -4839,6 +5034,7 @@ export class OperatorDaemon {
             sessionId: this.operatorSessionId,
             prompt,
             ...(toolAccess ? { toolAccess } : {}),
+            ...(turnToken ? { turnToken } : {}),
           })) {
             if (event.type === "text_delta") {
               streamed += event.text;

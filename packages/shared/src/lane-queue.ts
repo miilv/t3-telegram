@@ -30,9 +30,11 @@ interface LaneEntry {
 }
 
 export class LaneQueue {
-  private readonly lanes = new Map<OperatorLane, LaneEntry[]>(
-    OPERATOR_LANES.map((lane) => [lane, [] as LaneEntry[]]),
-  );
+  private readonly lanes: Record<OperatorLane, LaneEntry[]> = {
+    user: [],
+    "thread-events": [],
+    background: [],
+  };
   private running = false;
   private idleWaiters: Array<() => void> = [];
 
@@ -43,7 +45,7 @@ export class LaneQueue {
    */
   run<T>(lane: OperatorLane, task: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      this.lanes.get(lane)!.push({
+      this.lanes[lane].push({
         task: task as () => Promise<unknown>,
         resolve: resolve as (value: never) => void,
         reject,
@@ -58,11 +60,15 @@ export class LaneQueue {
     await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
   }
 
-  /** Queued (not yet started) task count, per lane or in total. */
+  /**
+   * Queued (not yet started) task count, per lane or in total. Introspection
+   * for tests and for the 1.5 watchdog, which needs "someone is waiting" to
+   * decide a turn is wedged; `idle()` alone cannot express that.
+   */
   depth(lane?: OperatorLane): number {
-    if (lane) return this.lanes.get(lane)!.length;
+    if (lane) return this.lanes[lane].length;
     let total = 0;
-    for (const entries of this.lanes.values()) total += entries.length;
+    for (const entries of Object.values(this.lanes)) total += entries.length;
     return total;
   }
 
@@ -101,7 +107,7 @@ export class LaneQueue {
 
   private takeNext(): LaneEntry | undefined {
     for (const lane of OPERATOR_LANES) {
-      const entries = this.lanes.get(lane)!;
+      const entries = this.lanes[lane];
       if (entries.length) return entries.shift();
     }
     return undefined;

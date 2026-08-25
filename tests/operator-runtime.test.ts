@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import { describe, expect, it } from "vitest";
@@ -307,6 +307,167 @@ process.stdin.on("end", () => {});
     await expect(runtime.compact("dead turn")).rejects.toThrow(
       "compaction turn ended without a confirmed result",
     );
+  });
+
+  it("resumes a session whose very first turn was interrupted (package 1.1)", async () => {
+    const directory = tempDirectory("fake-claude-interrupted-new-");
+    const binary = join(directory, "claude");
+    const argvLog = join(directory, "argv.log");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+const sessionIndex = process.argv.indexOf("--session-id");
+const resumeIndex = process.argv.indexOf("--resume");
+const session = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : process.argv[resumeIndex + 1];
+process.stdin.resume();
+process.stdin.on("end", () => {
+  console.log(JSON.stringify({ type: "result", result: "partial", session_id: session }));
+  // The provider accepted the turn and then hangs: SIGINT arrives here, after
+  // the result — exactly the shape of a preempted first turn.
+  if (process.argv.includes("--session-id")) setTimeout(() => {}, 60_000);
+});
+process.on("SIGINT", () => process.exit(130));
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+      interruptGraceMs: 50,
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+
+    await expect(
+      (async () => {
+        for await (const event of runtime.sendTurn({
+          sessionId: session.id,
+          prompt: "первый",
+          turnToken: "turn-1",
+        })) {
+          // The result is what marks the session as the provider's; interrupt
+          // right after it, the way a preemption does.
+          if (event.type === "result") void runtime.interrupt("turn-1");
+        }
+      })(),
+    ).rejects.toThrow(/exited/);
+
+    for await (const event of runtime.sendTurn({ sessionId: session.id, prompt: "второй" })) {
+      if (event.type === "result") expect(event.text).toBe("partial");
+    }
+
+    const invocations = readFileSync(argvLog, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(invocations).toHaveLength(2);
+    expect(invocations[0]).toContain("--session-id");
+    // Before package 1.1 the interrupted first turn left the session flagged as
+    // new, and this second turn forked it with --session-id + --system-prompt.
+    expect(invocations[1]).toContain("--resume");
+    expect(invocations[1]).not.toContain("--session-id");
+    expect(invocations[1]).not.toContain("--system-prompt");
+  });
+
+  it("ignores an interrupt aimed at a turn that no longer owns the runtime (package 1.1)", async () => {
+    const directory = tempDirectory("fake-claude-token-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+process.stdin.resume();
+process.stdin.on("end", () => {
+  setTimeout(() => {
+    console.log(JSON.stringify({ type: "result", result: "maintenance done", session_id: "s1" }));
+  }, 300);
+});
+process.on("SIGINT", () => process.exit(130));
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+      interruptGraceMs: 50,
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+    const events: string[] = [];
+    const turn = (async () => {
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "maintenance",
+        turnToken: "maintenance-turn",
+      })) {
+        events.push(event.type);
+      }
+    })();
+    // A preemption for the turn that already released the slot must not touch
+    // the maintenance call that took it.
+    await runtime.interrupt("superseded-chat-turn");
+    await turn;
+    expect(events).toContain("result");
+
+    // The same call without a token is the cancel-word hatch: it kills
+    // whatever holds the slot, which is the emergency behaviour path A relies
+    // on.
+    const hanging = (async () => {
+      const events = runtime.sendTurn({ sessionId: session.id, prompt: "again" })[
+        Symbol.asyncIterator
+      ]();
+      const first = events.next();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await runtime.interrupt();
+      await first;
+    })();
+    await expect(hanging).rejects.toThrow(/exited/);
+  });
+
+  it("escalates an ignored SIGINT to SIGKILL instead of holding the turn slot (package 1.1)", async () => {
+    const directory = tempDirectory("fake-claude-sigkill-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+process.on("SIGINT", () => {});
+process.stdin.resume();
+process.stdin.on("end", () => {
+  console.log(JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "думаю" } } }));
+  setInterval(() => {}, 1_000);
+});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+      interruptGraceMs: 100,
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+    const startedAt = Date.now();
+    await expect(
+      (async () => {
+        for await (const event of runtime.sendTurn({
+          sessionId: session.id,
+          prompt: "hang",
+          turnToken: "turn-1",
+        })) {
+          if (event.type === "text_delta") void runtime.interrupt("turn-1");
+        }
+      })(),
+    ).rejects.toThrow(/exited/);
+    // A CLI that swallows SIGINT would otherwise hold the single turn slot
+    // forever, leaving both the superseded and the new message unanswered.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
   });
 });
 

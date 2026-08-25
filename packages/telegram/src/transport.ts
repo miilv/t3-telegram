@@ -13,6 +13,7 @@ import {
 } from "./rendering.js";
 import type {
   SentMessage,
+  InboundMessageSignal,
   StreamDraft,
   TelegramAttachment,
   TelegramAccessPolicy,
@@ -53,6 +54,8 @@ const ALBUM_WINDOW_MS = 650;
 const MAX_ALBUM_WAIT_MS = 5_000;
 /** Quiet period that closes an inbound batch when no more pages are pending. */
 const BATCH_WINDOW_MS = 2_000;
+/** Package 1.1: what a superseded turn's preview is overwritten with. */
+const DISCARDED_DRAFT_TEXT = "—";
 /** Hard ceiling so a pathological flood can never hold a batch open forever. */
 const MAX_BATCH_WAIT_MS = 180_000;
 /** Telegram never returns more than this many updates per getUpdates call. */
@@ -213,7 +216,7 @@ export class TelegramBotTransport implements TelegramTransport {
   private draftAvailable: boolean | undefined;
   private richFinalAvailable: boolean | undefined;
   /** Package 1.1: preemption observer, notified on every accepted message. */
-  private inboundObserver: ((message: { chatId: number; userId: number }) => void) | undefined;
+  private inboundObserver: ((message: InboundMessageSignal) => void) | undefined;
 
   constructor(
     private readonly token: string,
@@ -245,8 +248,8 @@ export class TelegramBotTransport implements TelegramTransport {
     });
   }
 
-  onInboundMessage(handler: (message: { chatId: number; userId: number }) => void): void {
-    this.inboundObserver = handler;
+  setInboundObserver(observer: (message: InboundMessageSignal) => void): void {
+    this.inboundObserver = observer;
   }
 
   /**
@@ -257,12 +260,42 @@ export class TelegramBotTransport implements TelegramTransport {
    * may no longer touch) is not an error here.
    */
   async discardDraft(draft: StreamDraft): Promise<void> {
-    if (draft.mode !== "edit" || !draft.messageId) return;
-    const messageId = draft.messageId;
     try {
-      await this.outbound(draft.chatId, () => this.bot.api.deleteMessage(draft.chatId, messageId));
+      if (draft.mode === "edit" && draft.messageId) {
+        const messageId = draft.messageId;
+        await this.outbound(draft.chatId, () => this.bot.api.deleteMessage(draft.chatId, messageId));
+        return;
+      }
+      // Ephemeral drafts cannot be deleted, only overwritten. Left alone, the
+      // half-written answer of a superseded turn stays on screen until Telegram
+      // expires it — which is exactly the content single-voice must not show.
+      // The raw draft APIs are called directly: updateDraft() would fall back
+      // to POSTING a real message if the draft call failed, the opposite of a
+      // discard.
+      if (draft.mode === "rich-draft") {
+        await this.outbound(draft.chatId, () =>
+          this.bot.api.sendRichMessageDraft(
+            draft.chatId,
+            draft.draftId,
+            { markdown: DISCARDED_DRAFT_TEXT },
+            destinationOptions(draft),
+          ),
+        );
+        return;
+      }
+      await this.outbound(draft.chatId, () =>
+        this.bot.api.sendMessageDraft(
+          draft.chatId,
+          draft.draftId,
+          DISCARDED_DRAFT_TEXT,
+          destinationOptions(draft),
+        ),
+      );
     } catch (error) {
-      this.logger.debug({ err: error, chatId: draft.chatId, messageId }, "Draft discard skipped");
+      this.logger.debug(
+        { err: error, chatId: draft.chatId, mode: draft.mode },
+        "Draft discard skipped",
+      );
     }
   }
 
@@ -820,7 +853,12 @@ export class TelegramBotTransport implements TelegramTransport {
     // problem: they must never abort ingestion of the message itself.
     if (this.inboundObserver) {
       try {
-        this.inboundObserver({ chatId: normalized.chatId, userId: normalized.userId });
+        this.inboundObserver({
+          chatId: normalized.chatId,
+          userId: normalized.userId,
+          messageId: normalized.messageId,
+          edited: normalized.edited,
+        });
       } catch (error) {
         this.logger.warn({ err: error }, "Inbound message observer failed");
       }

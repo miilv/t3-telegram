@@ -93,6 +93,85 @@ describe("ThreadEventDigest (package 1.1)", () => {
     ]);
   });
 
+  it("never floats a fresh progress frame above the message it followed", async () => {
+    const sink = collector();
+    const digest = new ThreadEventDigest({ onFlush: sink.onFlush });
+    digest.push({ kind: "progress", threadId: "th_1", text: "40%" });
+    digest.push({ kind: "agent_message", threadId: "th_1", text: "нашёл причину" });
+    digest.push({ kind: "progress", threadId: "th_1", text: "80%" });
+
+    await digest.flush();
+    // The old contract merged into the FIRST progress and produced
+    // [progress:80%, agent_message] — a frame from after the message shown
+    // before it.
+    expect(sink.digests[0]!.map((item) => [item.kind, item.text])).toEqual([
+      ["progress", "40%"],
+      ["agent_message", "нашёл причину"],
+      ["progress", "80%"],
+    ]);
+  });
+
+  it("puts a completion where the thread last spoke, not where it started", async () => {
+    const sink = collector();
+    const digest = new ThreadEventDigest({ onFlush: sink.onFlush });
+    digest.push({ kind: "progress", threadId: "th_1", text: "10%" });
+    digest.push({ kind: "progress", threadId: "th_2", text: "другой тред" });
+    digest.push({ kind: "agent_message", threadId: "th_1", text: "почти всё" });
+    digest.push({ kind: "progress", threadId: "th_1", text: "90%" });
+    digest.push({ kind: "completion", threadId: "th_1", outcome: "completed", text: "готово" });
+
+    await digest.flush();
+    expect(sink.digests[0]!.map((item) => [item.threadId, item.kind])).toEqual([
+      ["th_2", "progress"],
+      ["th_1", "agent_message"],
+      ["th_1", "completion"],
+    ]);
+  });
+
+  it("dedupes a replayed agent message even when progress interleaves it", async () => {
+    const sink = collector();
+    const digest = new ThreadEventDigest({ onFlush: sink.onFlush });
+    digest.push({ kind: "agent_message", threadId: "th_1", text: "нашёл причину" });
+    digest.push({ kind: "progress", threadId: "th_1", text: "50%" });
+    // Broker resubscribe replays the message after a progress frame.
+    digest.push({ kind: "agent_message", threadId: "th_1", text: "нашёл причину" });
+
+    await digest.flush();
+    expect(sink.digests[0]!.map((item) => [item.kind, item.text])).toEqual([
+      ["agent_message", "нашёл причину"],
+      ["progress", "50%"],
+    ]);
+  });
+
+  it("does not let an event pushed during a flush ride the window that is leaving", async () => {
+    vi.useFakeTimers();
+    try {
+      const sink = collector();
+      const digest = new ThreadEventDigest({
+        windowMs: 1_000,
+        onFlush: async (items) => {
+          sink.onFlush(items);
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        },
+      });
+      digest.push({ kind: "progress", threadId: "th_1", text: "первое окно" });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sink.digests).toHaveLength(1);
+
+      // Arrives while the first digest is still being delivered.
+      digest.push({ kind: "progress", threadId: "th_1", text: "второе окно" });
+      expect(digest.size()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_200);
+
+      expect(sink.digests).toHaveLength(2);
+      expect(sink.digests[0]!.map((item) => item.text)).toEqual(["первое окно"]);
+      expect(sink.digests[1]!.map((item) => item.text)).toEqual(["второе окно"]);
+      expect(digest.size()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("hands the digest over once per quiet window without sliding it", async () => {
     vi.useFakeTimers();
     try {

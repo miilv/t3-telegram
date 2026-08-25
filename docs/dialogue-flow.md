@@ -235,25 +235,53 @@ to fan out. The deterministic routing cascade was deliberately deleted.
 
 ## 4. Preemption, cancellation and mid-turn messages
 
-**Preemption is the default** (package 1.1). Any message from the owner that
-arrives while an Operator turn of theirs runs in that chat supersedes it — no
+**Preemption is the default** (package 1.1). A message from the owner that
+arrives while their own Operator turn runs in that chat supersedes it — no
 cancel word needed:
 
 ```
-transport.onInboundMessage(chatId, userId)   fires on the ACCEPTED raw message,
-                                             before the 2 s batch window closes
-   └─ scope: same guard as path A (an active turn in THIS chat, AND
-             isAdministrator OR the turn's own initiator)
-   └─ effect: turn.superseded = true  +  runtime.interrupt() via interruptQuietly
-              worker threads untouched; nothing is said in the chat
-   └─ the superseded turn: no final enqueued (the check sits between the runtime
-              and the outbox), an `edit`-mode draft is deleted, the retry replay
-              is skipped, `operator.turn.superseded` + `operator.turn.dropped`
-              are recorded, and its ingress job still completes — so a restart
-              replays nothing (resetInterruptedBackgroundJobs sees no `running`)
+transport.setInboundObserver(chatId, userId, messageId, edited)
+                                        fires on the ACCEPTED raw message,
+                                        before the 2 s batch window closes
+   └─ scope: the turn's OWN initiator, in THIS chat. Deliberately NARROWER than
+             path A: an administrator may STOP a member's turn with a cancel
+             word, but an admin writing in a group does not replace a member's
+             conversation.
+   └─ two effects, covering two different windows:
+        · the watermark `chatId:userId → newest real messageId` moves. A turn
+          still queued behind the drain, or spending seconds on OCR/STT before
+          it is even in flight, sees it at the top of answerDirect and stops
+          there — this is what keeps two turns from running back to back.
+        · every in-flight turn of that user is flagged superseded and its
+          provider call is interrupted by TOKEN (`runtime.interrupt(turnToken)`),
+          so a preemption that lost its race cannot kill the maintenance,
+          mediation or memory call that took the slot next. `interrupt()` with
+          no token stays the unconditional hatch used by path A.
+   └─ interrupt = SIGINT, then SIGKILL after `interruptGraceMs` (8 s default):
+             a CLI that ignores SIGINT would hold the single turn slot forever,
+             leaving BOTH messages unanswered.
+   └─ the superseded turn: no final enqueued (checked at the top of the turn and
+             again between the runtime and the outbox), its draft is killed in
+             every mode (ephemeral drafts overwritten with `—`, an `edit`-mode
+             message deleted), the retry replay is skipped,
+             `operator.turn.superseded` + `operator.turn.dropped` are recorded,
+             and its ingress job still completes — so a restart replays nothing
+             (`resetInterruptedBackgroundJobs` sees no `running` row).
    └─ after the final row exists the answer is durable: a later message only
-              starts the next turn, it never rolls back what was sent
+             starts the next turn, it never rolls back what was sent
+             (memory-design §1).
+   └─ synthetic updates (automation runs, button answers) never travel through a
+             transport, so they neither move the watermark nor are judged by it.
 ```
+
+**The daemon stays silent about it, but the turn may not have been.** A
+superseded turn can already have sent something through `telegram.send_message`
+or dispatched durable work before it was cut off. That is why the threads it
+started are re-keyed from `job_thread:<ingressJobId>` to `chat_pending:<chatId>`
+and handed to the NEXT turn as one envelope line: the owner's previous message
+was superseded, work X is already running, answer only the current message. It
+is explicitly not "answer the old one too" — that would be two answers to one
+voice.
 
 The message itself takes the ordinary path: batching, durable ingress job, and a
 new turn on the `user` lane. The first message of a burst frees the turn slot
@@ -292,7 +320,13 @@ Operator turn at a time is a session invariant, not a queue detail):
 | `background` | startup ingress replay, the 1 s reliability pump |
 
 Starvation of the background lane is deliberate: every background producer is a
-repeating pump, so a skipped round retries. The digest accumulator
+repeating pump, so a skipped round retries. **The pump never awaits the lane** —
+it hands one drain over (`backgroundDrainQueued` keeps it to one in flight) and
+carries on, because awaiting it froze `requeueUncertain`, the outbox flush, the
+head-of-line warnings and the T3 dispatch drain for as long as the chat stayed
+busy. `initialize()` does await its startup replay, and a test pins that this
+still returns (the queue self-drains; there is no external consumer to wait for).
+The digest accumulator
 (`ThreadEventDigest`, `packages/shared/src/thread-digest.ts`) coalesces per
 thread inside its quiet window — repeated `progress` collapses to the newest
 frame, a `completion` evicts that thread's pending progress, each distinct
