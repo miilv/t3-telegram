@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import pino, { type Logger } from "pino";
+import pino, { type DestinationStream, type Logger } from "pino";
+import { redactSecrets } from "../../shared/src/index.js";
 
 export type MetricName =
   | "telegram_update_latency_ms"
@@ -165,37 +166,58 @@ export function classifyOperationalError(
   return classified("UNKNOWN", false, false, "Произошла внутренняя ошибка; подробности сохранены в диагностике.");
 }
 
-export function createLogger(level = "info"): Logger {
-  return pino({
-    level,
-    base: { service: "t3-telegram-operator" },
-    redact: {
-      paths: [
-        "token",
-        "telegram.token",
-        "t3.bearerToken",
-        "authorization",
-        "headers.authorization",
-        "*.token",
-        "*.apiKey",
-        "apiKey",
-        "prompt",
-        "transcript",
-        "providerResponse",
-        "detail",
-        "*.detail",
-        "payload.text",
-        "payload.prompt",
-        "err.message",
-        "err.stack",
-        "error.message",
-        "error.stack",
-        "*.err.message",
-        "*.err.stack",
-      ],
-      censor: "[REDACTED]",
+export function createLogger(level = "info", destination?: DestinationStream): Logger {
+  return pino(
+    {
+      level,
+      base: { service: "t3-telegram-operator" },
+      redact: {
+        paths: [
+          "token",
+          "telegram.token",
+          "t3.bearerToken",
+          "authorization",
+          "headers.authorization",
+          "*.token",
+          "*.apiKey",
+          "apiKey",
+          "prompt",
+          "transcript",
+          "providerResponse",
+          "detail",
+          "*.detail",
+          "payload.text",
+          "payload.prompt",
+        ],
+        censor: "[REDACTED]",
+      },
+      // Error messages and stacks stay readable for production diagnosis;
+      // only embedded credentials are masked (bug №32 in the 2026-08-24 audit).
+      serializers: {
+        err: serializeSanitizedError,
+        error: serializeSanitizedError,
+      },
     },
-  });
+    destination,
+  );
+}
+
+function serializeSanitizedError(error: unknown): unknown {
+  if (typeof error === "string") return redactSecrets(error);
+  if (!(error instanceof Error)) return error;
+  return sanitizeSerializedError(pino.stdSerializers.errWithCause(error) as Record<string, unknown>);
+}
+
+function sanitizeSerializedError(serialized: Record<string, unknown>): Record<string, unknown> {
+  for (const key of ["message", "stack"]) {
+    if (typeof serialized[key] === "string") serialized[key] = redactSecrets(serialized[key]);
+  }
+  if (typeof serialized.cause === "string") {
+    serialized.cause = redactSecrets(serialized.cause);
+  } else if (serialized.cause && typeof serialized.cause === "object") {
+    serialized.cause = sanitizeSerializedError(serialized.cause as Record<string, unknown>);
+  }
+  return serialized;
 }
 
 const fallbackHashSalt = randomBytes(32);

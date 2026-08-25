@@ -6,6 +6,7 @@ import type { Config } from "../../../packages/shared/src/config.js";
 import type {
   ArtifactRef,
   ApprovalRiskCategory,
+  Automation,
   OperatorEvent,
   OperatorNote,
   OperatorPolicySettings,
@@ -60,9 +61,9 @@ import {
 import {
   automationScheduleLabel,
   createAutomation,
-  firstAutomationRun,
   nextAutomationRun,
   parseAutomationSchedule,
+  resumeAutomationRun,
 } from "../../../packages/automations/src/index.js";
 import {
   classifyOperationalError,
@@ -403,7 +404,7 @@ export class OperatorDaemon {
 
   private async performMaintenance(reason: string): Promise<void> {
     const startedAt = Date.now();
-    const scheduledAutomations = this.dispatchDueAutomations();
+    const scheduledAutomations = await this.dispatchDueAutomations();
     await this.flushTelegramOutbox();
     await this.drainT3Dispatches();
     const expiredNotes = this.store.expireOperatorNotes();
@@ -431,6 +432,17 @@ export class OperatorDaemon {
           ? `context threshold ${contextUsagePercent.toFixed(1)}%`
           : reason,
       );
+    }
+
+    // Journal retention runs on the same daily gate as compaction so the
+    // per-minute maintenance tick stays cheap (bug №8).
+    const lastRetention = this.store.getRuntimeState("last_journal_retention_at");
+    const lastRetentionAt = lastRetention ? Date.parse(lastRetention) : Number.NaN;
+    if (!Number.isFinite(lastRetentionAt) || Date.now() - lastRetentionAt >= 24 * 60 * 60 * 1_000) {
+      const pruned = this.store.pruneJournals();
+      this.store.checkpointWal();
+      this.store.setRuntimeState("last_journal_retention_at", nowIso());
+      this.store.appendEvent("journals.pruned", { payload: pruned });
     }
 
     if (reason !== "startup") await this.recoverWorkers();
@@ -2317,18 +2329,26 @@ export class OperatorDaemon {
         : action.toLocaleLowerCase() === "resume"
           ? "active"
           : "deleted";
-      if (status === "active" && !automation.nextRunAt) {
+      let resumeNote = "";
+      if (status === "active") {
+        // Resume recomputes interval/daily schedules from "now" so a stale
+        // next_run_at does not fire a surprise catch-up run (bug №34).
+        const resumed = resumeAutomationRun(automation.schedule, automation.nextRunAt);
         automation.status = status;
-        automation.nextRunAt = firstAutomationRun(automation.schedule);
+        automation.nextRunAt = resumed.nextRunAt;
+        automation.consecutiveFailures = 0;
         automation.updatedAt = nowIso();
         this.store.saveAutomation(automation);
+        resumeNote = resumed.immediate
+          ? " Запланированное время уже прошло — сработает сейчас."
+          : ` Следующий запуск: ${escapeMarkdownText(resumed.nextRunAt)}.`;
       } else {
         this.store.updateAutomationStatus(automation.id, status);
       }
       this.store.appendEvent("automation.status.updated", {
         payload: { automationId: automation.id, status, actorUserId: String(update.userId) },
       });
-      await this.telegram.sendRich(update.chatId, `Automation **${escapeMarkdownText(automation.name)}**: ${status}.`, replyOptions(update));
+      await this.telegram.sendRich(update.chatId, `Automation **${escapeMarkdownText(automation.name)}**: ${status}.${resumeNote}`, replyOptions(update));
       return;
     }
     if (action.toLocaleLowerCase() !== "add") {
@@ -2786,7 +2806,9 @@ export class OperatorDaemon {
           followup.destination,
         );
       }
-      this.logger.info(
+      // A no-op recovery pass runs every maintenance minute; keep it out of
+      // the info log so real recoveries stay visible (bug №33).
+      this.logger[recoverable.length + recoveredFollowups > 0 ? "info" : "debug"](
         { recoveredWorkers: recoverable.length, recoveredFollowups },
         "Worker subscriptions recovered",
       );
@@ -3042,7 +3064,7 @@ export class OperatorDaemon {
     }
   }
 
-  private dispatchDueAutomations(): number {
+  private async dispatchDueAutomations(): Promise<number> {
     let dispatched = 0;
     for (let index = 0; index < 100; index += 1) {
       const automation = this.store.claimDueAutomation();
@@ -3092,12 +3114,54 @@ export class OperatorDaemon {
         }
       } catch (error) {
         const classified = classifyOperationalError(error);
-        this.store.releaseAutomationClaim(automation.id, classified.code);
-        this.logger.warn({ errorCode: classified.code, automationId: automation.id }, "Automation dispatch deferred");
+        // Exponential backoff instead of an eternal per-minute retry; after
+        // several straight failures the automation pauses and its owner is
+        // told why (bug №26).
+        const outcome = this.store.deferAutomationDispatch(automation.id, classified.code);
+        this.logger.warn(
+          {
+            err: error,
+            errorCode: classified.code,
+            automationId: automation.id,
+            failures: outcome.failures,
+            ...(outcome.status === "paused" ? { paused: true } : { nextRetryAt: outcome.nextRunAt }),
+          },
+          outcome.status === "paused" ? "Automation paused after repeated dispatch failures" : "Automation dispatch deferred",
+        );
+        if (outcome.status === "paused") {
+          await this.notifyAutomationPaused(automation, outcome.failures, classified.safeMessage);
+        }
         break;
       }
     }
     return dispatched;
+  }
+
+  private async notifyAutomationPaused(
+    automation: Automation,
+    failures: number,
+    reason: string,
+  ): Promise<void> {
+    try {
+      await this.telegram.sendRich(
+        automation.chatId,
+        [
+          `Автоматизация **${escapeMarkdownText(automation.name)}** приостановлена после ${failures} ошибок подряд: ${escapeMarkdownText(reason)}`,
+          `Возобновить: \`/automation resume ${automation.id}\``,
+        ].join("\n\n"),
+        {
+          ...(automation.messageThreadId ? { messageThreadId: automation.messageThreadId } : {}),
+          ...(automation.directMessagesTopicId
+            ? { directMessagesTopicId: automation.directMessagesTopicId }
+            : {}),
+        },
+      );
+    } catch (error) {
+      this.logger.warn(
+        { err: error, automationId: automation.id },
+        "Automation pause notification failed",
+      );
+    }
   }
 
   private async flushTelegramOutbox(): Promise<void> {

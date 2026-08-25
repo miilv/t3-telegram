@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { createAutomation } from "../packages/automations/src/index.js";
 import { nowIso } from "../packages/shared/src/index.js";
 import { OperatorStore } from "../packages/storage/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
@@ -448,6 +449,119 @@ describe("OperatorStore", () => {
     store.migrate();
     const columns = store.db.prepare("PRAGMA table_info(artifacts)").all() as Array<{ name: string }>;
     expect(columns.some((column) => column.name === "derived_from_artifact_id")).toBe(true);
+    store.close();
+  });
+
+  it("prunes only aged terminal journal rows and keeps live work untouched", () => {
+    const store = tempStore();
+    const daysAgo = (days: number) => new Date(Date.now() - days * 24 * 60 * 60 * 1_000).toISOString();
+
+    const oldEventId = store.appendEvent("legacy.event");
+    store.db.prepare("UPDATE daemon_events SET created_at=? WHERE id=?").run(daysAgo(31), oldEventId);
+    store.appendEvent("recent.event");
+
+    store.claimEvent("old-completed");
+    store.db.prepare("UPDATE processed_events SET updated_at=? WHERE dedupe_key=?").run(daysAgo(8), "old-completed");
+    store.beginEvent("old-processing");
+    store.db.prepare("UPDATE processed_events SET updated_at=? WHERE dedupe_key=?").run(daysAgo(8), "old-processing");
+    store.claimEvent("fresh-completed");
+
+    const doneJob = store.enqueueBackgroundJob("telegram_ingress", { note: "done" });
+    store.completeBackgroundJob(doneJob);
+    store.db.prepare("UPDATE background_jobs SET updated_at=? WHERE id=?").run(daysAgo(8), doneJob);
+    const pendingJob = store.enqueueBackgroundJob("telegram_ingress", { note: "pending" });
+    store.db.prepare("UPDATE background_jobs SET updated_at=? WHERE id=?").run(daysAgo(8), pendingJob);
+
+    const delivered = store.enqueueTelegramOutbox({ dedupeKey: "out-delivered", chatId: 7, operation: "rich", payload: {} });
+    store.db.prepare("UPDATE telegram_outbox SET status='delivered',updated_at=? WHERE id=?").run(daysAgo(8), delivered.id);
+    const uncertain = store.enqueueTelegramOutbox({ dedupeKey: "out-uncertain", chatId: 7, operation: "rich", payload: {} });
+    store.db.prepare("UPDATE telegram_outbox SET status='uncertain',updated_at=? WHERE id=?").run(daysAgo(8), uncertain.id);
+
+    const automation = createAutomation({
+      ownerId: "42",
+      name: "Nightly brief",
+      prompt: "prompt",
+      schedule: { type: "interval", intervalMinutes: 60 },
+      chatId: 7,
+    });
+    store.saveAutomation(automation);
+    store.db
+      .prepare("INSERT INTO automation_runs(id,automation_id,scheduled_for,status,created_at) VALUES (?,?,?,?,?)")
+      .run("autorun_legacy", automation.id, daysAgo(91), "completed", daysAgo(91));
+    store.db
+      .prepare("INSERT INTO automation_runs(id,automation_id,scheduled_for,status,created_at) VALUES (?,?,?,?,?)")
+      .run("autorun_recent", automation.id, nowIso(), "completed", nowIso());
+
+    expect(store.pruneJournals()).toEqual({
+      daemonEvents: 1,
+      processedEvents: 1,
+      backgroundJobs: 1,
+      telegramOutbox: 1,
+      automationRuns: 1,
+    });
+    expect(store.db.prepare("SELECT event_type FROM daemon_events ORDER BY created_at").all())
+      .not.toContainEqual(expect.objectContaining({ event_type: "legacy.event" }));
+    expect(store.db.prepare("SELECT dedupe_key FROM processed_events ORDER BY dedupe_key").all())
+      .toEqual([{ dedupe_key: "fresh-completed" }, { dedupe_key: "old-processing" }]);
+    expect(store.getBackgroundJob(pendingJob)).toBeDefined();
+    expect(store.getBackgroundJob(doneJob)).toBeUndefined();
+    expect(store.getTelegramOutbox("out-uncertain")).toBeDefined();
+    expect(store.getTelegramOutbox("out-delivered")).toBeUndefined();
+    expect(store.db.prepare("SELECT id FROM automation_runs").all()).toEqual([{ id: "autorun_recent" }]);
+    store.checkpointWal();
+    store.close();
+  });
+
+  it("defers failed automation dispatches with exponential backoff and pauses after five straight failures", () => {
+    const store = tempStore();
+    const automation = createAutomation({
+      ownerId: "42",
+      name: "Flaky brief",
+      prompt: "prompt",
+      schedule: { type: "interval", intervalMinutes: 5 },
+      chatId: 7,
+    });
+    store.saveAutomation(automation);
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    const claimHorizon = "2100-01-01T00:00:00.000Z";
+    const expectedBackoffMinutes = [1, 2, 4, 8];
+
+    for (const [index, backoff] of expectedBackoffMinutes.entries()) {
+      expect(store.claimDueAutomation(claimHorizon)?.id).toBe(automation.id);
+      const outcome = store.deferAutomationDispatch(automation.id, "T3_UNAVAILABLE", { now });
+      expect(outcome).toEqual({
+        failures: index + 1,
+        status: "active",
+        nextRunAt: new Date(now.getTime() + backoff * 60_000).toISOString(),
+      });
+      expect(store.getAutomation(automation.id)).toMatchObject({
+        status: "active",
+        consecutiveFailures: index + 1,
+        nextRunAt: outcome.nextRunAt,
+      });
+    }
+
+    expect(store.claimDueAutomation(claimHorizon)?.id).toBe(automation.id);
+    expect(store.deferAutomationDispatch(automation.id, "T3_UNAVAILABLE", { now })).toEqual({
+      failures: 5,
+      status: "paused",
+    });
+    expect(store.getAutomation(automation.id)).toMatchObject({ status: "paused", consecutiveFailures: 5 });
+    expect(store.getAutomation(automation.id)?.nextRunAt).toBeUndefined();
+    expect(
+      store.db.prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='automation.dispatch.failed'").get(),
+    ).toMatchObject({ count: 5 });
+
+    // A successful dispatch resets the streak.
+    store.db.prepare("UPDATE automations SET status='active',next_run_at=? WHERE id=?").run("2026-08-25T12:05:00.000Z", automation.id);
+    const claimed = store.claimDueAutomation(claimHorizon);
+    store.dispatchAutomationRun({
+      automation: claimed!,
+      scheduledFor: claimed!.nextRunAt!,
+      nextRunAt: "2026-08-25T12:10:00.000Z",
+      ingressPayload: {},
+    });
+    expect(store.getAutomation(automation.id)?.consecutiveFailures).toBeUndefined();
     store.close();
   });
 });

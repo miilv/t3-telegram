@@ -320,6 +320,7 @@ CREATE TABLE IF NOT EXISTS automations (
   status TEXT NOT NULL,
   next_run_at TEXT,
   last_run_at TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

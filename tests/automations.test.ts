@@ -4,6 +4,7 @@ import {
   firstAutomationRun,
   nextAutomationRun,
   parseAutomationSchedule,
+  resumeAutomationRun,
 } from "../packages/automations/src/index.js";
 import { tempStore } from "./helpers.js";
 
@@ -51,5 +52,21 @@ describe("proactive automations", () => {
     expect(store.listBackgroundJobs("telegram_ingress")).toHaveLength(1);
     expect(store.getAutomation(automation.id)?.status).toBe("completed");
     store.close();
+  });
+
+  it("recomputes resumed schedules from now instead of replaying a stale next run", () => {
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    expect(
+      resumeAutomationRun({ type: "interval", intervalMinutes: 30 }, "2026-08-20T00:00:00.000Z", now),
+    ).toEqual({ nextRunAt: "2026-08-25T12:30:00.000Z", immediate: false });
+    expect(
+      resumeAutomationRun({ type: "daily", timeOfDay: "09:30", timeZone: "Europe/Moscow" }, "2026-08-01T06:30:00.000Z", now),
+    ).toEqual({ nextRunAt: "2026-08-26T06:30:00.000Z", immediate: false });
+    expect(
+      resumeAutomationRun({ type: "once", runAt: "2026-08-01T00:00:00.000Z" }, "2026-08-01T00:00:00.000Z", now),
+    ).toEqual({ nextRunAt: "2026-08-01T00:00:00.000Z", immediate: true });
+    expect(
+      resumeAutomationRun({ type: "once", runAt: "2026-09-01T00:00:00.000Z" }, undefined, now),
+    ).toEqual({ nextRunAt: "2026-09-01T00:00:00.000Z", immediate: false });
   });
 });

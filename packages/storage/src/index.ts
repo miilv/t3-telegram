@@ -23,7 +23,7 @@ import type {
   WorkerResult,
   WorkThread,
 } from "../../shared/src/index.js";
-import { newId, nowIso } from "../../shared/src/index.js";
+import { newId, nowIso, redactSecrets } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
 
@@ -133,6 +133,10 @@ export class OperatorStore {
     if (backgroundJobColumns.length && !backgroundJobColumns.some((column) => column.name === "dedupe_key")) {
       this.db.exec("ALTER TABLE background_jobs ADD COLUMN dedupe_key TEXT");
       this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_background_jobs_dedupe ON background_jobs(dedupe_key)");
+    }
+    const automationColumns = this.db.prepare("PRAGMA table_info(automations)").all() as Row[];
+    if (automationColumns.length && !automationColumns.some((column) => column.name === "consecutive_failures")) {
+      this.db.exec("ALTER TABLE automations ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0");
     }
     const processedEventColumns = this.db.prepare("PRAGMA table_info(processed_events)").all() as Row[];
     if (processedEventColumns.length && !processedEventColumns.some((column) => column.name === "status")) {
@@ -301,14 +305,16 @@ export class OperatorStore {
       .prepare(`
         INSERT INTO automations(
           id,owner_id,name,prompt,schedule_json,chat_id,message_thread_id,
-          direct_messages_topic_id,project_id,status,next_run_at,last_run_at,created_at,updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          direct_messages_topic_id,project_id,status,next_run_at,last_run_at,
+          consecutive_failures,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
           name=excluded.name,prompt=excluded.prompt,schedule_json=excluded.schedule_json,
           chat_id=excluded.chat_id,message_thread_id=excluded.message_thread_id,
           direct_messages_topic_id=excluded.direct_messages_topic_id,
           project_id=excluded.project_id,status=excluded.status,
           next_run_at=excluded.next_run_at,last_run_at=excluded.last_run_at,
+          consecutive_failures=excluded.consecutive_failures,
           updated_at=excluded.updated_at
       `)
       .run(
@@ -324,6 +330,7 @@ export class OperatorStore {
         automation.status,
         automation.nextRunAt ?? null,
         automation.lastRunAt ?? null,
+        automation.consecutiveFailures ?? 0,
         automation.createdAt,
         automation.updatedAt,
       );
@@ -402,20 +409,51 @@ export class OperatorStore {
       }
       this.db
         .prepare(`
-          UPDATE automations SET status=?,last_run_at=?,next_run_at=?,updated_at=? WHERE id=?
+          UPDATE automations SET status=?,last_run_at=?,next_run_at=?,consecutive_failures=0,updated_at=?
+          WHERE id=?
         `)
         .run(input.nextRunAt ? "active" : "completed", input.scheduledFor, input.nextRunAt ?? null, createdAt, input.automation.id);
       return { runId, jobId, inserted: Number(inserted.changes) === 1 };
     });
   }
 
-  releaseAutomationClaim(id: string, lastError?: string): void {
-    this.db
-      .prepare("UPDATE automations SET status='active',updated_at=? WHERE id=? AND status='running'")
-      .run(nowIso(), id);
-    if (lastError) {
-      this.appendEvent("automation.dispatch.failed", { payload: { automationId: id, errorCode: lastError } });
-    }
+  /**
+   * Releases a claimed automation after a failed dispatch with exponential
+   * backoff (1, 2, 4… minutes, capped at 60); after `maxConsecutiveFailures`
+   * failures in a row the automation is paused instead of retried forever.
+   */
+  deferAutomationDispatch(
+    id: string,
+    errorCode: string,
+    input: { now?: Date; maxConsecutiveFailures?: number; maxBackoffMinutes?: number } = {},
+  ): { failures: number; status: "active" | "paused"; nextRunAt?: string } {
+    const now = input.now ?? new Date();
+    const maxFailures = input.maxConsecutiveFailures ?? 5;
+    const maxBackoffMinutes = input.maxBackoffMinutes ?? 60;
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT consecutive_failures FROM automations WHERE id=?").get(id) as
+        | Row
+        | undefined;
+      const failures = Number(row?.consecutive_failures ?? 0) + 1;
+      const paused = failures >= maxFailures;
+      const backoffMinutes = Math.min(2 ** (failures - 1), maxBackoffMinutes);
+      const nextRunAt = new Date(now.getTime() + backoffMinutes * 60_000).toISOString();
+      this.db
+        .prepare(`
+          UPDATE automations SET status=?,next_run_at=?,consecutive_failures=?,updated_at=?
+          WHERE id=? AND status='running'
+        `)
+        .run(paused ? "paused" : "active", paused ? null : nextRunAt, failures, nowIso(), id);
+      this.appendEvent("automation.dispatch.failed", {
+        payload: {
+          automationId: id,
+          errorCode,
+          failures,
+          ...(paused ? { paused: true } : { nextRunAt }),
+        },
+      });
+      return { failures, status: paused ? "paused" : "active", ...(paused ? {} : { nextRunAt }) };
+    });
   }
 
   completeAutomationRunByJob(jobId: string): void {
@@ -1539,6 +1577,48 @@ export class OperatorStore {
     return result;
   }
 
+  /**
+   * Bounded retention for append-only journals so the database stops growing
+   * forever (bug №8 in the 2026-08-24 audit). Terminal rows only; anything
+   * still pending/processing is left untouched.
+   */
+  pruneJournals(now = new Date()): {
+    daemonEvents: number;
+    processedEvents: number;
+    backgroundJobs: number;
+    telegramOutbox: number;
+    automationRuns: number;
+  } {
+    const cutoff = (days: number) => new Date(now.getTime() - days * 24 * 60 * 60 * 1_000).toISOString();
+    return this.transaction(() => ({
+      daemonEvents: Number(
+        this.db.prepare("DELETE FROM daemon_events WHERE created_at<?").run(cutoff(30)).changes,
+      ),
+      processedEvents: Number(
+        this.db
+          .prepare("DELETE FROM processed_events WHERE status='completed' AND COALESCE(updated_at,created_at)<?")
+          .run(cutoff(7)).changes,
+      ),
+      backgroundJobs: Number(
+        this.db
+          .prepare("DELETE FROM background_jobs WHERE status IN ('completed','failed') AND updated_at<?")
+          .run(cutoff(7)).changes,
+      ),
+      telegramOutbox: Number(
+        this.db
+          .prepare("DELETE FROM telegram_outbox WHERE status IN ('delivered','dead') AND updated_at<?")
+          .run(cutoff(7)).changes,
+      ),
+      automationRuns: Number(
+        this.db.prepare("DELETE FROM automation_runs WHERE created_at<?").run(cutoff(90)).changes,
+      ),
+    }));
+  }
+
+  checkpointWal(): void {
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  }
+
   diagnostics(): { journalMode: string; integrity: string; sizeBytes: number; eventCount: number } {
     const journal = this.db.prepare("PRAGMA journal_mode").get() as Row;
     const integrity = this.db.prepare("PRAGMA quick_check").get() as Row;
@@ -1730,6 +1810,9 @@ function rowToAutomation(row: Row): Automation {
     ...(row.project_id ? { projectId: String(row.project_id) } : {}),
     ...(row.next_run_at ? { nextRunAt: String(row.next_run_at) } : {}),
     ...(row.last_run_at ? { lastRunAt: String(row.last_run_at) } : {}),
+    ...(Number(row.consecutive_failures ?? 0) > 0
+      ? { consecutiveFailures: Number(row.consecutive_failures) }
+      : {}),
   };
 }
 
@@ -1898,14 +1981,7 @@ function boundedStrings(values: string[], limit = 50): string[] {
 }
 
 function redactStoredText(value: string): string {
-  return value
-    .replace(
-      /-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi,
-      "[REDACTED PRIVATE KEY]",
-    )
-    .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
-    .replace(/(token|secret|password|authorization)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
-    .replace(/\b(?:sk|ghp|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{12,}\b/g, "[REDACTED TOKEN]");
+  return redactSecrets(value);
 }
 
 function parseStringArray(value: unknown): string[] {

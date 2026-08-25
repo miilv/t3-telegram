@@ -61,6 +61,24 @@ export function nextAutomationRun(
   return nextDailyOccurrence(schedule.timeOfDay, schedule.timeZone, now).toISOString();
 }
 
+/**
+ * Next run after a pause is lifted. Interval/daily schedules restart from
+ * "now" instead of firing a surprise catch-up run for the stale next_run_at;
+ * a `once` schedule keeps its moment, and callers must announce an immediate
+ * run when that moment is already in the past.
+ */
+export function resumeAutomationRun(
+  schedule: AutomationSchedule,
+  previousNextRunAt: string | undefined,
+  now = new Date(),
+): { nextRunAt: string; immediate: boolean } {
+  if (schedule.type === "once") {
+    const nextRunAt = previousNextRunAt ?? firstAutomationRun(schedule, now);
+    return { nextRunAt, immediate: Date.parse(nextRunAt) <= now.getTime() };
+  }
+  return { nextRunAt: firstAutomationRun(schedule, now), immediate: false };
+}
+
 export function parseAutomationSchedule(input: string): AutomationSchedule {
   const normalized = input.trim();
   const once = /^once\s+(.+)$/iu.exec(normalized);
