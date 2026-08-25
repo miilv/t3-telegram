@@ -153,6 +153,19 @@ export const DAEMON_SECRET_ENV_NAMES: readonly string[] = Object.freeze(
 );
 
 /**
+ * Credential-shaped schema names that the provider-prefix exemption removes
+ * from DAEMON_SECRET_ENV_NAMES. Exported solely for the tripwire test: a
+ * daemon-owned secret declared under ANTHROPIC_/CLAUDE_/OPENAI_ would both
+ * escape the denial set and pass the allowlist prefix, silently.
+ */
+export const PROVIDER_EXEMPT_CREDENTIAL_ENV_NAMES: readonly string[] = Object.freeze(
+  Object.keys(envSchema.shape)
+    .filter((name) => /(_TOKEN|_API_KEY|_SECRET|_SALT|_PASSWORD)$/.test(name))
+    .filter((name) => PROVIDER_CREDENTIAL_ENV_PREFIXES.some((prefix) => name.startsWith(prefix)))
+    .sort(),
+);
+
+/**
  * A bare `*` (or a pattern that is only a wildcard) would hand the child the
  * entire daemon environment, which is exactly what the allowlist exists to
  * prevent. Reject it at load rather than silently narrowing it later.

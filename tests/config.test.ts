@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { DAEMON_SECRET_ENV_NAMES, loadConfig } from "../packages/shared/src/config.js";
+import {
+  DAEMON_SECRET_ENV_NAMES,
+  PROVIDER_EXEMPT_CREDENTIAL_ENV_NAMES,
+  loadConfig,
+} from "../packages/shared/src/config.js";
 
 describe("media configuration", () => {
   it("loads safe codec defaults without requiring a cloud provider", () => {
@@ -164,5 +168,13 @@ describe("child environment passthrough configuration", () => {
     );
     // The Codex provider authenticates with this one; it is not a daemon-only secret.
     expect(DAEMON_SECRET_ENV_NAMES).not.toContain("OPENAI_API_KEY");
+  });
+
+  it("tripwire: the provider-prefix exemption covers exactly OPENAI_API_KEY", () => {
+    // A daemon-owned secret declared under ANTHROPIC_/CLAUDE_/OPENAI_ would both
+    // escape DAEMON_SECRET_ENV_NAMES and pass the child allowlist prefix. If this
+    // assertion fails, decide deliberately: rename the variable or extend the
+    // hard-denial handling in sanitizedEnvironment.
+    expect(PROVIDER_EXEMPT_CREDENTIAL_ENV_NAMES).toEqual(["OPENAI_API_KEY"]);
   });
 });
