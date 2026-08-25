@@ -1497,6 +1497,10 @@ export class OperatorDaemon {
     const existingFinal = this.store.getTelegramOutbox(finalDedupeKey);
     if (existingFinal) {
       if (existingFinal.status === "pending") await this.flushTelegramOutbox();
+      // Package 1.2: this exact turn already spoke (a replayed job after a
+      // crash), so its terminals must stop waiting for the degraded fallback —
+      // otherwise the owner would hear the flat notice after the real story.
+      if (update.threadEvents?.length) this.settleThreadEventTurn(update.threadEvents);
       return;
     }
     // Package 1.2: a thread-event turn borrows the correlation id of the work
@@ -3449,6 +3453,9 @@ export class OperatorDaemon {
     for (const ref of refs) {
       if (!ref.terminal) continue;
       this.store.deleteRuntimeState(`${VOICE_TERMINAL_PREFIX}${ref.threadId}:${ref.epoch ?? "0"}`);
+      // The work ended and its story is told: the route is dead weight now. A
+      // follow-up turn on the same thread re-registers it on its first event.
+      this.threadEventRoutes.delete(ref.threadId);
       this.store.appendEvent("thread.terminal.relayed", {
         threadId: ref.threadId,
         payload: { outcome: ref.terminal, epoch: ref.epoch ?? "0" },
