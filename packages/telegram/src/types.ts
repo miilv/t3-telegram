@@ -175,9 +175,26 @@ export interface TelegramHealth {
   };
 }
 
+/**
+ * Chunk-level resume state for multi-chunk rich sends: a durable caller can
+ * persist how many chunks were already delivered and continue a retried
+ * delivery from the first undelivered chunk instead of duplicating the rest.
+ */
+export interface TelegramSendProgress {
+  /** Number of leading rich chunks a previous attempt already delivered. */
+  completedChunks?: number;
+  /** Called after each delivered chunk with the new completed-chunk count. */
+  onChunkSent?: (completedChunks: number, sent: SentMessage[]) => void;
+}
+
 export interface TelegramTransport {
   updates(signal?: AbortSignal): AsyncIterable<TelegramInbound>;
-  sendRich(chatId: number, text: string, options?: TelegramSendOptions): Promise<SentMessage[]>;
+  sendRich(
+    chatId: number,
+    text: string,
+    options?: TelegramSendOptions,
+    progress?: TelegramSendProgress,
+  ): Promise<SentMessage[]>;
   startDraft(chatId: number, options?: TelegramSendOptions & { phase?: StreamPhase }): Promise<StreamDraft>;
   updateDraft(draft: StreamDraft, text: string): Promise<void>;
   finalizeDraft(draft: StreamDraft, text: string): Promise<SentMessage[]>;

@@ -205,6 +205,87 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("revives a dead outbox row with the fresh payload when its dedupe key is emitted again", () => {
+    const store = tempStore();
+    const original = store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:thread:th_1:terminal:0",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "первая попытка" },
+    });
+    expect(store.claimNextTelegramOutbox()?.id).toBe(original.id);
+    store.markTelegramOutboxFailed(original.id, "dead", "TELEGRAM_AMBIGUOUS", "gave up");
+
+    // A worker monitor re-emits the terminal event with the same dedupe key:
+    // the dead row must come back to life instead of being swallowed forever.
+    const revived = store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:thread:th_1:terminal:0",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "повторная эмиссия" },
+    });
+    expect(revived.id).toBe(original.id);
+    expect(revived).toMatchObject({ status: "pending", payload: { text: "повторная эмиссия" } });
+    expect(revived.lastErrorCode).toBeUndefined();
+    expect(store.claimNextTelegramOutbox()?.id).toBe(original.id);
+
+    // Delivered and uncertain rows keep the historical DO NOTHING contract.
+    store.markTelegramOutboxDelivered(original.id, [100]);
+    const afterDelivered = store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:thread:th_1:terminal:0",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "не должно заменить" },
+    });
+    expect(afterDelivered).toMatchObject({ status: "delivered", payload: { text: "повторная эмиссия" } });
+    store.close();
+  });
+
+  it("persists outbox payload updates for chunk-level delivery progress", () => {
+    const store = tempStore();
+    const item = store.enqueueTelegramOutbox({
+      dedupeKey: "message:long",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "длинный ответ", sentChunkCount: 0 },
+    });
+    store.updateTelegramOutboxPayload(item.id, { text: "длинный ответ", sentChunkCount: 2, sentMessageIds: [100, 101] });
+    expect(store.getTelegramOutbox(item.id)?.payload).toEqual({
+      text: "длинный ответ",
+      sentChunkCount: 2,
+      sentMessageIds: [100, 101],
+    });
+    store.close();
+  });
+
+  it("reports chat-head outbox items parked in retry backoff with messages queued behind them", () => {
+    const store = tempStore();
+    const head = store.enqueueTelegramOutbox({
+      dedupeKey: "message:head",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "первый" },
+    });
+    // Alone in its chat and freshly backed off: nothing to report yet.
+    store.retryTelegramOutbox(head.id, "TELEGRAM_RATE_LIMIT", "flood wait", 300_000);
+    expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(0);
+
+    store.enqueueTelegramOutbox({
+      dedupeKey: "message:behind",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "второй" },
+    });
+    expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(0);
+    store.db
+      .prepare("UPDATE telegram_outbox SET updated_at=? WHERE id=?")
+      .run(new Date(Date.now() - 90_000).toISOString(), head.id);
+    const blocked = store.listBlockedTelegramOutboxHeads();
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ id: head.id, lastErrorCode: "TELEGRAM_RATE_LIMIT" });
+    store.close();
+  });
+
   it("resumes interrupted inbound events but rejects completed duplicates", () => {
     const store = tempStore();
     expect(store.beginEvent("callback:1")).toBe(true);

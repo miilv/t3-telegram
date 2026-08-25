@@ -9,7 +9,7 @@ import {
   pruneLocalBotApiFiles,
   TelegramBotTransport,
 } from "../packages/telegram/src/index.js";
-import type { TelegramMessageInbound } from "../packages/telegram/src/index.js";
+import type { TelegramInbound, TelegramMessageInbound } from "../packages/telegram/src/index.js";
 import { tempDirectory } from "./helpers.js";
 
 const logger = pino({ level: "silent" });
@@ -172,6 +172,139 @@ describe("grammY Telegram transport", () => {
     const transport = new TelegramBotTransport("test-token", 42, 1, logger);
     await expect(transport.editRich(7, 100, "already final")).resolves.toBeUndefined();
     expect(calls.map((call) => call.method)).toEqual(["editMessageText"]);
+  });
+
+  it("resumes a multi-chunk rich send from the first undelivered chunk", async () => {
+    const calls: ApiCall[] = [];
+    let richSends = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        if (call.method === "sendRichMessage") {
+          richSends += 1;
+          // The network dies mid-delivery on the second chunk: ambiguous, so
+          // the transport must not blindly retry, and a caller-driven retry
+          // must not resend the first chunk.
+          if (richSends === 2) throw new TypeError("connection reset after upload");
+        }
+        return telegramResponse(messageResult(100 + richSends));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const text = ["A".repeat(20_000), "B".repeat(20_000), "C".repeat(20_000)].join("\n\n");
+
+    let completed = 0;
+    await expect(
+      transport.sendRich(7, text, {}, { onChunkSent: (count) => (completed = count) }),
+    ).rejects.toThrow();
+    expect(completed).toBe(1);
+
+    const resumed = await transport.sendRich(7, text, {}, {
+      completedChunks: completed,
+      onChunkSent: (count) => (completed = count),
+    });
+    expect(completed).toBe(3);
+    expect(resumed).toHaveLength(2);
+    const sentChunks = calls
+      .filter((call) => call.method === "sendRichMessage")
+      .map((call) => (call.body.rich_message as { markdown: string }).markdown[0]);
+    expect(sentChunks).toEqual(["A", "B", "B", "C"]);
+  });
+
+  it("flushes an inbound batch at the 180 s ceiling even while messages keep arriving", async () => {
+    vi.useFakeTimers();
+    let updateId = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        if (call.method === "getMe") return telegramResponse(getMeResult());
+        if (call.method === "getUpdates") {
+          // One fresh message per second, forever: faster than the 2 s quiet
+          // window, so only the hard ceiling can ever close the batch.
+          updateId += 1;
+          const id = updateId;
+          return new Promise<Response>((resolve) => {
+            setTimeout(() => resolve(telegramResponse({ ok: true, result: [rawTextUpdate(id, id)] })), 1_000);
+          });
+        }
+        return telegramResponse(messageResult(1));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const controller = new AbortController();
+    const received: TelegramInbound[] = [];
+    const consume = (async () => {
+      for await (const update of transport.updates(controller.signal)) received.push(update);
+    })();
+
+    for (let second = 0; second < 200 && !received.length; second += 1) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(received).toHaveLength(1);
+    const envelope = received[0] as TelegramMessageInbound;
+    expect(envelope.type).toBe("message");
+    expect(envelope.messageIds.length).toBeGreaterThanOrEqual(150);
+    expect(envelope.messageIds.length).toBeLessThanOrEqual(182);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await consume;
+  });
+
+  it("holds the getUpdates offset back until buffered messages are flushed to the consumer", async () => {
+    vi.useFakeTimers();
+    const offsets: Array<number | undefined> = [];
+    let releaseFinalPoll: (() => void) | undefined;
+    let call = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const parsed = parseApiCall(input, init);
+        if (parsed.method === "getMe") return telegramResponse(getMeResult());
+        if (parsed.method !== "getUpdates") return telegramResponse(messageResult(1));
+        call += 1;
+        offsets.push(parsed.body.offset as number | undefined);
+        if (call === 1) {
+          return telegramResponse({ ok: true, result: [rawTextUpdate(1, 1), rawTextUpdate(2, 2)] });
+        }
+        if (call === 2) {
+          // The held-back offset makes Telegram re-serve the buffered burst;
+          // it must be skipped, not batched twice.
+          return telegramResponse({ ok: true, result: [rawTextUpdate(1, 1), rawTextUpdate(2, 2)] });
+        }
+        if (call === 3) {
+          return new Promise<Response>((resolve) => {
+            setTimeout(() => resolve(telegramResponse({ ok: true, result: [] })), 2_500);
+          });
+        }
+        return new Promise<Response>((resolve) => {
+          releaseFinalPoll = () => resolve(telegramResponse({ ok: true, result: [] }));
+        });
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const controller = new AbortController();
+    const received: TelegramInbound[] = [];
+    const consume = (async () => {
+      for await (const update of transport.updates(controller.signal)) received.push(update);
+    })();
+
+    for (let step = 0; step < 40 && offsets.length < 4; step += 1) {
+      await vi.advanceTimersByTimeAsync(250);
+    }
+    // While updates 1-2 sat in the batch buffer, the offset stayed at 1 so a
+    // crash would re-deliver them; after the flush it advanced past them.
+    expect(offsets).toEqual([undefined, 1, 1, 3]);
+    expect(received).toHaveLength(1);
+    expect((received[0] as TelegramMessageInbound).messageIds).toEqual([1, 2]);
+
+    controller.abort();
+    releaseFinalPoll?.();
+    await vi.advanceTimersByTimeAsync(100);
+    await consume;
   });
 
   it("honors retry_after and retries only server-confirmed rejection", async () => {
@@ -601,6 +734,23 @@ function messageResult(messageId: number) {
       date: 1_700_000_000,
       chat: { id: 7, type: "private", first_name: "M" },
       rich_message: { blocks: [] },
+    },
+  };
+}
+
+function getMeResult() {
+  return { ok: true, result: { id: 1, is_bot: true, first_name: "op", username: "op_bot" } };
+}
+
+function rawTextUpdate(updateId: number, messageId: number) {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: messageId,
+      chat: { id: 7, type: "private", first_name: "M" },
+      from: { id: 42, first_name: "M" },
+      date: 1_700_000_000,
+      text: `msg ${messageId}`,
     },
   };
 }

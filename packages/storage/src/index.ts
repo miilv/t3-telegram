@@ -1324,17 +1324,38 @@ export class OperatorStore {
   }): TelegramOutboxItem<T> {
     const now = nowIso();
     const id = newId("outbox");
+    return this.transaction(() => {
+      this.db
+        .prepare(`
+          INSERT INTO telegram_outbox(
+            id,dedupe_key,chat_id,operation,payload_json,status,attempts,next_attempt_at,
+            telegram_message_ids_json,last_error_code,last_error_detail,created_at,updated_at,delivered_at
+          ) VALUES (?,?,?,?,?,'pending',0,NULL,'[]',NULL,NULL,?,?,NULL)
+          ON CONFLICT(dedupe_key) DO NOTHING
+        `)
+        .run(id, input.dedupeKey, input.chatId, input.operation, JSON.stringify(input.payload), now, now);
+      const row = this.db.prepare("SELECT * FROM telegram_outbox WHERE dedupe_key=?").get(input.dedupeKey) as Row;
+      // A re-emitted event that lands on a dead row means the caller still
+      // needs the delivery: revive it with the fresh payload for a new attempt
+      // cycle instead of letting DO NOTHING swallow it forever (bug №3).
+      if (String(row.status) === "dead") {
+        this.db
+          .prepare(`
+            UPDATE telegram_outbox SET status='pending',payload_json=?,next_attempt_at=NULL,
+              last_error_code=NULL,last_error_detail=NULL,updated_at=? WHERE id=?
+          `)
+          .run(JSON.stringify(input.payload), now, String(row.id));
+        const revived = this.db.prepare("SELECT * FROM telegram_outbox WHERE id=?").get(String(row.id)) as Row;
+        return rowToTelegramOutbox<T>(revived);
+      }
+      return rowToTelegramOutbox<T>(row);
+    });
+  }
+
+  updateTelegramOutboxPayload<T>(id: string, payload: T): void {
     this.db
-      .prepare(`
-        INSERT INTO telegram_outbox(
-          id,dedupe_key,chat_id,operation,payload_json,status,attempts,next_attempt_at,
-          telegram_message_ids_json,last_error_code,last_error_detail,created_at,updated_at,delivered_at
-        ) VALUES (?,?,?,?,?,'pending',0,NULL,'[]',NULL,NULL,?,?,NULL)
-        ON CONFLICT(dedupe_key) DO NOTHING
-      `)
-      .run(id, input.dedupeKey, input.chatId, input.operation, JSON.stringify(input.payload), now, now);
-    const row = this.db.prepare("SELECT * FROM telegram_outbox WHERE dedupe_key=?").get(input.dedupeKey) as Row;
-    return rowToTelegramOutbox<T>(row);
+      .prepare("UPDATE telegram_outbox SET payload_json=?,updated_at=? WHERE id=?")
+      .run(JSON.stringify(payload), nowIso(), id);
   }
 
   getTelegramOutbox<T>(idOrDedupeKey: string): TelegramOutboxItem<T> | undefined {
@@ -1382,6 +1403,43 @@ export class OperatorStore {
       if (!claimed.changes) return undefined;
       return { ...rowToTelegramOutbox<T>(row), status: "sending" };
     });
+  }
+
+  /**
+   * Chat-head outbox items that have been parked in retry backoff for at least
+   * `waitingMs` while other pending messages queue up behind them. Delivery
+   * order is a deliberate trade-off (bug №37): the queue is not reordered, but
+   * the blockage must be visible to operators.
+   */
+  listBlockedTelegramOutboxHeads<T>(waitingMs = 60_000, limit = 20): TelegramOutboxItem<T>[] {
+    const now = nowIso();
+    const cutoff = new Date(Date.now() - waitingMs).toISOString();
+    const boundedLimit = Math.max(1, Math.min(limit, 100));
+    return (
+      this.db
+        .prepare(`
+          SELECT head.* FROM telegram_outbox head
+          WHERE head.status='pending'
+            AND head.next_attempt_at IS NOT NULL
+            AND head.next_attempt_at>?
+            AND head.updated_at<=?
+            AND NOT EXISTS (
+              SELECT 1 FROM telegram_outbox earlier
+              WHERE earlier.chat_id=head.chat_id
+                AND earlier.status IN ('pending','sending')
+                AND earlier.created_at<head.created_at
+            )
+            AND EXISTS (
+              SELECT 1 FROM telegram_outbox later
+              WHERE later.chat_id=head.chat_id
+                AND later.status='pending'
+                AND later.created_at>head.created_at
+            )
+          ORDER BY head.created_at
+          LIMIT ?
+        `)
+        .all(now, cutoff, boundedLimit) as Row[]
+    ).map((row) => rowToTelegramOutbox<T>(row));
   }
 
   markTelegramOutboxDelivered(id: string, messageIds: number[]): void {
