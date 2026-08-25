@@ -423,6 +423,54 @@ describe("local Bot API file downloads", () => {
     expect(fileFetches).toBe(0);
   });
 
+  it("fetchFile hands back the host path locally and buffered bytes from the cloud (bug №24)", async () => {
+    const root = tempDirectory("local-botapi-fetchfile-");
+    const relative = "1234:token/videos/file_2.mp4";
+    const target = join(root, relative);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "big-video-bytes");
+    const localFetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          result: { file_id: "f", file_unique_id: "u", file_path: `/var/lib/telegram-bot-api/${relative}` },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const local = new TelegramBotTransport(
+      "test-token",
+      42,
+      1,
+      logger,
+      "http://127.0.0.1:8081",
+      localFetch,
+      { serverRoot: "/var/lib/telegram-bot-api", hostRoot: root },
+    );
+    expect(await local.fetchFile("f")).toEqual({ localPath: target });
+
+    const cloudFetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/file/")) return new Response("cloud-bytes", { status: 200 });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          result: { file_id: "f", file_unique_id: "u", file_path: "documents/file_3.pdf" },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const cloud = new TelegramBotTransport(
+      "test-token",
+      42,
+      1,
+      logger,
+      "https://api.telegram.org",
+      cloudFetch,
+    );
+    const fetched = await cloud.fetchFile("f");
+    expect("bytes" in fetched && Buffer.from(fetched.bytes).toString()).toBe("cloud-bytes");
+  });
+
   it("refuses a local-server path that escapes the configured root", async () => {
     const root = tempDirectory("local-botapi-escape-");
     const fetchImpl = (async () =>
@@ -474,6 +522,40 @@ describe("local Bot API file pruning", () => {
     // Deleting a binlog would lose the server's update queue.
     expect(existsSync(queue)).toBe(true);
     expect(existsSync(tokenState)).toBe(true);
+    // The media directory still has file_2.m4a, so nothing is removed.
+    expect(pruned.removedDirectories).toBe(0);
+    expect(existsSync(media)).toBe(true);
+  });
+
+  it("removes media directories once pruning empties them, keeping root and token levels (bug №47)", async () => {
+    const root = tempDirectory("local-botapi-prune-dirs-");
+    const token = join(root, "1234:token");
+    const videos = join(token, "videos");
+    const nested = join(videos, "2026-08");
+    const documents = join(token, "documents");
+    mkdirSync(nested, { recursive: true });
+    mkdirSync(documents, { recursive: true });
+    const staleNested = join(nested, "file_7.mp4");
+    const staleFlat = join(videos, "file_8.mp4");
+    const keptDocument = join(documents, "file_9.pdf");
+    for (const path of [staleNested, staleFlat, keptDocument]) writeFileSync(path, "x");
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1_000);
+    utimesSync(staleNested, old, old);
+    utimesSync(staleFlat, old, old);
+
+    const pruned = await pruneLocalBotApiFiles({
+      root,
+      olderThanMs: 24 * 60 * 60 * 1_000,
+    });
+
+    expect(pruned.removedFiles).toBe(2);
+    // Both the nested month directory and the emptied kind directory go.
+    expect(pruned.removedDirectories).toBe(2);
+    expect(existsSync(videos)).toBe(false);
+    expect(existsSync(documents)).toBe(true);
+    // The token directory and the root survive even when they hold no media.
+    expect(existsSync(token)).toBe(true);
+    expect(existsSync(root)).toBe(true);
   });
 });
 

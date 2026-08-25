@@ -758,12 +758,31 @@ function numeric(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
+// Bug №43: with OPERATOR_FULL_ACCESS the CLI's Bash tool sees the whole daemon
+// environment, and a fixed blocklist misses every credential added after it was
+// written (OPENROUTER_API_KEY and friends). Strip anything whose *name* looks
+// like a credential instead. Benign variables (PATH, HOME, NODE_*, LANG, LC_*,
+// TERM, TMPDIR, XDG_*, …) never match the pattern and pass through untouched.
+const SECRET_LIKE_ENVIRONMENT_NAME = /TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|BEARER/i;
+// The CLI's own authentication is the one credential family the spawned
+// process legitimately needs (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN and
+// their endpoint overrides); everything else credential-shaped stays home.
+const CLI_AUTH_ENVIRONMENT_PREFIXES = ["ANTHROPIC_", "CLAUDE_"];
+// The per-turn MCP capability is injected explicitly after sanitizing; a value
+// inherited from the daemon's own environment must never reach a child.
+const NEVER_INHERITED_ENVIRONMENT_NAMES = new Set(["T3_OPERATOR_MCP_CAPABILITY"]);
+
 function sanitizedEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // Cap individual Bash tool commands: one runaway scan must not consume the
   // whole turn budget (the per-turn watchdog is the outer bound).
   env = { ...env, BASH_DEFAULT_TIMEOUT_MS: env.BASH_DEFAULT_TIMEOUT_MS ?? "300000", BASH_MAX_TIMEOUT_MS: env.BASH_MAX_TIMEOUT_MS ?? "300000" };
-  const blocked = /^(TELEGRAM_BOT_TOKEN|T3_BEARER_TOKEN|OPENAI_API_KEY|GROQ_API_KEY|DEEPGRAM_API_KEY|ELEVENLABS_API_KEY|GOOGLE_WORKSPACE_ACCESS_TOKEN|T3_OPERATOR_MCP_CAPABILITY)$/;
-  return Object.fromEntries(Object.entries(env).filter(([key]) => !blocked.test(key)));
+  return Object.fromEntries(
+    Object.entries(env).filter(([key]) => {
+      if (NEVER_INHERITED_ENVIRONMENT_NAMES.has(key)) return false;
+      if (!SECRET_LIKE_ENVIRONMENT_NAME.test(key)) return true;
+      return CLI_AUTH_ENVIRONMENT_PREFIXES.some((prefix) => key.startsWith(prefix));
+    }),
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

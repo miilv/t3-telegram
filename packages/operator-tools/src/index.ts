@@ -61,6 +61,7 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "memory.search",
   "memory.remember",
   "memory.update_focus",
+  "memory.journal",
   "scheduler.list_automations",
   "scheduler.create_automation",
   "scheduler.pause_automation",
@@ -699,6 +700,44 @@ export class OperatorToolServer {
         };
         this.options.store.setFocus(capability.context.ownerId, next);
         return next;
+      },
+    });
+    this.addTool(server, token, {
+      name: "memory.journal",
+      description:
+        "Read the daemon's durable event journal (what the Operator, workers and automations actually did), newest first. Answers 'what did you do yesterday' from the record, not from memory.",
+      schema: z.object({
+        since: z
+          .string()
+          .trim()
+          .min(1)
+          .max(64)
+          .optional()
+          .describe('Window start: ISO 8601 or relative like "-24h" (-30m/-24h/-7d)'),
+        until: z
+          .string()
+          .trim()
+          .min(1)
+          .max(64)
+          .optional()
+          .describe('Window end: ISO 8601 or relative like "-1h"'),
+        types: z
+          .array(z.string().trim().min(1).max(80))
+          .max(10)
+          .optional()
+          .describe('Event-type prefixes, e.g. "operator.", "worker.", "automation.", "telegram."'),
+        limit: z.number().int().min(1).max(200).optional(),
+      }),
+      readOnly: true,
+      handler: ({ since, until, types, limit }, capability) => {
+        this.requireAdministrativeRole(capability, "read the daemon journal");
+        const now = this.now();
+        return this.options.store.listDaemonEvents({
+          ...(since ? { since: resolveJournalInstant(since, now) } : {}),
+          ...(until ? { until: resolveJournalInstant(until, now) } : {}),
+          ...(types?.length ? { typePrefixes: types } : {}),
+          ...(limit !== undefined ? { limit } : {}),
+        });
       },
     });
 
@@ -1510,6 +1549,20 @@ function isImageToolPayload(value: unknown): value is ImageToolPayload {
       typeof candidate.image.mimeType === "string" &&
       candidate.metadata,
   );
+}
+
+/** Accepts either an ISO 8601 instant or a relative offset like "-24h". */
+function resolveJournalInstant(value: string, now: Date): string {
+  const relative = /^-(\d{1,6})(m|h|d)$/.exec(value.trim());
+  if (relative) {
+    const unitMs = relative[2] === "m" ? 60_000 : relative[2] === "h" ? 3_600_000 : 86_400_000;
+    return new Date(now.getTime() - Number(relative[1]) * unitMs).toISOString();
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`invalid time "${value}": use ISO 8601 or a relative offset like "-24h"`);
+  }
+  return new Date(parsed).toISOString();
 }
 
 function boundedJson(value: unknown): string {

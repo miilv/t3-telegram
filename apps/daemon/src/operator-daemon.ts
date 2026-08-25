@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, sep } from "node:path";
 import type { Logger } from "pino";
 import type { Config } from "../../../packages/shared/src/config.js";
 import type {
+  Artifact,
   ArtifactRef,
   ApprovalRiskCategory,
   Automation,
@@ -92,6 +93,10 @@ import type { DashboardServer } from "../../../packages/dashboard/src/index.js";
 
 /** The cloud Bot API's hard getFile ceiling; only a local server lifts it. */
 const CLOUD_BOT_API_MAX_FILE_BYTES = 20 * 1024 * 1024;
+/** Bug №24: how many attachments of one batch may be fetched at a time. */
+const ATTACHMENT_DOWNLOAD_CONCURRENCY = 2;
+/** Bug №24: total bytes of one batch the daemon is willing to buffer in memory. */
+const ATTACHMENT_BATCH_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024;
 
 /**
  * Bug №9: structural fencing for untrusted prompt content (user text with
@@ -170,6 +175,14 @@ export class OperatorDaemon {
   private readonly operatorRuntimeQueue = new SerialQueue();
   private readonly ingressQueue = new SerialQueue();
   private readonly workerEventQueue = new ConcurrentQueue(8);
+  /**
+   * Terminal worker events (completed/failed/cancelled) wait on the serial
+   * Operator runtime for result normalization. Parked in workerEventQueue they
+   * occupied all 8 slots at once and approvals/user-input of other threads
+   * queued behind them for minutes (bug №41) — so terminal events accumulate
+   * here instead and workerEventQueue stays free for interactive delivery.
+   */
+  private readonly workerCompletionQueue = new ConcurrentQueue(8);
   private readonly maintenanceQueue = new SerialQueue();
   private readonly outboxQueue = new SerialQueue();
   private readonly t3DispatchQueue = new SerialQueue();
@@ -337,6 +350,7 @@ export class OperatorDaemon {
     await this.operatorInputQueue.idle();
     await this.operatorRuntimeQueue.idle();
     await this.workerEventQueue.idle();
+    await this.workerCompletionQueue.idle();
     await this.maintenanceQueue.idle();
     await this.outboxQueue.idle();
     await this.t3DispatchQueue.idle();
@@ -711,20 +725,77 @@ export class OperatorDaemon {
         `[файл ${label} (${megabytes} MB) превышает лимит облачного Bot API 20 MB — недоступен]`,
       ];
     });
-    const ingested = await Promise.all(
-      update.attachments.map(async (attachment, index) => {
-        if (oversizeNotes[index]!.length) return undefined;
-        const bytes = await this.telegram.downloadFile(attachment.fileId);
-        return this.artifacts.ingestTelegram({
-          bytes,
-          filename:
-            attachment.filename ?? inferredAttachmentFilename(attachment, update.messageId),
-          mimeType: attachment.mimeType ?? inferredAttachmentMimeType(attachment),
-          telegramFileId: attachment.fileId,
-          chatId: update.chatId,
-          messageId: update.messageId,
+    // Bug №24: downloading a whole forwarded batch with one Promise.all
+    // buffered every file in memory at once — with a local Bot API server
+    // (files up to 2000 MB) that is an OOM, not a slowdown. Fetch a bounded
+    // number at a time under a shared per-batch buffer budget, and when the
+    // local server already has the file on disk, copy it into the artifact
+    // store without buffering at all.
+    const ingested: Array<Artifact | undefined> = new Array(update.attachments.length);
+    let batchBufferedBytes = 0;
+    const budgetNote = (attachment: TelegramAttachment): string => {
+      const label = attachment.filename ?? attachment.type;
+      const budgetMb = Math.round(ATTACHMENT_BATCH_MEMORY_BUDGET_BYTES / (1024 * 1024));
+      return `[файл ${label} пропущен: суммарный размер батча превышает лимит ${budgetMb} MB]`;
+    };
+    const ingestOne = async (attachment: TelegramAttachment, index: number): Promise<void> => {
+      if (oversizeNotes[index]!.length) return;
+      // With a local server the file arrives as a path (no buffering), so the
+      // budget reservation only applies when the bytes must be buffered.
+      // Reserving the declared size synchronously keeps concurrent workers
+      // from racing each other past the budget at its boundary.
+      let reservedBytes = 0;
+      if (!this.config.telegram.localFiles) {
+        reservedBytes = attachment.sizeBytes ?? 0;
+        if (batchBufferedBytes + reservedBytes > ATTACHMENT_BATCH_MEMORY_BUDGET_BYTES) {
+          oversizeNotes[index]!.push(budgetNote(attachment));
+          return;
+        }
+        batchBufferedBytes += reservedBytes;
+      }
+      const fetched = this.telegram.fetchFile
+        ? await this.telegram.fetchFile(attachment.fileId)
+        : { bytes: await this.telegram.downloadFile(attachment.fileId) };
+      const metadata = {
+        filename: attachment.filename ?? inferredAttachmentFilename(attachment, update.messageId),
+        mimeType: attachment.mimeType ?? inferredAttachmentMimeType(attachment),
+        telegramFileId: attachment.fileId,
+        chatId: update.chatId,
+        messageId: update.messageId,
+      };
+      if ("localPath" in fetched) {
+        batchBufferedBytes -= reservedBytes;
+        ingested[index] = await this.artifacts.ingestTelegram({
+          sourcePath: fetched.localPath,
+          ...metadata,
         });
-      }),
+        return;
+      }
+      // An understated declaration must not defeat the budget: account for the
+      // bytes actually held in memory when they exceed the reservation.
+      const excessBytes = fetched.bytes.byteLength - reservedBytes;
+      if (excessBytes > 0) {
+        if (batchBufferedBytes + excessBytes > ATTACHMENT_BATCH_MEMORY_BUDGET_BYTES) {
+          batchBufferedBytes -= reservedBytes;
+          oversizeNotes[index]!.push(budgetNote(attachment));
+          return;
+        }
+        batchBufferedBytes += excessBytes;
+      }
+      ingested[index] = await this.artifacts.ingestTelegram({ bytes: fetched.bytes, ...metadata });
+    };
+    const downloadQueue = update.attachments.map((attachment, index) => ({ attachment, index }));
+    await Promise.all(
+      Array.from(
+        { length: Math.min(ATTACHMENT_DOWNLOAD_CONCURRENCY, downloadQueue.length) },
+        async () => {
+          for (;;) {
+            const next = downloadQueue.shift();
+            if (!next) return;
+            await ingestOne(next.attachment, next.index);
+          }
+        },
+      ),
     );
     const stored = ingested.filter(
       (artifact): artifact is NonNullable<typeof artifact> => artifact !== undefined,
@@ -1149,7 +1220,15 @@ export class OperatorDaemon {
         for await (const event of this.broker.subscribeThread(threadId, controller.signal)) {
           resubscribeAttempt = 0;
           const route = currentRoute();
-          await this.workerEventQueue.run(async () => {
+          // Bug №41: terminal events go to their own accumulator queue so a
+          // burst of completions never occupies the interactive slots. This
+          // for-await still awaits every event, so one thread's events —
+          // including its terminal one — keep their order.
+          const queue =
+            event.type === "completed" || event.type === "failed" || event.type === "cancelled"
+              ? this.workerCompletionQueue
+              : this.workerEventQueue;
+          await queue.run(async () => {
             this.store.appendEvent(`worker.${event.type}`, {
               correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`) ?? `thread:${threadId}`,
               threadId,

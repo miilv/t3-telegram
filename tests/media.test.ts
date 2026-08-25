@@ -488,6 +488,78 @@ describe("MediaProcessor", () => {
     store.close();
   });
 
+  it("keeps the Docling in-flight counter balanced when a conversion fails (bug №45)", async () => {
+    const home = tempDirectory("media-docling-counter-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const ingest = (name: string, fileId: string, messageId: number) =>
+      artifacts.ingestTelegram({
+        bytes: Buffer.from("docx-bytes"),
+        filename: name,
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        telegramFileId: fileId,
+        chatId: 7,
+        messageId,
+      });
+    const longRunning = await ingest("long.docx", "doc_long", 21);
+    const failing = await ingest("broken.docx", "doc_broken", 22);
+    let releaseLongRunning!: (response: Response) => void;
+    const held = new Promise<Response>((resolvePromise) => (releaseLongRunning = resolvePromise));
+    let convertCalls = 0;
+    const processor = new MediaProcessor(
+      mediaConfig({
+        docling: {
+          endpoint: "http://127.0.0.1:5001",
+          container: "t3-docling",
+          startTimeoutMs: 30_000,
+          convertTimeoutMs: 30_000,
+          idleStopMinutes: 10,
+          ocrPreset: "rapidocr",
+          ocrLang: "eslav",
+        },
+        ocr: {
+          enabled: true,
+          tesseractBin: "tesseract-missing",
+          pdftotextBin: "pdftotext-missing",
+          pdftoppmBin: "pdftoppm-missing",
+          langs: "rus+eng",
+          maxPdfPages: 8,
+        },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+      async (url) => {
+        if (String(url).endsWith("/health")) return new Response("ok", { status: 200 });
+        convertCalls += 1;
+        if (convertCalls === 1) return held;
+        return new Response("boom", { status: 500 });
+      },
+    );
+    const activeConversions = () =>
+      (processor as unknown as { doclingActiveConversions: number }).doclingActiveConversions;
+    const first = processor.ocrInbound(longRunning);
+    while (convertCalls < 1) await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    expect(activeConversions()).toBe(1);
+    // The failed conversion must decrement exactly once: before the fix it
+    // decremented twice and freed the slot the live conversion still held,
+    // letting the idle stop kill the container mid-flight.
+    const failed = await processor.ocrInbound(failing);
+    expect(failed.unavailable).toBe("office document conversion requires Docling");
+    expect(activeConversions()).toBe(1);
+    expect(await processor.stopIdleDocling()).toBe(false);
+    releaseLongRunning(
+      new Response(
+        JSON.stringify({ status: "success", document: { md_content: "# Долгий отчёт" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const finished = await first;
+    expect(finished.provider).toBe("docling");
+    expect(activeConversions()).toBe(0);
+    store.close();
+  });
+
   it("falls back to the vision model when tesseract finds no printed text", async () => {
     const home = tempDirectory("media-vision-fallback-");
     const store = tempStore();

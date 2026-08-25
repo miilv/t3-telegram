@@ -40,14 +40,31 @@ export class ArtifactRegistry {
   }
 
   async ingestTelegram(input: {
-    bytes: Uint8Array;
+    /** Buffered content, as downloaded from the cloud Bot API. */
+    bytes?: Uint8Array;
+    /**
+     * Copy the file from disk instead (a local Bot API server already wrote
+     * it there), so large media never has to pass through daemon memory.
+     */
+    sourcePath?: string;
     filename?: string;
     mimeType?: string;
     telegramFileId: string;
     chatId: number;
     messageId: number;
   }): Promise<Artifact> {
-    if (input.bytes.byteLength > this.maxInboundBytes) {
+    if (input.bytes === undefined && input.sourcePath === undefined) {
+      throw new Error("Telegram ingestion needs bytes or a source path");
+    }
+    let sizeBytes: number;
+    if (input.bytes) {
+      sizeBytes = input.bytes.byteLength;
+    } else {
+      const metadata = await stat(input.sourcePath!);
+      if (!metadata.isFile()) throw new Error("Telegram attachment source must be a regular file");
+      sizeBytes = metadata.size;
+    }
+    if (sizeBytes > this.maxInboundBytes) {
       throw new Error(
         `Attachment exceeds the ${Math.round(this.maxInboundBytes / (1024 * 1024))} MiB inbound limit`,
       );
@@ -63,14 +80,19 @@ export class ArtifactRegistry {
     const directory = join(this.root, id);
     const localPath = join(directory, safeName);
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await writeFile(localPath, input.bytes, { mode: 0o600 });
+    if (input.bytes) {
+      await writeFile(localPath, input.bytes, { mode: 0o600 });
+    } else {
+      await copyFile(input.sourcePath!, localPath);
+      await chmod(localPath, 0o600);
+    }
     const artifact: Artifact = {
       id,
       localPath,
       filename: safeName,
       ...(input.mimeType ? { mimeType: input.mimeType } : {}),
-      sizeBytes: input.bytes.byteLength,
-      sha256: sha256(input.bytes),
+      sizeBytes,
+      sha256: input.bytes ? sha256(input.bytes) : await hashFile(localPath),
       source: "telegram_upload",
       telegramFileId: input.telegramFileId,
       telegramChatId: input.chatId,
