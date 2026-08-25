@@ -6,10 +6,19 @@ import { nowIso } from "../../shared/src/index.js";
 // facts stay in code — cancel intent, explicit project references for
 // commands, and durable focus bookkeeping.
 
-const cancelPattern = /^(?:стоп|отмени|хватит|cancel|stop)(?=$|[^\p{L}\p{N}_])/iu;
+const cancelWords = new Set(["стоп", "отмена", "отмени", "хватит", "cancel", "stop"]);
 
+/**
+ * A cancel intent is a short standalone phrase (≤3 words) that starts with a
+ * cancel word — «стоп», «хватит, спасибо», "stop it please". A sentence that
+ * merely begins with one ("stop doing X when the tests pass") is an
+ * instruction, not an interrupt, and must not kill running work (bug №1).
+ */
 export function isCancelIntent(text: string): boolean {
-  return cancelPattern.test(text.trim());
+  const words = text.normalize("NFKC").trim().split(/\s+/u).filter(Boolean);
+  if (words.length === 0 || words.length > 3) return false;
+  const first = words[0]!.toLocaleLowerCase().replace(/[^\p{L}\p{N}_]+$/u, "");
+  return cancelWords.has(first);
 }
 
 /**

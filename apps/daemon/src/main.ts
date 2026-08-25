@@ -92,6 +92,7 @@ async function main(): Promise<void> {
     connectors,
     getPolicy: () => daemon.getPolicy(),
     updatePolicy: (patch, updatedBy) => daemon.updatePolicy(patch, updatedBy),
+    activeWorkers: () => daemon.workerOccupancy(),
     logger,
     onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
   });

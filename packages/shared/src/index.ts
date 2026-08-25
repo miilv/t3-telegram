@@ -430,6 +430,46 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+/** The minimal runtime-state surface the own-dispatch bookkeeping needs. */
+export interface RuntimeStateStore {
+  getRuntimeState(key: string): string | undefined;
+  setRuntimeState(key: string, value: string): void;
+}
+
+/**
+ * Own-dispatch marker for turn-ownership classification (bug №27). The value
+ * is a COUNTER of dispatches we sent but have not yet seen start, not a
+ * boolean: with a boolean, a collaborator's simultaneous turn consumed the
+ * flag and our own follow-up was misclassified as external forever. A
+ * companion timestamp records the last raise so terminal events within a
+ * short window of our dispatch are never suppressed even when the started
+ * events arrived in a confusing order.
+ */
+export function raiseOwnDispatchPending(store: RuntimeStateStore, threadId: string): void {
+  store.setRuntimeState(
+    `thread_own_dispatch_pending:${threadId}`,
+    String(ownDispatchPendingCount(store, threadId) + 1),
+  );
+  store.setRuntimeState(`thread_own_dispatch_at:${threadId}`, nowIso());
+}
+
+/** Consume one pending own dispatch (dispatch failed, or its turn started). */
+export function releaseOwnDispatchPending(store: RuntimeStateStore, threadId: string): void {
+  const remaining = ownDispatchPendingCount(store, threadId) - 1;
+  store.setRuntimeState(
+    `thread_own_dispatch_pending:${threadId}`,
+    remaining > 0 ? String(remaining) : "",
+  );
+}
+
+export function ownDispatchPendingCount(store: RuntimeStateStore, threadId: string): number {
+  const raw = store.getRuntimeState(`thread_own_dispatch_pending:${threadId}`) ?? "";
+  if (!raw) return 0;
+  const parsed = Number(raw);
+  // Pre-counter deployments stored an ISO timestamp; treat it as one pending.
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 1;
+}
+
 export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }

@@ -1507,6 +1507,7 @@ describe("OperatorDaemon product flow", () => {
       { type: "agent_message", threadId: "th_1", text: "Шаг коллаборатора из T3 UI." },
       { type: "completed", threadId: "th_1", result: "Collaborative turn finished in the UI." },
     ];
+    broker.holdTerminal();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
@@ -1528,6 +1529,13 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() =>
       telegram.sent.some((entry) => entry.text.includes("тред продолжили напрямую в T3")),
     );
+    // The collaborator's terminal arrives well after our own dispatch, so the
+    // bug-№27 grace window no longer applies and the result stays suppressed.
+    store.setRuntimeState(
+      "thread_own_dispatch_at:th_1",
+      new Date(Date.now() - 10 * 60 * 1_000).toISOString(),
+    );
+    broker.releaseTerminal();
     await waitFor(() => store.getThread("th_1")?.status === "completed");
 
     // The daemon's own turn is mirrored; the external turn is announced once
@@ -1983,6 +1991,240 @@ describe("OperatorDaemon product flow", () => {
     expect(diagnostic).toContain("Metrics");
     expect(diagnostic).toMatch(/Chat: `chat_[a-f0-9]{12}`/);
     expect(diagnostic).not.toContain("Chat: `7`");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("scopes a bare cancel word to the initiating chat and an allowed role (bug №1)", async () => {
+    const home = tempDirectory("daemon-cancel-scope-");
+    const store = tempStore();
+    const runtime = new InterruptTrackingRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const base = config(home);
+    const cfg: Config = {
+      ...base,
+      telegram: { ...base.telegram, users: { 42: "owner", 43: "viewer" } },
+    };
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(cfg, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "подумай хорошенько над архитектурой миграции"));
+    await waitFor(() => runtime.turnStarted);
+
+    // A viewer in the same chat, the owner from ANOTHER chat, and a sentence
+    // that merely starts with "stop" must all leave the runtime alone.
+    telegram.push(messageAs(2, "стоп", 43));
+    telegram.push({ ...message(3, "стоп"), chatId: 8 });
+    telegram.push(message(4, "stop писать тесты после каждого шага и просто закончи"));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(runtime.interrupts).toBe(0);
+
+    // The initiator in the initiating chat interrupts immediately.
+    telegram.push(message(5, "стоп"));
+    await waitFor(() => runtime.interrupts === 1);
+
+    runtime.releaseTurn();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("retargets a live monitor when a busy thread is steered from another chat (bug №11)", async () => {
+    const home = tempDirectory("daemon-steer-chat-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /почини|доработай/u, title: "Steered work" }));
+    const broker = new FakeBroker();
+    broker.holdTerminal();
+    const telegram = new ChatRecordingTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "почини flaky сборку в CI"));
+    await waitFor(() => broker.turns.length === 1);
+    await waitFor(() => store.getRuntimeState("thread_chat:th_1") === "7");
+
+    // Steering the busy thread from another chat retargets the live monitor.
+    telegram.push({ ...message(2, "доработай ещё и prod конфиг"), chatId: 8 });
+    await waitFor(() => store.getRuntimeState("thread_chat:th_1") === "8", 5_000);
+
+    broker.releaseTerminal();
+    await waitFor(
+      () => telegram.richByChat.some((entry) => entry.chatId === 8 && entry.text.includes("Worker завершил задачу")),
+      5_000,
+    );
+    expect(
+      telegram.richByChat.filter((entry) => entry.chatId === 7 && entry.text.includes("Worker завершил задачу")),
+    ).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("resubscribes a worker monitor after a subscription failure instead of dying silently (bug №12)", async () => {
+    const home = tempDirectory("daemon-monitor-retry-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FlakySubscribeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь миграцию каталога заказов"));
+    // The first subscription dies mid-flight; the monitor backs off (1s),
+    // resubscribes, and still delivers the terminal result.
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу")),
+      6_000,
+    );
+    expect(broker.subscribeCalls).toBeGreaterThanOrEqual(2);
+    expect(store.getThread("th_1")?.status).toBe("completed");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("enforces maxParallelWorkers when the agent dispatches new workers (bug №13)", async () => {
+    const home = tempDirectory("daemon-worker-limit-");
+    const store = tempStore();
+    const script: OperatorScript = async (envelope, call) => {
+      const workspacesRoot =
+        /New project workspaces belong under (\S+)\./u.exec(envelope)?.[1] ?? "/tmp/workspaces";
+      const project = (await call("t3.create_project", {
+        name: "Fleet",
+        workspaceRoot: `${workspacesRoot}/fleet`,
+      })) as { id: string };
+      const outcomes: string[] = [];
+      for (const title of ["Scope A", "Scope B", "Scope C"]) {
+        const thread = (await call("t3.create_thread", { projectId: project.id, title })) as { id: string };
+        try {
+          await call("t3.send_turn", { threadId: thread.id, text: `Работай: ${title}` });
+          outcomes.push(`${title}: started`);
+        } catch (error) {
+          outcomes.push(`${title}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return outcomes.join("\n");
+    };
+    const runtime = new DelegatingRuntime(script);
+    const broker = new FakeBroker();
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const base = config(home);
+    const cfg: Config = { ...base, policy: { ...base.policy, maxParallelWorkers: 2 } };
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      getPolicy: () => daemon.getPolicy(),
+      activeWorkers: () => daemon.workerOccupancy(),
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(cfg, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "запусти все три направления параллельно"));
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Parallel worker limit reached")),
+      5_000,
+    );
+    // Only two workers actually started; the third dispatch was refused with
+    // an error the agent relays instead of silently exceeding the policy.
+    expect(broker.turns).toHaveLength(2);
+    expect(daemon.workerOccupancy().count).toBe(2);
+
+    broker.releaseTerminal();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("delivers a terminal event when the started race misclassified our turn as external (bug №27)", async () => {
+    const home = tempDirectory("daemon-own-turn-race-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /implement/u, title: "Race work" }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      // The collaborator's turn starts FIRST and eats our pending slot; our
+      // own follow-up is then classified external — the grace window still
+      // delivers its terminal result instead of suppressing it forever.
+      { type: "started", threadId: "th_1", turnId: "turn_external" },
+      { type: "started", threadId: "th_1", turnId: "turn_own" },
+      { type: "completed", threadId: "th_1", result: "Own follow-up finished." },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement the race-sensitive follow-up"));
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу")),
+      5_000,
+    );
+    expect(store.getThread("th_1")?.status).toBe("completed");
 
     telegram.finish();
     await run;
@@ -2685,6 +2927,38 @@ class FakeTelegram implements TelegramTransport {
   async sendChatAction(): Promise<void> {}
   async health(): Promise<{ healthy: boolean; username: string }> {
     return { healthy: true, username: "operator_test_bot" };
+  }
+}
+
+class InterruptTrackingRuntime extends BlockingRuntime {
+  interrupts = 0;
+
+  override async interrupt(): Promise<void> {
+    this.interrupts += 1;
+  }
+}
+
+class ChatRecordingTelegram extends FakeTelegram {
+  readonly richByChat: Array<{ chatId: number; text: string }> = [];
+
+  override async sendRich(chatId: number, text: string): Promise<SentMessage[]> {
+    this.richByChat.push({ chatId, text });
+    return super.sendRich(chatId, text);
+  }
+}
+
+class FlakySubscribeBroker extends FakeBroker {
+  subscribeCalls = 0;
+  private subscribeFailures = 1;
+
+  override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+    this.subscribeCalls += 1;
+    if (this.subscribeFailures > 0) {
+      this.subscribeFailures -= 1;
+      yield { type: "started", threadId };
+      throw new Error("thread subscription reset mid-flight");
+    }
+    yield* super.subscribeThread(threadId);
   }
 }
 

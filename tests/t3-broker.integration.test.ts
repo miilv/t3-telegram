@@ -4,6 +4,7 @@ import pino from "pino";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   HttpT3Broker,
+  isPermanentRpcError,
   resolveT3WebSocketUrl,
   type T3LiveClient,
   type T3ShellSubscriptionInput,
@@ -666,3 +667,20 @@ function json(response: ServerResponse, body: unknown): void {
   response.setHeader("content-type", "application/json");
   response.end(JSON.stringify(body));
 }
+
+describe("isPermanentRpcError", () => {
+  it("treats structural codes and authorization failures as permanent", () => {
+    expect(isPermanentRpcError(new Error("EnvironmentAuthorization: token rejected"))).toBe(true);
+    expect(isPermanentRpcError(new Error("missing required scope orchestration.subscribe"))).toBe(true);
+    expect(isPermanentRpcError({ _tag: "ThreadNotFound" })).toBe(true);
+    expect(isPermanentRpcError({ code: "NotFoundError" })).toBe(true);
+    expect(isPermanentRpcError(new Error("wrapped", { cause: { _tag: "InvalidThreadId" } }))).toBe(true);
+  });
+
+  it("no longer kills a subscription over transient errors that merely say 'not found' (bug №12)", () => {
+    expect(isPermanentRpcError(new Error("host not found (ENOTFOUND) while resolving t3.local"))).toBe(false);
+    expect(isPermanentRpcError(new Error("upstream replied 502: backend not found"))).toBe(false);
+    expect(isPermanentRpcError(new Error("thread not found in warm cache; retrying from storage"))).toBe(false);
+    expect(isPermanentRpcError(new Error("socket closed before response"))).toBe(false);
+  });
+});

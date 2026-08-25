@@ -23,7 +23,13 @@ import type {
   WorkerResult,
   WorkerEvent,
 } from "../../../packages/shared/src/index.js";
-import { newId, nowIso } from "../../../packages/shared/src/index.js";
+import {
+  newId,
+  nowIso,
+  ownDispatchPendingCount,
+  raiseOwnDispatchPending,
+  releaseOwnDispatchPending,
+} from "../../../packages/shared/src/index.js";
 import type {
   BackgroundJob,
   OperatorStore,
@@ -130,6 +136,19 @@ interface DurableTelegramPayload {
   uncertainRequeued?: boolean;
 }
 
+interface MonitorRoute {
+  chatId: number;
+  originMessageId?: number;
+  destination: TelegramDestination;
+}
+
+/** Resubscribe schedule for a failed worker monitor (bug №12). */
+const MONITOR_RESUBSCRIBE_MAX_ATTEMPTS = 10;
+const MONITOR_RESUBSCRIBE_BASE_DELAY_MS = 1_000;
+const MONITOR_RESUBSCRIBE_MAX_DELAY_MS = 60_000;
+/** Terminal events within this window of our own dispatch are never suppressed (bug №27). */
+const OWN_DISPATCH_GRACE_MS = 120_000;
+
 export class OperatorDaemon {
   private readonly operatorInputQueue = new SerialQueue();
   private readonly operatorRuntimeQueue = new SerialQueue();
@@ -139,6 +158,14 @@ export class OperatorDaemon {
   private readonly outboxQueue = new SerialQueue();
   private readonly t3DispatchQueue = new SerialQueue();
   private readonly monitors = new Map<string, AbortController>();
+  /**
+   * Live delivery target per monitored thread (bug №11). monitorThread updates
+   * it on every call, so steering a busy thread from another chat retargets
+   * the existing monitor instead of leaking progress into the old chat.
+   */
+  private readonly monitorRoutes = new Map<string, MonitorRoute>();
+  /** Chat/initiator of each in-flight direct Operator turn (bug №1). */
+  private readonly activeOperatorTurns = new Set<{ chatId: number; userId: number }>();
   /** Rate-limits the bug-№37 head-of-line warnings per outbox item. */
   private readonly blockedOutboxWarnedAt = new Map<string, number>();
   private readonly monitorTasks = new Set<Promise<void>>();
@@ -224,7 +251,17 @@ export class OperatorDaemon {
 
   async run(): Promise<void> {
     for await (const update of this.telegram.updates(this.shutdown.signal)) {
-      if (update.type === "message" && isCancelIntent(update.text)) void this.runtime.interrupt();
+      // Bug №1: a bare cancel word interrupts the Operator runtime only when
+      // an active direct turn was started from this very chat AND the sender
+      // may stop it (admin/owner, or the turn's own initiator). Worker-thread
+      // cancellation stays in cancelBoundWork, which has its own ACL.
+      if (
+        update.type === "message" &&
+        isCancelIntent(update.text) &&
+        this.mayInterruptOperatorTurn(update.chatId, update.userId)
+      ) {
+        void this.runtime.interrupt();
+      }
       const receivedAt = Date.now();
       void this.ingressQueue
         .run(async () => {
@@ -764,7 +801,21 @@ export class OperatorDaemon {
     // itself and routes durable work through the t3.* tools per its system
     // prompt. Mechanical facts (reply thread, focus, forwarded separation)
     // travel in the envelope; judgment stays with the agent.
-    await this.answerDirect(update, focus, enrichedArtifacts, replyContext?.primaryThreadId);
+    const turnOrigin = { chatId: update.chatId, userId: update.userId };
+    this.activeOperatorTurns.add(turnOrigin);
+    try {
+      await this.answerDirect(update, focus, enrichedArtifacts, replyContext?.primaryThreadId);
+    } finally {
+      this.activeOperatorTurns.delete(turnOrigin);
+    }
+  }
+
+  /** Bug №1: cancel-scope check for the global Operator runtime interrupt. */
+  private mayInterruptOperatorTurn(chatId: number, userId: number): boolean {
+    const sameChatTurns = [...this.activeOperatorTurns].filter((turn) => turn.chatId === chatId);
+    if (!sameChatTurns.length) return false;
+    if (this.isAdministrator(userId)) return true;
+    return sameChatTurns.some((turn) => turn.userId === userId);
   }
 
   private async answerDirect(
@@ -920,17 +971,35 @@ export class OperatorDaemon {
     originMessageId?: number,
     destination: TelegramDestination = {},
   ): void {
+    // Bug №11: refresh the delivery route on EVERY call, so steering an
+    // already-monitored thread from another chat retargets the live monitor
+    // instead of hitting the early return with a stale closure destination.
+    this.monitorRoutes.set(threadId, {
+      chatId,
+      ...(originMessageId !== undefined ? { originMessageId } : {}),
+      destination,
+    });
     if (this.monitors.has(threadId)) return;
+    this.store.setRuntimeState(`thread_monitor_lost:${threadId}`, "");
     const controller = new AbortController();
     this.monitors.set(threadId, controller);
     this.store.setRuntimeState(`thread_monitor_started_at:${threadId}`, nowIso());
     metrics.set("active_workers", this.monitors.size);
+    const currentRoute = (): MonitorRoute =>
+      this.monitorRoutes.get(threadId) ?? {
+        chatId,
+        ...(originMessageId !== undefined ? { originMessageId } : {}),
+        destination,
+      };
     const task = (async () => {
       let lastProgressAt = 0;
       let terminal = false;
       let performanceOutcome: boolean | undefined;
-      try {
+      let resubscribeAttempt = 0;
+      const subscribeOnce = async (): Promise<void> => {
         for await (const event of this.broker.subscribeThread(threadId, controller.signal)) {
+          resubscribeAttempt = 0;
+          const route = currentRoute();
           await this.workerEventQueue.run(async () => {
             this.store.appendEvent(`worker.${event.type}`, {
               correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`) ?? `thread:${threadId}`,
@@ -939,7 +1008,7 @@ export class OperatorDaemon {
             });
             if (event.type === "started") {
               this.store.updateThreadStatus(threadId, "running");
-              await this.observeTurnOwnership(threadId, chatId, event.turnId, destination);
+              await this.observeTurnOwnership(threadId, route.chatId, event.turnId, route.destination);
             } else if (this.isExternalTurn(threadId) && (event.type === "progress" || event.type === "agent_message")) {
               // A collaborator is driving this thread directly in the T3 UI;
               // mirroring their own steps back into Telegram is noise.
@@ -947,11 +1016,11 @@ export class OperatorDaemon {
               lastProgressAt = Date.now();
               this.enqueueTelegramOutbox(
                 `telegram:progress:${threadId}:${stableTextHash(event.summary)}`,
-                chatId,
+                route.chatId,
                 "rich",
                 {
                   text: `**${this.store.getThread(threadId)?.title ?? "Работа"}**\n\n${event.summary}`,
-                  options: destination,
+                  options: route.destination,
                   threadId,
                   correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`),
                   messageType: "worker_progress",
@@ -968,11 +1037,11 @@ export class OperatorDaemon {
               // not — it is low-volume and the only informative progress there is.
               this.enqueueTelegramOutbox(
                 `telegram:say:${threadId}:${stableTextHash(event.text)}`,
-                chatId,
+                route.chatId,
                 "rich",
                 {
                   text: `**${this.store.getThread(threadId)?.title ?? "Работа"}**\n\n${safeExcerpt(event.text, 2_500)}`,
-                  options: destination,
+                  options: route.destination,
                   threadId,
                   correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`),
                   messageType: "worker_progress",
@@ -984,30 +1053,62 @@ export class OperatorDaemon {
               );
               await this.flushTelegramOutbox();
             } else if (event.type === "approval_required") {
-              await this.requestApproval(chatId, event, originMessageId, destination);
+              await this.requestApproval(route.chatId, event, route.originMessageId, route.destination);
             } else if (event.type === "approval_resolved") {
               await this.reconcileApprovalResolution(event);
             } else if (event.type === "user_input_required") {
-              await this.requestUserInput(chatId, event, originMessageId, destination);
+              await this.requestUserInput(route.chatId, event, route.originMessageId, route.destination);
             } else if (event.type === "user_input_resolved") {
               await this.reconcileUserInputResolution(event);
             } else if (event.type === "completed") {
-              await this.deliverCompletion(chatId, event, originMessageId, destination);
+              await this.deliverCompletion(route.chatId, event, route.originMessageId, route.destination);
               terminal = true;
               performanceOutcome = true;
             } else if (event.type === "failed") {
-              terminal = !(await this.deliverFailure(chatId, threadId, event.error, destination));
+              terminal = !(await this.deliverFailure(route.chatId, threadId, event.error, route.destination));
               if (terminal) performanceOutcome = false;
             } else if (event.type === "cancelled") {
-              await this.deliverCancellation(chatId, threadId, destination);
+              await this.deliverCancellation(route.chatId, threadId, route.destination);
               terminal = true;
             }
           });
         }
-      } catch (error) {
-        if (!controller.signal.aborted) this.logger.error({ err: error, threadId }, "Worker monitor failed");
+      };
+      try {
+        // Bug №12: one failing event handler (or a fatal subscription error)
+        // no longer kills the monitor silently. Resubscribe with exponential
+        // backoff; after the attempts run out, tell the owner and leave a
+        // durable marker for the maintenance recovery pass.
+        while (!controller.signal.aborted && !terminal) {
+          try {
+            await subscribeOnce();
+            break; // the subscription stream closed cleanly
+          } catch (error) {
+            if (controller.signal.aborted) break;
+            resubscribeAttempt += 1;
+            if (resubscribeAttempt > MONITOR_RESUBSCRIBE_MAX_ATTEMPTS) {
+              this.logger.error(
+                { err: error, threadId, attempts: resubscribeAttempt - 1 },
+                "Worker monitor lost after repeated resubscribe failures",
+              );
+              await this.reportMonitorLost(threadId);
+              break;
+            }
+            const waitMs = Math.min(
+              MONITOR_RESUBSCRIBE_MAX_DELAY_MS,
+              MONITOR_RESUBSCRIBE_BASE_DELAY_MS * 2 ** (resubscribeAttempt - 1),
+            );
+            this.logger.warn(
+              { err: error, threadId, attempt: resubscribeAttempt, waitMs },
+              "Worker monitor failed; resubscribing with backoff",
+            );
+            await delay(waitMs, controller.signal);
+          }
+        }
       } finally {
+        const route = currentRoute();
         this.monitors.delete(threadId);
+        this.monitorRoutes.delete(threadId);
         metrics.set("active_workers", this.monitors.size);
         if (terminal) {
           const startedAt = Date.parse(this.store.getRuntimeState(`thread_monitor_started_at:${threadId}`) ?? "");
@@ -1032,7 +1133,7 @@ export class OperatorDaemon {
           this.store.getRuntimeState(`thread_recovery_pending:${threadId}`)
         ) {
           this.store.setRuntimeState(`thread_recovery_pending:${threadId}`, "");
-          this.monitorThread(threadId, chatId, originMessageId, destination);
+          this.monitorThread(threadId, route.chatId, route.originMessageId, route.destination);
         }
       }
     })();
@@ -1040,13 +1141,42 @@ export class OperatorDaemon {
     void task.finally(() => this.monitorTasks.delete(task));
   }
 
+  /** Bug №12: durable owner notice + marker when a monitor could not resubscribe. */
+  private async reportMonitorLost(threadId: string): Promise<void> {
+    this.store.setRuntimeState(`thread_monitor_lost:${threadId}`, nowIso());
+    this.store.appendEvent("worker.monitor.lost", { threadId, payload: {} });
+    const epoch = this.store.getRuntimeState(`thread_terminal_epoch:${threadId}`) ?? "0";
+    this.enqueueTelegramOutbox(
+      `telegram:monitor-lost:${threadId}:${epoch}`,
+      this.config.telegram.allowedUserId,
+      "rich",
+      {
+        text: `Потерял связь с тредом **${escapeMarkdownText(this.store.getThread(threadId)?.title ?? threadId)}** после нескольких попыток переподключения. Восстановлю подписку при следующем maintenance.`,
+        options: {},
+        threadId,
+        correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`),
+        messageType: "worker_monitor_lost",
+      },
+    );
+    await this.flushTelegramOutbox().catch(() => undefined);
+  }
+
   private async dispatchNextFollowup(threadId: string): Promise<QueuedThreadFollowup | undefined> {
+    // Bug №13: a queued follow-up must not restart a thread past the parallel
+    // worker ceiling; the job stays pending for the maintenance recovery pass.
+    if (!this.hasWorkerCapacity(threadId)) {
+      this.logger.debug(
+        { threadId, activeWorkers: this.monitors.size },
+        "Follow-up dispatch deferred by the parallel worker limit",
+      );
+      return undefined;
+    }
     const job = this.store.claimBackgroundJob<QueuedThreadFollowup>(
       "thread_followup",
       (payload) => payload.threadId === threadId,
     );
     if (!job) return undefined;
-    this.store.setRuntimeState(`thread_own_dispatch_pending:${threadId}`, nowIso());
+    raiseOwnDispatchPending(this.store, threadId);
     try {
       await this.broker.sendTurn({
         threadId,
@@ -1062,7 +1192,7 @@ export class OperatorDaemon {
           : {}),
       });
     } catch (error) {
-      this.store.setRuntimeState(`thread_own_dispatch_pending:${threadId}`, "");
+      releaseOwnDispatchPending(this.store, threadId);
       const detail = safeExcerpt(error instanceof Error ? error.message : String(error), 1_000);
       const gaveUp = this.store.retryBackgroundJob(job.id, detail);
       if (gaveUp) {
@@ -1484,10 +1614,19 @@ export class OperatorDaemon {
   /**
    * Decide whether a newly observed turn was dispatched by this daemon or
    * started externally (T3 UI, collaborator). Own dispatches raise a pending
-   * flag just before broker.sendTurn; anything else on a NEW turn id is
-   * external — announced once, then its steps and result are not mirrored.
-   * Without a server-advertised turn id the previous ownership state is kept,
-   * so servers that do not expose turn identity retain the old behavior.
+   * COUNTER (bug №27) just before broker.sendTurn; each NEW turn id consumes
+   * one pending slot, so a collaborator's simultaneous turn no longer eats
+   * the single flag and hides our own follow-up's result. Anything observed
+   * with zero pending slots is external — announced once, then its steps and
+   * result are not mirrored. Without a server-advertised turn id the previous
+   * ownership state is kept, so servers that do not expose turn identity
+   * retain the old behavior.
+   *
+   * Known limitation: without a server-side turnId↔commandId mapping the
+   * classification of WHICH turn is ours stays first-come-first-served. When
+   * our dispatch and a collaborator's start within the same window, the
+   * labels can be swapped; the OWN_DISPATCH_GRACE_MS terminal grace in
+   * deliverCompletion/deliverFailure keeps the result from being suppressed.
    */
   private async observeTurnOwnership(
     threadId: string,
@@ -1495,11 +1634,10 @@ export class OperatorDaemon {
     turnId: string | undefined,
     destination: TelegramDestination,
   ): Promise<void> {
-    const pendingKey = `thread_own_dispatch_pending:${threadId}`;
-    const own = Boolean(this.store.getRuntimeState(pendingKey));
+    const pending = ownDispatchPendingCount(this.store, threadId);
     if (!turnId) {
-      if (own) {
-        this.store.setRuntimeState(pendingKey, "");
+      if (pending > 0) {
+        releaseOwnDispatchPending(this.store, threadId);
         this.store.setRuntimeState(`thread_turn_external:${threadId}`, "");
       }
       return;
@@ -1507,7 +1645,8 @@ export class OperatorDaemon {
     const seenKey = `thread_seen_turn:${threadId}`;
     if (this.store.getRuntimeState(seenKey) === turnId) return;
     this.store.setRuntimeState(seenKey, turnId);
-    if (own) this.store.setRuntimeState(pendingKey, "");
+    const own = pending > 0;
+    if (own) releaseOwnDispatchPending(this.store, threadId);
     this.store.setRuntimeState(`thread_turn_external:${threadId}`, own ? "" : "1");
     if (own) return;
     this.store.appendEvent("worker.external_turn", { threadId, payload: { turnId } });
@@ -1523,6 +1662,27 @@ export class OperatorDaemon {
 
   private isExternalTurn(threadId: string): boolean {
     return this.store.getRuntimeState(`thread_turn_external:${threadId}`) === "1";
+  }
+
+  /**
+   * Bug №27: we dispatched to this thread moments ago, so an "external"
+   * classification is likely a race artifact — terminal events must still be
+   * delivered to Telegram instead of being suppressed for good.
+   */
+  private hadRecentOwnDispatch(threadId: string): boolean {
+    if (ownDispatchPendingCount(this.store, threadId) > 0) return true;
+    const raisedAt = Date.parse(this.store.getRuntimeState(`thread_own_dispatch_at:${threadId}`) ?? "");
+    return Number.isFinite(raisedAt) && Date.now() - raisedAt <= OWN_DISPATCH_GRACE_MS;
+  }
+
+  /** Bug №13: live worker occupancy, consumed by t3.send_turn via main.ts. */
+  workerOccupancy(): { count: number; threadIds: string[] } {
+    return { count: this.monitors.size, threadIds: [...this.monitors.keys()] };
+  }
+
+  /** A thread that is already monitored never adds parallelism. */
+  private hasWorkerCapacity(threadId: string): boolean {
+    return this.monitors.has(threadId) || this.monitors.size < this.getPolicy().maxParallelWorkers;
   }
 
   // A per-thread delivery epoch distinguishes terminal events of successive
@@ -1546,7 +1706,7 @@ export class OperatorDaemon {
     destination: TelegramDestination = {},
   ): Promise<void> {
     if (this.store.getRuntimeState(`thread_completion_delivered:${event.threadId}`)) return;
-    if (this.isExternalTurn(event.threadId)) {
+    if (this.isExternalTurn(event.threadId) && !this.hadRecentOwnDispatch(event.threadId)) {
       this.store.updateThreadStatus(event.threadId, "completed", {
         result: safeExcerpt(event.result, 4_000),
       });
@@ -1764,7 +1924,7 @@ export class OperatorDaemon {
   ): Promise<boolean> {
     const classified = classifyOperationalError(error, "provider");
     metrics.increment("provider_errors_total", { code: classified.code });
-    if (this.isExternalTurn(threadId)) {
+    if (this.isExternalTurn(threadId) && !this.hadRecentOwnDispatch(threadId)) {
       this.store.updateThreadStatus(threadId, "failed", { result: classified.safeMessage });
       this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, nowIso());
       return false;
@@ -3367,7 +3527,28 @@ export class OperatorDaemon {
 
   private async processT3Dispatch(job: BackgroundJob<DurableT3Dispatch>): Promise<boolean> {
     const payload = job.payload;
-    this.store.setRuntimeState(`thread_own_dispatch_pending:${payload.threadId}`, nowIso());
+    // Bug №13: enforce the parallel worker ceiling for durable dispatches too.
+    // The job is requeued with backoff and unlimited attempts — a full fleet
+    // is not an error, the dispatch just waits for a slot.
+    if (!this.hasWorkerCapacity(payload.threadId)) {
+      const limit = this.getPolicy().maxParallelWorkers;
+      this.store.retryBackgroundJob(job.id, "PARALLEL_WORKER_LIMIT", Number.MAX_SAFE_INTEGER);
+      this.enqueueTelegramOutbox(`telegram:${payload.commandId}:worker-limit`, payload.chatId, "rich", {
+        text: `Достигнут лимит ${limit} параллельных воркеров — запуск отложен до освобождения слота.`,
+        options: { ...payload.destination, replyToMessageId: payload.originMessageId },
+        messageType: "t3_dispatch_deferred",
+        projectId: payload.projectId,
+        threadId: payload.threadId,
+        correlationId: payload.correlationId,
+      });
+      this.logger.info(
+        { threadId: payload.threadId, commandId: payload.commandId, activeWorkers: this.monitors.size, limit },
+        "T3 dispatch deferred by the parallel worker limit",
+      );
+      await this.flushTelegramOutbox();
+      return false;
+    }
+    raiseOwnDispatchPending(this.store, payload.threadId);
     try {
       await this.broker.sendTurn({
         threadId: payload.threadId,
@@ -3418,7 +3599,7 @@ export class OperatorDaemon {
       );
       return true;
     } catch (error) {
-      this.store.setRuntimeState(`thread_own_dispatch_pending:${payload.threadId}`, "");
+      releaseOwnDispatchPending(this.store, payload.threadId);
       const classified = classifyOperationalError(error, "t3");
       const gaveUp = this.store.retryBackgroundJob(job.id, classified.code);
       if (gaveUp) {

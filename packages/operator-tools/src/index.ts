@@ -24,7 +24,11 @@ import type {
   T3Broker,
   WorkThread,
 } from "../../shared/src/index.js";
-import { nowIso } from "../../shared/src/index.js";
+import {
+  nowIso,
+  raiseOwnDispatchPending,
+  releaseOwnDispatchPending,
+} from "../../shared/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 import type {
   SentMessage,
@@ -121,6 +125,8 @@ export interface OperatorToolServerOptions {
   connectors?: GoogleWorkspaceConnectors;
   getPolicy?: () => OperatorPolicySettings;
   updatePolicy?: (patch: Partial<OperatorPolicySettings>, updatedBy: string) => OperatorPolicySettings;
+  /** Bug №13: live worker occupancy so t3.send_turn can enforce maxParallelWorkers. */
+  activeWorkers?: () => { count: number; threadIds: string[] };
   logger: Logger;
   onThreadStarted?: (input: ToolStartedThread) => void | Promise<void>;
   fetchImpl?: typeof fetch;
@@ -472,9 +478,24 @@ export class OperatorToolServer {
             return { threadId: input.threadId, queued: true, reason: "thread is busy; the follow-up dispatches after the current turn" };
           }
         }
+        // Bug №13: a fresh dispatch on an idle thread adds a parallel worker;
+        // refuse it past the policy ceiling with an error the agent can relay
+        // ("wait, queue, or raise the limit") instead of silently exceeding it.
+        const occupancy = this.options.activeWorkers?.();
+        const workerLimit = this.options.getPolicy?.().maxParallelWorkers;
+        if (
+          occupancy &&
+          workerLimit &&
+          occupancy.count >= workerLimit &&
+          !occupancy.threadIds.includes(input.threadId)
+        ) {
+          throw new Error(
+            `Parallel worker limit reached (${workerLimit} of ${workerLimit} running). Wait for a running thread to finish, queue this task for later, or raise maxParallelWorkers via policy.update before dispatching.`,
+          );
+        }
         // Mark the dispatch as our own so the daemon's monitor can tell it
-        // apart from turns started directly in the T3 UI.
-        this.options.store.setRuntimeState(`thread_own_dispatch_pending:${input.threadId}`, nowIso());
+        // apart from turns started directly in the T3 UI (counter, bug №27).
+        raiseOwnDispatchPending(this.options.store, input.threadId);
         let handle;
         try {
           handle = await this.options.broker.sendTurn({
@@ -485,7 +506,7 @@ export class OperatorToolServer {
             ...(input.model ? { model: input.model } : {}),
           });
         } catch (error) {
-          this.options.store.setRuntimeState(`thread_own_dispatch_pending:${input.threadId}`, "");
+          releaseOwnDispatchPending(this.options.store, input.threadId);
           throw error;
         }
         await this.options.onThreadStarted?.(started);
