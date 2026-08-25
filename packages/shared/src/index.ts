@@ -520,6 +520,17 @@ export function ownDispatchPendingCount(store: RuntimeStateStore, threadId: stri
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 1;
 }
 
+export {
+  closeDanglingFences,
+  defangMarkers,
+  fenceUntrusted,
+  knownFenceNonces,
+  openFence,
+  truncateFenceAware,
+  UNTRUSTED_LABELS,
+} from "./fencing.js";
+export type { Fence, UntrustedLabel } from "./fencing.js";
+
 export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }

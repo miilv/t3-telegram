@@ -1398,9 +1398,30 @@ describe("OperatorDaemon product flow", () => {
     expect(prompt.labels).toEqual(["Синий-зелёный", "Поэтапный"]);
     // The cached result lives on the pending record: redraw uses it without a
     // second LLM call.
-    const mediationCalls = runtime.oneShotPrompts.filter((entry) => entry.includes("Вопросы воркера")).length;
+    const mediationPrompts = runtime.oneShotPrompts.filter((entry) => entry.includes("Вопросы воркера"));
     expect(store.listPendingUserInputs()[0]?.mediation?.intro).toContain("Воркер деплоит auth-сервис");
-    expect(mediationCalls).toBe(1);
+    expect(mediationPrompts).toHaveLength(1);
+
+    // Roadmap 0.5: the worker's own intermediate words reach the operator LLM
+    // as fenced DATA. Both blobs of one prompt share one unpredictable marker,
+    // and every marker opened is closed.
+    const questionPrompt = mediationPrompts[0]!;
+    const questionNonces = fenceNonces(questionPrompt);
+    expect(questionNonces.size).toBe(1);
+    const questionNonce = [...questionNonces][0]!;
+    expect(questionPrompt.split(`<<<worker:${questionNonce}>>>`)).toHaveLength(3);
+    expect(questionPrompt.split(`<<<end:${questionNonce}>>>`)).toHaveLength(3);
+    expect(questionPrompt).toContain("Which deployment strategy should be used?");
+    // The instructions to the mediator stay OUTSIDE the fence.
+    expect(questionPrompt.slice(0, questionPrompt.indexOf("<<<worker:"))).toContain("оркестратор");
+
+    const approvalPrompt = runtime.oneShotPrompts.find((entry) => entry.includes("Запрос воркера"))!;
+    const approvalNonces = fenceNonces(approvalPrompt);
+    expect(approvalNonces.size).toBe(1);
+    expect(approvalNonces).not.toEqual(questionNonces);
+    const approvalNonce = [...approvalNonces][0]!;
+    expect(approvalPrompt.split(`<<<end:${approvalNonce}>>>`)).toHaveLength(3);
+    expect(approvalPrompt).toContain("rm -rf data");
 
     expect(telegram.approvals[0]?.text).toContain("просит разрешение удалить старую БД");
     expect(telegram.approvals[0]?.text).toContain("Рекомендация: Лучше отклонить");
@@ -3767,6 +3788,11 @@ describe("OperatorDaemon product flow", () => {
     await run;
   }, 15_000);
 });
+
+/** Every distinct fence marker opened in a prompt (roadmap 0.5). */
+function fenceNonces(prompt: string): Set<string> {
+  return new Set([...prompt.matchAll(/<<<worker:([0-9a-f]{8})>>>/g)].map((match) => match[1]!));
+}
 
 function config(home: string): Config {
   return {
