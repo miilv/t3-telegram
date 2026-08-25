@@ -24,6 +24,38 @@ describe("proactive automations", () => {
     )).toBe("2026-08-21T09:40:00.000Z");
   });
 
+  it("defaults a zone-less daily schedule to UTC rather than the host clock", () => {
+    // The daemon's own zone is an accident of the machine it runs on; pinning
+    // a stored schedule to it would move the schedule when the daemon moves.
+    expect(parseAutomationSchedule("daily 09:30")).toEqual({
+      type: "daily",
+      timeOfDay: "09:30",
+      timeZone: "UTC",
+    });
+    expect(firstAutomationRun(parseAutomationSchedule("daily 09:30"), new Date("2026-08-21T05:00:00Z")))
+      .toBe("2026-08-21T09:30:00.000Z");
+  });
+
+  it("canonicalizes a daily zone and rejects an unknown one", () => {
+    expect(parseAutomationSchedule("daily 09:30 europe/moscow")).toEqual({
+      type: "daily",
+      timeOfDay: "09:30",
+      timeZone: "Europe/Moscow",
+    });
+    expect(() => parseAutomationSchedule("daily 09:30 Mars/Olympus_Mons")).toThrow(
+      /Unknown IANA time zone/,
+    );
+  });
+
+  it("keeps a stored schedule with a blank zone running on UTC", () => {
+    expect(
+      firstAutomationRun(
+        { type: "daily", timeOfDay: "09:30", timeZone: "" },
+        new Date("2026-08-21T05:00:00Z"),
+      ),
+    ).toBe("2026-08-21T09:30:00.000Z");
+  });
+
   it("claims and dispatches a scheduled run to durable ingress exactly once", () => {
     const store = tempStore();
     const automation = createAutomation({
