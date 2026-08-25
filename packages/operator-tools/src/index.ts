@@ -25,7 +25,9 @@ import type {
   WorkThread,
 } from "../../shared/src/index.js";
 import {
+  closeDanglingFences,
   nowIso,
+  openFence,
   raiseOwnDispatchPending,
   releaseOwnDispatchPending,
 } from "../../shared/src/index.js";
@@ -842,15 +844,17 @@ export class OperatorToolServer {
         limit: z.number().int().min(1).max(50).optional(),
       }),
       readOnly: true,
-      handler: (input, capability) => {
+      handler: async (input, capability) => {
         this.requireAdministrativeRole(capability, "read the team calendar");
         if (!this.options.connectors) throw new Error("Google Workspace connectors are unavailable");
-        return this.options.connectors.listCalendarEvents({
+        const events = await this.options.connectors.listCalendarEvents({
           timeMin: input.timeMin,
           ...(input.timeMax ? { timeMax: input.timeMax } : {}),
           ...(input.query ? { query: input.query } : {}),
           ...(input.limit ? { limit: input.limit } : {}),
         });
+        // Roadmap 0.5: anyone able to send an invite writes these strings.
+        return fenceTextFields(events, ["title", "description", "location"]);
       },
     });
     this.addTool(server, token, {
@@ -884,13 +888,17 @@ export class OperatorToolServer {
       description: "Search Gmail and return bounded metadata/snippets, never full mailbox dumps.",
       schema: z.object({ query: z.string().trim().min(1).max(1_000), limit: z.number().int().min(1).max(10).optional() }),
       readOnly: true,
-      handler: (input, capability) => {
+      handler: async (input, capability) => {
         this.requireAdministrativeRole(capability, "search team email");
         if (!this.options.connectors) throw new Error("Google Workspace connectors are unavailable");
-        return this.options.connectors.searchEmail({
+        const messages = await this.options.connectors.searchEmail({
           query: input.query,
           ...(input.limit ? { limit: input.limit } : {}),
         });
+        // Roadmap 0.5: subject and snippet are written by whoever mailed us.
+        // Addresses, ids and dates stay raw — the Operator reuses them verbatim
+        // when replying, and a fenced address would not survive that round trip.
+        return fenceTextFields(messages, ["subject", "snippet"]);
       },
     });
     this.addTool(server, token, {
@@ -1006,7 +1014,10 @@ export class OperatorToolServer {
           metadata: compactArtifact(artifact),
           totalChars: content.length,
           offset,
-          content: window,
+          // Roadmap 0.5: the file body is the widest untrusted surface there is
+          // (OCR sidecars, transcripts, forwarded documents). Counters above
+          // describe the RAW window, not the fenced rendering of it.
+          content: openFence("tool")(window),
           truncated: offset + window.length < content.length,
         };
       },
@@ -1434,6 +1445,9 @@ export class OperatorToolServer {
     });
     if (!response.ok) throw new Error(`web search failed with HTTP ${response.status}`);
     const xml = (await response.text()).slice(0, 2_000_000);
+    // Roadmap 0.5: titles and snippets are whatever a web page chose to say.
+    // One unpredictable marker per call; the JSON shape stays intact.
+    const fence = openFence("tool");
     const results = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)]
       .slice(0, limit)
       .map((match) => {
@@ -1444,7 +1458,8 @@ export class OperatorToolServer {
           snippet: stripMarkup(xmlValue(item, "description")).slice(0, 500),
         };
       })
-      .filter((item) => item.title && item.url);
+      .filter((item) => item.title && item.url)
+      .map((item) => ({ ...item, title: fence(item.title), snippet: fence(item.snippet) }));
     return { query, results };
   }
 
@@ -1573,12 +1588,36 @@ function resolveJournalInstant(value: string, now: Date): string {
 function boundedJson(value: unknown): string {
   const json = JSON.stringify(value, jsonReplacer);
   if (json.length <= MAX_TOOL_RESULT_CHARS) return json;
-  return JSON.stringify({ truncated: true, preview: json.slice(0, MAX_TOOL_RESULT_CHARS - 100) });
+  return JSON.stringify({
+    truncated: true,
+    preview: closeDanglingFences(json.slice(0, MAX_TOOL_RESULT_CHARS - 100)),
+  });
 }
 
 function jsonReplacer(_key: string, value: unknown): unknown {
-  if (typeof value === "string" && value.length > 8_000) return `${value.slice(0, 8_000)}…`;
+  if (typeof value === "string" && value.length > 8_000) {
+    return closeDanglingFences(`${value.slice(0, 8_000)}…`);
+  }
   return value;
+}
+
+/**
+ * Roadmap 0.5: fence the externally-written TEXT fields of a tool result while
+ * leaving its structure — ids, timestamps, addresses — machine-readable. All
+ * fields of one call share ONE unpredictable marker, so no field can close a
+ * sibling's fence and no attacker can guess the terminator ahead of time.
+ */
+function fenceTextFields<T>(rows: T, fields: readonly string[]): T {
+  if (!Array.isArray(rows)) return rows;
+  const fence = openFence("tool");
+  return rows.map((row) => {
+    if (!row || typeof row !== "object") return row;
+    const fenced: Record<string, unknown> = { ...(row as Record<string, unknown>) };
+    for (const field of fields) {
+      if (typeof fenced[field] === "string") fenced[field] = fence(fenced[field]);
+    }
+    return fenced;
+  }) as T;
 }
 
 function xmlValue(xml: string, tag: string): string {
