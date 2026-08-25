@@ -156,6 +156,10 @@ interface DurableTelegramPayload {
   sentMessageIds?: number[];
   /** Set when an uncertain delivery was requeued once; a second failure goes dead (bug №2). */
   uncertainRequeued?: boolean;
+  /** Set once the owner was told this item has been failing for a long time (package 0.7). */
+  stallNoticeSent?: boolean;
+  /** Set once the owner was told this item is blocking the rest of its chat (package 0.7). */
+  blockedHeadNoticeSent?: boolean;
 }
 
 interface MonitorRoute {
@@ -170,6 +174,15 @@ const MONITOR_RESUBSCRIBE_BASE_DELAY_MS = 1_000;
 const MONITOR_RESUBSCRIBE_MAX_DELAY_MS = 60_000;
 /** Terminal events within this window of our own dispatch are never suppressed (bug №27). */
 const OWN_DISPATCH_GRACE_MS = 120_000;
+/**
+ * Package 0.7: the outbox still retries a retryable item forever — 429/5xx do
+ * clear on their own and giving up would lose the message. But silence for
+ * that long is its own failure, so after this many failed attempts the owner
+ * gets one out-of-band notice and the retries continue unchanged.
+ */
+const STALLED_DELIVERY_ATTEMPTS = 10;
+/** At most one delivery alert per chat per minute, whatever produced it. */
+const DELIVERY_ALERT_THROTTLE_MS = 60_000;
 
 export class OperatorDaemon {
   private readonly operatorInputQueue = new SerialQueue();
@@ -198,6 +211,8 @@ export class OperatorDaemon {
   private readonly activeOperatorTurns = new Set<{ chatId: number; userId: number }>();
   /** Rate-limits the bug-№37 head-of-line warnings per outbox item. */
   private readonly blockedOutboxWarnedAt = new Map<string, number>();
+  /** Shared 60 s throttle for out-of-band delivery alerts, per chat (package 0.7). */
+  private readonly deliveryAlertSentAt = new Map<number, number>();
   private readonly monitorTasks = new Set<Promise<void>>();
   private readonly shutdown = new AbortController();
   private reliabilityTask: Promise<void> | undefined;
@@ -3520,7 +3535,7 @@ export class OperatorDaemon {
       try {
         this.requeueUncertainTelegramOutbox();
         await this.flushTelegramOutbox();
-        this.warnBlockedTelegramOutboxHeads();
+        await this.warnBlockedTelegramOutboxHeads();
         await this.drainT3Dispatches();
         await this.operatorInputQueue.run(() => this.drainTelegramIngress());
       } catch (error) {
@@ -3591,7 +3606,7 @@ export class OperatorDaemon {
    * parked in a long flood-wait backoff silently delays everything behind it.
    * Surface that state with the real error code instead of hiding it.
    */
-  private warnBlockedTelegramOutboxHeads(): void {
+  private async warnBlockedTelegramOutboxHeads(): Promise<void> {
     for (const item of this.store.listBlockedTelegramOutboxHeads<DurableTelegramPayload>(60_000)) {
       const warnedAt = this.blockedOutboxWarnedAt.get(item.id) ?? 0;
       if (Date.now() - warnedAt < 60_000) continue;
@@ -3609,7 +3624,80 @@ export class OperatorDaemon {
         },
         "Outbox head item has been waiting for its retry for over a minute; later messages in this chat are blocked behind it",
       );
+      // Package 0.7: the log is invisible to the person staring at a silent
+      // chat, so say it out loud once per blocked head — out of band, because
+      // the outbox itself is exactly what is stuck.
+      const payload = item.payload;
+      if (payload.blockedHeadNoticeSent) continue;
+      const alerted = await this.sendDeliveryAlert(
+        item.chatId,
+        `Доставка в этот чат застряла: сообщение в начале очереди не уходит уже ${stalledMinutes(item.createdAt)} мин (${item.lastErrorCode ?? "неизвестная ошибка"}), остальные ждут за ним. Продолжаю пытаться.`,
+        payload.options,
+      );
+      if (!alerted) continue;
+      payload.blockedHeadNoticeSent = true;
+      this.store.updateTelegramOutboxPayload(item.id, payload);
     }
+  }
+
+  /**
+   * Package 0.7: after {@link STALLED_DELIVERY_ATTEMPTS} failed attempts of one
+   * item, tell the owner once — and keep retrying. The notice is deliberately
+   * out of band: routed through the outbox it would queue behind the very item
+   * it is reporting on.
+   */
+  private async notifyStalledTelegramDelivery(
+    item: TelegramOutboxItem<DurableTelegramPayload>,
+    payload: DurableTelegramPayload,
+    errorCode: string,
+  ): Promise<void> {
+    // `retryTelegramOutbox` has already counted the attempt that just failed.
+    const attempts = item.attempts + 1;
+    if (attempts < STALLED_DELIVERY_ATTEMPTS || payload.stallNoticeSent) return;
+    const alerted = await this.sendDeliveryAlert(
+      item.chatId,
+      `Не могу доставить сообщение уже ${stalledMinutes(item.createdAt)} мин (${errorCode}) — продолжаю пытаться.`,
+      payload.options,
+    );
+    // Throttled alerts leave the flag unset, so a later attempt says it instead.
+    if (!alerted) return;
+    payload.stallNoticeSent = true;
+    this.store.updateTelegramOutboxPayload(item.id, payload);
+    this.store.appendEvent("telegram.outbox.stalled", {
+      correlationId: payload.correlationId ?? item.dedupeKey,
+      ...(payload.threadId ? { threadId: payload.threadId } : {}),
+      payload: { outboxId: item.id, errorCode, attempts },
+    });
+  }
+
+  /**
+   * Out-of-band delivery alert: bypasses the outbox and the per-chat send lock,
+   * one quick attempt, at most one per chat per minute. Returns whether the
+   * attempt was made (a throttled alert can be retried later, a dropped one is
+   * simply lost — this is a best-effort signal, not a message).
+   */
+  private async sendDeliveryAlert(
+    chatId: number,
+    text: string,
+    destination: TelegramDestination = {},
+  ): Promise<boolean> {
+    const alertedAt = this.deliveryAlertSentAt.get(chatId) ?? 0;
+    if (Date.now() - alertedAt < DELIVERY_ALERT_THROTTLE_MS) return false;
+    if (this.deliveryAlertSentAt.size > 200) this.deliveryAlertSentAt.clear();
+    this.deliveryAlertSentAt.set(chatId, Date.now());
+    const sent = await this.telegram.sendAlert(chatId, text, {
+      ...(destination.messageThreadId ? { messageThreadId: destination.messageThreadId } : {}),
+      ...(destination.directMessagesTopicId
+        ? { directMessagesTopicId: destination.directMessagesTopicId }
+        : {}),
+    });
+    if (!sent) {
+      this.logger.warn(
+        { chat: hashChatId(chatId) },
+        "Delivery alert did not get through; durable retries continue regardless",
+      );
+    }
+    return true;
   }
 
   private async drainTelegramIngress(): Promise<void> {
@@ -3825,6 +3913,7 @@ export class OperatorDaemon {
           detail,
           disposition.retryAfterMs,
         );
+        await this.notifyStalledTelegramDelivery(item, payload, disposition.code);
       } else {
         this.store.markTelegramOutboxFailed(
           item.id,
@@ -4824,6 +4913,13 @@ function classifyApprovalRisk(
 function isOutsideRoot(path: string, root: string): boolean {
   const relation = relative(root, path);
   return relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation);
+}
+
+/** Whole minutes an outbox item has been undelivered, never less than one. */
+function stalledMinutes(createdAt: string): number {
+  const startedAt = Date.parse(createdAt);
+  if (!Number.isFinite(startedAt)) return 1;
+  return Math.max(1, Math.round((Date.now() - startedAt) / 60_000));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

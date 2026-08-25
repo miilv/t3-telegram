@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { GrammyError } from "grammy";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import {
@@ -2258,6 +2259,125 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   }, 60_000);
 
+  it("tells the owner once after ten failed delivery attempts and keeps retrying forever (package 0.7)", async () => {
+    const home = tempDirectory("daemon-stalled-delivery-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new RateLimitedTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+
+    const item = store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:operator:chat7:stalled",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "Ответ готов.", options: {}, messageType: "operator_answer" },
+    });
+    // Nine attempts already burned; the next 429 is the tenth.
+    const rewind = (): void =>
+      void store.db
+        .prepare("UPDATE telegram_outbox SET attempts=9,next_attempt_at=NULL WHERE id=?")
+        .run(item.id);
+    rewind();
+
+    await daemon.initialize();
+    const run = daemon.run();
+
+    await waitFor(() => telegram.alerts.length > 0, 15_000);
+    expect(telegram.alerts[0]?.chatId).toBe(7);
+    expect(telegram.alerts[0]?.text).toMatch(
+      /^Не могу доставить сообщение уже \d+ мин \(TELEGRAM_RATE_LIMIT\) — продолжаю пытаться\.$/u,
+    );
+    // The alert is an out-of-band signal, not an outbox message: nothing was
+    // enqueued behind the stuck head, and the head itself still retries.
+    expect(store.listTelegramOutbox(["pending", "sending"]).map((row) => row.dedupeKey)).toEqual([
+      "telegram:operator:chat7:stalled",
+    ]);
+    const stalled = store.getTelegramOutbox<{ stallNoticeSent?: boolean }>(item.id);
+    expect(stalled?.status).toBe("pending");
+    expect(stalled?.attempts).toBeGreaterThanOrEqual(10);
+    expect(stalled?.payload.stallNoticeSent).toBe(true);
+    expect(telegram.sent.some((entry) => entry.text.startsWith("Ответ готов."))).toBe(false);
+
+    // Further failures must stay silent: one notice per item, retries continue.
+    for (let round = 0; round < 3; round += 1) {
+      rewind();
+      await waitFor(
+        () => (store.getTelegramOutbox(item.id)?.attempts ?? 0) >= 10,
+        15_000,
+      );
+    }
+    expect(telegram.alerts).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 60_000);
+
+  it("says out of band why a chat went silent behind a blocked outbox head (package 0.7)", async () => {
+    const home = tempDirectory("daemon-blocked-head-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new RateLimitedTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+
+    const head = store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:operator:chat7:head",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "Первый ответ.", options: {}, messageType: "operator_answer" },
+    });
+    store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:operator:chat7:behind",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "Второй ответ.", options: {}, messageType: "operator_answer" },
+    });
+    // The head is parked in a long flood-wait backoff, so nothing in this chat
+    // can move and the user sees pure silence.
+    store.db
+      .prepare(`
+        UPDATE telegram_outbox
+        SET attempts=3,next_attempt_at=?,updated_at=?,last_error_code='TELEGRAM_RATE_LIMIT'
+        WHERE id=?
+      `)
+      .run(
+        new Date(Date.now() + 300_000).toISOString(),
+        new Date(Date.now() - 120_000).toISOString(),
+        head.id,
+      );
+
+    await daemon.initialize();
+    const run = daemon.run();
+
+    await waitFor(() => telegram.alerts.length > 0, 15_000);
+    expect(telegram.alerts[0]?.chatId).toBe(7);
+    expect(telegram.alerts[0]?.text).toContain("Доставка в этот чат застряла");
+    expect(telegram.alerts[0]?.text).toContain("TELEGRAM_RATE_LIMIT");
+    // Direct path: the alert arrived while both queued messages are still stuck.
+    expect(telegram.sent).toHaveLength(0);
+    const blocked = store.getTelegramOutbox<{ blockedHeadNoticeSent?: boolean }>(head.id);
+    expect(blocked?.status).toBe("pending");
+    expect(blocked?.payload.blockedHeadNoticeSent).toBe(true);
+
+    // One notice per blocked head, however many times the pump sees it.
+    await waitFor(() => telegram.alerts.length > 1, 3_000).catch(() => undefined);
+    expect(telegram.alerts).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 60_000);
+
   it("resumes a durably accepted Telegram request after mapping-time crash without creating a second worker", async () => {
     const home = tempDirectory("daemon-ingress-restart-");
     const databasePath = `${home}/operator.db`;
@@ -4100,6 +4220,11 @@ class FakeTelegram implements TelegramTransport {
     this.sent.push({ messageId, text, at });
     return [{ chatId: 7, messageId }];
   }
+  readonly alerts: Array<{ chatId: number; text: string }> = [];
+  async sendAlert(chatId: number, text: string): Promise<SentMessage | undefined> {
+    this.alerts.push({ chatId, text });
+    return { chatId, messageId: this.nextMessageId++ };
+  }
   async startDraft(chatId: number): Promise<StreamDraft> {
     this.visible.push({ kind: "draft", at: Date.now() });
     return { mode: "edit", phase: "text", chatId, draftId: this.nextMessageId, messageId: this.nextMessageId++, text: "…" };
@@ -4328,6 +4453,18 @@ class AmbiguousSendTelegram extends FakeTelegram {
       throw new TypeError("connection reset after upload");
     }
     return super.sendRich(chatId, text);
+  }
+}
+
+/** Every rich delivery is rejected with a server-confirmed 429: retryable forever. */
+class RateLimitedTelegram extends FakeTelegram {
+  override async sendRich(): Promise<SentMessage[]> {
+    throw new GrammyError(
+      "Call to 'sendMessage' failed!",
+      { ok: false, error_code: 429, description: "Too Many Requests: retry later", parameters: { retry_after: 0 } },
+      "sendMessage",
+      {},
+    );
   }
 }
 
