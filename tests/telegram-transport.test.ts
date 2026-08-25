@@ -451,6 +451,122 @@ describe("Telegram inbound normalization", () => {
     expect(merged.text).toBe("caption");
     expect(merged.attachments.map((attachment) => attachment.fileId)).toEqual(["a", "b"]);
   });
+
+  it("keeps a caption hanging on any album element instead of the first placeholder", () => {
+    const element = (
+      messageId: number,
+      text: string,
+      placeholder: boolean,
+    ): TelegramMessageInbound => ({
+      type: "message",
+      updateId: messageId,
+      edited: false,
+      chatId: 7,
+      chatType: "private",
+      userId: 42,
+      messageId,
+      messageIds: [messageId],
+      date: 100,
+      mediaGroupId: "album",
+      text,
+      ...(placeholder ? { textIsMediaPlaceholder: true } : {}),
+      attachments: [{ type: "photo", fileId: `f${messageId}` }],
+    });
+    // The caption hangs on the middle element; captionless photos already
+    // carry synthesized `(photo: ...)` stand-ins that used to win find(Boolean).
+    const merged = mergeTelegramAlbum([
+      element(1, "(photo: photo-1.jpg)", true),
+      element(2, "вот сметы по ремонту", false),
+      element(3, "(photo: photo-3.jpg)", true),
+    ]);
+    expect(merged.text).toBe("вот сметы по ремонту");
+    expect(merged.textIsMediaPlaceholder).toBeUndefined();
+
+    const multi = mergeTelegramAlbum([
+      element(2, "вторая подпись", false),
+      element(1, "первая подпись", false),
+      element(3, "(photo: photo-3.jpg)", true),
+    ]);
+    expect(multi.text).toBe("первая подпись\nвторая подпись");
+
+    const captionless = mergeTelegramAlbum([
+      element(1, "(photo: photo-1.jpg)", true),
+      element(2, "(photo: photo-2.jpg)", true),
+    ]);
+    expect(captionless.text).toBe("(photo: photo-1.jpg)");
+    expect(captionless.textIsMediaPlaceholder).toBe(true);
+  });
+
+  it("marks synthesized media stand-ins so a caption is never mistaken for one", () => {
+    const raw = (updateId: number, caption?: string) =>
+      ({
+        update_id: updateId,
+        message: {
+          message_id: updateId,
+          chat: { id: 7, type: "private" },
+          from: { id: 42, first_name: "M" },
+          date: 100,
+          media_group_id: "g1",
+          ...(caption ? { caption } : {}),
+          photo: [{ file_id: `p${updateId}`, file_unique_id: `u${updateId}`, width: 1, height: 1 }],
+        },
+      }) as never;
+    const placeholder = normalizeTelegramUpdate(raw(1), 42) as TelegramMessageInbound;
+    expect(placeholder.text).toBe("(photo: photo-1.jpg)");
+    expect(placeholder.textIsMediaPlaceholder).toBe(true);
+    const captioned = normalizeTelegramUpdate(raw(2, "смета этажа") , 42) as TelegramMessageInbound;
+    expect(captioned.text).toBe("смета этажа");
+    expect(captioned.textIsMediaPlaceholder).toBeUndefined();
+  });
+
+  it("holds an album open across getUpdates page boundaries instead of splitting it", async () => {
+    vi.useFakeTimers();
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const internals = transport as unknown as {
+      morePagesPending: boolean;
+      acceptUpdate(update: unknown): void;
+      albums: Map<string, { messages: unknown[] }>;
+      inbound: { push(item: unknown): void };
+    };
+    const delivered: TelegramMessageInbound[] = [];
+    internals.inbound.push = (item) => delivered.push(item as TelegramMessageInbound);
+    const albumPhoto = (updateId: number, caption?: string) => ({
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        chat: { id: 7, type: "private" },
+        from: { id: 42, first_name: "M" },
+        date: 100,
+        media_group_id: "g1",
+        ...(caption ? { caption } : {}),
+        photo: [{ file_id: `p${updateId}`, file_unique_id: `u${updateId}`, width: 1, height: 1 }],
+      },
+    });
+
+    // Page boundary: the first element arrived on a full page, the rest is
+    // still queued on Telegram's side. 650 ms of silence is a round trip,
+    // not the end of the album.
+    internals.morePagesPending = true;
+    internals.acceptUpdate(albumPhoto(1));
+    await vi.advanceTimersByTimeAsync(700);
+    expect(internals.albums.size).toBe(1);
+    expect(delivered).toHaveLength(0);
+
+    internals.acceptUpdate(albumPhoto(2, "подпись со второй страницы"));
+    internals.morePagesPending = false;
+    await vi.advanceTimersByTimeAsync(650);
+    expect(internals.albums.size).toBe(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.messageIds).toEqual([1, 2]);
+    expect(delivered[0]!.text).toBe("подпись со второй страницы");
+
+    // The ceiling still closes a pathological album even if pages never stop.
+    internals.morePagesPending = true;
+    internals.acceptUpdate(albumPhoto(3));
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(internals.albums.size).toBe(0);
+  });
 });
 
 interface ApiCall {

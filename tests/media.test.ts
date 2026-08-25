@@ -1,9 +1,12 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { crc32 } from "node:zlib";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
 import {
+  extractOfficeArchiveText,
+  isOfficeDocument,
   MediaProcessor,
   type MediaProcessorConfig,
 } from "../packages/media/src/index.js";
@@ -484,7 +487,266 @@ describe("MediaProcessor", () => {
     expect(rows.map((row) => row.filename)).toEqual(["report.docling.json", "report.ocr.md"]);
     store.close();
   });
+
+  it("falls back to the vision model when tesseract finds no printed text", async () => {
+    const home = tempDirectory("media-vision-fallback-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    // A UI screenshot or handwriting: tesseract exits fine but emits noise.
+    const fakeBin = `${home}/tesseract`;
+    writeFileSync(fakeBin, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo tesseract 5; exit 0; fi\necho ' . , '\n");
+    chmodSync(fakeBin, 0o755);
+    writeFileSync(`${home}/screen.png`, "png-bytes");
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(`${home}/screen.png`),
+      filename: "screen.png",
+      mimeType: "image/png",
+      telegramFileId: "photo_file",
+      chatId: 7,
+      messageId: 13,
+    });
+    const processor = new MediaProcessor(
+      mediaConfig({
+        ocr: {
+          enabled: true,
+          tesseractBin: fakeBin,
+          pdftotextBin: "pdftotext-missing",
+          pdftoppmBin: "pdftoppm-missing",
+          langs: "rus+eng",
+          maxPdfPages: 8,
+          vision: { apiKey: "or-key", model: "qwen/qwen2.5-vl-72b-instruct" },
+        },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+      async (url, init) => {
+        expect(String(url)).toBe("https://openrouter.ai/api/v1/chat/completions");
+        expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer or-key");
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: "Кнопка «Оплатить» и сумма 4 500 ₽" } }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+    const result = await processor.ocrInbound(original);
+    expect(result.provider).toBe("vision:qwen/qwen2.5-vl-72b-instruct");
+    expect(result.text).toContain("Кнопка «Оплатить»");
+    store.close();
+  });
+
+  it("keeps a substantial tesseract result without ever calling the vision model", async () => {
+    const home = tempDirectory("media-vision-skip-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const fakeBin = `${home}/tesseract`;
+    writeFileSync(fakeBin, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo tesseract 5; exit 0; fi\necho 'Договор аренды № 42 от 01.02.2026'\n");
+    chmodSync(fakeBin, 0o755);
+    writeFileSync(`${home}/scan.png`, "png-bytes");
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(`${home}/scan.png`),
+      filename: "scan.png",
+      mimeType: "image/png",
+      telegramFileId: "photo_file",
+      chatId: 7,
+      messageId: 14,
+    });
+    const processor = new MediaProcessor(
+      mediaConfig({
+        ocr: {
+          enabled: true,
+          tesseractBin: fakeBin,
+          pdftotextBin: "pdftotext-missing",
+          pdftoppmBin: "pdftoppm-missing",
+          langs: "rus+eng",
+          maxPdfPages: 8,
+          vision: { apiKey: "or-key", model: "qwen/qwen2.5-vl-72b-instruct" },
+        },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+      async () => {
+        throw new Error("vision must not run when tesseract already read the text");
+      },
+    );
+    const result = await processor.ocrInbound(original);
+    expect(result.provider).toBe("tesseract");
+    expect(result.text).toContain("Договор аренды № 42");
+    store.close();
+  });
+
+  it("extracts docx text locally when Docling is disabled", async () => {
+    const home = tempDirectory("media-ooxml-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const docx = storedZip([
+      ["[Content_Types].xml", "<Types/>"],
+      [
+        "word/document.xml",
+        '<w:document><w:body><w:p><w:r><w:t>Первый абзац</w:t></w:r><w:r><w:t xml:space="preserve"> договора</w:t></w:r></w:p>' +
+          "<w:p><w:r><w:t>Сумма &amp; срок &lt;уточняются&gt;</w:t></w:r></w:p></w:body></w:document>",
+      ],
+    ]);
+    writeFileSync(`${home}/contract.docx`, docx);
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(`${home}/contract.docx`),
+      filename: "contract.docx",
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      telegramFileId: "doc_file",
+      chatId: 7,
+      messageId: 15,
+    });
+    const processor = new MediaProcessor(
+      mediaConfig({
+        ocr: {
+          enabled: true,
+          tesseractBin: "tesseract-missing",
+          pdftotextBin: "pdftotext-missing",
+          pdftoppmBin: "pdftoppm-missing",
+          langs: "rus+eng",
+          maxPdfPages: 8,
+        },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+    );
+    const result = await processor.ocrInbound(original);
+    expect(result.provider).toBe("ooxml-text");
+    expect(result.text).toContain("[basic text extraction; formatting lost]");
+    expect(result.text).toContain("Первый абзац договора");
+    expect(result.text).toContain("Сумма & срок <уточняются>");
+    expect(result.artifact?.filename).toBe("contract.ocr.md");
+    store.close();
+  });
+
+  it("still asks for Docling on a legacy binary .doc it cannot parse", async () => {
+    const home = tempDirectory("media-legacy-doc-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    writeFileSync(`${home}/old.doc`, Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(`${home}/old.doc`),
+      filename: "old.doc",
+      mimeType: "application/msword",
+      telegramFileId: "doc_file",
+      chatId: 7,
+      messageId: 16,
+    });
+    const processor = new MediaProcessor(
+      mediaConfig({
+        ocr: {
+          enabled: true,
+          tesseractBin: "tesseract-missing",
+          pdftotextBin: "pdftotext-missing",
+          pdftoppmBin: "pdftoppm-missing",
+          langs: "rus+eng",
+          maxPdfPages: 8,
+        },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+    );
+    const result = await processor.ocrInbound(original);
+    expect(result.unavailable).toBe("office document conversion requires Docling");
+    store.close();
+  });
+
+  it("pulls xlsx shared strings and pptx slides in order", () => {
+    const xlsx = storedZip([
+      ["xl/sharedStrings.xml", "<sst><si><t>Выручка</t></si><si><t>1200</t></si></sst>"],
+    ]);
+    expect(extractOfficeArchiveText(xlsx, "report.xlsx")).toBe("Выручка\n1200");
+    const pptx = storedZip([
+      ["ppt/slides/slide10.xml", "<p:sld><a:t>Десятый слайд</a:t></p:sld>"],
+      ["ppt/slides/slide2.xml", "<p:sld><a:t>Второй слайд</a:t></p:sld>"],
+    ]);
+    expect(extractOfficeArchiveText(pptx, "deck.pptx")).toBe("Второй слайд\n\nДесятый слайд");
+  });
+
+  it("treats CSV and HTML as plain text, not office documents", async () => {
+    expect(isOfficeDocument("text/csv", "data.csv")).toBe(false);
+    expect(isOfficeDocument("text/html", "page.html")).toBe(false);
+    expect(
+      isOfficeDocument(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "contract.docx",
+      ),
+    ).toBe(true);
+    const home = tempDirectory("media-csv-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    writeFileSync(`${home}/data.csv`, "a,b\n1,2\n");
+    const original = await artifacts.ingestTelegram({
+      bytes: readFileSync(`${home}/data.csv`),
+      filename: "data.csv",
+      mimeType: "text/csv",
+      telegramFileId: "csv_file",
+      chatId: 7,
+      messageId: 17,
+    });
+    const processor = new MediaProcessor(
+      mediaConfig({
+        ocr: {
+          enabled: true,
+          tesseractBin: "tesseract-missing",
+          pdftotextBin: "pdftotext-missing",
+          pdftoppmBin: "pdftoppm-missing",
+          langs: "rus+eng",
+          maxPdfPages: 8,
+        },
+      }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+    );
+    // Plain text is read directly via artifacts.read_text; OCR must decline
+    // quietly so the daemon does not surface a bogus "unavailable" note.
+    const result = await processor.ocrInbound(original);
+    expect(result.unavailable).toBe("unsupported media type for OCR");
+    store.close();
+  });
 });
+
+/** Build a minimal stored (uncompressed) zip archive for OOXML fixtures. */
+function storedZip(entries: Array<[name: string, content: string]>): Buffer {
+  const chunks: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  for (const [name, content] of entries) {
+    const nameBytes = Buffer.from(name, "utf8");
+    const data = Buffer.from(content, "utf8");
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt32LE(crc32(data), 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    chunks.push(local, nameBytes, data);
+    const record = Buffer.alloc(46);
+    record.writeUInt32LE(0x02014b50, 0);
+    record.writeUInt16LE(20, 4);
+    record.writeUInt16LE(20, 6);
+    record.writeUInt32LE(crc32(data), 16);
+    record.writeUInt32LE(data.length, 20);
+    record.writeUInt32LE(data.length, 24);
+    record.writeUInt16LE(nameBytes.length, 28);
+    record.writeUInt32LE(offset, 42);
+    central.push(record, nameBytes);
+    offset += 30 + nameBytes.length + data.length;
+  }
+  const centralBytes = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralBytes.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...chunks, centralBytes, eocd]);
+}
 
 function mediaConfig(overrides: Partial<MediaProcessorConfig> = {}): MediaProcessorConfig {
   return {

@@ -78,6 +78,9 @@ import { isOfficeDocument } from "../../../packages/media/src/index.js";
 import type { MediaProcessor } from "../../../packages/media/src/index.js";
 import type { DashboardServer } from "../../../packages/dashboard/src/index.js";
 
+/** The cloud Bot API's hard getFile ceiling; only a local server lifts it. */
+const CLOUD_BOT_API_MAX_FILE_BYTES = 20 * 1024 * 1024;
+
 interface DurableTelegramIngress {
   update: Extract<TelegramInbound, { type: "message" }>;
   processExisting: boolean;
@@ -529,8 +532,27 @@ export class OperatorDaemon {
       return;
     }
 
+    // The cloud Bot API refuses getFile above 20 MB with a permanent error;
+    // retrying it for two minutes only to surface a generic failure helps
+    // nobody. Skip the download up front and tell the agent why the file is
+    // missing so it can explain to the user. A local Bot API server (the
+    // localFiles config) lifts the cap, so the guard applies to cloud only.
+    const cloudFileLimit = this.config.telegram.localFiles
+      ? undefined
+      : CLOUD_BOT_API_MAX_FILE_BYTES;
+    const oversizeNotes: string[][] = update.attachments.map((attachment) => {
+      if (!cloudFileLimit || !attachment.sizeBytes || attachment.sizeBytes <= cloudFileLimit) {
+        return [];
+      }
+      const megabytes = (attachment.sizeBytes / (1024 * 1024)).toFixed(1);
+      const label = attachment.filename ?? attachment.type;
+      return [
+        `[файл ${label} (${megabytes} MB) превышает лимит облачного Bot API 20 MB — недоступен]`,
+      ];
+    });
     const ingested = await Promise.all(
-      update.attachments.map(async (attachment) => {
+      update.attachments.map(async (attachment, index) => {
+        if (oversizeNotes[index]!.length) return undefined;
         const bytes = await this.telegram.downloadFile(attachment.fileId);
         return this.artifacts.ingestTelegram({
           bytes,
@@ -543,7 +565,10 @@ export class OperatorDaemon {
         });
       }),
     );
-    for (const artifact of ingested) {
+    const stored = ingested.filter(
+      (artifact): artifact is NonNullable<typeof artifact> => artifact !== undefined,
+    );
+    for (const artifact of stored) {
       this.store.appendEvent("artifact.ingress.bound", {
         correlationId: correlationForUpdate(update),
         payload: { artifactId: artifact.id },
@@ -551,14 +576,14 @@ export class OperatorDaemon {
     }
     // A forwarded bulk batch takes minutes of media work before the Operator
     // even sees it; acknowledge immediately so the chat never looks frozen.
-    const bulkBatch = update.messageIds.length >= 5 || ingested.length >= 5;
+    const bulkBatch = update.messageIds.length >= 5 || stored.length >= 5;
     if (bulkBatch) {
       this.enqueueTelegramOutbox(
         `telegram:bulk-ack:${update.chatId}:${update.messageId}`,
         update.chatId,
         "rich",
         {
-          text: `Принял ${update.messageIds.length} сообщ. (вложений: ${ingested.length}). Разбираю — расшифровка и распознавание займут пару минут.`,
+          text: `Принял ${update.messageIds.length} сообщ. (вложений: ${stored.length}). Разбираю — расшифровка и распознавание займут пару минут.`,
           options: replyOptions(update),
           messageType: "bulk_ingest_ack",
           correlationId: correlationForUpdate(update),
@@ -567,15 +592,15 @@ export class OperatorDaemon {
       await this.flushTelegramOutbox();
     }
 
-    const enrichedArtifacts = [...ingested];
+    const enrichedArtifacts = [...stored];
     const mediaContext: string[] = [];
     if (this.media) {
       // Bulk batches carry dozens of voices/photos; enriching them one by one
       // blocks the whole chat for minutes. Run a bounded number concurrently
       // and keep per-attachment context slots so the order stays stable.
       const media = this.media;
-      const slots: string[][] = update.attachments.map(() => []);
-      const derived: Array<Array<(typeof ingested)[number]>> = update.attachments.map(() => []);
+      const slots: string[][] = update.attachments.map((_, index) => [...oversizeNotes[index]!]);
+      const derived: Array<Array<(typeof stored)[number]>> = update.attachments.map(() => []);
       // Keep the combined excerpt budget bounded regardless of batch size.
       const excerptBudget = Math.max(
         600,
@@ -660,6 +685,8 @@ export class OperatorDaemon {
       await Promise.all(workers);
       for (const items of derived) enrichedArtifacts.push(...items);
       for (const items of slots) mediaContext.push(...items);
+    } else {
+      mediaContext.push(...oversizeNotes.flat());
     }
     if (mediaContext.length) {
       const userText = isMediaPlaceholder(update.text) ? "" : update.text.trim();

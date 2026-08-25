@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { access, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
+import { inflateRawSync } from "node:zlib";
 import type { Logger } from "pino";
 import type { ArtifactRegistry } from "../../artifacts/src/index.js";
 import type { Artifact } from "../../shared/src/index.js";
@@ -12,6 +13,11 @@ const TELEGRAM_MAX_VIDEO_NOTE_SECONDS = 60;
 const TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 const MAX_TRANSCRIPT_CHARS = 64_000;
 const MAX_PROVIDER_RESPONSE_BYTES = 2 * 1024 * 1024;
+/**
+ * Below this many non-whitespace characters a tesseract pass is treated as
+ * "no printed text here" and the image is retried through the vision model.
+ */
+const MIN_TESSERACT_CHARS = 16;
 
 export interface MediaProcessorConfig {
   ffmpegBin: string;
@@ -469,7 +475,17 @@ export class MediaProcessor {
         }
       }
       if (text === undefined && isOffice) {
-        return { unavailable: "office document conversion requires Docling" };
+        // OOXML documents are zip archives of XML; pulling the raw text runs
+        // locally with no dependencies, so a default install (Docling off)
+        // still surfaces the content instead of a dead end.
+        const extracted = extractOfficeArchiveText(await readFile(original.localPath), name);
+        if (extracted === undefined) {
+          return { unavailable: "office document conversion requires Docling" };
+        }
+        text = extracted.trim()
+          ? `[basic text extraction; formatting lost]\n\n${extracted}`
+          : extracted;
+        provider = "ooxml-text";
       }
       if (text === undefined && isPdf) {
         const extracted = await this.pdfTextLayer(original, temporaryDirectory, deadline);
@@ -491,6 +507,24 @@ export class MediaProcessor {
         );
         text = result.stdout;
         provider = "tesseract";
+        // Tesseract only reads printed text: a UI screenshot, handwriting or a
+        // plain photo yields noise, and without this fallback a configured
+        // vision model would never run. Near-empty output means "nothing
+        // printed here", so hand the image to the vision model instead.
+        if (isImage && ocr.vision && countNonWhitespace(text) < MIN_TESSERACT_CHARS) {
+          try {
+            const visionText = await this.visionOcr(original, ocr.vision, deadline);
+            if (visionText.trim()) {
+              text = visionText;
+              provider = `vision:${ocr.vision.model}`;
+            }
+          } catch (error) {
+            this.logger.warn(
+              { artifactId: original.id, error: safeError(error) },
+              "Vision OCR fallback after empty tesseract output failed",
+            );
+          }
+        }
       } else if (text === undefined && isImage && ocr.vision) {
         text = await this.visionOcr(original, ocr.vision, deadline);
         provider = `vision:${ocr.vision.model}`;
@@ -1175,6 +1209,9 @@ function finiteNumber(value: unknown): number | undefined {
 }
 
 export function isOfficeDocument(mime: string, name: string): boolean {
+  // CSV/HTML are plain text the agent reads directly via artifacts.read_text;
+  // routing them through a document converter would waste a Docling container
+  // start (or fail outright when Docling is disabled).
   if (
     [
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1183,13 +1220,126 @@ export function isOfficeDocument(mime: string, name: string): boolean {
       "application/msword",
       "application/vnd.ms-excel",
       "application/vnd.ms-powerpoint",
-      "text/csv",
-      "text/html",
     ].includes(mime)
   ) {
     return true;
   }
-  return /\.(docx?|xlsx?|pptx?|csv|html?)$/.test(name);
+  return /\.(docx?|xlsx?|pptx?)$/.test(name);
+}
+
+function countNonWhitespace(text: string | undefined): number {
+  return text ? text.replace(/\s+/g, "").length : 0;
+}
+
+/**
+ * Last-resort text extraction for OOXML documents (docx/xlsx/pptx) when
+ * Docling is not configured. The formats are zip archives of XML, so the run
+ * text can be pulled out locally: `word/document.xml` (`<w:t>`),
+ * `xl/sharedStrings.xml` (`<t>`), `ppt/slides/slideN.xml` (`<a:t>`).
+ * Formatting, tables and cell layout are lost — callers must label the result
+ * accordingly. Returns undefined for anything that is not a readable OOXML
+ * archive (e.g. legacy binary .doc/.xls/.ppt).
+ */
+export function extractOfficeArchiveText(bytes: Buffer, name: string): string | undefined {
+  let entries: Map<string, Buffer>;
+  try {
+    entries = readZipEntries(bytes);
+  } catch {
+    return undefined;
+  }
+  const decode = (buffer: Buffer): string => buffer.toString("utf8");
+  if (name.endsWith(".docx") || entries.has("word/document.xml")) {
+    const document = entries.get("word/document.xml");
+    if (!document) return undefined;
+    // A paragraph is the reading unit; runs inside it concatenate without
+    // separators so split words stay whole.
+    return decode(document)
+      .split(/<\/w:p>/)
+      .map((paragraph) => xmlTagText(paragraph, "w:t", ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (name.endsWith(".xlsx") || entries.has("xl/sharedStrings.xml")) {
+    const shared = entries.get("xl/sharedStrings.xml");
+    if (!shared) return undefined;
+    return xmlTagText(decode(shared), "t", "\n");
+  }
+  if (name.endsWith(".pptx") || [...entries.keys()].some((entry) => /^ppt\/slides\/slide\d+\.xml$/.test(entry))) {
+    const slides = [...entries.keys()]
+      .filter((entry) => /^ppt\/slides\/slide\d+\.xml$/.test(entry))
+      .sort((left, right) => Number(left.replace(/\D/g, "")) - Number(right.replace(/\D/g, "")));
+    if (!slides.length) return undefined;
+    return slides
+      .map((slide) => xmlTagText(decode(entries.get(slide)!), "a:t", "\n"))
+      .filter(Boolean)
+      .join("\n\n");
+  }
+  return undefined;
+}
+
+/** Concatenate the text content of every `<tag>` element in an XML fragment. */
+function xmlTagText(xml: string, tag: string, separator: string): string {
+  const pattern = new RegExp(`<${tag}(?:\\s[^>]*)?>([^<]*)</${tag}>`, "g");
+  const parts: string[] = [];
+  for (const match of xml.matchAll(pattern)) parts.push(decodeXmlEntities(match[1]!));
+  return parts.join(separator).trim();
+}
+
+function decodeXmlEntities(text: string): string {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+const ZIP_EOCD_SIGNATURE = 0x06054b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const MAX_ZIP_ENTRY_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Minimal read-only zip parser: walks the central directory and inflates each
+ * entry (methods 0 and 8 only, which is all OOXML writers produce). Kept
+ * dependency-free on purpose — this backs a last-resort fallback path.
+ */
+function readZipEntries(bytes: Buffer): Map<string, Buffer> {
+  let eocd = -1;
+  const scanFloor = Math.max(0, bytes.length - 22 - 65_535);
+  for (let offset = bytes.length - 22; offset >= scanFloor; offset -= 1) {
+    if (bytes.readUInt32LE(offset) === ZIP_EOCD_SIGNATURE) {
+      eocd = offset;
+      break;
+    }
+  }
+  if (eocd < 0) throw new Error("not a zip archive");
+  const entryCount = bytes.readUInt16LE(eocd + 10);
+  let cursor = bytes.readUInt32LE(eocd + 16);
+  const entries = new Map<string, Buffer>();
+  for (let index = 0; index < entryCount; index += 1) {
+    if (bytes.readUInt32LE(cursor) !== ZIP_CENTRAL_SIGNATURE) throw new Error("corrupt zip central directory");
+    const method = bytes.readUInt16LE(cursor + 10);
+    const compressedSize = bytes.readUInt32LE(cursor + 20);
+    const uncompressedSize = bytes.readUInt32LE(cursor + 24);
+    const nameLength = bytes.readUInt16LE(cursor + 28);
+    const extraLength = bytes.readUInt16LE(cursor + 30);
+    const commentLength = bytes.readUInt16LE(cursor + 32);
+    const localOffset = bytes.readUInt32LE(cursor + 42);
+    const name = bytes.subarray(cursor + 46, cursor + 46 + nameLength).toString("utf8");
+    cursor += 46 + nameLength + extraLength + commentLength;
+    if (uncompressedSize > MAX_ZIP_ENTRY_BYTES) throw new Error("zip entry too large");
+    // The local header repeats the name/extra fields with its own lengths.
+    const localNameLength = bytes.readUInt16LE(localOffset + 26);
+    const localExtraLength = bytes.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    const compressed = bytes.subarray(dataStart, dataStart + compressedSize);
+    if (method === 0) entries.set(name, Buffer.from(compressed));
+    else if (method === 8) entries.set(name, inflateRawSync(compressed));
+    else throw new Error(`unsupported zip compression method ${method}`);
+  }
+  return entries;
 }
 
 function stem(filename: string): string {
