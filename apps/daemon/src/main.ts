@@ -19,6 +19,7 @@ import {
   OperatorDaemon,
   createFatalErrorHandler,
   createShutdownController,
+  resolveStartupProvider,
 } from "./operator-daemon.js";
 
 async function main(): Promise<void> {
@@ -50,7 +51,21 @@ async function main(): Promise<void> {
       turnTimeoutMs: config.operator.turnTimeoutMs,
     });
   }
-  const runtime = new SwitchableOperatorRuntime(providers, config.operator.provider);
+  // Package 0.1: OPERATOR_PROVIDER may name a provider this build did not wire
+  // up (codex configured, OPERATOR_CODEX_ENABLED=false). Start on something
+  // that exists instead of leaving the switchable runtime pointing at nothing.
+  const defaultProvider = resolveStartupProvider(
+    config.operator.provider,
+    Object.keys(providers),
+    "claude",
+  );
+  if (defaultProvider !== config.operator.provider) {
+    logger.warn(
+      { requested: config.operator.provider, resolved: defaultProvider },
+      "Configured Operator provider is not enabled; starting on the fallback",
+    );
+  }
+  const runtime = new SwitchableOperatorRuntime(providers, defaultProvider);
   const broker = new HttpT3Broker(
     {
       baseUrl: config.t3.baseUrl,

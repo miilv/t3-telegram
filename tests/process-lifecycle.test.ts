@@ -3,6 +3,7 @@ import {
   awaitShutdownSteps,
   createFatalErrorHandler,
   createShutdownController,
+  resolveStartupProvider,
 } from "../apps/daemon/src/operator-daemon.js";
 
 /** Minimal pino-shaped sink: records the level and the first (context) argument. */
@@ -74,6 +75,24 @@ describe("awaitShutdownSteps (package 0.1)", () => {
     expect(unfinished).toEqual(["dashboard"]);
     expect(reached).toEqual(["monitors"]);
     expect(failures).toEqual(["dashboard:port stuck"]);
+  });
+});
+
+describe("resolveStartupProvider (package 0.1)", () => {
+  it("keeps the remembered provider when it is still wired up", () => {
+    expect(resolveStartupProvider("codex", ["claude", "codex"], "claude")).toBe("codex");
+  });
+
+  it("falls back to the configured default when the remembered one is gone", () => {
+    expect(resolveStartupProvider("codex", ["claude"], "claude")).toBe("claude");
+  });
+
+  it("falls back to any available provider when the configured default is gone too", () => {
+    expect(resolveStartupProvider("codex", ["claude"], "gemini")).toBe("claude");
+  });
+
+  it("leaves the request untouched when the runtime does not report providers", () => {
+    expect(resolveStartupProvider("codex", [], "claude")).toBe("codex");
   });
 });
 

@@ -3414,6 +3414,50 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("boots on a fallback provider instead of refusing when the remembered one is gone (package 0.1)", async () => {
+    const home = tempDirectory("daemon-provider-fallback-");
+    const store = tempStore();
+    const runtime = new SingleProviderRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+
+    // A previous run switched to codex; this build no longer wires codex up.
+    store.setRuntimeState("operator_session_id", "operator-session");
+    store.setRuntimeState("operator_provider", "codex");
+    store.setRuntimeState("owner_chat_id", "7");
+
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await expect(daemon.initialize()).resolves.toBeUndefined();
+
+    // Resume never sees the unavailable id, and the correction is persisted so
+    // the next boot does not repeat the fallback.
+    expect(runtime.resumedProviders).toEqual(["claude"]);
+    expect(store.getRuntimeState("operator_provider")).toBe("claude");
+    await waitFor(() =>
+      telegram.sent.some((entry) => entry.text.includes("Провайдер «codex» недоступен")),
+    );
+    expect(
+      telegram.sent.filter((entry) => entry.text.includes("Провайдер «codex» недоступен")),
+    ).toHaveLength(1);
+
+    const run = daemon.run();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("writes the graceful-exit marker even when a queue never settles (package 0.1)", async () => {
     const home = tempDirectory("daemon-stop-deadline-");
     const databasePath = `${home}/operator.db`;
@@ -3683,7 +3727,7 @@ class FakeRuntime implements OperatorRuntime {
     this.compactReasons.push(reason);
     return { sessionId: "operator-session", summary: "compact" };
   }
-  async resume(): Promise<void> {}
+  async resume(_sessionId?: string, _providerId?: string): Promise<void> {}
   async health(): Promise<{ healthy: boolean }> {
     return { healthy: true };
   }
@@ -3896,6 +3940,23 @@ class BlockingRuntime extends FakeRuntime {
     await this.gate;
     yield { type: "text_delta", text: "Париж." };
     yield { type: "result", text: "Париж.", sessionId: input.sessionId };
+  }
+}
+
+/** Only claude is wired up, and every resume records the provider it was handed. */
+class SingleProviderRuntime extends FakeRuntime {
+  readonly resumedProviders: Array<string | undefined> = [];
+
+  currentProvider(): string {
+    return "claude";
+  }
+
+  availableProviders(): string[] {
+    return ["claude"];
+  }
+
+  override async resume(_sessionId?: string, providerId?: string): Promise<void> {
+    this.resumedProviders.push(providerId);
   }
 }
 

@@ -221,6 +221,23 @@ export async function awaitShutdownSteps(
   return [...unfinished];
 }
 
+/**
+ * Package 0.1: the boot-time provider guard. A runtime_state pointing at a
+ * provider that is no longer wired up (codex remembered, then disabled) used to
+ * throw out of initialize() and could only be fixed by editing the database by
+ * hand. Fall back instead: the configured default when it is available, else
+ * whatever the runtime does offer.
+ */
+export function resolveStartupProvider(
+  requested: string,
+  available: readonly string[],
+  configured: string,
+): string {
+  if (available.length === 0 || available.includes(requested)) return requested;
+  if (available.includes(configured)) return configured;
+  return available[0]!;
+}
+
 /** Everything the signal handler needs; injected so exit paths stay testable. */
 export interface ShutdownControllerHooks {
   stop: () => Promise<void>;
@@ -359,8 +376,9 @@ export class OperatorDaemon {
     await this.dashboard?.start();
 
     const existingSession = this.store.getRuntimeState("operator_session_id");
-    const existingProvider = this.store.getRuntimeState("operator_provider")
+    const storedProvider = this.store.getRuntimeState("operator_provider")
       ?? this.config.operator.provider;
+    const existingProvider = this.recoverStuckProvider(storedProvider);
     if (existingSession) {
       // The system prompt travels with resume so a runtime that seeds future
       // fresh sessions from it (Codex compaction) never restarts with an
@@ -504,6 +522,45 @@ export class OperatorDaemon {
     // previous run crashed and the owner should hear about it (bug №7).
     this.store.setRuntimeState("clean_shutdown", "1");
     this.store.close();
+  }
+
+  /**
+   * Package 0.1: a remembered provider that is no longer wired up (codex in
+   * runtime_state after OPERATOR_CODEX_ENABLED=false) used to abort the boot
+   * with "configured Operator provider is unavailable". Boot on the default
+   * instead, persist the correction, and tell the owner in one line so the
+   * silent downgrade is not a surprise.
+   */
+  private recoverStuckProvider(storedProvider: string): string {
+    const available = this.runtime.availableProviders?.() ?? [];
+    const resolved = resolveStartupProvider(
+      storedProvider,
+      available,
+      this.config.operator.provider,
+    );
+    if (resolved === storedProvider) return storedProvider;
+    this.store.setRuntimeState("operator_provider", resolved);
+    this.logger.warn(
+      { errorCode: "OPERATOR_PROVIDER_UNAVAILABLE", requested: storedProvider, resolved, available },
+      "Configured Operator provider is unavailable; falling back to an available one",
+    );
+    this.store.appendEvent("operator.provider.fallback", {
+      payload: { requested: storedProvider, resolved, available },
+    });
+    const ownerChatId = Number(this.store.getRuntimeState("owner_chat_id"));
+    if (Number.isSafeInteger(ownerChatId) && ownerChatId !== 0) {
+      this.enqueueTelegramOutbox(
+        `telegram:provider-fallback:${storedProvider}:${nowIso()}`,
+        ownerChatId,
+        "rich",
+        {
+          text: `Провайдер «${storedProvider}» недоступен, продолжаю работу на «${resolved}».`,
+          options: {},
+          messageType: "provider_fallback_notice",
+        },
+      );
+    }
+    return resolved;
   }
 
   private reportUncleanRestart(recoveredCount: number): void {
