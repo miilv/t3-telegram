@@ -161,6 +161,15 @@ interface DurableTelegramPayload {
   sentMessageIds?: number[];
   /** Set when an uncertain delivery was requeued once; a second failure goes dead (bug №2). */
   uncertainRequeued?: boolean;
+  /**
+   * Set once the owner was told this item's delivery is jammed (package 0.7).
+   * One marker for both ways of noticing the same jam — a long retry streak and
+   * a blocked chat head — so one stuck item never produces two complaints.
+   * A revive replaces the payload, which correctly clears it for the new life.
+   */
+  deliveryAlertSent?: boolean;
+  /** First failed attempt of the current life; stall duration is measured from it. */
+  firstFailureAt?: string;
 }
 
 interface MonitorRoute {
@@ -175,6 +184,16 @@ const MONITOR_RESUBSCRIBE_BASE_DELAY_MS = 1_000;
 const MONITOR_RESUBSCRIBE_MAX_DELAY_MS = 60_000;
 /** Terminal events within this window of our own dispatch are never suppressed (bug №27). */
 const OWN_DISPATCH_GRACE_MS = 120_000;
+/**
+ * Package 0.7: the outbox still retries a retryable item forever — 429/5xx do
+ * clear on their own and giving up would lose the message. But silence for
+ * that long is its own failure, so after this many failed attempts the owner
+ * gets one out-of-band notice and the retries continue unchanged.
+ */
+const STALLED_DELIVERY_ATTEMPTS = 10;
+/** At most one delivery alert per chat per minute, whatever produced it. */
+const DELIVERY_ALERT_THROTTLE_MS = 60_000;
+
 export class OperatorDaemon {
   private readonly operatorInputQueue = new SerialQueue();
   private readonly operatorRuntimeQueue = new SerialQueue();
@@ -202,6 +221,10 @@ export class OperatorDaemon {
   private readonly activeOperatorTurns = new Set<{ chatId: number; userId: number }>();
   /** Rate-limits the bug-№37 head-of-line warnings per outbox item. */
   private readonly blockedOutboxWarnedAt = new Map<string, number>();
+  /** Shared throttle for out-of-band delivery alerts, keyed by recipient chat (package 0.7). */
+  private readonly deliveryAlertSentAt = new Map<number, number>();
+  /** Recipients with an alert in flight, so a fire-and-forget send is never launched twice. */
+  private readonly deliveryAlertsInFlight = new Set<number>();
   private readonly monitorTasks = new Set<Promise<void>>();
   private readonly shutdown = new AbortController();
   private reliabilityTask: Promise<void> | undefined;
@@ -219,6 +242,8 @@ export class OperatorDaemon {
     private readonly operatorTools?: OperatorToolServer,
     private readonly media?: MediaProcessor,
     private readonly dashboard?: DashboardServer,
+    /** Overridable so tests can exercise the retry-after-a-dropped-alert path. */
+    private readonly deliveryAlertThrottleMs = DELIVERY_ALERT_THROTTLE_MS,
   ) {}
 
   async initialize(): Promise<void> {
@@ -466,8 +491,8 @@ export class OperatorDaemon {
   private reportUncleanRestart(recoveredCount: number): void {
     const previousStartedAt = this.store.getRuntimeState("daemon_started_at");
     if (!previousStartedAt || this.store.getRuntimeState("clean_shutdown") === "1") return;
-    const ownerChatId = Number(this.store.getRuntimeState("owner_chat_id"));
-    if (!Number.isSafeInteger(ownerChatId) || ownerChatId === 0) return;
+    const ownerChatId = this.ownerChatId();
+    if (ownerChatId === undefined) return;
     const lastNoticeAt = Date.parse(this.store.getRuntimeState("restart_notice_at") ?? "");
     if (Number.isFinite(lastNoticeAt) && Date.now() - lastNoticeAt < 10 * 60_000) return;
     this.store.setRuntimeState("restart_notice_at", nowIso());
@@ -607,8 +632,8 @@ export class OperatorDaemon {
   private notifyOwnerAboutCompaction(): void {
     const pendingIngress = this.store.listBackgroundJobs("telegram_ingress").length;
     if (!pendingIngress) return;
-    const ownerChatId = Number(this.store.getRuntimeState("owner_chat_id"));
-    if (!Number.isSafeInteger(ownerChatId) || ownerChatId === 0) return;
+    const ownerChatId = this.ownerChatId();
+    if (ownerChatId === undefined) return;
     // The previous compaction timestamp identifies this cycle: a retried
     // compact reuses the key, a later cycle gets a fresh one.
     const cycle = this.store.getRuntimeState("last_compaction_at") ?? "initial";
@@ -3705,9 +3730,9 @@ export class OperatorDaemon {
   private warnBlockedTelegramOutboxHeads(): void {
     for (const item of this.store.listBlockedTelegramOutboxHeads<DurableTelegramPayload>(60_000)) {
       const warnedAt = this.blockedOutboxWarnedAt.get(item.id) ?? 0;
-      if (Date.now() - warnedAt < 60_000) continue;
-      if (this.blockedOutboxWarnedAt.size > 200) this.blockedOutboxWarnedAt.clear();
+      if (Date.now() - warnedAt < this.deliveryAlertThrottleMs) continue;
       this.blockedOutboxWarnedAt.set(item.id, Date.now());
+      evictOlderThan(this.blockedOutboxWarnedAt, this.deliveryAlertThrottleMs);
       this.logger.warn(
         {
           outboxId: item.id,
@@ -3715,12 +3740,127 @@ export class OperatorDaemon {
           errorCode: item.lastErrorCode,
           attempts: item.attempts,
           nextAttemptAt: item.nextAttemptAt,
-          waitedMs: Date.now() - Date.parse(item.updatedAt),
+          silentForMs: Date.now() - Date.parse(item.payload.firstFailureAt ?? item.updatedAt),
           messageType: item.payload.messageType,
         },
-        "Outbox head item has been waiting for its retry for over a minute; later messages in this chat are blocked behind it",
+        "Outbox head item is parked in retry backoff; later messages in this chat are blocked behind it",
+      );
+      // Package 0.7: the log is invisible to the person staring at a silent
+      // chat, so say it out loud once per jam — out of band, because the outbox
+      // itself is exactly what is stuck.
+      const payload = item.payload;
+      if (payload.deliveryAlertSent) continue;
+      this.dispatchDeliveryAlert(
+        item,
+        `Доставка в этот чат застряла: сообщение в начале очереди не уходит уже ${stalledMinutes(item)} мин (${item.lastErrorCode ?? "неизвестная ошибка"}), остальные ждут за ним. Продолжаю пытаться.`,
       );
     }
+  }
+
+  /**
+   * Package 0.7: after {@link STALLED_DELIVERY_ATTEMPTS} failed attempts of one
+   * item, tell the owner once — and keep retrying. The notice is deliberately
+   * out of band: routed through the outbox it would queue behind the very item
+   * it is reporting on.
+   */
+  private notifyStalledTelegramDelivery(
+    item: TelegramOutboxItem<DurableTelegramPayload>,
+    payload: DurableTelegramPayload,
+    errorCode: string,
+  ): void {
+    // `retryTelegramOutbox` has already counted the attempt that just failed.
+    const attempts = item.attempts + 1;
+    if (!payload.firstFailureAt) {
+      // Stall duration is measured from here, not from `createdAt`: a revived
+      // item carries an old creation time and would report days of delay.
+      payload.firstFailureAt = nowIso();
+      this.store.updateTelegramOutboxPayload(item.id, payload);
+    }
+    if (attempts < STALLED_DELIVERY_ATTEMPTS || payload.deliveryAlertSent) return;
+    this.dispatchDeliveryAlert(
+      item,
+      `Не могу доставить сообщение уже ${stalledMinutes(item)} мин (${errorCode}) — продолжаю пытаться.`,
+      () => {
+        this.store.appendEvent("telegram.outbox.stalled", {
+          correlationId: payload.correlationId ?? item.dedupeKey,
+          ...(payload.threadId ? { threadId: payload.threadId } : {}),
+          payload: { outboxId: item.id, errorCode, attempts },
+        });
+      },
+    );
+  }
+
+  /**
+   * Out-of-band delivery alert about a jammed outbox item: bypasses the outbox
+   * and the per-chat send lock, one quick attempt, at most one per recipient per
+   * throttle window.
+   *
+   * Fire-and-forget on purpose — the reliability pump also drains ingress, and
+   * awaiting a Telegram round trip here would stall incoming messages for as
+   * long as the API takes to answer. The jam marker is written only when the
+   * alert really left, so a dropped alert is said again on a later pass while a
+   * successful one is never repeated.
+   */
+  private dispatchDeliveryAlert(
+    item: TelegramOutboxItem<DurableTelegramPayload>,
+    text: string,
+    onSent?: () => void,
+  ): void {
+    const payload = item.payload;
+    const ownerChatId = this.ownerChatId();
+    // Alerts belong to the owner, not to the chat that is choking: sending into
+    // a flood-limited or group chat can extend its own retry_after, and a topic
+    // id is only valid inside its own chat.
+    const target = ownerChatId ?? item.chatId;
+    const destination: TelegramDestination =
+      target === item.chatId
+        ? {
+            ...(payload.options.messageThreadId ? { messageThreadId: payload.options.messageThreadId } : {}),
+            ...(payload.options.directMessagesTopicId
+              ? { directMessagesTopicId: payload.options.directMessagesTopicId }
+              : {}),
+          }
+        : {};
+    if (this.deliveryAlertsInFlight.has(target)) return;
+    const alertedAt = this.deliveryAlertSentAt.get(target) ?? 0;
+    if (Date.now() - alertedAt < this.deliveryAlertThrottleMs) return;
+    // The throttle is spent on the attempt, not on its success: a chat that
+    // just rejected us is not asked again for another window.
+    this.deliveryAlertSentAt.set(target, Date.now());
+    evictOlderThan(this.deliveryAlertSentAt, this.deliveryAlertThrottleMs);
+    this.deliveryAlertsInFlight.add(target);
+    const task = this.telegram
+      .sendAlert(target, text, destination)
+      .then((sent) => {
+        if (!sent) {
+          this.logger.warn(
+            { chat: hashChatId(target), outboxId: item.id },
+            "Delivery alert did not get through; it will be offered again after the throttle window",
+          );
+          return;
+        }
+        // Re-read instead of writing back the payload captured before the send:
+        // a chunked retry may have recorded `sentChunkCount`/`sentMessageIds`
+        // while this alert was in flight, and a stale write would resend chunks.
+        const current = this.store.getTelegramOutbox<DurableTelegramPayload>(item.id);
+        if (!current) return;
+        current.payload.deliveryAlertSent = true;
+        this.store.updateTelegramOutboxPayload(item.id, current.payload);
+        onSent?.();
+      })
+      .catch((error: unknown) => {
+        this.logger.warn({ err: error, outboxId: item.id }, "Delivery alert failed");
+      })
+      .finally(() => {
+        this.deliveryAlertsInFlight.delete(target);
+      });
+    this.monitorTasks.add(task);
+    void task.finally(() => this.monitorTasks.delete(task));
+  }
+
+  private ownerChatId(): number | undefined {
+    const chatId = Number(this.store.getRuntimeState("owner_chat_id"));
+    return Number.isSafeInteger(chatId) && chatId !== 0 ? chatId : undefined;
   }
 
   private async drainTelegramIngress(): Promise<void> {
@@ -3833,24 +3973,38 @@ export class OperatorDaemon {
     failures: number,
     reason: string,
   ): Promise<void> {
-    try {
-      await this.telegram.sendRich(
-        automation.chatId,
-        [
+    // Durable, not best-effort: this is an addressed, actionable message (it
+    // carries the resume command), so it must survive a jam rather than being
+    // dropped like a delivery signal. A chat that stays blocked is covered by
+    // the stall alert instead (package 0.7). The dedupe key is the pause
+    // *moment* (updatedAt is bumped by the pause write), not the failure
+    // count: the threshold is a fixed 5 and resume resets the counter, so a
+    // count-based key would repeat on the next pause and ON CONFLICT would
+    // silently eat every notice after the first.
+    this.enqueueTelegramOutbox(
+      `telegram:automation:${automation.id}:paused:${automation.updatedAt}`,
+      automation.chatId,
+      "rich",
+      {
+        text: [
           `Автоматизация **${escapeMarkdownText(automation.name)}** приостановлена после ${failures} ошибок подряд: ${escapeMarkdownText(reason)}`,
           `Возобновить: \`/automation resume ${automation.id}\``,
         ].join("\n\n"),
-        {
+        options: {
           ...(automation.messageThreadId ? { messageThreadId: automation.messageThreadId } : {}),
           ...(automation.directMessagesTopicId
             ? { directMessagesTopicId: automation.directMessagesTopicId }
             : {}),
         },
-      );
+        messageType: "automation_paused",
+      },
+    );
+    try {
+      await this.flushTelegramOutbox();
     } catch (error) {
       this.logger.warn(
         { err: error, automationId: automation.id },
-        "Automation pause notification failed",
+        "Automation pause notification flush failed; the outbox will retry",
       );
     }
   }
@@ -3936,6 +4090,7 @@ export class OperatorDaemon {
           detail,
           disposition.retryAfterMs,
         );
+        this.notifyStalledTelegramDelivery(item, payload, disposition.code);
       } else {
         this.store.markTelegramOutboxFailed(
           item.id,
@@ -4935,6 +5090,27 @@ function classifyApprovalRisk(
 function isOutsideRoot(path: string, root: string): boolean {
   const relation = relative(root, path);
   return relation === ".." || relation.startsWith(`..${sep}`) || isAbsolute(relation);
+}
+
+/**
+ * Whole minutes this delivery has been failing, never less than one. Measured
+ * from the first failed attempt of the current life rather than from creation:
+ * a revived item (bug №3) keeps its original `createdAt` and would otherwise
+ * report the days it spent dead.
+ */
+function stalledMinutes(item: TelegramOutboxItem<DurableTelegramPayload>): number {
+  const startedAt = Date.parse(item.payload.firstFailureAt ?? item.updatedAt);
+  if (!Number.isFinite(startedAt)) return 1;
+  return Math.max(1, Math.round((Date.now() - startedAt) / 60_000));
+}
+
+/** Drops map entries older than `maxAgeMs` — never the whole map, which would lift every throttle at once. */
+function evictOlderThan<K>(entries: Map<K, number>, maxAgeMs: number): void {
+  if (entries.size <= 200) return;
+  const cutoff = Date.now() - maxAgeMs;
+  for (const [key, at] of entries) {
+    if (at < cutoff) entries.delete(key);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

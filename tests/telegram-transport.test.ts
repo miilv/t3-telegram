@@ -353,6 +353,77 @@ describe("grammY Telegram transport", () => {
     await consume;
   });
 
+  it("sends a best-effort alert in one attempt and never waits out a flood (package 0.7)", async () => {
+    // Real timers on purpose: a 25 s inline flood wait would blow the test
+    // timeout instead of resolving immediately.
+    const calls: ApiCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push(parseApiCall(input, init));
+        return telegramResponse(
+          {
+            ok: false,
+            error_code: 429,
+            description: "Too Many Requests: retry later",
+            parameters: { retry_after: 25 },
+          },
+          429,
+        );
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    const startedAt = Date.now();
+    await expect(transport.sendAlert(7, "Не могу доставить сообщение")).resolves.toBeUndefined();
+
+    // Comfortably under the 25 s flood wait the transport must not honour here.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("sendMessage");
+    expect(calls[0]?.body).toMatchObject({ chat_id: 7, text: "Не могу доставить сообщение" });
+  });
+
+  it("does not queue a best-effort alert behind a chat parked in flood backoff (package 0.7)", async () => {
+    vi.useFakeTimers();
+    const calls: ApiCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        if (call.method === "sendRichMessage" && calls.filter((entry) => entry.method === "sendRichMessage").length === 1) {
+          return telegramResponse(
+            {
+              ok: false,
+              error_code: 429,
+              description: "Too Many Requests: retry later",
+              parameters: { retry_after: 20 },
+            },
+            429,
+          );
+        }
+        return telegramResponse(messageResult(110));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    // The regular send holds the per-chat lock through a 20 s inline retry.
+    const blocked = transport.sendRich(7, "заблокированный ответ");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.map((call) => call.method)).toEqual(["sendRichMessage"]);
+
+    // The alert goes out while that wait is still running — no timers advanced.
+    await expect(transport.sendAlert(7, "Доставка застряла")).resolves.toMatchObject({
+      chatId: 7,
+      messageId: 110,
+    });
+    expect(calls.map((call) => call.method)).toEqual(["sendRichMessage", "sendMessage"]);
+
+    await vi.runAllTimersAsync();
+    await expect(blocked).resolves.toEqual([{ chatId: 7, messageId: 110 }]);
+  });
+
   it("honors retry_after and retries only server-confirmed rejection", async () => {
     vi.useFakeTimers();
     const calls: ApiCall[] = [];
