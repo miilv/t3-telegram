@@ -1662,7 +1662,7 @@ describe("OperatorDaemon product flow", () => {
       onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
     });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
-    const testConfig = { ...config(home), approval: { autoAllow: [] } };
+    const testConfig = { ...config(home), approval: { autoAllow: [], ttlHours: 6 } };
     daemon = new OperatorDaemon(testConfig, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
@@ -1672,6 +1672,228 @@ describe("OperatorDaemon product flow", () => {
     for (const [index, entry] of cases.entries()) {
       expect(telegram.approvals[index]?.text).toContain(`Категория риска: **${entry.expected}**`);
     }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("expires an unanswered approval in the maintenance tick and declines it to the broker", async () => {
+    const home = tempDirectory("daemon-approval-ttl-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    // The real 60 s maintenance tick, wired exactly as main.ts wires it.
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_stale",
+      t3ApprovalId: "t3_stale",
+      threadId: "th_stale",
+      payload: { summary: "Delete generated database", risk: "destructive" },
+      chatId: 7,
+      messageId: 555,
+      createdAt: new Date(Date.now() - 7 * 60 * 60 * 1_000).toISOString(),
+    });
+    store.saveApproval({
+      id: "approval_fresh",
+      t3ApprovalId: "t3_fresh",
+      threadId: "th_stale",
+      payload: { summary: "Read source file" },
+      chatId: 7,
+      messageId: 556,
+    });
+    const run = daemon.run();
+
+    await scheduler.trigger();
+
+    expect(broker.approvalResponses).toHaveLength(1);
+    expect(broker.approvalResponses[0]).toMatchObject({
+      approvalId: "t3_stale",
+      decision: "decline",
+      reason: "approval expired",
+    });
+    expect(store.getApproval("approval_stale")?.status).toBe("expired");
+    expect(store.getApproval("approval_fresh")?.status).toBe("pending");
+    expect(
+      telegram.sent.some(
+        (entry) =>
+          entry.messageId === 555 && entry.text.includes("Запрос истёк без ответа (6 ч) — действие отклонено."),
+      ),
+    ).toBe(true);
+    expect(telegram.keyboardClears).toContain(555);
+    expect(telegram.keyboardClears).not.toContain(556);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("never redraws an expired approval keyboard after a restart", async () => {
+    const home = tempDirectory("daemon-approval-ttl-restart-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    store.saveApproval({
+      id: "approval_stale",
+      t3ApprovalId: "t3_stale",
+      threadId: "th_stale",
+      payload: { summary: "Delete generated database" },
+      chatId: 7,
+      messageId: 555,
+      createdAt: new Date(Date.now() - 7 * 60 * 60 * 1_000).toISOString(),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+
+    expect(telegram.approvals).toHaveLength(0);
+    expect(store.getApproval("approval_stale")?.status).toBe("expired");
+    expect(broker.approvalResponses[0]).toMatchObject({ decision: "decline", reason: "approval expired" });
+
+    const run = daemon.run();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("caps pending approvals per chat at four by auto-denying the oldest instead of hiding the newest", async () => {
+    const home = tempDirectory("daemon-approval-cap-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /policy/u, title: "Cap matrix" }));
+    const broker = new FakeBroker();
+    const pendingIds = ["cap_1", "cap_2", "cap_3", "cap_4", "cap_5"];
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      ...pendingIds.map(
+        (approvalId): WorkerEvent => ({
+          type: "approval_required",
+          threadId: "th_1",
+          approvalId,
+          summary: `Delete generated database ${approvalId}`,
+          requestKind: "command",
+          requestType: "command_execution_approval",
+          detail: "rm -rf data",
+        }),
+      ),
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "run a policy cap test"));
+    await waitFor(() => telegram.approvals.length === pendingIds.length);
+    await waitFor(() => broker.approvalResponses.length === 1);
+
+    // The newest request is shown; the oldest one is the one that gets retired.
+    expect(telegram.approvals[4]?.text).toContain("Delete generated database cap\\_5");
+    expect(broker.approvalResponses[0]).toMatchObject({
+      approvalId: "cap_1",
+      decision: "decline",
+      reason: "approval superseded",
+    });
+    const pending = store.listPendingApprovals();
+    expect(pending).toHaveLength(4);
+    expect(pending.map((entry) => entry.t3ApprovalId)).toEqual(["cap_2", "cap_3", "cap_4", "cap_5"]);
+    await waitFor(() =>
+      telegram.sent.some(
+        (entry) =>
+          entry.messageId === telegram.approvals[0]!.messageId &&
+          entry.text.includes("Запрос вытеснен новыми (ожидающих больше 4) — действие отклонено."),
+      ),
+    );
+    expect(telegram.keyboardClears).toContain(telegram.approvals[0]!.messageId);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("answers the approval callback before dispatching the decision so the button never spins", async () => {
+    const home = tempDirectory("daemon-approval-order-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const order: string[] = [];
+    class OrderedBroker extends FakeBroker {
+      override async respondApproval(input: ApprovalDecision): Promise<void> {
+        order.push(`broker:${input.decision}`);
+        await super.respondApproval(input);
+      }
+    }
+    class OrderedTelegram extends FakeTelegram {
+      override async answerCallback(callbackId: string, text?: string): Promise<void> {
+        order.push(`answer:${text ?? ""}`);
+        await super.answerCallback(callbackId, text);
+      }
+    }
+    const broker = new OrderedBroker();
+    const telegram = new OrderedTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_order",
+      t3ApprovalId: "t3_approval_order",
+      threadId: "th_order",
+      payload: { summary: "Run tests" },
+      chatId: 7,
+      messageId: 778,
+    });
+    const run = daemon.run();
+
+    telegram.push(callback(1, "cb_order", 778, `a:${compactCallbackToken("approval_order")}:1`));
+    await waitFor(() => broker.approvalResponses.length === 1);
+
+    expect(order).toEqual(["answer:Allowed", "broker:accept"]);
 
     telegram.finish();
     await run;
@@ -3452,7 +3674,7 @@ function config(home: string): Config {
       databasePath: `${home}/operator.db`,
       codex: undefined,
     },
-    approval: { autoAllow: ["safe-read"] },
+    approval: { autoAllow: ["safe-read"], ttlHours: 6 },
     policy: {
       maxParallelWorkers: 4,
       progressIntervalMs: 60_000,
@@ -4196,7 +4418,10 @@ class FakeTelegram implements TelegramTransport {
   async clearInlineKeyboard(_chatId: number, messageId: number): Promise<void> {
     this.keyboardClears.push(messageId);
   }
-  async answerCallback(): Promise<void> {}
+  readonly callbackAnswers: string[] = [];
+  async answerCallback(_callbackId: string, text?: string): Promise<void> {
+    this.callbackAnswers.push(text ?? "");
+  }
   async editRich(_chatId: number, messageId: number, text: string): Promise<void> {
     // Keep a call history: real Telegram replaces the message in place, while
     // tests need to assert both the durable start frame and terminal edit.
