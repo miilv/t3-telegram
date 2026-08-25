@@ -436,6 +436,8 @@ export interface ApprovalDecision {
   approvalId: string;
   commandId?: string;
   decision: "accept" | "acceptForSession" | "decline" | "cancel";
+  /** Human-readable cause carried to the worker, e.g. "approval expired". */
+  reason?: string;
 }
 
 export interface UserInputDecision {

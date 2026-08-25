@@ -1126,8 +1126,9 @@ export class OperatorStore {
     payload: unknown;
     chatId?: number;
     messageId?: number;
+    createdAt?: string;
   }): void {
-    const now = nowIso();
+    const now = input.createdAt ?? nowIso();
     this.db
       .prepare(`
         INSERT OR REPLACE INTO pending_approvals(
@@ -1172,6 +1173,7 @@ export class OperatorStore {
         threadId: string;
         status: string;
         payload: unknown;
+        createdAt: string;
         chatId?: number;
         messageId?: number;
       }
@@ -1184,6 +1186,7 @@ export class OperatorStore {
       threadId: String(row.thread_id),
       status: String(row.status),
       payload: JSON.parse(String(row.payload_json)),
+      createdAt: String(row.created_at),
       ...(row.telegram_chat_id !== null && row.telegram_chat_id !== undefined
         ? { chatId: Number(row.telegram_chat_id) }
         : {}),
@@ -1206,7 +1209,9 @@ export class OperatorStore {
 
   listPendingApprovals(): Array<NonNullable<ReturnType<OperatorStore["getApproval"]>>> {
     return (
-      this.db.prepare("SELECT * FROM pending_approvals WHERE status='pending'").all() as Row[]
+      this.db
+        .prepare("SELECT * FROM pending_approvals WHERE status='pending' ORDER BY created_at ASC, id ASC")
+        .all() as Row[]
     ).flatMap((row) => {
       const approval = this.getApproval(String(row.id));
       return approval ? [approval] : [];

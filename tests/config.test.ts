@@ -22,6 +22,27 @@ describe("media configuration", () => {
       users: { 42: "owner" },
       allowGroups: false,
     });
+    // Hours, so a request that arrives while the owner sleeps survives the night.
+    expect(config.approval).toMatchObject({ autoAllow: ["safe-read"], ttlHours: 6 });
+  });
+
+  it("accepts an explicit approval TTL in hours", () => {
+    const config = loadConfig({
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+      APPROVAL_TTL_HOURS: "12",
+    });
+
+    expect(config.approval.ttlHours).toBe(12);
+    expect(() =>
+      loadConfig({
+        TELEGRAM_BOT_TOKEN: "test-token",
+        TELEGRAM_ALLOWED_USER_ID: "42",
+        OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+        APPROVAL_TTL_HOURS: "0",
+      }),
+    ).toThrow();
   });
 
   it("parses explicit team roles and group authorization without replacing the owner", () => {

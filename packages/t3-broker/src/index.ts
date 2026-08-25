@@ -478,12 +478,17 @@ export class HttpT3Broker implements T3Broker {
       threadId: input.threadId,
       requestId: input.approvalId,
       decision: input.decision,
+      ...(input.reason ? { reason: input.reason } : {}),
       createdAt: nowIso(),
     });
     this.store.appendEvent("thread.approval.responded", {
       correlationId: commandId,
       threadId: input.threadId,
-      payload: { approvalId: input.approvalId, decision: input.decision },
+      payload: {
+        approvalId: input.approvalId,
+        decision: input.decision,
+        ...(input.reason ? { reason: input.reason } : {}),
+      },
     });
   }
 
