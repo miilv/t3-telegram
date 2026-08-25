@@ -35,6 +35,7 @@ async function main(): Promise<void> {
     model: config.operator.model,
     effort: config.operator.effort,
     turnTimeoutMs: config.operator.turnTimeoutMs,
+    interruptGraceMs: config.operator.interruptGraceMs,
     fullAccess: config.operator.fullAccess,
     envPassthrough: config.operator.envPassthrough,
     logger,
@@ -47,6 +48,7 @@ async function main(): Promise<void> {
       model: config.operator.codex.model,
       effort: config.operator.codex.effort,
       turnTimeoutMs: config.operator.turnTimeoutMs,
+      interruptGraceMs: config.operator.interruptGraceMs,
       envPassthrough: config.operator.envPassthrough,
       logger,
     });

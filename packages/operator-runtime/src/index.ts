@@ -11,6 +11,34 @@ import type {
 } from "../../shared/src/index.js";
 import { DAEMON_SECRET_ENV_NAMES } from "../../shared/src/config.js";
 
+/** Package 1.1: default SIGINT→SIGKILL grace for an interrupted turn. */
+const DEFAULT_INTERRUPT_GRACE_MS = 8_000;
+
+/**
+ * Package 1.1: interrupt a CLI turn and make sure it actually ends. SIGINT is
+ * the polite form (the CLI flushes its result), but a wedged child would keep
+ * the single turn slot forever, so a SIGKILL follows after the grace. The timer
+ * is cleared on close and never keeps the process alive.
+ */
+function interruptChild(
+  child: ChildProcessWithoutNullStreams | undefined,
+  graceMs = DEFAULT_INTERRUPT_GRACE_MS,
+  logger?: Logger,
+): void {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGINT");
+  const escalation = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      // Not routine: a provider CLI that ignores SIGINT is a bug worth seeing
+      // in the log, because every escalation is a turn that ended abruptly.
+      logger?.warn({ pid: child.pid, graceMs }, "Operator turn ignored SIGINT; escalating to SIGKILL");
+      child.kill("SIGKILL");
+    }
+  }, graceMs);
+  escalation.unref();
+  child.once("close", () => clearTimeout(escalation));
+}
+
 /** Extra environment names inherited by the child, parsed by `loadConfig`. */
 interface EnvironmentFilterOptions {
   envPassthrough?: readonly string[];
@@ -24,6 +52,13 @@ export interface ClaudeCliRuntimeOptions extends EnvironmentFilterOptions {
   effort: "low" | "medium" | "high" | "xhigh" | "max";
   /** Absolute wall-clock cap per turn; a hung CLI must not stall daemon queues. */
   turnTimeoutMs?: number;
+  /**
+   * Package 1.1: grace between the SIGINT of an interrupt and the SIGKILL that
+   * follows it. A CLI that ignores SIGINT would otherwise hold the single turn
+   * slot forever — and after a preemption the previous turn is already
+   * superseded, so the owner would hear nothing about either message.
+   */
+  interruptGraceMs?: number;
   /** Owner opt-in: unrestricted built-in tools (Bash/Read/Write) on the host. */
   fullAccess?: boolean;
 }
@@ -35,6 +70,13 @@ export interface CodexCliRuntimeOptions extends EnvironmentFilterOptions {
   effort: "low" | "medium" | "high" | "xhigh";
   /** Absolute wall-clock cap per turn; a hung CLI must not stall daemon queues. */
   turnTimeoutMs?: number;
+  /**
+   * Package 1.1: grace between the SIGINT of an interrupt and the SIGKILL that
+   * follows it. A CLI that ignores SIGINT would otherwise hold the single turn
+   * slot forever — and after a preemption the previous turn is already
+   * superseded, so the owner would hear nothing about either message.
+   */
+  interruptGraceMs?: number;
 }
 
 export class SwitchableOperatorRuntime implements OperatorRuntime {
@@ -64,12 +106,13 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
+    turnToken?: string;
   }): AsyncIterable<OperatorEvent> {
     return this.current().sendTurn(input);
   }
 
-  interrupt(): Promise<void> {
-    return this.current().interrupt();
+  interrupt(turnToken?: string): Promise<void> {
+    return this.current().interrupt(turnToken);
   }
 
   compact(reason?: string): ReturnType<OperatorRuntime["compact"]> {
@@ -125,6 +168,8 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
   private readonly newSessions = new Set<string>();
   private readonly systemPrompts = new Map<string, string>();
   private active: ChildProcessWithoutNullStreams | undefined;
+  /** Package 1.1: which turn owns the slot, for targeted interruption. */
+  private activeTurnToken: string | undefined;
   private currentSessionId?: string;
   private defaultSystemPrompt = "";
   private lastUsage?: { contextTokens: number; contextWindow?: number; percentUsed?: number };
@@ -157,6 +202,7 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
+    turnToken?: string;
   }): AsyncIterable<OperatorEvent> {
     if (this.active) throw new Error("Operator runtime already has an active turn");
     const isNew = this.newSessions.has(input.sessionId);
@@ -201,6 +247,7 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.active = child;
+    this.activeTurnToken = input.turnToken;
     const prompt = isNew
       ? [
           "<operator_system_policy>",
@@ -297,17 +344,26 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
       else queue.fail(new Error(`Codex CLI exited ${code}: ${stderr.slice(-1_200)}`));
     });
     try {
-      for await (const event of queue) yield event;
-      this.newSessions.delete(input.sessionId);
-      this.systemPrompts.delete(input.sessionId);
+      for await (const event of queue) {
+        // Package 1.1: see the Claude runtime — the session is the provider's
+        // the moment it accepts a result, so an interrupted first turn must not
+        // leave this session looking brand new to the next one.
+        if (event.type === "result") {
+          this.newSessions.delete(input.sessionId);
+          this.systemPrompts.delete(input.sessionId);
+        }
+        yield event;
+      }
     } finally {
       clearTimeout(watchdog);
       this.active = undefined;
+      this.activeTurnToken = undefined;
     }
   }
 
-  async interrupt(): Promise<void> {
-    this.active?.kill("SIGINT");
+  async interrupt(turnToken?: string): Promise<void> {
+    if (turnToken !== undefined && turnToken !== this.activeTurnToken) return;
+    interruptChild(this.active, this.options.interruptGraceMs, this.options.logger);
   }
 
   async compact(reason = "scheduled compaction"): Promise<{ sessionId: string; summary?: string }> {
@@ -385,6 +441,8 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   private readonly newSessions = new Set<string>();
   private readonly systemPrompts = new Map<string, string>();
   private active: ChildProcessWithoutNullStreams | undefined;
+  /** Package 1.1: which turn owns the slot, for targeted interruption. */
+  private activeTurnToken: string | undefined;
   private currentSessionId?: string;
   private lastUsage?: { contextTokens: number; contextWindow?: number; percentUsed?: number };
 
@@ -416,6 +474,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     prompt: string;
     toolAccess?: OperatorToolAccess;
     allowBuiltInSlashCommands?: boolean;
+    turnToken?: string;
   }): AsyncIterable<OperatorEvent> {
     if (this.active) throw new Error("Operator runtime already has an active turn");
     const isNew = this.newSessions.has(input.sessionId);
@@ -462,6 +521,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.active = child;
+    this.activeTurnToken = input.turnToken;
     this.currentSessionId = input.sessionId;
     child.stdin.end(input.prompt);
 
@@ -508,20 +568,29 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
 
     try {
       for await (const event of queue) {
-        if (event.type === "result" && event.usage) this.lastUsage = event.usage;
+        if (event.type === "result") {
+          // Package 1.1: the session exists on the provider's side the moment a
+          // result is accepted, so the "brand new session" flags are dropped
+          // HERE and not on a clean drain. An interrupted first turn used to
+          // leave them set, and the next turn re-sent --session-id with the
+          // system prompt instead of --resume — a silently forked session.
+          this.newSessions.delete(input.sessionId);
+          this.systemPrompts.delete(input.sessionId);
+          if (event.usage) this.lastUsage = event.usage;
+        }
         yield event;
       }
-      this.newSessions.delete(input.sessionId);
-      this.systemPrompts.delete(input.sessionId);
     } finally {
       clearTimeout(watchdog);
       this.active = undefined;
+      this.activeTurnToken = undefined;
       if (mcpConfigPath) await unlink(mcpConfigPath).catch(() => undefined);
     }
   }
 
-  async interrupt(): Promise<void> {
-    this.active?.kill("SIGINT");
+  async interrupt(turnToken?: string): Promise<void> {
+    if (turnToken !== undefined && turnToken !== this.activeTurnToken) return;
+    interruptChild(this.active, this.options.interruptGraceMs, this.options.logger);
   }
 
   /**

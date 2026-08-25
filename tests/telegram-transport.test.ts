@@ -851,6 +851,125 @@ describe("Telegram inbound normalization", () => {
     expect(captioned.textIsMediaPlaceholder).toBeUndefined();
   });
 
+  it("kills a superseded turn's draft in every mode, not just the editable fallback (package 1.1)", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        if (call.method === "getMe") return telegramResponse(getMeResult());
+        return telegramResponse(messageResult(1));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    // The mode production almost always runs in: an ephemeral rich draft.
+    await transport.discardDraft({
+      mode: "rich-draft",
+      phase: "text",
+      chatId: 7,
+      draftId: 5,
+      text: "половина ответа",
+    });
+    // The plain-draft fallback.
+    await transport.discardDraft({
+      mode: "draft",
+      phase: "text",
+      chatId: 7,
+      draftId: 6,
+      text: "половина ответа",
+    });
+    // The editable fallback is a real message and is deleted outright.
+    await transport.discardDraft({
+      mode: "edit",
+      phase: "text",
+      chatId: 7,
+      draftId: 7,
+      messageId: 99,
+      text: "половина ответа",
+    });
+
+    const methods = calls.filter((call) => call.method !== "getMe").map((call) => call.method);
+    expect(methods).toEqual(["sendRichMessageDraft", "sendMessageDraft", "deleteMessage"]);
+    // Nothing half-written survives: both ephemeral modes are overwritten with
+    // an ellipsis (reads as "still going", not as a content-bearing answer)
+    // rather than left on screen until Telegram expires them.
+    const rich = calls.find((call) => call.method === "sendRichMessageDraft")!;
+    expect((rich.body.rich_message as { markdown: string }).markdown).toBe("…");
+    expect(calls.find((call) => call.method === "sendMessageDraft")!.body.text).toBe("…");
+    expect(calls.find((call) => call.method === "deleteMessage")!.body.message_id).toBe(99);
+  });
+
+  it("never lets a failed draft discard throw or post a replacement message (package 1.1)", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        if (call.method === "getMe") return telegramResponse(getMeResult());
+        return telegramResponse({ ok: false, error_code: 400, description: "Bad Request: message to delete not found" }, 400);
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    await expect(
+      transport.discardDraft({
+        mode: "edit",
+        phase: "text",
+        chatId: 7,
+        draftId: 8,
+        messageId: 404,
+        text: "…",
+      }),
+    ).resolves.toBeUndefined();
+    expect(calls.some((call) => call.method === "sendMessage")).toBe(false);
+  });
+
+  it("signals every accepted message to the preemption observer while the burst still batches (package 1.1)", async () => {
+    vi.useFakeTimers();
+    const transport = new TelegramBotTransport(
+      "test-token",
+      { users: { 42: "owner" }, allowGroups: false },
+      1,
+      logger,
+    );
+    const internals = transport as unknown as {
+      acceptUpdate(update: unknown): void;
+      inbound: { push(item: unknown): void };
+    };
+    const delivered: TelegramMessageInbound[] = [];
+    internals.inbound.push = (item) => delivered.push(item as TelegramMessageInbound);
+    const observed: Array<{ chatId: number; userId: number }> = [];
+    transport.setInboundObserver((message) =>
+      observed.push({ chatId: message.chatId, userId: message.userId }),
+    );
+
+    // The first message of the series is observed immediately — the running
+    // turn is freed while the rest of the burst is still being glued together.
+    internals.acceptUpdate(rawTextUpdate(1, 1));
+    expect(observed).toEqual([{ chatId: 7, userId: 42 }]);
+    expect(delivered).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    internals.acceptUpdate(rawTextUpdate(2, 2));
+    expect(observed).toHaveLength(2);
+    expect(delivered).toHaveLength(0);
+
+    // …and the series still leaves as ONE update, exactly as before.
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.messageIds).toEqual([1, 2]);
+
+    // An unauthorized sender is filtered before the observer, so no stranger
+    // can preempt the owner's turn.
+    internals.acceptUpdate({
+      ...rawTextUpdate(3, 3),
+      message: { ...rawTextUpdate(3, 3).message, from: { id: 99, first_name: "X" } },
+    });
+    expect(observed).toHaveLength(2);
+  });
+
   it("holds an album open across getUpdates page boundaries instead of splitting it", async () => {
     vi.useFakeTimers();
     const transport = new TelegramBotTransport("test-token", 42, 1, logger);

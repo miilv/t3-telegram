@@ -204,8 +204,37 @@ export interface TelegramSendProgress {
 /** An inbound Telegram file: either already on the daemon's disk or buffered. */
 export type TelegramFileRef = { localPath: string } | { bytes: Uint8Array };
 
+/** Package 1.1: the preemption signal carried by an accepted inbound message. */
+export interface InboundMessageSignal {
+  chatId: number;
+  userId: number;
+  messageId: number;
+  /** An edit reuses an old message id, so it must not move the watermark. */
+  edited: boolean;
+  /** Forum topic / direct-messages topic: a separate conversation in one chat. */
+  messageThreadId?: number;
+  directMessagesTopicId?: number;
+}
+
 export interface TelegramTransport {
   updates(signal?: AbortSignal): AsyncIterable<TelegramInbound>;
+  /**
+   * Package 1.1: subscribe to accepted inbound messages. The observer fires as
+   * soon as an authorized message is accepted — before the 2 s batch window
+   * closes and long before it becomes an update on `updates()` — so the daemon
+   * can preempt the running Operator turn on the FIRST message of a burst while
+   * the rest is still being glued into one job. One observer at a time;
+   * it must not consume or alter the update.
+   */
+  setInboundObserver?(observer: (message: InboundMessageSignal) => void): void;
+  /**
+   * Package 1.1: kill a draft that will never be finalized (a superseded turn).
+   * Every mode is handled: the `edit` fallback is a real message and is
+   * deleted, the ephemeral draft modes are overwritten with a neutral dash so
+   * no half-written answer lingers until Telegram expires them. Best-effort —
+   * never throws for a draft that is already gone.
+   */
+  discardDraft?(draft: StreamDraft): Promise<void>;
   sendRich(
     chatId: number,
     text: string,

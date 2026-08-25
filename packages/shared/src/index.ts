@@ -1,3 +1,13 @@
+export { LaneQueue, OPERATOR_LANES } from "./lane-queue.js";
+export type { OperatorLane } from "./lane-queue.js";
+export { ThreadEventDigest } from "./thread-digest.js";
+export type {
+  ThreadDigestEvent,
+  ThreadDigestItem,
+  ThreadDigestKind,
+  ThreadEventDigestOptions,
+  ThreadTerminalOutcome,
+} from "./thread-digest.js";
 export {
   DEFAULT_TIME_ZONE,
   isValidTimeZone,
@@ -372,8 +382,20 @@ export interface OperatorRuntime {
     toolAccess?: OperatorToolAccess;
     /** Internal runtime maintenance may opt into Claude's built-in /compact command. */
     allowBuiltInSlashCommands?: boolean;
+    /**
+     * Package 1.1: identifies THIS turn for targeted interruption. The runtime
+     * slot is shared with maintenance, mediation and memory work, so a
+     * preemption that names its turn cannot kill whatever ran after it.
+     */
+    turnToken?: string;
   }): AsyncIterable<OperatorEvent>;
-  interrupt(): Promise<void>;
+  /**
+   * Package 1.1: with a `turnToken` the interrupt applies only while that exact
+   * turn owns the runtime slot — a preemption arriving late is a no-op instead
+   * of killing an unrelated call. Without one it is the unconditional emergency
+   * hatch (the cancel word), unchanged.
+   */
+  interrupt(turnToken?: string): Promise<void>;
   compact(reason?: string): Promise<{
     sessionId: string;
     summary?: string;
