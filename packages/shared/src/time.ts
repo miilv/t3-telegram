@@ -7,37 +7,69 @@
  * library, no hidden tz database to keep in sync with the host.
  *
  * Contract for a missing zone: `undefined`/empty falls back to UTC, so a
- * daemon without `owner.timezone` still produces stable output. An explicitly
- * given but unknown zone throws — the config schema rejects those up front, so
- * reaching a helper with garbage means a real bug, not a formatting nuance.
+ * daemon without `owner.timezone` still produces stable output.
+ *
+ * Contract for an unknown zone: `resolveTimeZone(zone)` throws. Only the
+ * config schema guarantees a validated zone; strings also arrive from the
+ * model (automation `daily` schedules, calendar tool arguments, `utility.time`)
+ * and from Google's calendar payloads. A caller holding a zone from any such
+ * untrusted source must either check `isValidTimeZone` first and report the bad
+ * input, or ask for the non-throwing `resolveTimeZone(zone, fallback)` — a
+ * formatting helper is the wrong place to discover a typo, and the wrong place
+ * to crash a scheduler tick over one.
  */
 
 /** Fallback zone for owners who never configured one. */
 export const DEFAULT_TIME_ZONE = "UTC";
 
-const validZoneCache = new Map<string, boolean>();
+// Only accepted zones are cached: the inputs are model- and API-supplied, and
+// remembering every rejected string would let a caller grow this map without
+// bound. Rejection is one Intl construction, and a rejected zone should not be
+// on a hot path anyway.
+const canonicalZoneCache = new Map<string, string>();
+
+/**
+ * Canonical IANA spelling of the zone, or undefined when Intl rejects it.
+ * Validation and canonicalization are the same call: Intl resolves aliases and
+ * casing ("europe/moscow" -> "Europe/Moscow"), so stored zones stay comparable.
+ */
+function canonicalTimeZone(timeZone: string): string | undefined {
+  const cached = canonicalZoneCache.get(timeZone);
+  if (cached !== undefined) return cached;
+  let canonical: string | undefined;
+  try {
+    canonical = new Intl.DateTimeFormat(undefined, { timeZone }).resolvedOptions().timeZone;
+  } catch {
+    return undefined;
+  }
+  canonicalZoneCache.set(timeZone, canonical);
+  return canonical;
+}
 
 /** True when the string is an IANA zone this runtime's Intl accepts. */
 export function isValidTimeZone(timeZone: string): boolean {
-  const cached = validZoneCache.get(timeZone);
-  if (cached !== undefined) return cached;
-  let valid = false;
-  try {
-    new Intl.DateTimeFormat(undefined, { timeZone });
-    valid = true;
-  } catch {
-    valid = false;
-  }
-  validZoneCache.set(timeZone, valid);
-  return valid;
+  return canonicalTimeZone(timeZone) !== undefined;
 }
 
-/** Resolve an optional configured zone to a usable one, or throw when unknown. */
-export function resolveTimeZone(timeZone?: string): string {
+/** Resolve an optional configured zone to a canonical one, or throw when unknown. */
+export function resolveTimeZone(timeZone?: string): string;
+/**
+ * Non-throwing form for zones from untrusted sources (model arguments, Google
+ * payloads): an unknown zone degrades to `fallback` instead of aborting the
+ * caller. The fallback itself must be a valid zone — that one is ours.
+ */
+export function resolveTimeZone(timeZone: string | undefined, fallback: string): string;
+export function resolveTimeZone(timeZone?: string, fallback?: string): string {
   const zone = timeZone?.trim();
-  if (!zone) return DEFAULT_TIME_ZONE;
-  if (!isValidTimeZone(zone)) throw new Error(`Unknown IANA time zone: ${zone}`);
-  return zone;
+  const canonical = zone ? canonicalTimeZone(zone) : undefined;
+  if (canonical) return canonical;
+  if (fallback === undefined) {
+    if (!zone) return DEFAULT_TIME_ZONE;
+    throw new Error(`Unknown IANA time zone: ${zone}`);
+  }
+  const canonicalFallback = canonicalTimeZone(fallback);
+  if (!canonicalFallback) throw new Error(`Unknown IANA fallback time zone: ${fallback}`);
+  return canonicalFallback;
 }
 
 export interface LocalTimeParts {
@@ -74,6 +106,9 @@ function partsFormatter(zone: string): Intl.DateTimeFormat {
 /** Wall-clock components of `date` as seen in the owner's zone. */
 export function ownerLocalParts(date: Date, timeZone?: string): LocalTimeParts {
   const zone = resolveTimeZone(timeZone);
+  // formatToParts throws a bare RangeError on an invalid Date; say which
+  // argument was wrong, since these dates come from parsed user text.
+  if (!Number.isFinite(date.getTime())) throw new Error("ownerLocalParts requires a valid Date");
   const bag: Record<string, string> = {};
   for (const part of partsFormatter(zone).formatToParts(date)) {
     if (part.type !== "literal") bag[part.type] = part.value;
@@ -136,9 +171,15 @@ export function ownerLogicalDay(date: Date, timeZone?: string, boundaryHour = 3)
   const parts = ownerLocalParts(date, timeZone);
   // Calendar arithmetic on the already-localized wall clock: shifting the UTC
   // instant would re-enter the zone and could cross a DST jump twice.
-  const shifted = new Date(
-    Date.UTC(parts.year, parts.month - 1, parts.day - (parts.hour < boundaryHour ? 1 : 0)),
+  // setUTCFullYear rather than Date.UTC: the latter maps two-digit years into
+  // the 1900s, so a year like 5 would silently become 1905.
+  const shifted = new Date(0);
+  shifted.setUTCFullYear(
+    parts.year,
+    parts.month - 1,
+    parts.day - (parts.hour < boundaryHour ? 1 : 0),
   );
+  shifted.setUTCHours(0, 0, 0, 0);
   return `${pad(shifted.getUTCFullYear(), 4)}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}`;
 }
 
@@ -155,13 +196,13 @@ export function isWithinLocalWindow(
   fromHour: number,
   toHour: number,
 ): boolean {
-  for (const [name, value] of [
-    ["fromHour", fromHour],
-    ["toHour", toHour],
-  ] as const) {
-    if (!Number.isInteger(value) || value < 0 || value > 24) {
-      throw new Error(`${name} must be an integer hour 0..24, got ${value}`);
-    }
+  // fromHour stops at 23: a start of 24 is not "end of day", it would read as
+  // 24:00 > toHour and silently turn any window into a midnight-wrapping one.
+  if (!Number.isInteger(fromHour) || fromHour < 0 || fromHour > 23) {
+    throw new Error(`fromHour must be an integer hour 0..23, got ${fromHour}`);
+  }
+  if (!Number.isInteger(toHour) || toHour < 0 || toHour > 24) {
+    throw new Error(`toHour must be an integer hour 0..24, got ${toHour}`);
   }
   const { minutesOfDay } = ownerLocalParts(date, timeZone);
   const from = fromHour * 60;

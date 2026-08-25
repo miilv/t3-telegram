@@ -41,9 +41,32 @@ describe("owner.timezone configuration", () => {
   it("recognizes valid and invalid zones directly", () => {
     expect(isValidTimeZone("America/New_York")).toBe(true);
     expect(isValidTimeZone("UTC")).toBe(true);
-    // Cached path returns the same verdict on a second call.
     expect(isValidTimeZone("Europe/Nowhere")).toBe(false);
-    expect(isValidTimeZone("Europe/Nowhere")).toBe(false);
+    expect(isValidTimeZone("")).toBe(false);
+  });
+});
+
+describe("resolveTimeZone", () => {
+  it("canonicalizes casing and aliases so stored zones stay comparable", () => {
+    expect(resolveTimeZone("europe/moscow")).toBe("Europe/Moscow");
+    expect(resolveTimeZone("AMERICA/new_york")).toBe("America/New_York");
+    expect(resolveTimeZone("Europe/Moscow")).toBe("Europe/Moscow");
+  });
+
+  it("throws for an unknown zone when no fallback is offered", () => {
+    expect(() => resolveTimeZone("Mars/Olympus_Mons")).toThrow(/Unknown IANA time zone/);
+    expect(resolveTimeZone(undefined)).toBe(DEFAULT_TIME_ZONE);
+    expect(resolveTimeZone("  ")).toBe(DEFAULT_TIME_ZONE);
+  });
+
+  it("degrades to the fallback for zones from untrusted sources", () => {
+    // A model-authored or Google-supplied zone must not abort the caller.
+    expect(resolveTimeZone("Mars/Olympus_Mons", "Europe/Moscow")).toBe("Europe/Moscow");
+    expect(resolveTimeZone(undefined, "Europe/Moscow")).toBe("Europe/Moscow");
+    expect(resolveTimeZone("Asia/Tokyo", "Europe/Moscow")).toBe("Asia/Tokyo");
+    // The fallback is canonicalized too, and a broken one is our own bug.
+    expect(resolveTimeZone("nope", "europe/moscow")).toBe("Europe/Moscow");
+    expect(() => resolveTimeZone("nope", "Mars/Base")).toThrow(/fallback/);
   });
 });
 
@@ -75,6 +98,11 @@ describe("ownerLocalTime", () => {
 
   it("throws on an explicitly bad zone instead of silently drifting", () => {
     expect(() => ownerLocalTime(new Date(), "Mars/Olympus_Mons")).toThrow(/Unknown IANA time zone/);
+  });
+
+  it("names the bad argument when handed an invalid Date", () => {
+    expect(() => ownerLocalTime(new Date("not a date"), "Europe/Moscow")).toThrow(/valid Date/);
+    expect(() => ownerLogicalDay(new Date(Number.NaN), "Europe/Moscow")).toThrow(/valid Date/);
   });
 
   it("survives DST in a zone that observes it", () => {
@@ -151,6 +179,13 @@ describe("ownerLogicalDay", () => {
     expect(ownerLogicalDay(new Date("2026-11-01T08:30:00Z"), "America/New_York")).toBe("2026-11-01");
   });
 
+  it("keeps a far-past year intact instead of mapping it into the 1900s", () => {
+    const ancient = new Date(0);
+    ancient.setUTCFullYear(5, 5, 10);
+    ancient.setUTCHours(12, 0, 0, 0);
+    expect(ownerLogicalDay(ancient, "UTC")).toBe("0005-06-10");
+  });
+
   it("falls back to UTC and rejects an unknown zone", () => {
     expect(ownerLogicalDay(new Date("2026-08-26T01:30:00Z"))).toBe("2026-08-25");
     expect(() => ownerLogicalDay(new Date(), "Mars/Olympus_Mons")).toThrow(/Unknown IANA time zone/);
@@ -199,9 +234,41 @@ describe("isWithinLocalWindow", () => {
     );
   });
 
+  it("handles a half-hour DST shift (Lord Howe) and a :45 offset (Kathmandu)", () => {
+    // Lord Howe shifts by 30 minutes, not an hour: +11:00 summer, +10:30 winter.
+    const lordHowe = (iso: string) =>
+      isWithinLocalWindow(new Date(iso), "Australia/Lord_Howe", 2, 4);
+    // Autumn: 01:30 repeats, so the window opens half an hour "late" in UTC.
+    expect(ownerLocalTime(new Date("2026-04-04T14:30:00Z"), "Australia/Lord_Howe")).toBe(
+      "2026-04-05 01:30",
+    );
+    expect(ownerLocalTime(new Date("2026-04-04T15:00:00Z"), "Australia/Lord_Howe")).toBe(
+      "2026-04-05 01:30",
+    );
+    expect(lordHowe("2026-04-04T14:30:00Z")).toBe(false); // 01:30 LHDT
+    expect(lordHowe("2026-04-04T15:00:00Z")).toBe(false); // 01:30 again, LHST
+    expect(lordHowe("2026-04-04T15:30:00Z")).toBe(true); // 02:00 LHST
+    expect(lordHowe("2026-04-04T17:00:00Z")).toBe(true); // 03:30 LHST
+    expect(lordHowe("2026-04-04T17:30:00Z")).toBe(false); // 04:00 LHST
+    // Spring: the clock jumps 01:30 -> 02:30, so 02:00-02:29 never happens.
+    expect(lordHowe("2026-10-03T15:00:00Z")).toBe(false); // 01:30 LHST
+    expect(lordHowe("2026-10-03T15:30:00Z")).toBe(true); // 02:30 LHDT
+    // Kathmandu sits at +05:45, so local hours never align with UTC hours.
+    const kathmandu = (iso: string) => isWithinLocalWindow(new Date(iso), "Asia/Kathmandu", 2, 4);
+    expect(ownerLocalTime(new Date("2026-08-25T20:15:00Z"), "Asia/Kathmandu")).toBe(
+      "2026-08-26 02:00",
+    );
+    expect(kathmandu("2026-08-25T20:14:00Z")).toBe(false); // 01:59 local
+    expect(kathmandu("2026-08-25T20:15:00Z")).toBe(true); // 02:00 local
+    expect(kathmandu("2026-08-25T22:14:00Z")).toBe(true); // 03:59 local
+    expect(kathmandu("2026-08-25T22:15:00Z")).toBe(false); // 04:00 local
+  });
+
   it("falls back to UTC, validates hours, and rejects an unknown zone", () => {
     expect(isWithinLocalWindow(new Date("2026-08-25T02:30:00Z"), undefined, 2, 4)).toBe(true);
     expect(() => isWithinLocalWindow(new Date(), "Europe/Moscow", -1, 4)).toThrow(/fromHour/);
+    // fromHour=24 would silently read as a wrapping window; reject it.
+    expect(() => isWithinLocalWindow(new Date(), "Europe/Moscow", 24, 4)).toThrow(/fromHour/);
     expect(() => isWithinLocalWindow(new Date(), "Europe/Moscow", 2, 25)).toThrow(/toHour/);
     expect(() => isWithinLocalWindow(new Date(), "Mars/Olympus_Mons", 2, 4)).toThrow(
       /Unknown IANA time zone/,
