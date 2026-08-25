@@ -1682,6 +1682,63 @@ export class OperatorStore {
     });
   }
 
+  /**
+   * The agent-facing journal read (bug №31): a bounded, filtered slice of
+   * daemon_events so "what did you do yesterday" is answerable from the
+   * durable record instead of thread summaries alone. Newest first; the
+   * idx_events_created index carries the time-window scan.
+   */
+  listDaemonEvents(
+    filter: { since?: string; until?: string; typePrefixes?: string[]; limit?: number } = {},
+  ): Array<{
+    eventType: string;
+    createdAt: string;
+    correlationId?: string;
+    projectId?: string;
+    threadId?: string;
+    payload: Record<string, unknown>;
+  }> {
+    const clauses: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (filter.since) {
+      clauses.push("created_at>=?");
+      parameters.push(filter.since);
+    }
+    if (filter.until) {
+      clauses.push("created_at<=?");
+      parameters.push(filter.until);
+    }
+    const prefixes = (filter.typePrefixes ?? []).map((prefix) => prefix.trim()).filter(Boolean);
+    if (prefixes.length) {
+      clauses.push(`(${prefixes.map(() => "event_type LIKE ? ESCAPE '\\'").join(" OR ")})`);
+      parameters.push(...prefixes.map((prefix) => `${prefix.replace(/[\\%_]/g, "\\$&")}%`));
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(`
+        SELECT event_type,correlation_id,project_id,thread_id,payload_json,created_at
+        FROM daemon_events ${where}
+        ORDER BY created_at DESC LIMIT ?
+      `)
+      .all(...parameters, Math.max(1, Math.min(filter.limit ?? 50, 200))) as Row[];
+    return rows.map((row) => {
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+      } catch {
+        // Legacy/malformed diagnostics are represented without their payload.
+      }
+      return {
+        eventType: String(row.event_type),
+        createdAt: String(row.created_at),
+        ...(row.correlation_id ? { correlationId: String(row.correlation_id) } : {}),
+        ...(row.project_id ? { projectId: String(row.project_id) } : {}),
+        ...(row.thread_id ? { threadId: String(row.thread_id) } : {}),
+        payload,
+      };
+    });
+  }
+
   findLatestTelegramMessageForThread(threadId: string, messageTypes: string[]): TelegramMessageRecord | undefined {
     if (!messageTypes.length) return undefined;
     const placeholders = messageTypes.map(() => "?").join(",");

@@ -452,6 +452,39 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("lists daemon events filtered by window and type prefixes, newest first (bug №31)", () => {
+    const store = tempStore();
+    const at = (iso: string, id: string) =>
+      store.db.prepare("UPDATE daemon_events SET created_at=? WHERE id=?").run(iso, id);
+    at("2026-08-23T10:00:00.000Z", store.appendEvent("worker.completed", { threadId: "th_1", payload: { status: "completed" } }));
+    at("2026-08-23T11:00:00.000Z", store.appendEvent("worker.failed", { threadId: "th_2", payload: { errorCode: "provider" } }));
+    at("2026-08-23T12:00:00.000Z", store.appendEvent("automation.dispatched", { payload: { automationId: "auto_1" } }));
+    at("2026-08-23T13:00:00.000Z", store.appendEvent("operator.turn.completed", { correlationId: "corr_1" }));
+    at("2026-08-20T09:00:00.000Z", store.appendEvent("worker.completed", { threadId: "th_old" }));
+
+    const windowed = store.listDaemonEvents({
+      since: "2026-08-23T00:00:00.000Z",
+      until: "2026-08-23T12:30:00.000Z",
+      typePrefixes: ["worker.", "automation."],
+    });
+    expect(windowed.map((event) => event.eventType)).toEqual([
+      "automation.dispatched",
+      "worker.failed",
+      "worker.completed",
+    ]);
+    expect(windowed[2]).toMatchObject({ threadId: "th_1", payload: { status: "completed" } });
+
+    // The prefix is a literal match, not a LIKE pattern.
+    expect(store.listDaemonEvents({ typePrefixes: ["worker_"] })).toEqual([]);
+    // limit clamps to the newest rows.
+    expect(store.listDaemonEvents({ limit: 1 }).map((event) => event.eventType)).toEqual([
+      "operator.turn.completed",
+    ]);
+    // No filters: everything, newest first, default bound.
+    expect(store.listDaemonEvents()).toHaveLength(5);
+    store.close();
+  });
+
   it("prunes only aged terminal journal rows and keeps live work untouched", () => {
     const store = tempStore();
     const daysAgo = (days: number) => new Date(Date.now() - days * 24 * 60 * 60 * 1_000).toISOString();

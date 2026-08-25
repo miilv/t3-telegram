@@ -187,6 +187,31 @@ describe("OperatorToolServer", () => {
       await callJson(client, "memory.remember", { category: "decision", content: "Use MCP capabilities" });
       const memory = await callJson(client, "memory.search", { query: "capabilities" });
       expect(memory).toMatchObject({ notes: [{ category: "decision", content: "Use MCP capabilities" }] });
+
+      store.appendEvent("worker.completed", { threadId: thread.id, payload: { status: "completed" } });
+      store.appendEvent("automation.dispatched", { payload: { automationId: "auto_brief" } });
+      const journal = await callJson(client, "memory.journal", {
+        since: "-24h",
+        types: ["worker.", "automation."],
+        limit: 10,
+      }) as Array<{ eventType: string; threadId?: string; payload: Record<string, unknown> }>;
+      expect(journal.map((event) => event.eventType).sort()).toEqual([
+        "automation.dispatched",
+        "worker.completed",
+      ]);
+      expect(journal.find((event) => event.eventType === "worker.completed")).toMatchObject({
+        threadId: thread.id,
+        payload: { status: "completed" },
+      });
+      // The server clock is pinned to 2026-08-21: an until in its past hides
+      // everything appended by this test run.
+      expect(await callJson(client, "memory.journal", { until: "-48h" })).toEqual([]);
+      const badJournal = await client.callTool({
+        name: "memory.journal",
+        arguments: { since: "yesterday-ish" },
+      });
+      expect(badJournal.isError).toBe(true);
+      expect(textResult(badJournal)).toContain("use ISO 8601 or a relative offset");
       const automation = await callJson(client, "scheduler.create_automation", {
         name: "Morning brief",
         prompt: "Summarize active work",
@@ -294,6 +319,12 @@ describe("OperatorToolServer", () => {
         });
         expect(deniedMemory.isError).toBe(true);
         expect(textResult(deniedMemory)).toContain("requires owner or admin role");
+        const deniedJournal = await viewerClient.callTool({
+          name: "memory.journal",
+          arguments: {},
+        });
+        expect(deniedJournal.isError).toBe(true);
+        expect(textResult(deniedJournal)).toContain("requires owner or admin role");
       } finally {
         viewerLease.revoke();
         await viewerClient.close().catch(() => undefined);
