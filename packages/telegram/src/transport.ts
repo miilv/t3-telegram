@@ -1162,6 +1162,18 @@ export function mergeInboundBatch(messages: TelegramMessageInbound[]): TelegramM
     ...(ownText ? { ownText } : {}),
     ...(forwarded.length ? { forwardedCount: forwarded.length } : {}),
     attachments: ordered.flatMap((message) => message.attachments),
+    // A real multi-message merge keeps the per-message breakdown so the daemon
+    // can answer a worker prompt with the replying message only (bug №35).
+    ...(ordered.length > 1
+      ? {
+          parts: ordered.map((message) => ({
+            messageId: message.messageId,
+            text: message.text,
+            ...(message.replyToMessageId ? { replyToMessageId: message.replyToMessageId } : {}),
+            ...(message.forwardOrigin ? { forwarded: true } : {}),
+          })),
+        }
+      : {}),
   };
 }
 

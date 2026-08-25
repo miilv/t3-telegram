@@ -2,9 +2,13 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
-import { OperatorDaemon, operatorHeartbeatText } from "../apps/daemon/src/operator-daemon.js";
+import {
+  OperatorDaemon,
+  operatorHeartbeatText,
+  syntheticNegativeMessageId,
+} from "../apps/daemon/src/operator-daemon.js";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
-import { compactCallbackToken } from "../packages/telegram/src/index.js";
+import { compactCallbackToken, mergeInboundBatch } from "../packages/telegram/src/index.js";
 import { createAutomation } from "../packages/automations/src/index.js";
 import { OperatorToolServer } from "../packages/operator-tools/src/index.js";
 import type { MediaProcessor } from "../packages/media/src/index.js";
@@ -2645,6 +2649,305 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   });
+
+  it("answers a worker prompt with the replying message only and routes the glued rest as the next turn (bug №35)", async () => {
+    const home = tempDirectory("daemon-batch-reply-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /deploy/u, title: "Auth deploy" }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      {
+        type: "user_input_required",
+        threadId: "th_1",
+        requestId: "t3_input_1",
+        questions: [
+          { id: "note", header: "Note", question: "Any deployment note?", options: [], multiSelect: false },
+        ],
+      },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "deploy auth service and ask me for a note"));
+    await waitFor(() => telegram.userInputs.length === 1);
+    const prompt = telegram.userInputs[0]!;
+    // Two messages inside one 2 s batch window: the actual reply to the worker
+    // prompt plus an unrelated question that must NOT leak into the answer.
+    telegram.push(
+      mergeInboundBatch([
+        { ...message(5, "Deploy after 22:00 UTC"), replyToMessageId: prompt.messageId },
+        message(6, "столица Франции?"),
+      ]),
+    );
+
+    await waitFor(() => broker.userInputResponses.length === 1);
+    expect(broker.userInputResponses[0]?.answers).toEqual({ note: "Deploy after 22:00 UTC" });
+    // The unrelated message continues through normal ingress as its own turn.
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 5_000);
+    expect(runtime.prompts.some((prompt) => prompt.includes("столица Франции?"))).toBe(true);
+    expect(runtime.prompts.every((prompt) => !prompt.includes("Deploy after 22:00 UTC"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("delivers an identical progress text again in a new worker turn while deduping within one turn (bug №36)", async () => {
+    const home = tempDirectory("daemon-progress-epoch-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /implement|also add/u, providerInstanceId: "claude_work", title: "Auth flow" }),
+    );
+    const broker = new RepeatedProgressBroker();
+    broker.providers = [
+      { ...testProviderDescriptor(), capabilities: { ...testProviderDescriptor().capabilities, liveInput: false } },
+    ];
+    broker.holdFirstTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const progressCount = () => telegram.sent.filter((entry) => entry.text.includes("Запускаю тесты…")).length;
+    telegram.push(message(1, "implement the auth flow"));
+    await waitFor(() => progressCount() === 1, 5_000);
+    telegram.push(message(2, "also add a regression test"));
+    await waitFor(() => store.listBackgroundJobs("thread_followup").length === 1);
+    broker.releaseFirstTerminal();
+    // The follow-up turn repeats the very same progress text; a turn-scoped
+    // dedupe key must deliver it instead of silently swallowing it.
+    await waitFor(() => progressCount() === 2, 5_000);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("sends command replies through the durable outbox and keeps a replayed cancel from interrupting twice (bug №38)", async () => {
+    const home = tempDirectory("daemon-command-outbox-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /implement/u, title: "Cancel target" }));
+    const broker = new InterruptCountingBroker();
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "/status"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("## Работа")));
+    // The reply exists as a delivered durable outbox item, not a direct send.
+    const commandRows = store.db
+      .prepare("SELECT status FROM telegram_outbox WHERE dedupe_key LIKE 'telegram:command:%'")
+      .all() as Array<{ status: string }>;
+    expect(commandRows.length).toBeGreaterThan(0);
+    expect(commandRows.every((row) => row.status === "delivered")).toBe(true);
+
+    telegram.push(message(2, "implement the cancellable auth flow"));
+    await waitFor(() => store.getThread("th_1")?.status === "running", 5_000);
+    const cancel = message(3, "стоп");
+    telegram.push(cancel);
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Остановил")));
+    expect(broker.interrupts).toBe(1);
+
+    // A replayed ingress job (crash between side effect and completion) must
+    // not interrupt the thread again nor duplicate the confirmation.
+    const replayId = "replayed-cancel-job";
+    store.enqueueBackgroundJob(
+      "telegram_ingress",
+      { update: cancel, processExisting: true },
+      undefined,
+      { id: replayId, dedupeKey: replayId },
+    );
+    telegram.push(message(4, "столица Франции?"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 5_000);
+    expect(broker.interrupts).toBe(1);
+    expect(telegram.sent.filter((entry) => entry.text.includes("Остановил"))).toHaveLength(1);
+
+    broker.releaseTerminal();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("never resurrects the pre-tool preamble in the final answer (bug №40)", async () => {
+    const home = tempDirectory("daemon-preamble-");
+    const store = tempStore();
+    const runtime = new ScriptedEventsRuntime([
+      { type: "text_delta", text: "Сейчас посмотрю логи." },
+      { type: "tool_started", tool: "mcp__operator__t3_get_thread_status" },
+      { type: "result", text: "Сейчас посмотрю логи." },
+    ]);
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "как дела у воркера?"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Готово — выполнено шагов: 1.")));
+    expect(telegram.sent.every((entry) => !entry.text.includes("Сейчас посмотрю"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("keeps the last inter-tool commentary when no text follows the final tool call (bug №40)", async () => {
+    const home = tempDirectory("daemon-inter-segment-");
+    const store = tempStore();
+    const runtime = new ScriptedEventsRuntime([
+      { type: "text_delta", text: "Сейчас посмотрю логи." },
+      { type: "tool_started", tool: "mcp__operator__t3_get_thread_status" },
+      { type: "text_delta", text: "Тесты зелёные, перезапускаю деплой." },
+      { type: "tool_started", tool: "mcp__operator__t3_send_turn" },
+      { type: "result", text: "" },
+    ]);
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "продолжай деплой"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Тесты зелёные, перезапускаю деплой.")));
+    expect(telegram.sent.every((entry) => !entry.text.includes("Сейчас посмотрю"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("tells a replayed ingress turn about threads its first attempt already created (bug №28)", async () => {
+    const home = tempDirectory("daemon-turn-replay-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, title: "Replay guard" }));
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const request = message(1, "исправь race condition в auth и прогони тесты");
+    telegram.push(request);
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Запустил работу")), 5_000);
+    expect(broker.turns).toHaveLength(1);
+    // The dispatched thread is durably attributed to its ingress job.
+    expect(store.getRuntimeState("job_thread:telegram-ingress:7:1")).toBe("th_1");
+
+    // Simulate a crash mid-turn: the final was never enqueued and the ingress
+    // job is replayed after restart. Focus is wiped so only the recovery note
+    // can point the agent at the existing thread.
+    store.db.prepare("DELETE FROM telegram_outbox WHERE dedupe_key LIKE 'telegram:operator:%'").run();
+    store.setFocus("42", { secondary: [] });
+    store.enqueueBackgroundJob(
+      "telegram_ingress",
+      { update: request, processExisting: true },
+      undefined,
+      { id: "replayed-ingress-job", dedupeKey: "replayed-ingress-job" },
+    );
+    telegram.push(message(9, "столица Франции?"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 5_000);
+
+    const replayEnvelope = runtime.prompts.find((prompt) => prompt.includes("Recovery note"));
+    expect(replayEnvelope).toContain('"Replay guard" (threadId th_1)');
+    // The agent continued th_1 instead of creating a twin thread.
+    expect(broker.threads).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("issues 48-bit synthetic negative message ids that stay clear of real ones (bug №46)", () => {
+    const id = syntheticNegativeMessageId("autorun_example:2026-08-25T10:00:00Z");
+    expect(id).toBeLessThan(0);
+    expect(id).toBeGreaterThanOrEqual(-(2 ** 48));
+    expect(Number.isSafeInteger(id)).toBe(true);
+    // Deterministic for dedupe, distinct across seeds.
+    expect(syntheticNegativeMessageId("autorun_example:2026-08-25T10:00:00Z")).toBe(id);
+    const ids = new Set(
+      Array.from({ length: 5_000 }, (_, index) => syntheticNegativeMessageId(`choice:ch_${index}`)),
+    );
+    expect(ids.size).toBe(5_000);
+    // The widened range actually uses more than the previous 28 bits.
+    expect([...ids].some((value) => value < -(2 ** 28))).toBe(true);
+  });
 });
 
 function config(home: string): Config {
@@ -3395,6 +3698,63 @@ class FakeTelegram implements TelegramTransport {
   }
   async health(): Promise<{ healthy: boolean; username: string }> {
     return { healthy: true, username: "operator_test_bot" };
+  }
+}
+
+/** Replays a fixed event script for user-facing envelopes (bug №40 tests). */
+class ScriptedEventsRuntime extends FakeRuntime {
+  constructor(private readonly events: OperatorEvent[]) {
+    super();
+  }
+
+  override async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (!input.prompt.includes("User message:")) {
+      yield* super.sendTurn(input);
+      return;
+    }
+    this.prompts.push(input.prompt);
+    for (const event of this.events) {
+      yield event.type === "result" ? { ...event, sessionId: input.sessionId } : event;
+    }
+  }
+}
+
+/** Counts thread interrupts so a replayed cancel can be proven idempotent (bug №38). */
+class InterruptCountingBroker extends FakeBroker {
+  interrupts = 0;
+
+  override async interruptThread(threadId: string): Promise<void> {
+    this.interrupts += 1;
+    await super.interruptThread(threadId);
+  }
+}
+
+/** Emits the same progress text in every monitored turn of one thread (bug №36). */
+class RepeatedProgressBroker extends FakeBroker {
+  sessions = 0;
+  private firstTerminalGate: Promise<void> | undefined;
+  private releaseFirstTerminalGate: (() => void) | undefined;
+
+  holdFirstTerminal(): void {
+    this.firstTerminalGate = new Promise((resolve) => {
+      this.releaseFirstTerminalGate = resolve;
+    });
+  }
+
+  releaseFirstTerminal(): void {
+    this.releaseFirstTerminalGate?.();
+  }
+
+  override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+    const session = ++this.sessions;
+    yield { type: "started", threadId, turnId: `turn_${session}` };
+    yield { type: "progress", threadId, summary: "Запускаю тесты…" };
+    if (session === 1 && this.firstTerminalGate) await this.firstTerminalGate;
+    yield { type: "completed", threadId, result: `Turn ${session} finished.` };
   }
 }
 
