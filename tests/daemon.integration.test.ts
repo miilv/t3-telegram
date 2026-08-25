@@ -3417,7 +3417,7 @@ describe("OperatorDaemon product flow", () => {
 
 function config(home: string): Config {
   return {
-    owner: { name: "Ilia Mikhalchuk", language: "ru" },
+    owner: { name: "Ilia Mikhalchuk", language: "ru", timezone: "Europe/Moscow" },
     telegram: {
       token: "test",
       allowedUserId: 42,

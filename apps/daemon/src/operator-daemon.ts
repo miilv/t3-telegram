@@ -28,6 +28,7 @@ import type {
   WorkerEvent,
 } from "../../../packages/shared/src/index.js";
 import {
+  DEFAULT_TIME_ZONE,
   newId,
   nowIso,
   ownDispatchPendingCount,
@@ -2674,6 +2675,9 @@ export class OperatorDaemon {
       owner: {
         ...(this.config.owner.name ? { name: this.config.owner.name } : {}),
         language: this.config.owner.language,
+        // Availability only for now; date rendering keeps its current behavior
+        // until the memory phases start using the owner's local clock (§2.7).
+        timezone: this.config.owner.timezone ?? DEFAULT_TIME_ZONE,
       },
       focus: {
         ...(focus.primary
