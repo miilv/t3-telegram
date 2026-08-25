@@ -178,6 +178,12 @@ describe("OperatorToolServer", () => {
       );
       const listed = await client.listTools();
       expect(listed.tools.map((tool) => tool.name).sort()).toEqual([...OPERATOR_MCP_TOOL_NAMES].sort());
+      // Package 1.3: memory.update_focus is abolished (memory-design §2.2/§6.3).
+      // The Operator no longer steers the focus binding; the daemon maintains it
+      // itself at dispatch time. Asserted against both the served list and the
+      // exported name list, since the equality above only pins them to each other.
+      expect(listed.tools.map((tool) => tool.name)).not.toContain("memory.update_focus");
+      expect([...OPERATOR_MCP_TOOL_NAMES]).not.toContain("memory.update_focus");
       expect(lease.access.allowedTools).toContain("mcp__operator__t3_send_turn");
 
       const viewed = await client.callTool({

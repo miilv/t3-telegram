@@ -67,7 +67,6 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "t3.respond_approval",
   "memory.search",
   "memory.remember",
-  "memory.update_focus",
   "memory.journal",
   "scheduler.list_automations",
   "scheduler.create_automation",
@@ -700,39 +699,9 @@ export class OperatorToolServer {
         });
       },
     });
-    this.addTool(server, token, {
-      name: "memory.update_focus",
-      description: "Update the owner's durable primary work focus after verifying project/thread references.",
-      schema: z.object({
-        projectId: z.string().min(1),
-        threadId: z.string().min(1).optional(),
-        topic: z.string().trim().min(1).max(1_000),
-        confidence: z.number().min(0).max(1).optional(),
-      }),
-      handler: async (input, capability) => {
-        this.requireProjectAccess(capability, input.projectId, false);
-        const project = await this.options.broker.getProject(input.projectId);
-        if (input.threadId) {
-          const thread = await this.options.broker.getThread(input.threadId);
-          if (thread.projectId !== project.id) throw new Error("thread does not belong to project");
-        }
-        const previous = this.options.store.getFocus(capability.context.ownerId);
-        const next = {
-          primary: {
-            projectId: project.id,
-            ...(input.threadId ? { threadId: input.threadId } : {}),
-            topic: input.topic,
-            confidence: input.confidence ?? 0.9,
-            updatedAt: nowIso(),
-          },
-          secondary: previous.secondary.filter(
-            (item) => item.projectId !== project.id || item.threadId !== input.threadId,
-          ).slice(0, 8),
-        };
-        this.options.store.setFocus(capability.context.ownerId, next);
-        return next;
-      },
-    });
+    // Package 1.3: memory.update_focus is abolished (memory-design §2.2/§6.3).
+    // focus_state is now purely a machine binding maintained by the daemon at
+    // dispatch time; the model no longer steers it.
     this.addTool(server, token, {
       name: "memory.journal",
       description:

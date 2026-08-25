@@ -434,8 +434,15 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(messageAs(2, "/work", 11));
     await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Shared work")));
     expect(telegram.sent.at(-1)?.text).not.toContain("Private work");
+    // Package 1.3: /focus is gone, so the viewer wall — not a per-command role
+    // check — is what answers it now. The dedicated "Роль viewer не может
+    // изменять фокус." reply died with the command; the invariant that a viewer
+    // cannot reach anything beyond the safe list survives in this form.
     telegram.push(messageAs(3, "/focus clear", 11));
-    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("роль viewer")));
+    await waitFor(() =>
+      telegram.sent.some((entry) => entry.text.includes("Ваша роль viewer разрешает только")),
+    );
+    expect(telegram.sent.at(-1)?.text).not.toContain("/focus");
 
     telegram.push(callbackAs(4, "cb_viewer", 777, `a:${compactCallbackToken("approval_shared")}:1`, 11));
     await waitFor(() => {
@@ -2477,7 +2484,7 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("maintains structured thread memory, durable notes, focus commands, and daily compaction restoration", async () => {
+  it("maintains structured thread memory, durable notes, and daily compaction restoration", async () => {
     const home = tempDirectory("daemon-memory-");
     const store = tempStore();
     const runtime = new DelegatingRuntime(
@@ -2518,6 +2525,9 @@ describe("OperatorDaemon product flow", () => {
     });
     // The prompt carries the bridge, so the instruction cannot silently vanish.
     expect(runtime.startPrompts.at(-1) ?? "").toContain("memory.remember");
+    // Package 1.3: with /stop deleted, a semantic stop request is the Operator's
+    // own job — the policy must say so, or "останови сборку" reaches nobody.
+    expect(runtime.startPrompts.at(-1) ?? "").toContain("t3.interrupt_thread");
 
     telegram.push(message(2, "/memory remember preference: Always run auth regression tests"));
     await waitFor(() => store.searchOperatorNotes("auth regression").length === 1);
@@ -2525,9 +2535,15 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Memory search")));
     expect(telegram.sent.some((entry) => entry.text.includes("Always run auth regression tests"))).toBe(true);
 
+    // Package 1.3: /focus is no longer a command. The card it used to print
+    // ("## Фокус" + recent contexts) is gone by design — focus is an internal
+    // binding, not a user surface (memory-design §2.2). The text falls through
+    // to the Operator like any other message, while the machine binding the
+    // daemon keeps for relatedThreadIds and the cancel hatch is untouched.
     telegram.push(message(4, "/focus"));
-    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Фокус")));
-    expect(telegram.sent.some((entry) => entry.text.includes("Refresh-token"))).toBe(true);
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    expect(telegram.sent.some((entry) => entry.text.startsWith("## Фокус"))).toBe(false);
+    expect(store.getFocus("42").primary?.threadId).toBe("th_1");
 
     telegram.push(message(5, "запомни, что production deploy идёт после 22:00 UTC"));
     await waitFor(() => store.searchOperatorNotes("production deploy").length === 1);
@@ -4132,6 +4148,69 @@ describe("OperatorDaemon product flow", () => {
     );
     expect(telegram.sent.some((sent) => sent.text.includes("Половина ответа"))).toBe(false);
     expect(broker.interrupts).toBe(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("routes /stop, /cancel and /focus to the Operator as ordinary preempting text (package 1.3)", async () => {
+    const home = tempDirectory("daemon-dead-commands-");
+    const store = tempStore();
+    const runtime = new ChainPreemptibleRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // The three commands package 1.3 deletes are not cancel words either
+    // (isCancelIntent matches the bare word, not the slash form), so each is
+    // simply a message: it preempts the running turn like any other, and its
+    // text reaches the Operator, which decides what a stop request means and
+    // calls t3.interrupt_thread itself.
+    for (const [index, text] of ["/stop", "/cancel", "/focus clear"].entries()) {
+      telegram.push(message(index * 2 + 1, `жди ${index}`));
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes(`жди ${index}`)));
+      telegram.push(message(index * 2 + 2, text));
+      await waitFor(() => runtime.interrupts === index + 1);
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes(text)));
+    }
+    runtime.releaseAll();
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."), 5_000);
+
+    // No command branch fired: no cancel reply, no focus card, no thread stopped.
+    expect(
+      telegram.sent.some(
+        (sent) =>
+          sent.text.includes("Остановил") ||
+          sent.text.includes("Не вижу активной работы") ||
+          sent.text.startsWith("## Фокус") ||
+          sent.text.includes("Рабочий фокус очищен"),
+      ),
+    ).toBe(false);
+    expect(broker.interrupts).toBe(0);
+    // And no envelope talks to the model about focus any more.
+    expect(runtime.prompts.some((prompt) => prompt.includes("durable work focus"))).toBe(false);
+
+    // /help must not advertise what no longer exists.
+    telegram.push(message(9, "/help"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text.startsWith("## Operator")));
+    const help = telegram.sent.findLast((sent) => sent.text.startsWith("## Operator"))!.text;
+    expect(help).toContain("/status");
+    for (const dead of ["/stop", "/cancel", "/focus"]) expect(help).not.toContain(dead);
 
     telegram.finish();
     await run;
@@ -6595,9 +6674,14 @@ function delegatingScript(options: {
   title?: string;
   providerInstanceId?: string;
 }): OperatorScript {
+  // Package 1.3: the envelope no longer carries a focus line, so the scripted
+  // agent continues its own work the way the real one is told to (policy:
+  // "identify that thread yourself") — from what it remembers of the session,
+  // or from the reply/recovery line the envelope still states explicitly.
+  let ownLastThreadId: string | undefined;
   return async (envelope, call) => {
     const task = userText(envelope);
-    const focusThreadId = envelopeThreadId(envelope);
+    const focusThreadId = envelopeThreadId(envelope) ?? ownLastThreadId;
     if (!options.workPattern.test(task)) return "Париж.";
     if (focusThreadId) {
       const outcome = (await call("t3.send_turn", { threadId: focusThreadId, text: task })) as {
@@ -6619,6 +6703,7 @@ function delegatingScript(options: {
       title: options.title ?? "Auth race fix",
       ...(options.providerInstanceId ? { providerInstanceId: options.providerInstanceId } : {}),
     })) as { id: string };
+    ownLastThreadId = thread.id;
     const artifactIds = envelopeArtifactIds(envelope);
     await call("t3.send_turn", {
       threadId: thread.id,
