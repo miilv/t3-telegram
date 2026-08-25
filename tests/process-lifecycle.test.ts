@@ -1,10 +1,17 @@
+import { execFile } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { OperatorStore } from "../packages/storage/src/index.js";
 import {
   awaitShutdownSteps,
   createFatalErrorHandler,
   createShutdownController,
   resolveStartupProvider,
-} from "../apps/daemon/src/operator-daemon.js";
+} from "../apps/daemon/src/lifecycle.js";
 
 /** Minimal pino-shaped sink: records the level and the first (context) argument. */
 function recordingLogger() {
@@ -101,11 +108,11 @@ describe("createShutdownController (package 0.1)", () => {
     const logger = recordingLogger();
     const exits: number[] = [];
     const stopped = deferred();
-    const markers: string[] = [];
+    const outcomes: boolean[] = [];
     const onSignal = createShutdownController({
       logger,
       stop: () => stopped.promise,
-      markCleanShutdown: () => markers.push("clean"),
+      markShutdownOutcome: (clean) => outcomes.push(clean),
       exit: (code) => exits.push(code),
     });
 
@@ -115,15 +122,15 @@ describe("createShutdownController (package 0.1)", () => {
     await stopped.promise;
     await Promise.resolve();
     expect(exits).toEqual([0]);
-    // stop() wrote the marker itself, so the controller does not duplicate it.
-    expect(markers).toEqual([]);
+    // stop() drained and wrote its own marker; the controller adds nothing.
+    expect(outcomes).toEqual([]);
     expect(logger.lines[0]).toMatchObject({ level: "info", context: { signal: "SIGTERM" } });
   });
 
   it("forces the exit on a second signal instead of leaving Node to hard-kill", async () => {
     const logger = recordingLogger();
     const exits: number[] = [];
-    const markers: string[] = [];
+    const outcomes: boolean[] = [];
     const stopping = deferred();
     let stopCalls = 0;
     const onSignal = createShutdownController({
@@ -132,21 +139,22 @@ describe("createShutdownController (package 0.1)", () => {
         stopCalls += 1;
         return stopping.promise;
       },
-      markCleanShutdown: () => markers.push("clean"),
+      markShutdownOutcome: (clean) => outcomes.push(clean),
       exit: (code) => exits.push(code),
     });
 
     onSignal("SIGINT");
     onSignal("SIGINT");
-    // The forced path writes the marker itself, because stop() will never reach it.
-    expect(markers).toEqual(["clean"]);
+    // Forcing abandons whatever was still draining, so the run is recorded as
+    // unclean and the next boot recovers it instead of trusting a clean exit.
+    expect(outcomes).toEqual([false]);
     expect(exits).toEqual([0]);
     expect(stopCalls).toBe(1);
     expect(logger.lines.some((line) => line.level === "warn")).toBe(true);
 
     // A third signal is inert: no second marker, no second exit.
     onSignal("SIGINT");
-    expect(markers).toEqual(["clean"]);
+    expect(outcomes).toEqual([false]);
     expect(exits).toEqual([0]);
     stopping.resolve();
   });
@@ -154,17 +162,18 @@ describe("createShutdownController (package 0.1)", () => {
   it("still writes the marker and exits when the graceful stop fails", async () => {
     const logger = recordingLogger();
     const exits: number[] = [];
-    const markers: string[] = [];
+    const outcomes: boolean[] = [];
     const onSignal = createShutdownController({
       logger,
       stop: () => Promise.reject(new Error("queue exploded")),
-      markCleanShutdown: () => markers.push("clean"),
+      markShutdownOutcome: (clean) => outcomes.push(clean),
       exit: (code) => exits.push(code),
     });
 
     onSignal("SIGTERM");
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(markers).toEqual(["clean"]);
+    // A stop() that threw drained nothing it can vouch for: unclean.
+    expect(outcomes).toEqual([false]);
     expect(exits).toEqual([1]);
     expect(logger.lines.some((line) => line.level === "error")).toBe(true);
   });
@@ -177,7 +186,7 @@ describe("createFatalErrorHandler (package 0.1)", () => {
     let crashed = 0;
     const onFatal = createFatalErrorHandler({
       logger,
-      markCrashed: () => (crashed += 1),
+      markShutdownOutcome: () => (crashed += 1),
       exit: (code) => exits.push(code),
     });
 
@@ -196,7 +205,7 @@ describe("createFatalErrorHandler (package 0.1)", () => {
     const exits: number[] = [];
     const onFatal = createFatalErrorHandler({
       logger,
-      markCrashed: () => {},
+      markShutdownOutcome: () => {},
       exit: (code) => exits.push(code),
     });
 
@@ -214,7 +223,7 @@ describe("createFatalErrorHandler (package 0.1)", () => {
           throw new Error("logger closed");
         },
       } as never,
-      markCrashed: () => {
+      markShutdownOutcome: () => {
         throw new Error("database closed");
       },
       exit: (code) => exits.push(code),
@@ -223,4 +232,29 @@ describe("createFatalErrorHandler (package 0.1)", () => {
     onFatal(new Error("boom"), "uncaughtException");
     expect(exits).toEqual([1]);
   });
+});
+
+describe("installProcessGuards wiring (package 0.1)", () => {
+  it("turns a floating rejection into a non-zero exit and a crashed marker", async () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const child = join(here, "fixtures", "floating-rejection-child.ts");
+    const databasePath = join(mkdtempSync(join(tmpdir(), "lifecycle-child-")), "operator.db");
+
+    const result = await promisify(execFile)(
+      process.execPath,
+      ["--import", "tsx", child, databasePath],
+      { cwd: join(here, ".."), timeout: 20_000 },
+    ).then(
+      () => ({ code: 0 }),
+      (error: { code?: number }) => ({ code: error.code ?? -1 }),
+    );
+
+    expect(result.code).toBe(1);
+
+    // The discriminating assertion: Node's own default also exits 1, but it
+    // exits before anything can clear the marker, leaving "1" behind.
+    const store = new OperatorStore(databasePath);
+    expect(store.getRuntimeState("clean_shutdown")).toBe("");
+    store.close();
+  }, 30_000);
 });

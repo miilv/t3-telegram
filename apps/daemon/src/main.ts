@@ -15,12 +15,8 @@ import { OperatorToolServer } from "../../../packages/operator-tools/src/index.j
 import { MediaProcessor } from "../../../packages/media/src/index.js";
 import { GoogleWorkspaceConnectors } from "../../../packages/connectors/src/index.js";
 import { DashboardServer } from "../../../packages/dashboard/src/index.js";
-import {
-  OperatorDaemon,
-  createFatalErrorHandler,
-  createShutdownController,
-  resolveStartupProvider,
-} from "./operator-daemon.js";
+import { OperatorDaemon } from "./operator-daemon.js";
+import { installProcessGuards, resolveStartupProvider } from "./lifecycle.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -141,36 +137,19 @@ async function main(): Promise<void> {
     dashboard,
   );
 
-  // Best effort by design: the marker is a hint for the next boot, never a
-  // reason to keep a dying process alive.
-  const writeShutdownMarker = (value: "1" | "") => {
-    try {
-      store.setRuntimeState("clean_shutdown", value);
-    } catch (error) {
-      logger.warn({ err: error }, "Could not write the shutdown marker");
-    }
-  };
-
-  // Package 0.1: without these a stray rejection killed the daemon silently and
-  // left the graceful-exit marker in place, so the crash never got reported.
-  const onFatal = createFatalErrorHandler({
-    logger,
-    markCrashed: () => writeShutdownMarker(""),
-    exit: (code) => process.exit(code),
-  });
-  process.on("uncaughtException", (error) => onFatal(error, "uncaughtException"));
-  process.on("unhandledRejection", (reason) => onFatal(reason, "unhandledRejection"));
-
-  // process.on, not process.once: the second signal must reach our forcing
-  // handler instead of Node's default kill.
-  const onSignal = createShutdownController({
+  // Package 0.1: crash and signal handling. Best effort by design — the marker
+  // is a hint for the next boot, never a reason to keep a dying process alive.
+  installProcessGuards({
     logger,
     stop: () => daemon.stop(),
-    markCleanShutdown: () => writeShutdownMarker("1"),
-    exit: (code) => process.exit(code),
+    markShutdownOutcome: (clean) => {
+      try {
+        store.setRuntimeState("clean_shutdown", clean ? "1" : "");
+      } catch (error) {
+        logger.warn({ err: error }, "Could not write the shutdown marker");
+      }
+    },
   });
-  process.on("SIGINT", () => onSignal("SIGINT"));
-  process.on("SIGTERM", () => onSignal("SIGTERM"));
 
   await daemon.initialize();
   await daemon.run();
