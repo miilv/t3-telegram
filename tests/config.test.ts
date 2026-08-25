@@ -70,6 +70,24 @@ describe("media configuration", () => {
     expect(config.media.groq).toBeUndefined();
   });
 
+  it("defaults the owner profile to an empty name and Russian, and trims explicit values", () => {
+    const defaults = loadConfig({
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+    });
+    expect(defaults.owner).toEqual({ name: "", language: "ru" });
+
+    const configured = loadConfig({
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+      OWNER_NAME: "  Ilia Mikhalchuk  ",
+      OWNER_LANGUAGE: "en",
+    });
+    expect(configured.owner).toEqual({ name: "Ilia Mikhalchuk", language: "en" });
+  });
+
   it("requires an explicit gate for Codex and parses Phase 3 controls", () => {
     expect(() => loadConfig({
       TELEGRAM_BOT_TOKEN: "test-token",
