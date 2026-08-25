@@ -815,20 +815,24 @@ worker event (progress | agent_message | completed | failed | cancelled)
    ├─ progress   → ThreadEventDigest, throttled by policy.progressIntervalMs
    ├─ agent_message → ThreadEventDigest (excerpt ≤ 4 000)
    └─ terminal   → thread status + summary + audit event
+                   (title and epoch captured HERE, carried in the event —
+                    re-reading them at flush raced the next dispatch)
                    → requested artifacts (files only, no worker prose)
                    → runtime_state `voice_pending_terminal:<threadId>:<epoch>`
                    → ThreadEventDigest, flushed IMMEDIATELY
 
-ThreadEventDigest (3 s quiet window, coalescing per §1.1)
-└─ flush → one synthetic ingress job per chat, threadEvents[] attached
+ThreadEventDigest (THREAD_DIGEST_WINDOW_MS, default 3 s; coalescing per §1.1)
+└─ flush → one synthetic ingress job per chat AND topic, threadEvents[] attached
    └─ LaneQueue lane `thread-events` → answerDirect
       envelope: `system message from thread "<title>" (<threadId>) — …`
                 + the event text inside ONE <<<worker:…>>> fence for the turn
       ├─ non-empty final → the Operator's own words go to the chat
       ├─ EMPTY final     → nothing is sent (a deliberate silence, event
       │                    `operator.turn.silent`), terminals still settled
-      └─ turn throws     → the ingress job retries with backoff; on give-up the
-                           digest is dropped SILENTLY (no "не удалось обработать")
+      └─ turn throws     → the ingress job retries with backoff, the fallback
+                           wait restarts; on give-up the digest is dropped
+                           without a chat message, but the NEXT digest carries
+                           "потеряно сообщений этой работы: N"
 ```
 
 A thread-event turn differs from an owner turn in four ways: no draft/preview is
@@ -837,18 +841,35 @@ owner message never supersedes it — a work that ended stays ended), and it
 borrows the correlation id of the thread it speaks for, keeping the audit chain
 `telegram.received → worker.completed → telegram.outbox.delivered` intact.
 
-Lane discipline is enforced at the job table, not only in the queue: the `user`
-lane drain claims ingress jobs WITHOUT `threadEvents`, the `thread-events` lane
-claims only those with them. The background pump and the startup replay claim
-anything left, so nothing can be stranded.
+Lane discipline is enforced at the job table, by IDENTITY: every ingress job
+carries `lane` (`user` | `thread-events` | `background`) and `enqueuedAt`, and
+each drain claims only its own lane. Jobs written before package 1.2 have the
+lane derived from the payload (digest → `thread-events`, `automationRunId` →
+`background`, otherwise `user`). A negation ("everything that is not a digest")
+was the earlier shape and was wrong: automation runs and button replays landed
+in the owner's lane and overtook them by FIFO.
+
+Two escapes keep that strictness from stranding anything:
+
+- the `background` drain is a safety net — it also claims any job older than
+  `INGRESS_ESCALATION_MS` (60 s), whatever lane it belongs to;
+- an aged `background` job is *escalated into the owner's lane*, because a
+  one-shot event (an automation firing) will never come round again by itself
+  and a chat that never quiets would starve it forever.
+
+**Yielding.** A drain used to hold its lane for up to fifty jobs — an owner who
+wrote after the first digest waited out the whole backlog of interpretations.
+Both the `thread-events` and `background` drains now check
+`operatorInputQueue.depth("user")` after every job and, if someone is waiting,
+re-queue themselves and hand the queue back.
 
 ### Degraded fallback — the one template that survives
 
 `voice_pending_terminal:<threadId>:<epoch>` is written before the digest and
 cleared only when a turn of the Operator's has actually spoken for that terminal
-(`settleThreadEventTurn`). The reliability pump sweeps it every second; a record
-older than `OPERATOR_VOICE_FALLBACK_MINUTES` (default 5) produces exactly one
-durable message:
+(`ThreadVoice.settle`). The reliability pump sweeps it every second; a record
+whose *wait* exceeds `OPERATOR_VOICE_FALLBACK_MINUTES` (default 5) produces
+exactly one durable message:
 
 ```
 Работа **<title>** завершилась (<успешно|с ошибкой|остановлена>).
@@ -857,7 +878,19 @@ durable message:
 
 No worker content travels with it. The outbox dedupe key is
 `telegram:thread:<threadId>:terminal:<epoch>`, so restarts and retries cannot
-repeat it, and the record is deleted as it fires. Progress digests have NO
+repeat it, and the record is deleted as it fires.
+
+The deadline measures **the Operator's failure to speak, not the age of the
+event**. `voice_relaying:<threadId>:<epoch>` is set when a thread-event turn
+starts and cleared when it settles or fails; the sweep skips a record whose
+relay marker is present and keeps rolling its `waitingSince` forward. A turn
+that is merely WAITING (behind the owner, behind another interpretation) is
+therefore never overtaken by the template — the earlier shape counted from the
+arrival of the terminal and produced "подробности расскажу, когда восстановлюсь"
+immediately followed by the real story. Every failed attempt restarts the wait.
+A restart clears all relay markers (`ThreadVoice.recoverAfterRestart`) and
+restarts every deadline, so a crash mid-sentence cannot silence a terminal
+forever. Progress digests have NO
 fallback by design: while the Operator is down the owner simply hears nothing
 about steps, and the durable ingress job replays the story when it returns.
 
@@ -868,9 +901,26 @@ flushed, and a provider that never comes back.
 
 What the daemon may still say on its own: mediated worker questions and approval
 cards, command replies, the finals of Operator turns, delivery alerts (§11), the
-automation-pause notice, the monitor-lost and external-turn notices, and this
-one degraded terminal notice. Everything else about a work comes from the
-Operator's mouth.
+automation-pause notice, the external-turn notice, dispatch acks, requested
+artifacts, and this one degraded terminal notice. A whitelist test over the
+daemon source pins that list, so a NEW message type about a work fails the suite
+until it is argued past the single-voice rule; the remaining direct paths are
+tracked as package 1.2 debt in the roadmap.
+
+Things the daemon knows about a work but no longer says itself — a lost
+subscription, a dispatched follow-up, an automatic recovery attempt, notes it
+failed to interpret — go into the digest as `[сообщение демона, не слова
+воркера]` sections, so the Operator decides whether the owner needs them and
+never attributes them to the worker.
+
+A worker note that the broker replays on resubscribe is remembered per thread
+(`thread_relayed_notes:<threadId>`, last 20 hashes, wiped when the thread starts
+a new turn), so a replay cannot open a second turn once the digest's in-window
+dedupe has expired.
+
+A turn that ends in deliberate silence leaves `operator_turn_silent:<opturnId>`;
+a replayed job recognises it and settles without spending a second provider turn
+(there is no outbox row for a silence to recognise itself by).
 
 Failures keep their single automatic recovery attempt
 (`tryRecoverFailedWorker`); only a final failure is digested, as

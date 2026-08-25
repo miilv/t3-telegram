@@ -27,12 +27,29 @@ export type ThreadDigestKind = "progress" | "agent_message" | "completion";
 
 export type ThreadTerminalOutcome = "completed" | "failed" | "cancelled";
 
-export type ThreadDigestEvent =
-  | { kind: "progress"; threadId: string; text: string }
-  | { kind: "agent_message"; threadId: string; text: string }
-  | { kind: "completion"; threadId: string; outcome: ThreadTerminalOutcome; text?: string };
+/**
+ * Facts about the emitting thread, captured WHEN THE EVENT HAPPENED. Package
+ * 1.2 learned this the hard way: reading the title and the terminal epoch back
+ * out of storage at flush time races the next dispatch on the same thread
+ * (`resetThreadTerminalDelivery` bumps the epoch), which orphans the pending
+ * terminal record and lets the degraded fallback fire minutes after the story
+ * was already told.
+ */
+export interface ThreadDigestContext {
+  /** Human title of the work at the moment of the event. */
+  title?: string;
+  /** Terminal delivery epoch of the thread at the moment of the event. */
+  epoch?: string;
+}
 
-export interface ThreadDigestItem {
+export type ThreadDigestEvent = ThreadDigestContext &
+  (
+    | { kind: "progress"; threadId: string; text: string }
+    | { kind: "agent_message"; threadId: string; text: string }
+    | { kind: "completion"; threadId: string; outcome: ThreadTerminalOutcome; text?: string }
+  );
+
+export interface ThreadDigestItem extends ThreadDigestContext {
   kind: ThreadDigestKind;
   threadId: string;
   text: string;
@@ -78,9 +95,13 @@ export class ThreadEventDigest {
   /** Accumulate one worker event, coalescing it into the pending digest. */
   push(event: ThreadDigestEvent): void {
     const at = this.now();
-    if (event.kind === "progress") this.pushProgress(event.threadId, event.text, at);
-    else if (event.kind === "agent_message") this.pushAgentMessage(event.threadId, event.text, at);
-    else this.pushCompletion(event, at);
+    const context: ThreadDigestContext = {
+      ...(event.title !== undefined ? { title: event.title } : {}),
+      ...(event.epoch !== undefined ? { epoch: event.epoch } : {}),
+    };
+    if (event.kind === "progress") this.pushProgress(event.threadId, event.text, at, context);
+    else if (event.kind === "agent_message") this.pushAgentMessage(event.threadId, event.text, at, context);
+    else this.pushCompletion(event, at, context);
     this.arm();
   }
 
@@ -142,7 +163,12 @@ export class ThreadEventDigest {
     return undefined;
   }
 
-  private pushProgress(threadId: string, text: string, at: number): void {
+  private pushProgress(
+    threadId: string,
+    text: string,
+    at: number,
+    context: ThreadDigestContext,
+  ): void {
     const last = this.lastOf(threadId);
     // Merge only into a progress frame that is still the thread's last word.
     // Merging into an older one would float a fresh frame above the message
@@ -151,15 +177,21 @@ export class ThreadEventDigest {
       last.text = text;
       last.collapsed += 1;
       last.lastAt = at;
+      Object.assign(last, context);
       return;
     }
     // The thread already finished as far as this window is concerned; a late
     // progress frame is stale by construction.
     if (last?.kind === "completion") return;
-    this.items.push({ kind: "progress", threadId, text, collapsed: 1, firstAt: at, lastAt: at });
+    this.items.push({ kind: "progress", threadId, text, collapsed: 1, firstAt: at, lastAt: at, ...context });
   }
 
-  private pushAgentMessage(threadId: string, text: string, at: number): void {
+  private pushAgentMessage(
+    threadId: string,
+    text: string,
+    at: number,
+    context: ThreadDigestContext,
+  ): void {
     // A broker replay can interleave progress with the messages it repeats, so
     // the duplicate check spans every message this thread wrote in the window,
     // not just its latest item.
@@ -171,12 +203,21 @@ export class ThreadEventDigest {
       duplicate.collapsed += 1;
       return;
     }
-    this.items.push({ kind: "agent_message", threadId, text, collapsed: 1, firstAt: at, lastAt: at });
+    this.items.push({
+      kind: "agent_message",
+      threadId,
+      text,
+      collapsed: 1,
+      firstAt: at,
+      lastAt: at,
+      ...context,
+    });
   }
 
   private pushCompletion(
     event: Extract<ThreadDigestEvent, { kind: "completion" }>,
     at: number,
+    context: ThreadDigestContext,
   ): void {
     let collapsed = 1;
     let firstAt = at;
@@ -215,6 +256,7 @@ export class ThreadEventDigest {
       collapsed,
       firstAt,
       lastAt: at,
+      ...context,
     };
     if (position >= 0) this.items.splice(position, 0, item);
     else this.items.push(item);

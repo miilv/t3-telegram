@@ -58,6 +58,7 @@ import {
   resolveProjectReference,
   updateFocus,
 } from "../../../packages/router/src/index.js";
+import { ThreadVoice } from "./voice.js";
 import {
   SHUTDOWN_DEADLINE_MS,
   awaitShutdownSteps,
@@ -117,38 +118,70 @@ const CLOUD_BOT_API_MAX_FILE_BYTES = 20 * 1024 * 1024;
 const ATTACHMENT_DOWNLOAD_CONCURRENCY = 2;
 /** Bug №24: total bytes of one batch the daemon is willing to buffer in memory. */
 const ATTACHMENT_BATCH_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024;
-/**
- * Package 1.2: quiet window before digested worker events wake the Operator.
- * Long enough that a chatty worker does not spend a turn per frame, short
- * enough that a finished work is relayed while the owner still cares.
- */
-const THREAD_DIGEST_WINDOW_MS = 3_000;
-/** How much of one worker frame travels into the Operator envelope. */
-const THREAD_EVENT_EXCERPT_LIMIT = 4_000;
-
-/** Package 1.2: what a terminal event is waiting for the Operator to say. */
-interface PendingVoiceTerminal {
-  threadId: string;
-  title: string;
-  outcome: ThreadTerminalOutcome;
-  epoch: string;
-  chatId: number;
-  destination: TelegramDestination;
-  raisedAt: string;
-}
-
-const VOICE_TERMINAL_PREFIX = "voice_pending_terminal:";
-
-/** Russian wording of a terminal outcome for the degraded fallback notice. */
-const TERMINAL_OUTCOME_RU: Record<ThreadTerminalOutcome, string> = {
-  completed: "успешно",
-  failed: "с ошибкой",
-  cancelled: "остановлена",
-};
-
 interface DurableTelegramIngress {
   update: Extract<TelegramInbound, { type: "message" }>;
   processExisting: boolean;
+  /**
+   * Package 1.2: which lane this job belongs to, stated at enqueue time. An
+   * explicit identity, not a negation: a drain that claimed "everything that is
+   * not a digest" pulled automation runs and button replays into the owner's
+   * lane, where FIFO let them overtake the person actually waiting.
+   */
+  lane?: IngressLane;
+  /** When it was queued — the anti-starvation escalation reads it. */
+  enqueuedAt?: string;
+}
+
+type IngressLane = "user" | "thread-events" | "background";
+
+/**
+ * A one-shot background job (an automation firing, mostly) may not starve
+ * forever behind a chat that never goes quiet: past this age it is escalated
+ * into the owner's lane, because it will never come round again by itself.
+ */
+const INGRESS_ESCALATION_MS = 60_000;
+
+/**
+ * The lane of a queued ingress job. Jobs written before package 1.2 carry no
+ * `lane`, so it is derived from the payload — the same rules, stated once.
+ */
+export function ingressLane(payload: DurableTelegramIngress): IngressLane {
+  if (payload.lane) return payload.lane;
+  if (payload.update.threadEvents?.length) return "thread-events";
+  if (payload.update.automationRunId) return "background";
+  return "user";
+}
+
+function ingressAgeMs(payload: DurableTelegramIngress, now: number): number {
+  const queuedAt = Date.parse(payload.enqueuedAt ?? "");
+  return Number.isFinite(queuedAt) ? now - queuedAt : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Claim predicate for one lane's drain.
+ *
+ * The `background` drain is a SAFETY NET, not a second general queue: claiming
+ * anything it liked let it run a thread-event digest while the owner's message
+ * waited on the (higher) user lane — the priority the lanes express evaporated
+ * at the job table. It takes its own jobs, plus anything that has been sitting
+ * around long enough to count as stranded.
+ */
+export function ingressClaim(lane: IngressLane): (payload: DurableTelegramIngress) => boolean {
+  if (lane === "user") {
+    return (payload) => {
+      const own = ingressLane(payload);
+      if (own === "user") return true;
+      // Escalation: an aged one-shot background job rides the owner's lane
+      // rather than waiting for a quiet minute that may never come.
+      return own === "background" && ingressAgeMs(payload, Date.now()) > INGRESS_ESCALATION_MS;
+    };
+  }
+  if (lane === "background") {
+    return (payload) =>
+      ingressLane(payload) === "background" ||
+      ingressAgeMs(payload, Date.now()) > INGRESS_ESCALATION_MS;
+  }
+  return (payload) => ingressLane(payload) === lane;
 }
 
 interface DurableT3Dispatch {
@@ -301,13 +334,6 @@ export class OperatorDaemon {
    * the existing monitor instead of leaking progress into the old chat.
    */
   private readonly monitorRoutes = new Map<string, MonitorRoute>();
-  /**
-   * Package 1.2: where each thread's digested events belong. `monitorRoutes` is
-   * deleted the moment a monitor ends, and a terminal event is digested exactly
-   * then — this outlives the monitor so the interpretation turn still lands in
-   * the right chat and topic.
-   */
-  private readonly threadEventRoutes = new Map<string, MonitorRoute>();
   /** Chat/initiator of each in-flight direct Operator turn (bug №1, package 1.1). */
   private readonly activeOperatorTurns = new Set<ActiveOperatorTurn>();
   /**
@@ -329,18 +355,8 @@ export class OperatorDaemon {
   /** Recipients with an alert in flight, so a fire-and-forget send is never launched twice. */
   private readonly deliveryAlertsInFlight = new Set<number>();
   private readonly monitorTasks = new Set<Promise<void>>();
-  /**
-   * Package 1.2 — the single voice. Worker events are no longer chat content:
-   * they accumulate here and leave as ONE synthetic system message per window,
-   * which the Operator interprets for the owner in their own words. Nothing a
-   * worker wrote reaches the chat as-is.
-   */
-  private readonly threadDigest = new ThreadEventDigest({
-    windowMs: THREAD_DIGEST_WINDOW_MS,
-    onFlush: (items) => this.dispatchThreadEventTurn(items),
-    onError: (error: unknown) =>
-      this.logger.error({ err: error }, "Thread-event digest flush failed"),
-  });
+  /** Package 1.2: the single voice over worker events (apps/daemon/src/voice.ts). */
+  private readonly voice: ThreadVoice;
   private readonly shutdown = new AbortController();
   private reliabilityTask: Promise<void> | undefined;
   private operatorSessionId = "";
@@ -363,6 +379,36 @@ export class OperatorDaemon {
     // Package 1.1: wired in the constructor, not in initialize(), so preemption
     // is live for any consumer that starts run() on its own.
     this.telegram.setInboundObserver?.((message) => this.noteInboundMessage(message));
+    // Package 1.2: the single voice over worker events (apps/daemon/src/voice.ts).
+    this.voice = new ThreadVoice({
+      store: this.store,
+      logger: this.logger,
+      ownerUserId: this.config.telegram.allowedUserId,
+      digestWindowMs: this.config.operator.threadDigestWindowMs,
+      fallbackMs: this.config.operator.voiceFallbackMs,
+      ownerChatId: () => this.ownerChatId(),
+      recoveredDestination: (threadId) => this.recoveredDestination(threadId),
+      enqueueTurn: (update) => this.enqueueIngressJob(update, "thread-events"),
+      wake: () => this.queueThreadEventDrain(),
+      sendFallback: (pending, text) => {
+        this.enqueueTelegramOutbox(
+          `telegram:thread:${pending.threadId}:terminal:${pending.epoch}`,
+          pending.chatId,
+          "rich",
+          {
+            text,
+            options: pending.destination ?? {},
+            threadId: pending.threadId,
+            messageType: "worker_terminal_fallback",
+            completionThreadIds: [pending.threadId],
+            correlationId: this.store.getRuntimeState(`thread_correlation_id:${pending.threadId}`),
+          },
+        );
+      },
+      syntheticMessageId: (seed) => syntheticNegativeMessageId(seed),
+      textHash: (value) => stableTextHash(value),
+      excerpt: (value, limit) => safeExcerpt(value, limit),
+    });
   }
 
   async initialize(): Promise<void> {
@@ -433,6 +479,10 @@ export class OperatorDaemon {
     );
     await this.flushTelegramOutbox();
     await this.drainT3Dispatches();
+    // Package 1.2: a crash mid-sentence must not leave a terminal marked "being
+    // interpreted" forever — that marker is exactly what holds the degraded
+    // fallback back. Cleared here, with every deadline restarted from now.
+    this.voice.recoverAfterRestart();
     // Startup replay is background work: nothing else can be queued yet, and if
     // a live message beats it to the queue that message goes first by design.
     // The watermark is seeded FIRST: several messages the owner sent before the
@@ -468,22 +518,15 @@ export class OperatorDaemon {
       void this.ingressQueue
         .run(async () => {
           if (update.type === "message") {
-            const jobId = telegramIngressJobId(update);
-            this.store.enqueueBackgroundJob<DurableTelegramIngress>(
-              "telegram_ingress",
-              {
-                update,
-                processExisting: !update.messageIds.some((messageId) =>
-                  this.store.hasTelegramMessage(update.chatId, messageId),
-                ),
-              },
-              undefined,
-              { id: jobId, dedupeKey: jobId },
+            this.enqueueIngressJob(
+              update,
+              "user",
+              !update.messageIds.some((messageId) =>
+                this.store.hasTelegramMessage(update.chatId, messageId),
+              ),
             );
             void this.operatorInputQueue
-              .run("user", () =>
-                this.drainTelegramIngress((payload) => !payload.update.threadEvents?.length),
-              )
+              .run("user", () => this.drainTelegramIngress(ingressClaim("user")))
               .catch((error) => this.logUpdateFailure(error, update.updateId))
               .finally(() => {
                 metrics.observe("telegram_update_latency_ms", Date.now() - receivedAt, {
@@ -528,6 +571,9 @@ export class OperatorDaemon {
     // Monitors are aborted up front rather than after the scheduler settles, so
     // a wedged scheduler cannot keep them subscribed for the whole deadline.
     for (const controller of this.monitors.values()) controller.abort();
+    // Package 1.2: undelivered progress dies with the process by design — a
+    // terminal never does, its record outlives us and is swept on the way back.
+    this.voice.clear();
     const unfinished = await awaitShutdownSteps(
       [
         {
@@ -1290,6 +1336,25 @@ export class OperatorDaemon {
    * ingress as its own durable job — идемпотентно по своим message id — and is
    * processed as the next Operator turn.
    */
+  /**
+   * Package 1.2: the one place an ingress job is written, so a call site can
+   * never forget the lane or the queue timestamp.
+   */
+  private enqueueIngressJob(
+    update: Extract<TelegramInbound, { type: "message" }>,
+    lane: IngressLane,
+    processExisting = true,
+  ): string {
+    const jobId = telegramIngressJobId(update);
+    this.store.enqueueBackgroundJob<DurableTelegramIngress>(
+      "telegram_ingress",
+      { update, processExisting, lane, enqueuedAt: nowIso() },
+      undefined,
+      { id: jobId, dedupeKey: jobId },
+    );
+    return jobId;
+  }
+
   private enqueueBatchRemainder(
     update: Extract<TelegramInbound, { type: "message" }>,
     remainder: TelegramInboundBatchPart[],
@@ -1324,13 +1389,7 @@ export class OperatorDaemon {
       attachments: [],
       parts: remainder,
     };
-    const jobId = telegramIngressJobId(rest);
-    this.store.enqueueBackgroundJob<DurableTelegramIngress>(
-      "telegram_ingress",
-      { update: rest, processExisting: true },
-      undefined,
-      { id: jobId, dedupeKey: jobId },
-    );
+    this.enqueueIngressJob(rest, "user");
   }
 
   /**
@@ -1500,7 +1559,16 @@ export class OperatorDaemon {
       // Package 1.2: this exact turn already spoke (a replayed job after a
       // crash), so its terminals must stop waiting for the degraded fallback —
       // otherwise the owner would hear the flat notice after the real story.
-      if (update.threadEvents?.length) this.settleThreadEventTurn(update.threadEvents);
+      if (update.threadEvents?.length) this.voice.settle(update.threadEvents);
+      return;
+    }
+    // Package 1.2: …and a turn that deliberately said NOTHING leaves no outbox
+    // row to recognise itself by. Without this marker a replay (a crash between
+    // the silence and the job being completed) would spend a second provider
+    // turn on events that were already judged not worth a word.
+    const silenceKey = `operator_turn_silent:${operatorTurnId}`;
+    if (update.threadEvents?.length && this.store.getRuntimeState(silenceKey)) {
+      this.voice.settle(update.threadEvents);
       return;
     }
     // Package 1.2: a thread-event turn borrows the correlation id of the work
@@ -1532,6 +1600,11 @@ export class OperatorDaemon {
     }
     const threadEvents = update.threadEvents ?? [];
     const isThreadEventTurn = threadEvents.length > 0;
+    // Package 1.2: from here until this turn settles, the degraded fallback
+    // must not fire — an interpretation that is merely WAITING (behind the
+    // owner, behind another turn) is not an Operator that cannot speak, and
+    // the owner must never get the flat template and the real story in a row.
+    if (isThreadEventTurn) this.voice.beginRelay(threadEvents);
     let writer: DraftWriter | undefined;
     // Package 1.2: no live preview for a thread-event turn. The owner wrote
     // nothing, so a «⏳ Работаю…» bubble appearing by itself would be the daemon
@@ -1775,11 +1848,14 @@ export class OperatorDaemon {
     // is enqueued at all. The terminals it covered are settled either way: the
     // Operator has seen them, so the degraded fallback must stop waiting.
     if (isThreadEventTurn && !finalText) {
+      // Durable BEFORE the events are settled: a crash in between replays the
+      // job, and the marker is what stops it spending a second provider turn.
+      this.store.setRuntimeState(silenceKey, nowIso());
       this.store.appendEvent("operator.turn.silent", {
         correlationId,
         payload: { operatorTurnId, threadEvents: threadEvents.map((ref) => ref.threadId) },
       });
-      this.settleThreadEventTurn(threadEvents);
+      this.voice.settle(threadEvents);
       return;
     }
 
@@ -1799,7 +1875,7 @@ export class OperatorDaemon {
     // The answer is durable now, so the handoff this turn carried is spent.
     this.clearIssuedChatPending(update, turn);
     // …and so is the wait for a terminal event: the Operator has spoken for it.
-    if (isThreadEventTurn) this.settleThreadEventTurn(threadEvents);
+    if (isThreadEventTurn) this.voice.settle(threadEvents);
     await this.flushTelegramOutbox();
 
     if (retryDelayMs !== undefined && !this.shutdown.signal.aborted) {
@@ -2016,15 +2092,16 @@ export class OperatorDaemon {
               // message. The digest coalesces the frames; the interval still
               // bounds how often a chatty worker may bubble up at all.
               lastProgressAt = Date.now();
-              this.noteThreadEvent(threadId, route, { kind: "progress", threadId, text: event.summary });
+              this.voice.note(threadId, route, {
+                kind: "progress",
+                threadId,
+                text: event.summary,
+                title: this.threadTitle(threadId),
+              });
             } else if (event.type === "agent_message") {
               // The worker's own narration — data for the Operator to retell,
               // never text the owner sees verbatim.
-              this.noteThreadEvent(threadId, route, {
-                kind: "agent_message",
-                threadId,
-                text: safeExcerpt(event.text, THREAD_EVENT_EXCERPT_LIMIT),
-              });
+              this.voice.noteWorkerMessage(threadId, route, this.threadTitle(threadId), event.text);
             } else if (event.type === "approval_required") {
               await this.requestApproval(route.chatId, event, route.originMessageId, route.destination);
             } else if (event.type === "approval_resolved") {
@@ -2064,7 +2141,7 @@ export class OperatorDaemon {
                 { err: error, threadId, attempts: resubscribeAttempt - 1 },
                 "Worker monitor lost after repeated resubscribe failures",
               );
-              await this.reportMonitorLost(threadId);
+              this.reportMonitorLost(threadId, currentRoute());
               break;
             }
             const waitMs = Math.min(
@@ -2124,23 +2201,18 @@ export class OperatorDaemon {
   }
 
   /** Bug №12: durable owner notice + marker when a monitor could not resubscribe. */
-  private async reportMonitorLost(threadId: string): Promise<void> {
+  private reportMonitorLost(threadId: string, route: MonitorRoute): void {
     this.store.setRuntimeState(`thread_monitor_lost:${threadId}`, nowIso());
     this.store.appendEvent("worker.monitor.lost", { threadId, payload: {} });
-    const epoch = this.store.getRuntimeState(`thread_terminal_epoch:${threadId}`) ?? "0";
-    this.enqueueTelegramOutbox(
-      `telegram:monitor-lost:${threadId}:${epoch}`,
-      this.config.telegram.allowedUserId,
-      "rich",
-      {
-        text: `Потерял связь с тредом **${escapeMarkdownText(this.store.getThread(threadId)?.title ?? threadId)}** после нескольких попыток переподключения. Восстановлю подписку при следующем maintenance.`,
-        options: {},
-        threadId,
-        correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`),
-        messageType: "worker_monitor_lost",
-      },
+    // Package 1.2: a lost subscription is STATE OF THE WORK, so it travels the
+    // same way as everything else about the work — to the Operator, who decides
+    // whether the owner needs to hear it and says it in their own words.
+    this.voice.noteDaemonFact(
+      threadId,
+      route,
+      this.threadTitle(threadId),
+      "потеряна связь с этой работой после нескольких попыток переподключения; подписка восстановится при ближайшем maintenance.",
     );
-    await this.flushTelegramOutbox().catch(() => undefined);
   }
 
   private async dispatchNextFollowup(threadId: string): Promise<QueuedThreadFollowup | undefined> {
@@ -2205,21 +2277,16 @@ export class OperatorDaemon {
       payload: { jobId: job.id, attempts: job.attempts },
     });
     try {
-      this.enqueueTelegramOutbox(`telegram:${job.id}:started`, job.payload.chatId, "rich", {
-        text: `Начал отложенное уточнение для **${escapeMarkdownText(this.store.getThread(threadId)?.title ?? threadId)}**.`,
-        options: {
-          ...job.payload.destination,
-          replyToMessageId: job.payload.originMessageId,
-        },
+      // Package 1.2: "I have started the queued follow-up" is state of the
+      // work, not a message the daemon owes the chat. The Operator hears it and
+      // decides — and the follow-up's own outcome will be relayed anyway.
+      this.voice.forgetRelayedNotes(threadId);
+      this.voice.noteDaemonFact(
         threadId,
-        correlationId: job.payload.correlationId ?? this.store.getRuntimeState(`thread_correlation_id:${threadId}`),
-        messageType: "worker_followup_started",
-        anchor: {
-          threadId,
-          messageTypes: ["worker_started", "worker_progress", "worker_completed"],
-        },
-      });
-      await this.flushTelegramOutbox();
+        { chatId: job.payload.chatId, destination: job.payload.destination },
+        this.threadTitle(threadId),
+        "отложенное уточнение к этой работе отправлено воркеру, работа снова идёт.",
+      );
     } catch (error) {
       this.logger.warn(
         { err: error, threadId, jobId: job.id },
@@ -2778,16 +2845,18 @@ export class OperatorDaemon {
         : {}),
     };
     const jobId = `choice-answer:${choiceId}`;
+    // A button press is the owner acting in the chat, so it rides their lane —
+    // and the drain claims that lane ONLY (package 1.2): unfiltered, it could
+    // carry off a thread-event digest and make the owner wait behind it.
     this.store.enqueueBackgroundJob<DurableTelegramIngress>(
       "telegram_ingress",
-      { update: synthetic, processExisting: false },
+      { update: synthetic, processExisting: false, lane: "user", enqueuedAt: nowIso() },
       undefined,
       { id: jobId, dedupeKey: jobId },
     );
     await this.flushTelegramOutbox();
     void this.operatorInputQueue
-      // A button press is the owner acting in the chat: same lane as a message.
-      .run("user", () => this.drainTelegramIngress())
+      .run("user", () => this.drainTelegramIngress(ingressClaim("user")))
       .catch((error) => this.logUpdateFailure(error, update.updateId));
   }
 
@@ -3065,6 +3134,7 @@ export class OperatorDaemon {
     await this.deliverRequestedArtifacts(route.chatId, event.threadId, route.destination);
     await this.flushTelegramOutbox();
     this.raiseThreadTerminal(route, event.threadId, "completed", event.result);
+
   }
 
   /**
@@ -3124,24 +3194,15 @@ export class OperatorDaemon {
     this.raiseThreadTerminal(route, threadId, "cancelled", summary);
   }
 
-  /** Package 1.2: one worker event into the digest, remembering where it belongs. */
-  private noteThreadEvent(threadId: string, route: MonitorRoute, event: ThreadDigestEvent): void {
-    this.threadEventRoutes.set(threadId, route);
-    this.threadDigest.push(event);
+  /** Package 1.2: the work's human title as it stands right now. */
+  private threadTitle(threadId: string): string {
+    return this.store.getThread(threadId)?.title ?? threadId;
   }
 
   /**
-   * Package 1.2 — a terminal event is durable BEFORE it is interpreted.
-   *
-   * Two layers, and each covers what the other cannot. The digest turn is a
-   * durable `telegram_ingress` job, so a restart mid-interpretation replays it
-   * — the same mechanism automations already ride on, nothing new to maintain.
-   * But no job exists until the window closes, and no job survives a provider
-   * that stays down: so the terminal ALSO leaves a runtime-state record here,
-   * keyed by the thread's terminal epoch. That record is what the degraded
-   * fallback sweeps, and the epoch key is what keeps the notice idempotent
-   * across restarts and retries. It is cleared only once a turn of the
-   * Operator's has actually spoken for it.
+   * Package 1.2: hand a terminal event to the voice, with the title and epoch
+   * captured HERE — reading them back at flush time raced the next dispatch on
+   * the same thread and orphaned the pending record.
    */
   private raiseThreadTerminal(
     route: MonitorRoute,
@@ -3150,32 +3211,14 @@ export class OperatorDaemon {
     text: string,
   ): void {
     this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, nowIso());
-    const epoch = this.store.getRuntimeState(`thread_terminal_epoch:${threadId}`) ?? "0";
-    const pending: PendingVoiceTerminal = {
+    this.voice.raiseTerminal({
       threadId,
-      title: this.store.getThread(threadId)?.title ?? threadId,
+      title: this.threadTitle(threadId),
+      epoch: this.store.getRuntimeState(`thread_terminal_epoch:${threadId}`) ?? "0",
       outcome,
-      epoch,
-      chatId: route.chatId,
-      destination: route.destination,
-      raisedAt: nowIso(),
-    };
-    this.store.setRuntimeState(
-      `${VOICE_TERMINAL_PREFIX}${threadId}:${epoch}`,
-      JSON.stringify(pending),
-    );
-    this.noteThreadEvent(threadId, route, {
-      kind: "completion",
-      threadId,
-      outcome,
-      text: safeExcerpt(text, THREAD_EVENT_EXCERPT_LIMIT),
+      text,
+      route,
     });
-    // A finished work does not wait out the quiet window: the owner is waiting.
-    void this.threadDigest
-      .flush()
-      .catch((error: unknown) =>
-        this.logger.error({ err: error, threadId }, "Terminal digest flush failed"),
-      );
   }
 
   private async tryRecoverFailedWorker(
@@ -3289,14 +3332,22 @@ export class OperatorDaemon {
       chatId,
       originMessageId,
       destination,
-      ackText: mustCreateThread
-        ? `Worker столкнулся с ошибкой \`${classified.code}\`; Operator продолжил работу в новом recovery thread **${escapeMarkdownText(targetThread.title)}**.`
-        : `Worker столкнулся с ошибкой \`${classified.code}\`; Operator выполняет один безопасный повтор.`,
+      // Package 1.2: no ackText. The daemon does not announce its own recovery
+      // attempt in the chat — it tells the Operator (below), which is the only
+      // mouth there is; the recovered work's outcome is relayed anyway.
       messageType: "worker_followup_started",
       ...(selectedProvider ? { providerInstanceId: selectedProvider.instanceId } : {}),
       ...(selectedModel ? { model: selectedModel } : {}),
       anchorThreadId: threadId,
     }, undefined, { id: commandId, dedupeKey: `t3-dispatch:${commandId}` });
+    this.voice.noteDaemonFact(
+      targetThread.id,
+      { chatId, destination },
+      targetThread.title,
+      mustCreateThread
+        ? `предыдущая попытка этой работы упала с ошибкой ${classified.code}; работа продолжена в новом recovery-треде.`
+        : `эта работа упала с ошибкой ${classified.code}; выполняется один безопасный повтор.`,
+    );
     this.store.appendEvent("worker.recovery.scheduled", {
       correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`) ?? `thread:${threadId}`,
       projectId: project.id,
@@ -3316,116 +3367,6 @@ export class OperatorDaemon {
     return true;
   }
 
-  /**
-   * Package 1.2 — a flushed digest becomes ONE synthetic system message per
-   * chat, queued on the `thread-events` lane.
-   *
-   * It is a durable ingress job, exactly like an automation run: that is what
-   * makes an interpretation survive a restart, and it costs nothing new. The
-   * lane run is deliberately NOT awaited — the caller is a worker monitor, and
-   * a completion must not hold a monitor slot for the length of an Operator
-   * turn. The owner's own messages keep winning the queue (`user` lane), and
-   * this turn simply waits its place: it is never dropped as stale, because a
-   * work that finished stays finished no matter what the owner says next.
-   */
-  private dispatchThreadEventTurn(items: ThreadDigestItem[]): void {
-    if (!items.length) return;
-    const byChat = new Map<number, ThreadDigestItem[]>();
-    for (const item of items) {
-      const chatId = this.threadEventChatId(item.threadId);
-      if (chatId === undefined) {
-        this.logger.warn({ threadId: item.threadId }, "Thread event has no chat to interpret it in");
-        continue;
-      }
-      const bucket = byChat.get(chatId);
-      if (bucket) bucket.push(item);
-      else byChat.set(chatId, [item]);
-    }
-    for (const [chatId, chatItems] of byChat) {
-      this.enqueueThreadEventTurn(chatId, chatItems);
-    }
-    if (byChat.size) this.queueThreadEventDrain();
-  }
-
-  private threadEventChatId(threadId: string): number | undefined {
-    const route = this.threadEventRoutes.get(threadId) ?? this.monitorRoutes.get(threadId);
-    if (route) return route.chatId;
-    const stored = Number(this.store.getRuntimeState(`thread_chat:${threadId}`));
-    if (Number.isSafeInteger(stored) && stored !== 0) return stored;
-    return this.ownerChatId();
-  }
-
-  private threadEventDestination(threadId: string): TelegramDestination {
-    return this.threadEventRoutes.get(threadId)?.destination ?? this.recoveredDestination(threadId);
-  }
-
-  private enqueueThreadEventTurn(chatId: number, items: ThreadDigestItem[]): void {
-    // One fence for the whole turn: the label says "worker", so every section
-    // below it is data the Operator retells, never instructions it follows.
-    const fence = openFence("worker");
-    const sections = items.map((item) => {
-      const title = this.store.getThread(item.threadId)?.title ?? item.threadId;
-      const head =
-        item.kind === "completion"
-          ? `system message from thread "${title}" (${item.threadId}) — the work ENDED with outcome "${item.outcome}". Its own final report follows:`
-          : item.kind === "agent_message"
-            ? `system message from thread "${title}" (${item.threadId}) — the worker wrote a note:`
-            : `system message from thread "${title}" (${item.threadId}) — progress${item.collapsed > 1 ? ` (${item.collapsed} frames collapsed, newest only)` : ""}:`;
-      return [head, fence(item.text || "(no text)")].join("\n");
-    });
-    const refs: TelegramThreadEventRef[] = items.map((item) => ({
-      threadId: item.threadId,
-      title: this.store.getThread(item.threadId)?.title ?? item.threadId,
-      ...(item.kind === "completion" && item.outcome ? { terminal: item.outcome } : {}),
-      ...(item.kind === "completion"
-        ? { epoch: this.store.getRuntimeState(`thread_terminal_epoch:${item.threadId}`) ?? "0" }
-        : {}),
-    }));
-    const seed = items
-      .map((item) => `${item.threadId}:${item.kind}:${item.lastAt}:${stableTextHash(item.text)}`)
-      .join("|");
-    const syntheticId = syntheticNegativeMessageId(`thread-events:${chatId}:${seed}`);
-    const destination = this.threadEventDestination(items[0]!.threadId);
-    const update: Extract<TelegramInbound, { type: "message" }> = {
-      type: "message",
-      updateId: syntheticId,
-      edited: false,
-      synthetic: true,
-      chatId,
-      chatType: "private",
-      userId: this.config.telegram.allowedUserId,
-      messageId: syntheticId,
-      messageIds: [syntheticId],
-      date: Math.floor(Date.now() / 1_000),
-      text: sections.join("\n\n"),
-      attachments: [],
-      threadEvents: refs,
-      ...(destination.messageThreadId ? { messageThreadId: destination.messageThreadId } : {}),
-      ...(destination.directMessagesTopicId
-        ? { directMessagesTopicId: destination.directMessagesTopicId }
-        : {}),
-    };
-    const jobId = telegramIngressJobId(update);
-    this.store.enqueueBackgroundJob<DurableTelegramIngress>(
-      "telegram_ingress",
-      { update, processExisting: true },
-      undefined,
-      { id: jobId, dedupeKey: jobId },
-    );
-    this.store.appendEvent("thread.events.digested", {
-      payload: {
-        chatId: hashChatId(chatId),
-        jobId,
-        items: items.map((item) => ({
-          threadId: item.threadId,
-          kind: item.kind,
-          ...(item.outcome ? { outcome: item.outcome } : {}),
-          collapsed: item.collapsed,
-        })),
-      },
-    });
-  }
-
   /** Package 1.2: one thread-events drain in flight at a time, like the background one. */
   private queueThreadEventDrain(): void {
     if (this.threadEventDrainQueued || this.shutdown.signal.aborted) return;
@@ -3433,7 +3374,13 @@ export class OperatorDaemon {
     void this.operatorInputQueue
       .run("thread-events", async () => {
         this.threadEventDrainQueued = false;
-        await this.drainTelegramIngress((payload) => Boolean(payload.update.threadEvents?.length));
+        await this.drainTelegramIngress(
+          ingressClaim("thread-events"),
+          // The owner is waiting in the chat: stop after the interpretation in
+          // hand and give them the queue.
+          () => this.operatorInputQueue.depth("user") > 0,
+          () => this.queueThreadEventDrain(),
+        );
       })
       .catch((error: unknown) => {
         this.threadEventDrainQueued = false;
@@ -3442,78 +3389,6 @@ export class OperatorDaemon {
           "Thread-event interpretation drain failed; the digest job stays pending",
         );
       });
-  }
-
-  /**
-   * Package 1.2: the Operator has spoken for these terminals (or deliberately
-   * stayed silent about a progress-only digest), so they stop waiting for the
-   * degraded fallback.
-   */
-  private settleThreadEventTurn(refs: readonly TelegramThreadEventRef[]): void {
-    for (const ref of refs) {
-      if (!ref.terminal) continue;
-      this.store.deleteRuntimeState(`${VOICE_TERMINAL_PREFIX}${ref.threadId}:${ref.epoch ?? "0"}`);
-      // The work ended and its story is told: the route is dead weight now. A
-      // follow-up turn on the same thread re-registers it on its first event.
-      this.threadEventRoutes.delete(ref.threadId);
-      this.store.appendEvent("thread.terminal.relayed", {
-        threadId: ref.threadId,
-        payload: { outcome: ref.terminal, epoch: ref.epoch ?? "0" },
-      });
-    }
-  }
-
-  /**
-   * Package 1.2 — the ONE templated path that survives, and the only content
-   * the daemon may still author about a work: a finished work whose
-   * interpretation never happened (provider down, queue wedged, the turn failed
-   * every retry) is announced flatly after `OPERATOR_VOICE_FALLBACK_MINUTES`.
-   * No worker content travels with it — just the title, the honest outcome and
-   * a promise to explain. The outbox key is the terminal epoch, so the notice
-   * is sent at most once per terminal even across restarts.
-   *
-   * Progress digests have no fallback by design: a silent Operator means the
-   * owner hears nothing about steps, which is exactly right — they will hear
-   * the story once it can be told.
-   */
-  private sweepVoiceFallbacks(): void {
-    const deadline = Date.now() - this.config.operator.voiceFallbackMs;
-    for (const entry of this.store.listRuntimeState(VOICE_TERMINAL_PREFIX)) {
-      let pending: PendingVoiceTerminal;
-      try {
-        const parsed: unknown = JSON.parse(entry.value);
-        if (!isRecord(parsed) || typeof parsed.threadId !== "string") throw new Error("malformed");
-        pending = parsed as unknown as PendingVoiceTerminal;
-      } catch {
-        this.store.deleteRuntimeState(entry.key);
-        continue;
-      }
-      const raisedAt = Date.parse(pending.raisedAt);
-      if (!Number.isFinite(raisedAt) || raisedAt > deadline) continue;
-      const outcome = TERMINAL_OUTCOME_RU[pending.outcome] ?? pending.outcome;
-      this.enqueueTelegramOutbox(
-        `telegram:thread:${pending.threadId}:terminal:${pending.epoch}`,
-        pending.chatId,
-        "rich",
-        {
-          text: `Работа **${escapeMarkdownText(pending.title)}** завершилась (${outcome}). Подробности расскажу, когда восстановлюсь.`,
-          options: pending.destination ?? {},
-          threadId: pending.threadId,
-          messageType: "worker_terminal_fallback",
-          completionThreadIds: [pending.threadId],
-          correlationId: this.store.getRuntimeState(`thread_correlation_id:${pending.threadId}`),
-        },
-      );
-      this.store.deleteRuntimeState(entry.key);
-      this.store.appendEvent("thread.terminal.fallback", {
-        threadId: pending.threadId,
-        payload: { outcome: pending.outcome, epoch: pending.epoch },
-      });
-      this.logger.warn(
-        { threadId: pending.threadId, outcome: pending.outcome },
-        "Operator did not relay a finished work in time; sent the degraded notice",
-      );
-    }
   }
 
   private async handleCallback(update: Extract<TelegramInbound, { type: "callback" }>): Promise<void> {
@@ -4619,7 +4494,7 @@ export class OperatorDaemon {
         await this.flushTelegramOutbox();
         this.warnBlockedTelegramOutboxHeads();
         await this.drainT3Dispatches();
-        this.sweepVoiceFallbacks();
+        this.voice.sweepFallbacks();
         this.queueThreadEventDrain();
         this.queueBackgroundIngressDrain();
       } catch (error) {
@@ -4647,7 +4522,11 @@ export class OperatorDaemon {
     void this.operatorInputQueue
       .run("background", async () => {
         this.backgroundDrainQueued = false;
-        await this.drainTelegramIngress();
+        await this.drainTelegramIngress(
+          ingressClaim("background"),
+          () => this.operatorInputQueue.depth("user") > 0,
+          () => this.queueBackgroundIngressDrain(),
+        );
       })
       .catch((error: unknown) => {
         this.backgroundDrainQueued = false;
@@ -4862,6 +4741,8 @@ export class OperatorDaemon {
    */
   private async drainTelegramIngress(
     filter: (payload: DurableTelegramIngress) => boolean = () => true,
+    yieldWhen?: () => boolean,
+    requeue?: () => void,
   ): Promise<void> {
     for (let index = 0; index < 50; index += 1) {
       const job = this.store.claimBackgroundJob<DurableTelegramIngress>(
@@ -4873,6 +4754,15 @@ export class OperatorDaemon {
         await this.handleUpdate(job.payload.update, job.payload.processExisting);
         this.store.completeBackgroundJob(job.id);
         if (job.payload.update.automationRunId) this.store.completeAutomationRunByJob(job.id);
+        // Package 1.2: one job, then look up. A drain used to hold its lane for
+        // up to fifty jobs, so an owner who wrote after the first digest waited
+        // out the whole backlog of interpretations — minutes with a real
+        // provider. Yielding hands the queue back; the rest are re-queued and
+        // continue as soon as the owner's turn is done.
+        if (yieldWhen?.()) {
+          requeue?.();
+          return;
+        }
       } catch (error) {
         const classified = classifyOperationalError(error);
         const gaveUp = this.store.retryBackgroundJob(job.id, classified.code);
@@ -4880,16 +4770,25 @@ export class OperatorDaemon {
           correlationId: correlationForUpdate(job.payload.update),
           payload: { jobId: job.id, errorCode: classified.code, gaveUp },
         });
-        if (gaveUp && job.payload.update.threadEvents?.length) {
-          // Package 1.2: a digest the Operator could never interpret is dropped
-          // silently — telling the owner "не удалось обработать сообщение"
-          // about a message they never sent explains nothing. A terminal event
-          // in it is still covered by the degraded fallback record.
-          this.logger.warn(
-            { jobId: job.id, errorCode: classified.code },
-            "Thread-event digest gave up; the degraded fallback owns it now",
-          );
-          continue;
+        const threadEvents = job.payload.update.threadEvents;
+        if (threadEvents?.length) {
+          // Package 1.2: the wait for a terminal restarts from THIS failure —
+          // the fallback deadline measures the Operator's inability to speak,
+          // not the age of the event.
+          this.voice.failRelay(threadEvents);
+          if (gaveUp) {
+            // Telling the owner "не удалось обработать сообщение" about a
+            // message they never sent explains nothing — but the notes are not
+            // lost in silence either: the next digest carries the fact that
+            // they existed, so the Operator can say so.
+            this.voice.reportLostDigest(threadEvents);
+            this.logger.warn(
+              { jobId: job.id, errorCode: classified.code },
+              "Thread-event digest gave up; reported the loss into the next digest",
+            );
+          }
+          if (gaveUp) continue;
+          throw error;
         }
         if (gaveUp) {
           this.enqueueTelegramOutbox(`telegram:job:${job.id}:gave_up`, job.payload.update.chatId, "rich", {
@@ -4943,7 +4842,15 @@ export class OperatorDaemon {
           automation,
           scheduledFor,
           ...(nextRunAt ? { nextRunAt } : {}),
-          ingressPayload: { update, processExisting: false },
+          // Package 1.2: an automation fires on its own schedule, so it is
+          // background work — it must never overtake the owner in the chat.
+          // The age escalation keeps it from starving behind a busy chat.
+          ingressPayload: {
+            update,
+            processExisting: false,
+            lane: "background",
+            enqueuedAt: nowIso(),
+          },
         });
         if (run.inserted) {
           dispatched += 1;

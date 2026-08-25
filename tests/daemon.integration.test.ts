@@ -6,6 +6,8 @@ import pino from "pino";
 import type { Logger } from "pino";
 import { describe, expect, it } from "vitest";
 import {
+  ingressClaim,
+  ingressLane,
   OperatorDaemon,
   operatorHeartbeatText,
   syntheticNegativeMessageId,
@@ -1185,13 +1187,14 @@ describe("OperatorDaemon product flow", () => {
     releaseNormalization();
     // Every finished work is eventually named — in one message or in a few,
     // because the digest coalesces whatever accumulated while a turn ran.
-    await waitFor(
-      () =>
-        Array.from({ length: 8 }, (_, index) => `Работа «Job ${index + 1}»`).every((title) =>
-          telegram.sent.some((entry) => entry.text.includes(title)),
-        ),
-      15_000,
-    );
+    const mentions = (title: string) =>
+      telegram.sent.filter((entry) => entry.text.includes(title)).length;
+    const titles = Array.from({ length: 8 }, (_, index) => `Работа «Job ${index + 1}»`);
+    await waitFor(() => titles.every((title) => mentions(title) >= 1), 15_000);
+    // EXACTLY once each: a finished work told about twice is as wrong as one
+    // never mentioned, and the digest must not re-open a settled terminal.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    for (const title of titles) expect(mentions(title)).toBe(1);
 
     telegram.finish();
     await run;
@@ -2499,14 +2502,22 @@ describe("OperatorDaemon product flow", () => {
     const run = daemon.run();
 
     telegram.push(message(1, "implement refresh-token locking and run regression tests"));
-    // Package 1.2: the summary keeps the worker's own report (bounded) instead
-    // of a normalization pass the daemon no longer runs — the Operator is the
-    // one who interprets, and it does so in its turn, not in a side call.
+    // Package 1.2 — an explicit, deliberate change of shape, not an omission.
+    // The daemon no longer runs a normalization pass, so the summary keeps the
+    // worker's own bounded report as `currentState`, and the structured fields
+    // it used to derive (importantDecisions, changedFiles, openIssues,
+    // nextActions) are no longer extracted by the daemon at all. Until phase
+    // 2.1/2.2 restores structural extraction, the Operator is instructed to
+    // write those down through memory.remember (see the policy prompt).
     await waitFor(() => store.getThreadSummary("th_1")?.currentState.includes("Tests pass") === true);
     expect(store.getThreadSummary("th_1")).toMatchObject({
       purpose: "implement refresh-token locking and run regression tests",
+      currentState: "Fixed auth race. Tests pass.",
+      importantDecisions: [],
       openIssues: [],
     });
+    // The prompt carries the bridge, so the instruction cannot silently vanish.
+    expect(runtime.startPrompts.at(-1) ?? "").toContain("memory.remember");
 
     telegram.push(message(2, "/memory remember preference: Always run auth regression tests"));
     await waitFor(() => store.searchOperatorNotes("auth regression").length === 1);
@@ -3309,8 +3320,16 @@ describe("OperatorDaemon product flow", () => {
 
     telegram.push(message(1, "implement auth recovery and run tests"));
     await waitFor(() => broker.turns.length === 2);
-    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("PROVIDER_RATE_LIMIT")));
+    // Package 1.2: the daemon no longer announces its own recovery attempt in
+    // the chat — it tells the Operator, who decides what the owner hears.
+    await waitFor(
+      () => runtime.prompts.some((prompt) => prompt.includes("PROVIDER_RATE_LIMIT")),
+      10_000,
+    );
     expect(store.getRuntimeState("thread_failure_recovery_count:th_1")).toBe("1");
+    expect(telegram.sent.some((entry) => entry.text.includes("PROVIDER_RATE_LIMIT"))).toBe(false);
+    // The raw provider error — token and all — reaches neither the chat nor
+    // the Operator's session unfenced.
     expect(telegram.sent.every((entry) => !entry.text.includes("super-secret-provider-token"))).toBe(true);
 
     telegram.finish();
@@ -5036,20 +5055,58 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   }, 20_000);
 
-  it("keeps worker progress out of the chat and inside the Operator's envelope (package 1.2)", async () => {
-    // Tripwire: the direct-delivery paths must stay deleted, not merely unused.
+  it("lets no new daemon-authored message type about a work slip in (package 1.2 tripwire)", () => {
     const daemonSource = readFileSync(
       new URL("../apps/daemon/src/operator-daemon.ts", import.meta.url),
       "utf8",
     );
-    expect(daemonSource).not.toContain('messageType: "worker_progress"');
-    expect(daemonSource).not.toContain('messageType: "worker_completed"');
-    expect(daemonSource).not.toContain('messageType: "worker_failed"');
-    expect(daemonSource).not.toContain('messageType: "worker_cancelled"');
+    // A WHITELIST, not a blacklist: every message the daemon may still author
+    // is listed here with a reason, so a newly added type fails this test until
+    // someone argues it past the single-voice rule (roadmap phase 1 DoD).
+    const allowedMessageTypes = new Set([
+      // Not about a work at all — chat/daemon plumbing.
+      "bulk_ingest_ack",
+      "compaction_notice",
+      "daemon_restart_notice",
+      "delivery_failed",
+      "ingress_failed",
+      "interaction_keyboard_cleared",
+      "provider_fallback_notice",
+      "automation_paused",
+      "user_input_submitted",
+      "approval_decision_failed",
+      // About a work, still direct — each one tracked in roadmap 1.2 debt.
+      "artifact_sent",
+      "worker_external_turn",
+      "worker_started",
+      "worker_started_degraded",
+      "worker_followup_started",
+      "followup_failed",
+      "t3_dispatch_deferred",
+      "t3_dispatch_failed",
+      // The single degraded template the package deliberately keeps.
+      "worker_terminal_fallback",
+    ]);
+    const used = new Set(
+      [...daemonSource.matchAll(/messageType:\s*"([\w-]+)"/gu)].map((match) => match[1]!),
+    );
+    expect([...used].filter((type) => !allowedMessageTypes.has(type))).toEqual([]);
+    // The removed rendering paths stay removed.
     expect(daemonSource).not.toContain("renderWorkerResult(");
     expect(daemonSource).not.toContain("normalizeWorkerResult(");
     expect(daemonSource).not.toContain("fallbackWorkerResult(");
+    // …and no worker-written field may be handed to the outbox: the delivery
+    // call sites must never see `event.summary` / `event.text` / `event.result`.
+    const outboxCalls = [...daemonSource.matchAll(/enqueueTelegramOutbox\([\s\S]{0,1200}?\n {4,6}\);/gu)].map(
+      (match) => match[0],
+    );
+    expect(outboxCalls.length).toBeGreaterThan(5);
+    for (const call of outboxCalls) {
+      expect(call).not.toMatch(/event\.(summary|text|result)/u);
+    }
+  });
 
+  it("keeps worker progress out of the chat and inside the Operator's envelope (package 1.2)", async () => {
     const home = tempDirectory("voice-progress-");
     const store = tempStore();
     const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
@@ -5384,6 +5441,361 @@ describe("OperatorDaemon product flow", () => {
     await secondRun;
     await second.stop();
   }, 30_000);
+
+  it("hands the queue back to a waiting owner between interpretations (package 1.2)", async () => {
+    const home = tempDirectory("voice-fairness-");
+    const store = tempStore();
+    const relayGates: Array<() => void> = [];
+    class SlowRelayRuntime extends FakeRuntime {
+      relayStarts = 0;
+      override async *sendTurn(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        if (input.prompt.includes("system message from thread")) {
+          this.prompts.push(input.prompt);
+          this.relayStarts += 1;
+          await new Promise<void>((resolve) => relayGates.push(resolve));
+          const text = threadEventRelay(input.prompt)!;
+          yield { type: "text_delta", text };
+          yield { type: "result", text, sessionId: input.sessionId };
+          return;
+        }
+        yield* super.sendTurn(input);
+      }
+    }
+    const runtime = new SlowRelayRuntime();
+    class PerThreadBroker extends FakeBroker {
+      readonly eventsByThread = new Map<string, WorkerEvent[]>();
+      override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+        for (const event of this.eventsByThread.get(threadId) ?? []) {
+          await Promise.resolve();
+          yield event;
+        }
+      }
+    }
+    const broker = new PerThreadBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: `${home}/acme` });
+    store.upsertProject(project);
+    // Four works finish at once, each its own interpretation turn.
+    for (let index = 1; index <= 4; index += 1) {
+      const thread = await broker.createThread({ projectId: project.id, title: `Работа ${index}` });
+      broker.eventsByThread.set(thread.id, [
+        { type: "started", threadId: thread.id },
+        { type: "completed", threadId: thread.id, result: `итог ${index}` },
+      ]);
+      await daemon.trackOperatorToolThread({
+        threadId: thread.id,
+        context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: index, operatorTurnId: `opturn_${index}` },
+      });
+    }
+    await waitFor(() => runtime.relayStarts === 1, 10_000);
+
+    // The owner writes while the FIRST interpretation runs. They must be
+    // answered right after it — not after the whole backlog of four.
+    telegram.push(message(10, "столица Франции?"));
+    // Wait until their message is genuinely queued on the user lane, so the
+    // release below tests the yield and not a race with the transport.
+    await waitFor(
+      () =>
+        store
+          .listBackgroundJobs<{ update: { text: string } }>("telegram_ingress")
+          .some((job) => job.payload.update.text.includes("столица Франции")),
+      10_000,
+    );
+    relayGates.shift()!();
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 10_000);
+    // The owner was answered after the FIRST interpretation, not after the
+    // backlog: exactly one work had been told about by then. (Before the yield,
+    // one lane task drained up to fifty digests before releasing the queue.)
+    const ownerIndex = telegram.sent.findIndex((entry) => entry.text === "Париж.");
+    const toldBefore = telegram.sent
+      .slice(0, ownerIndex)
+      .filter((entry) => entry.text.includes("готова")).length;
+    expect(toldBefore).toBe(1);
+
+    // …and the remaining three still arrive once the owner is served.
+    for (let index = 0; index < 4; index += 1) {
+      await waitFor(() => relayGates.length > 0, 10_000).catch(() => undefined);
+      relayGates.shift()?.();
+    }
+    await waitFor(
+      () =>
+        [1, 2, 3, 4].every((index) =>
+          telegram.sent.some((entry) => entry.text.includes(`Работа «Работа ${index}» готова`)),
+        ),
+      15_000,
+    );
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
+  it("holds the degraded notice back while an interpretation is actually running (package 1.2)", async () => {
+    const home = tempDirectory("voice-relaying-");
+    const store = tempStore();
+    let releaseRelay!: () => void;
+    const relayGate = new Promise<void>((resolve) => (releaseRelay = resolve));
+    let relayStarted = false;
+    class SlowRelayRuntime extends FakeRuntime {
+      override async *sendTurn(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        if (input.prompt.includes("system message from thread")) {
+          this.prompts.push(input.prompt);
+          relayStarted = true;
+          await relayGate;
+          const text = threadEventRelay(input.prompt)!;
+          yield { type: "text_delta", text };
+          yield { type: "result", text, sessionId: input.sessionId };
+          return;
+        }
+        yield* super.sendTurn(input);
+      }
+    }
+    const runtime = new SlowRelayRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    const settings = config(home);
+    // Zero patience: without the relaying marker the template would fire on the
+    // very next sweep, while the Operator is mid-sentence.
+    const impatient: Config = { ...settings, operator: { ...settings.operator, voiceFallbackMs: 0 } };
+    daemon = new OperatorDaemon(impatient, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: `${home}/acme` });
+    store.upsertProject(project);
+    const thread = await broker.createThread({ projectId: project.id, title: "Долгий пересказ" });
+    await daemon.trackOperatorToolThread({
+      threadId: thread.id,
+      context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: 1, operatorTurnId: "opturn_1" },
+    });
+    await waitFor(() => relayStarted, 10_000);
+    // Several sweeps pass while the turn is speaking: no template.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(telegram.sent.some((entry) => entry.text.includes("Подробности расскажу"))).toBe(false);
+
+    releaseRelay();
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Работа «Долгий пересказ» готова")),
+      10_000,
+    );
+    // The real story arrived, so the flat one never may.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(telegram.sent.some((entry) => entry.text.includes("Подробности расскажу"))).toBe(false);
+    expect(store.listRuntimeState("voice_pending_terminal:")).toHaveLength(0);
+    expect(store.listRuntimeState("voice_relaying:")).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  it("assigns ingress lanes by identity, and escalates an aged one-shot (package 1.2)", () => {
+    const owner = (text: string): unknown => ({
+      update: { text, messageIds: [1] },
+      processExisting: false,
+      lane: "user",
+      enqueuedAt: nowIso(),
+    });
+    const automation: unknown = {
+      update: { text: "[Scheduled automation: Ночная сводка]", automationRunId: "autorun_1" },
+      processExisting: false,
+      lane: "background",
+      enqueuedAt: nowIso(),
+    };
+    const digest: unknown = {
+      update: { text: "system message from thread", threadEvents: [{ threadId: "th_1", title: "X" }] },
+      processExisting: true,
+      lane: "thread-events",
+      enqueuedAt: nowIso(),
+    };
+    // Identity, not negation: an automation run and a button replay are not
+    // "everything that is not a digest", and must not ride the owner's lane.
+    expect(ingressLane(owner("привет") as never)).toBe("user");
+    expect(ingressLane(automation as never)).toBe("background");
+    expect(ingressLane(digest as never)).toBe("thread-events");
+    // Jobs written before package 1.2 carry no lane: derived, same rules.
+    expect(ingressLane({ update: { text: "x" }, processExisting: false } as never)).toBe("user");
+    expect(
+      ingressLane({ update: { text: "x", automationRunId: "a" }, processExisting: false } as never),
+    ).toBe("background");
+
+    const userClaim = ingressClaim("user");
+    const digestClaim = ingressClaim("thread-events");
+    const backgroundClaim = ingressClaim("background");
+    expect(userClaim(owner("привет") as never)).toBe(true);
+    expect(userClaim(automation as never)).toBe(false);
+    expect(userClaim(digest as never)).toBe(false);
+    expect(digestClaim(digest as never)).toBe(true);
+    expect(digestClaim(owner("привет") as never)).toBe(false);
+    // The background drain is a safety net, not a second general queue: it must
+    // not carry off a digest while the owner waits on a higher lane…
+    expect(backgroundClaim(automation as never)).toBe(true);
+    expect(backgroundClaim(digest as never)).toBe(false);
+
+    // …and a one-shot event may not starve behind a chat that never quiets: an
+    // aged automation is escalated into the owner's lane, because nothing else
+    // will ever bring it round again.
+    const aged: unknown = {
+      ...(automation as Record<string, unknown>),
+      enqueuedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+    };
+    expect(userClaim(aged as never)).toBe(true);
+    expect(backgroundClaim(aged as never)).toBe(true);
+    // A stranded digest (nothing drained it for minutes) is picked up too.
+    expect(
+      backgroundClaim({
+        ...(digest as Record<string, unknown>),
+        enqueuedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+      } as never),
+    ).toBe(true);
+  });
+
+  it("does not re-open a turn for a worker note the broker replays (package 1.2)", async () => {
+    const home = tempDirectory("voice-replay-note-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    class ReplayingBroker extends FakeBroker {
+      subscribeCount = 0;
+      override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+        this.subscribeCount += 1;
+        yield { type: "started", threadId };
+        // The same note, re-emitted on resubscribe long after the first
+        // digest window closed: the owner must not be woken about it twice.
+        yield { type: "agent_message", threadId, text: "Нашёл причину падения." };
+        if (this.subscribeCount === 1) {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          throw new Error("subscription reset");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    const broker = new ReplayingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь падение импорта"));
+    await waitFor(() => broker.subscribeCount >= 2, 10_000);
+    const relayTurns = () =>
+      runtime.prompts.filter((prompt) => prompt.includes("Нашёл причину падения.")).length;
+    await waitFor(() => relayTurns() >= 1, 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(relayTurns()).toBe(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  it("does not spend a second turn on a digest it already judged not worth a word (package 1.2)", async () => {
+    const home = tempDirectory("voice-silent-replay-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "progress", threadId: "th_1", summary: "Читаю логи…" },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(
+      () => runtime.prompts.some((prompt) => prompt.includes("Читаю логи…")),
+      10_000,
+    );
+    const digestTurns = () =>
+      runtime.prompts.filter((prompt) => prompt.includes("Читаю логи…")).length;
+    expect(digestTurns()).toBe(1);
+    const silenceMarkers = store.listRuntimeState("operator_turn_silent:");
+    expect(silenceMarkers).toHaveLength(1);
+
+    // A crash between the silence and the job being completed replays the job.
+    // The marker is what keeps the provider out of it a second time.
+    const job = store
+      .listBackgroundJobs<{ update: { threadEvents?: unknown[] } }>("telegram_ingress", "completed")
+      .find((entry) => entry.payload.update.threadEvents?.length);
+    expect(job).toBeDefined();
+    store.enqueueBackgroundJob(
+      "telegram_ingress",
+      job!.payload,
+      undefined,
+      { id: `${job!.id}:replay`, dedupeKey: `${job!.id}:replay` },
+    );
+    await waitFor(
+      () => store.listBackgroundJobs("telegram_ingress").length === 0,
+      10_000,
+    );
+    expect(digestTurns()).toBe(1);
+    expect(telegram.sent.some((entry) => entry.text.includes("Читаю логи…"))).toBe(false);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
 });
 
 /** Every distinct fence marker opened in a prompt (roadmap 0.5). */
@@ -5422,9 +5834,12 @@ function config(home: string): Config {
       interruptGraceMs: 8_000,
       envPassthrough: [],
       mediationTimeoutMs: 250,
-      // Package 1.2: tests that exercise the degraded fallback move the clock
-      // themselves; this only has to be a real, non-zero deadline.
+      // Package 1.2: tests that exercise the degraded fallback set their own
+      // deadline; this only has to be a real, non-zero one.
       voiceFallbackMs: 5 * 60_000,
+      // A short digest window keeps the suite off the global timeouts; the
+      // coalescing behaviour under test does not depend on its length.
+      threadDigestWindowMs: 50,
       fullAccess: false,
       home,
       runtimeDir: `${home}/runtime`,
