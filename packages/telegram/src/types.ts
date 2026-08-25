@@ -84,6 +84,12 @@ export interface TelegramMessageInbound extends TelegramDestination {
   /** How many forwarded messages this envelope carries. */
   forwardedCount?: number;
   text: string;
+  /**
+   * True when `text` is a synthesized `(photo: ...)`-style stand-in for a
+   * captionless media message rather than words the sender typed. Album
+   * merging must never let a stand-in shadow a real caption.
+   */
+  textIsMediaPlaceholder?: boolean;
   attachments: TelegramAttachment[];
   /** Daemon-created proactive ingress; never passed through Telegram normalization. */
   synthetic?: boolean;

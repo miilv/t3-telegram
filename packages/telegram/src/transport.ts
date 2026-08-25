@@ -36,6 +36,12 @@ const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
 const CAPTION_LIMIT = 1024;
 const ALBUM_WINDOW_MS = 650;
+/**
+ * Ceiling for keeping an album open across getUpdates page boundaries. An
+ * album is at most 10 elements, so unlike a chat batch it never needs the
+ * 180 s budget — a few page round trips are enough.
+ */
+const MAX_ALBUM_WAIT_MS = 5_000;
 /** Quiet period that closes an inbound batch when no more pages are pending. */
 const BATCH_WINDOW_MS = 2_000;
 /** Hard ceiling so a pathological flood can never hold a batch open forever. */
@@ -141,6 +147,7 @@ interface RawUpdate {
 interface AlbumBuffer {
   messages: TelegramMessageInbound[];
   timer: NodeJS.Timeout;
+  openedAt: number;
 }
 
 interface InboundBatch {
@@ -677,12 +684,13 @@ export class TelegramBotTransport implements TelegramTransport {
       if (existing) {
         clearTimeout(existing.timer);
         existing.messages.push(normalized);
-        existing.timer = setTimeout(() => this.flushAlbum(key), ALBUM_WINDOW_MS);
+        existing.timer = this.scheduleAlbumFlush(key);
         return;
       }
       this.albums.set(key, {
         messages: [normalized],
-        timer: setTimeout(() => this.flushAlbum(key), ALBUM_WINDOW_MS),
+        openedAt: Date.now(),
+        timer: this.scheduleAlbumFlush(key),
       });
       return;
     }
@@ -734,6 +742,23 @@ export class TelegramBotTransport implements TelegramTransport {
     this.inbound.push(
       batch.messages.length === 1 ? batch.messages[0]! : mergeInboundBatch(batch.messages),
     );
+  }
+
+  private scheduleAlbumFlush(key: string): NodeJS.Timeout {
+    const timer = setTimeout(() => {
+      const album = this.albums.get(key);
+      if (!album) return;
+      if (this.morePagesPending && Date.now() - album.openedAt < MAX_ALBUM_WAIT_MS) {
+        // The tail of the album is still queued server-side (a getUpdates page
+        // boundary split it); the silence is a network round trip, not the end
+        // of the album.
+        album.timer = this.scheduleAlbumFlush(key);
+        return;
+      }
+      this.flushAlbum(key);
+    }, ALBUM_WINDOW_MS);
+    timer.unref();
+    return timer;
   }
 
   private flushAlbum(key: string): void {
@@ -995,6 +1020,9 @@ export function normalizeTelegramUpdate(
     ...(message.media_group_id ? { mediaGroupId: message.media_group_id } : {}),
     ...(message.forward_origin ? { forwardOrigin: normalizeForwardOrigin(message.forward_origin) } : {}),
     text: message.text ?? message.caption ?? fallbackMediaText(attachments),
+    ...(message.text === undefined && message.caption === undefined && attachments.length
+      ? { textIsMediaPlaceholder: true }
+      : {}),
     attachments,
   };
   return result;
@@ -1073,12 +1101,24 @@ export function mergeTelegramAlbum(messages: TelegramMessageInbound[]): Telegram
   const ordered = [...messages].sort((left, right) => left.messageId - right.messageId);
   const first = ordered[0]!;
   const last = ordered.at(-1)!;
+  // A caption can hang on any album element (Telegram allows several), while
+  // captionless elements carry synthesized `(photo: ...)` stand-ins. Keep
+  // every real caption and only fall back to a single stand-in when nobody
+  // typed anything.
+  const captions = ordered
+    .filter((message) => !message.textIsMediaPlaceholder)
+    .map((message) => message.text.trim())
+    .filter(Boolean);
+  const { textIsMediaPlaceholder: _firstPlaceholder, ...base } = first;
   return {
-    ...first,
+    ...base,
     updateId: Math.max(...ordered.map((message) => message.updateId)),
     messageId: last.messageId,
     messageIds: ordered.map((message) => message.messageId),
-    text: ordered.map((message) => message.text).find(Boolean) ?? "",
+    text: captions.length
+      ? captions.join("\n")
+      : ordered.map((message) => message.text).find(Boolean) ?? "",
+    ...(captions.length ? {} : { textIsMediaPlaceholder: true }),
     attachments: ordered.flatMap((message) => message.attachments),
   };
 }
