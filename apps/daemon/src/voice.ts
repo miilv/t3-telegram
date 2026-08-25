@@ -187,8 +187,11 @@ export class ThreadVoice {
     this.note(threadId, route, {
       kind: "agent_message",
       threadId,
-      text: `[сообщение демона, не слова воркера] ${text}`,
+      text,
       title,
+      // The section header says who is speaking, so the text itself carries no
+      // "[сообщение демона]" prefix that the header would then contradict.
+      source: "daemon",
     });
   }
 
@@ -421,11 +424,13 @@ export class ThreadVoice {
       // later dispatch on the same thread must not rewrite this turn's facts.
       const title = item.title ?? item.threadId;
       const head =
-        item.kind === "completion"
-          ? `system message from thread "${title}" (${item.threadId}) — the work ENDED with outcome "${item.outcome}". Its own final report follows:`
-          : item.kind === "agent_message"
-            ? `system message from thread "${title}" (${item.threadId}) — the worker wrote a note:`
-            : `system message from thread "${title}" (${item.threadId}) — progress${item.collapsed > 1 ? ` (${item.collapsed} frames collapsed, newest only)` : ""}:`;
+        item.source === "daemon"
+          ? `system message about thread "${title}" (${item.threadId}) — this is the DAEMON reporting the state of the work, not anything the worker said:`
+          : item.kind === "completion"
+            ? `system message from thread "${title}" (${item.threadId}) — the work ENDED with outcome "${item.outcome}". Its own final report follows:`
+            : item.kind === "agent_message"
+              ? `system message from thread "${title}" (${item.threadId}) — the worker wrote a note:`
+              : `system message from thread "${title}" (${item.threadId}) — progress${item.collapsed > 1 ? ` (${item.collapsed} frames collapsed, newest only)` : ""}:`;
       return [head, fence(item.text || "(no text)")].join("\n");
     });
     const refs: TelegramThreadEventRef[] = items.map((item) => ({

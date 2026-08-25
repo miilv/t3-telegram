@@ -40,6 +40,13 @@ export interface ThreadDigestContext {
   title?: string;
   /** Terminal delivery epoch of the thread at the moment of the event. */
   epoch?: string;
+  /**
+   * Who is speaking. `worker` (the default) is the work itself; `daemon` is the
+   * runtime reporting ABOUT the work — a lost subscription, a follow-up it
+   * dispatched, notes it failed to deliver. The envelope must say which, or a
+   * section headed "the worker wrote a note" contradicts its own content.
+   */
+  source?: "worker" | "daemon";
 }
 
 export type ThreadDigestEvent = ThreadDigestContext &
@@ -98,6 +105,7 @@ export class ThreadEventDigest {
     const context: ThreadDigestContext = {
       ...(event.title !== undefined ? { title: event.title } : {}),
       ...(event.epoch !== undefined ? { epoch: event.epoch } : {}),
+      ...(event.source !== undefined ? { source: event.source } : {}),
     };
     if (event.kind === "progress") this.pushProgress(event.threadId, event.text, at, context);
     else if (event.kind === "agent_message") this.pushAgentMessage(event.threadId, event.text, at, context);

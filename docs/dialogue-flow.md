@@ -849,7 +849,14 @@ lane derived from the payload (digest → `thread-events`, `automationRunId` →
 was the earlier shape and was wrong: automation runs and button replays landed
 in the owner's lane and overtook them by FIFO.
 
-Two escapes keep that strictness from stranding anything:
+Each drain claims in STRICT PRIORITY TIERS: it tries its own lane first and
+only falls through to a fallback tier when that lane is empty. This matters
+because claims are FIFO by creation time — a single predicate covering both the
+owner's messages and escalated background jobs handed over the older automation
+run while a fresh message waited behind it, re-creating the very overtaking the
+escalation exists to prevent.
+
+Two fallback tiers keep that strictness from stranding anything:
 
 - the `background` drain is a safety net — it also claims any job older than
   `INGRESS_ESCALATION_MS` (60 s), whatever lane it belongs to;
@@ -909,14 +916,20 @@ tracked as package 1.2 debt in the roadmap.
 
 Things the daemon knows about a work but no longer says itself — a lost
 subscription, a dispatched follow-up, an automatic recovery attempt, notes it
-failed to interpret — go into the digest as `[сообщение демона, не слова
-воркера]` sections, so the Operator decides whether the owner needs them and
-never attributes them to the worker.
+failed to interpret — go into the digest with their own section header
+(`system message ABOUT thread … this is the DAEMON reporting the state of the
+work`), so the Operator decides whether the owner needs them and never
+attributes them to the worker. They are carried as `source: "daemon"` on the
+digest item; the content still rides inside the turn's `worker` fence, which
+over-claims untrustworthiness in the safe direction.
 
 A worker note that the broker replays on resubscribe is remembered per thread
-(`thread_relayed_notes:<threadId>`, last 20 hashes, wiped when the thread starts
-a new turn), so a replay cannot open a second turn once the digest's in-window
-dedupe has expired.
+(`thread_relayed_notes:<threadId>`, last 20 hashes), so a replay cannot open a
+second turn once the digest's in-window dedupe has expired. The memory lives for
+exactly one worker turn: it is wiped in `resetThreadTerminalDelivery`, which is
+the single place that means "a new turn starts here" (tool dispatch, follow-up,
+recovery). Otherwise a worker that opens every turn with the same sentence would
+be heard once and silently swallowed forever after.
 
 A turn that ends in deliberate silence leaves `operator_turn_silent:<opturnId>`;
 a replayed job recognises it and settles without spending a second provider turn

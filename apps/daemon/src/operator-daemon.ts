@@ -158,30 +158,39 @@ function ingressAgeMs(payload: DurableTelegramIngress, now: number): number {
 }
 
 /**
- * Claim predicate for one lane's drain.
+ * Claim predicates for one lane's drain, in STRICT PRIORITY ORDER. A drain
+ * tries the first tier and only falls through to the next when that tier has
+ * nothing waiting.
  *
- * The `background` drain is a SAFETY NET, not a second general queue: claiming
- * anything it liked let it run a thread-event digest while the owner's message
- * waited on the (higher) user lane — the priority the lanes express evaporated
- * at the job table. It takes its own jobs, plus anything that has been sitting
- * around long enough to count as stranded.
+ * The tiers matter: `claimBackgroundJob` is FIFO by `created_at`, so a single
+ * predicate that accepted both the owner's messages and escalated background
+ * jobs handed over the older automation run while a fresh message of the
+ * owner's sat behind it — the escalation quietly re-created the very overtaking
+ * it exists to prevent. Escalation is a fallback, never a competitor.
+ *
+ * The `background` drain is likewise a SAFETY NET, not a second general queue:
+ * claiming anything it liked let it run a thread-event digest while the owner
+ * waited on the higher lane.
  */
-export function ingressClaim(lane: IngressLane): (payload: DurableTelegramIngress) => boolean {
+export function ingressClaims(
+  lane: IngressLane,
+): Array<(payload: DurableTelegramIngress) => boolean> {
+  const strict = (payload: DurableTelegramIngress): boolean => ingressLane(payload) === lane;
   if (lane === "user") {
-    return (payload) => {
-      const own = ingressLane(payload);
-      if (own === "user") return true;
-      // Escalation: an aged one-shot background job rides the owner's lane
-      // rather than waiting for a quiet minute that may never come.
-      return own === "background" && ingressAgeMs(payload, Date.now()) > INGRESS_ESCALATION_MS;
-    };
+    return [
+      strict,
+      // An aged one-shot background job rides the owner's lane rather than
+      // waiting for a quiet minute that may never come — but only once no
+      // owner message is waiting at all.
+      (payload) =>
+        ingressLane(payload) === "background" &&
+        ingressAgeMs(payload, Date.now()) > INGRESS_ESCALATION_MS,
+    ];
   }
   if (lane === "background") {
-    return (payload) =>
-      ingressLane(payload) === "background" ||
-      ingressAgeMs(payload, Date.now()) > INGRESS_ESCALATION_MS;
+    return [strict, (payload) => ingressAgeMs(payload, Date.now()) > INGRESS_ESCALATION_MS];
   }
-  return (payload) => ingressLane(payload) === lane;
+  return [strict];
 }
 
 interface DurableT3Dispatch {
@@ -526,7 +535,7 @@ export class OperatorDaemon {
               ),
             );
             void this.operatorInputQueue
-              .run("user", () => this.drainTelegramIngress(ingressClaim("user")))
+              .run("user", () => this.drainTelegramIngress(ingressClaims("user")))
               .catch((error) => this.logUpdateFailure(error, update.updateId))
               .finally(() => {
                 metrics.observe("telegram_update_latency_ms", Date.now() - receivedAt, {
@@ -2280,7 +2289,6 @@ export class OperatorDaemon {
       // Package 1.2: "I have started the queued follow-up" is state of the
       // work, not a message the daemon owes the chat. The Operator hears it and
       // decides — and the follow-up's own outcome will be relayed anyway.
-      this.voice.forgetRelayedNotes(threadId);
       this.voice.noteDaemonFact(
         threadId,
         { chatId: job.payload.chatId, destination: job.payload.destination },
@@ -2856,7 +2864,7 @@ export class OperatorDaemon {
     );
     await this.flushTelegramOutbox();
     void this.operatorInputQueue
-      .run("user", () => this.drainTelegramIngress(ingressClaim("user")))
+      .run("user", () => this.drainTelegramIngress(ingressClaims("user")))
       .catch((error) => this.logUpdateFailure(error, update.updateId));
   }
 
@@ -3101,6 +3109,12 @@ export class OperatorDaemon {
     this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, "");
     const epoch = Number(this.store.getRuntimeState(`thread_terminal_epoch:${threadId}`) ?? "0");
     this.store.setRuntimeState(`thread_terminal_epoch:${threadId}`, String(epoch + 1));
+    // Package 1.2: this is THE place that means "a new worker turn starts here",
+    // so it is where the replay memory of the worker's notes is dropped. Kept
+    // anywhere else, a worker that opens every turn with the same sentence
+    // ("Готово, проверяю тесты.") would be heard once and then silently
+    // swallowed for the rest of the thread's life.
+    this.voice.forgetRelayedNotes(threadId);
   }
 
   /**
@@ -3375,7 +3389,7 @@ export class OperatorDaemon {
       .run("thread-events", async () => {
         this.threadEventDrainQueued = false;
         await this.drainTelegramIngress(
-          ingressClaim("thread-events"),
+          ingressClaims("thread-events"),
           // The owner is waiting in the chat: stop after the interpretation in
           // hand and give them the queue.
           () => this.operatorInputQueue.depth("user") > 0,
@@ -4523,7 +4537,7 @@ export class OperatorDaemon {
       .run("background", async () => {
         this.backgroundDrainQueued = false;
         await this.drainTelegramIngress(
-          ingressClaim("background"),
+          ingressClaims("background"),
           () => this.operatorInputQueue.depth("user") > 0,
           () => this.queueBackgroundIngressDrain(),
         );
@@ -4740,15 +4754,19 @@ export class OperatorDaemon {
    * pass no filter: whatever is left must eventually run.
    */
   private async drainTelegramIngress(
-    filter: (payload: DurableTelegramIngress) => boolean = () => true,
+    tiers: Array<(payload: DurableTelegramIngress) => boolean> = [() => true],
     yieldWhen?: () => boolean,
     requeue?: () => void,
   ): Promise<void> {
+    const claim = (): BackgroundJob<DurableTelegramIngress> | undefined => {
+      for (const tier of tiers) {
+        const job = this.store.claimBackgroundJob<DurableTelegramIngress>("telegram_ingress", tier);
+        if (job) return job;
+      }
+      return undefined;
+    };
     for (let index = 0; index < 50; index += 1) {
-      const job = this.store.claimBackgroundJob<DurableTelegramIngress>(
-        "telegram_ingress",
-        filter,
-      );
+      const job = claim();
       if (!job) return;
       try {
         await this.handleUpdate(job.payload.update, job.payload.processExisting);
