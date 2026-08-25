@@ -139,6 +139,15 @@ interface DurableT3Dispatch {
  */
 const MAX_PENDING_APPROVALS_PER_CHAT = 4;
 
+/** A dead T3 must not hang the maintenance tick behind a socket read. */
+const APPROVAL_DISPATCH_TIMEOUT_MS = 15_000;
+
+/** How long a claimed ("expiring") row may stay claimed before it is released. */
+const APPROVAL_CLAIM_LEASE_MS = 5 * 60 * 1_000;
+
+/** After this many failed declines the request is retired locally instead of warning every minute. */
+const APPROVAL_EXPIRY_MAX_ATTEMPTS = 5;
+
 interface DurableTelegramPayload {
   text?: string;
   path?: string;
@@ -191,6 +200,9 @@ export class OperatorDaemon {
    */
   private readonly workerCompletionQueue = new ConcurrentQueue(8);
   private readonly maintenanceQueue = new SerialQueue();
+  // Pending approvals are a shared per-chat resource; two worker events landing
+  // together on the concurrent event queue must not both evict the same row.
+  private readonly approvalCapQueue = new SerialQueue();
   private readonly outboxQueue = new SerialQueue();
   private readonly t3DispatchQueue = new SerialQueue();
   private readonly monitors = new Map<string, AbortController>();
@@ -359,6 +371,7 @@ export class OperatorDaemon {
     await this.workerEventQueue.idle();
     await this.workerCompletionQueue.idle();
     await this.maintenanceQueue.idle();
+    await this.approvalCapQueue.idle();
     await this.outboxQueue.idle();
     await this.t3DispatchQueue.idle();
     await this.reliabilityTask;
@@ -1631,7 +1644,7 @@ export class OperatorDaemon {
         );
       }
     }
-    await this.enforcePendingApprovalCap(chatId, id);
+    const evicted = await this.enforcePendingApprovalCap(chatId, id);
     const mediation = await this.mediateApproval(event, thread?.title, risk);
     if (mediation) {
       const saved = this.store.getApproval(id);
@@ -1640,10 +1653,22 @@ export class OperatorDaemon {
       }
     }
     const savedApproval = this.store.getApproval(id);
-    const approvalText = renderApprovalPrompt(
-      savedApproval && isRecord(savedApproval.payload) ? savedApproval.payload : {},
-      thread?.title ?? event.threadId,
-    );
+    // The evicted card is edited in place, but the owner has already scrolled
+    // past it, so the new card says what it cost to make room.
+    const approvalText = [
+      renderApprovalPrompt(
+        savedApproval && isRecord(savedApproval.payload) ? savedApproval.payload : {},
+        thread?.title ?? event.threadId,
+      ),
+      ...(evicted
+        ? [
+            "",
+            evicted === 1
+              ? "Чтобы освободить место, самый старый запрос отклонён."
+              : `Чтобы освободить место, отклонены самые старые запросы (${evicted}).`,
+          ]
+        : []),
+    ].join("\n");
     const anchor = this.interactionAnchor(event.threadId, chatId);
     const sent = anchor
       ? (await this.telegram.editApproval(chatId, anchor.messageId, approvalText, id), {
@@ -1668,18 +1693,28 @@ export class OperatorDaemon {
   /**
    * The new request is never dropped: the oldest unanswered one is declined so
    * the chat keeps at most MAX_PENDING_APPROVALS_PER_CHAT live keyboards.
+   *
+   * Serialized per daemon and recomputed on every iteration: two worker events
+   * arriving together on the concurrent event queue would otherwise both decide
+   * from the same snapshot and evict the same row twice.
    */
-  private async enforcePendingApprovalCap(chatId: number, incomingId: string): Promise<void> {
-    const siblings = this.store
-      .listPendingApprovals()
-      .filter((candidate) => candidate.id !== incomingId && candidate.chatId === chatId);
-    const overflow = siblings.length - (MAX_PENDING_APPROVALS_PER_CHAT - 1);
-    if (overflow <= 0) return;
-    let evicted = 0;
-    for (const stale of siblings.slice(0, overflow)) {
-      if (await this.retireApproval(stale, "superseded")) evicted += 1;
-    }
-    if (evicted) await this.flushTelegramOutbox();
+  private async enforcePendingApprovalCap(chatId: number, incomingId: string): Promise<number> {
+    return this.approvalCapQueue.run(async () => {
+      const attempted = new Set<string>();
+      let evicted = 0;
+      for (;;) {
+        const siblings = this.store
+          .listPendingApprovals(chatId)
+          .filter((candidate) => candidate.id !== incomingId);
+        if (siblings.length <= MAX_PENDING_APPROVALS_PER_CHAT - 1) break;
+        const oldest = siblings.find((candidate) => !attempted.has(candidate.id));
+        if (!oldest) break;
+        attempted.add(oldest.id);
+        if (await this.retireApproval(oldest, "superseded")) evicted += 1;
+      }
+      if (evicted) await this.flushTelegramOutbox();
+      return evicted;
+    });
   }
 
   private async requestUserInput(
@@ -1833,7 +1868,7 @@ export class OperatorDaemon {
     const approval = this.store.findPendingApprovalByT3(event.threadId, event.approvalId);
     if (!approval) return;
     this.store.resolveApproval(approval.id, event.decision ?? "resolved-externally");
-    this.observeApprovalWait(approval.id);
+    this.observeApprovalWait(approval.id, "external");
     this.store.appendEvent("approval.resolved", {
       threadId: event.threadId,
       payload: { decision: event.decision, external: true },
@@ -1849,9 +1884,16 @@ export class OperatorDaemon {
     }
   }
 
-  private observeApprovalWait(approvalId: string): void {
+  private observeApprovalWait(
+    approvalId: string,
+    outcome: "answered" | "expired" | "superseded" | "external",
+  ): void {
     const requestedAt = Date.parse(this.store.getRuntimeState(`approval_requested_at:${approvalId}`) ?? "");
-    if (Number.isFinite(requestedAt)) metrics.observe("approval_wait_ms", Date.now() - requestedAt);
+    // Without the label, six-hour synthetic tails from expiry drown the real
+    // human answer latency in the same p95.
+    if (Number.isFinite(requestedAt)) {
+      metrics.observe("approval_wait_ms", Date.now() - requestedAt, { outcome });
+    }
   }
 
   private approvalTtlMs(): number {
@@ -1860,8 +1902,15 @@ export class OperatorDaemon {
 
   private approvalTtlLabel(): string {
     const hours = this.config.approval.ttlHours;
-    if (hours >= 1) return `${Math.round(hours)} ч`;
-    return `${Math.max(1, Math.round(hours * 60))} мин`;
+    // Rounding 1.5 h to "2 ч" would misreport the deadline the owner missed.
+    if (hours < 2) return `${Math.max(1, Math.round(hours * 60))} мин`;
+    return `${hours.toFixed(1).replace(/\.0$/, "").replace(".", ",")} ч`;
+  }
+
+  private approvalClosingText(cause: "expired" | "superseded"): string {
+    return cause === "expired"
+      ? `Запрос истёк без ответа (${this.approvalTtlLabel()}) — действие отклонено.`
+      : `Запрос вытеснен новыми (ожидающих больше ${MAX_PENDING_APPROVALS_PER_CHAT}) — действие отклонено.`;
   }
 
   private isApprovalExpired(
@@ -1877,12 +1926,19 @@ export class OperatorDaemon {
    * Resolve a request the owner never answered. The worker is waiting on a
    * decision, so an unanswered request must still reach T3 as a decline —
    * otherwise the thread hangs forever.
+   *
+   * The status claim comes first and the broker call second: the sweep and a
+   * button press live on different queues, so only the caller that flips
+   * `pending` may dispatch. A failed dispatch releases the claim, and a claim
+   * whose owner died is released by the next sweep through its lease.
    */
   private async retireApproval(
     approval: NonNullable<ReturnType<OperatorStore["getApproval"]>>,
     cause: "expired" | "superseded",
   ): Promise<boolean> {
+    if (!this.store.resolveApproval(approval.id, "expiring", "pending")) return false;
     const reason = cause === "expired" ? "approval expired" : "approval superseded";
+    const attemptsKey = `approval_expiry_attempts:${approval.id}`;
     try {
       await this.broker.respondApproval({
         threadId: approval.threadId,
@@ -1890,55 +1946,81 @@ export class OperatorDaemon {
         commandId: `approval:${cause}:${approval.threadId}:${approval.t3ApprovalId}`,
         decision: "decline",
         reason,
+        timeoutMs: APPROVAL_DISPATCH_TIMEOUT_MS,
       });
     } catch (error) {
-      this.logger.warn(
-        { err: error, threadId: approval.threadId, approvalId: approval.id, cause },
-        "Could not decline a stale approval; it stays pending for the next sweep",
+      const attempts = Number(this.store.getRuntimeState(attemptsKey) ?? "0") + 1;
+      this.store.setRuntimeState(attemptsKey, String(attempts));
+      if (attempts < APPROVAL_EXPIRY_MAX_ATTEMPTS) {
+        this.store.resolveApproval(approval.id, "pending", "expiring");
+        this.logger.warn(
+          { err: error, threadId: approval.threadId, approvalId: approval.id, cause, attempts },
+          "Could not decline a stale approval; it stays pending for the next sweep",
+        );
+        return false;
+      }
+      // Fuse: a decline T3 will never take must still stop occupying a live
+      // keyboard and stop warning every minute.
+      this.store.resolveApproval(approval.id, `${cause}-undelivered`, "expiring");
+      this.observeApprovalWait(approval.id, cause === "expired" ? "expired" : "superseded");
+      this.store.appendEvent("approval.expiry.undelivered", {
+        threadId: approval.threadId,
+        payload: { approvalId: approval.id, cause, attempts },
+      });
+      this.logger.error(
+        { err: error, threadId: approval.threadId, approvalId: approval.id, cause, attempts },
+        "Gave up delivering an approval decline to T3; the request is retired locally",
       );
-      return false;
+      this.closeApprovalCard(
+        approval,
+        cause,
+        "Не удалось передать отказ воркеру — проверьте тред в T3.",
+      );
+      return true;
     }
-    this.store.resolveApproval(approval.id, cause);
-    this.observeApprovalWait(approval.id);
+    this.store.resolveApproval(approval.id, cause, "expiring");
+    this.store.setRuntimeState(attemptsKey, "0");
+    this.observeApprovalWait(approval.id, cause === "expired" ? "expired" : "superseded");
     this.store.appendEvent("approval.resolved", {
       threadId: approval.threadId,
       payload: { approvalId: approval.id, decision: "decline", automatic: true, reason },
     });
-    if (approval.chatId !== undefined && approval.messageId !== undefined) {
-      const payload = isRecord(approval.payload) ? approval.payload : {};
-      const closing = cause === "expired"
-        ? `Запрос истёк без ответа (${this.approvalTtlLabel()}) — действие отклонено.`
-        : `Запрос вытеснен новыми (ожидающих больше ${MAX_PENDING_APPROVALS_PER_CHAT}) — действие отклонено.`;
-      this.enqueueTelegramOutbox(
-        `telegram:approval:${approval.id}:${cause}`,
-        approval.chatId,
-        "rich",
-        {
-          text: [
-            renderApprovalPrompt(
-              payload,
-              this.store.getThread(approval.threadId)?.title ?? approval.threadId,
-            ),
-            "",
-            closing,
-          ].join("\n"),
-          options: {},
-          editMessageId: approval.messageId,
-          threadId: approval.threadId,
-          messageType: cause === "expired" ? "approval_expired" : "approval_superseded",
-          correlationId: this.store.getRuntimeState(`thread_correlation_id:${approval.threadId}`)
-            ?? `approval:${approval.id}`,
-        },
-      );
-      this.enqueueKeyboardCleanup(
-        approval.chatId,
-        approval.messageId,
-        approval.threadId,
-        this.store.getRuntimeState(`thread_correlation_id:${approval.threadId}`)
-          ?? `approval:${approval.id}`,
-      );
-    }
+    this.closeApprovalCard(approval, cause);
     return true;
+  }
+
+  /** Rewrite a retired request's own message and take its keyboard away. */
+  private closeApprovalCard(
+    approval: NonNullable<ReturnType<OperatorStore["getApproval"]>>,
+    cause: "expired" | "superseded",
+    note?: string,
+  ): void {
+    if (approval.chatId === undefined || approval.messageId === undefined) return;
+    const payload = isRecord(approval.payload) ? approval.payload : {};
+    const correlationId = this.store.getRuntimeState(`thread_correlation_id:${approval.threadId}`)
+      ?? `approval:${approval.id}`;
+    this.enqueueTelegramOutbox(
+      `telegram:approval:${approval.id}:${cause}`,
+      approval.chatId,
+      "rich",
+      {
+        text: [
+          renderApprovalPrompt(
+            payload,
+            this.store.getThread(approval.threadId)?.title ?? approval.threadId,
+          ),
+          "",
+          this.approvalClosingText(cause),
+          ...(note ? [note] : []),
+        ].join("\n"),
+        options: {},
+        editMessageId: approval.messageId,
+        threadId: approval.threadId,
+        messageType: cause === "expired" ? "approval_expired" : "approval_superseded",
+        correlationId,
+      },
+    );
+    this.enqueueKeyboardCleanup(approval.chatId, approval.messageId, approval.threadId, correlationId);
   }
 
   /**
@@ -1947,6 +2029,15 @@ export class OperatorDaemon {
    */
   private async sweepExpiredApprovals(): Promise<number> {
     const now = Date.now();
+    const leaseCutoff = new Date(now - APPROVAL_CLAIM_LEASE_MS).toISOString();
+    for (const stranded of this.store.listStaleApprovalClaims(leaseCutoff)) {
+      if (this.store.resolveApproval(stranded.id, "pending", "expiring")) {
+        this.logger.warn(
+          { approvalId: stranded.id, threadId: stranded.threadId },
+          "Released an approval claim left behind by an interrupted expiry",
+        );
+      }
+    }
     let expired = 0;
     for (const approval of this.store.listPendingApprovals()) {
       if (!this.isApprovalExpired(approval, now)) continue;
@@ -2641,7 +2732,7 @@ export class OperatorDaemon {
       .listPendingApprovals()
       .find((candidate) => compactCallbackToken(candidate.id) === match[1]!);
     if (!approval || approval.status !== "pending") {
-      await this.telegram.answerCallback(update.callbackId, "Approval is no longer pending");
+      await this.telegram.answerCallback(update.callbackId, "Запрос уже неактивен");
       if (approval?.chatId !== undefined && approval.messageId !== undefined) {
         this.enqueueKeyboardCleanup(approval.chatId, approval.messageId, approval.threadId, eventKey);
         await this.flushTelegramOutbox();
@@ -2650,23 +2741,68 @@ export class OperatorDaemon {
       return;
     }
     if (!this.isAdministrator(update.userId)) {
-      await this.telegram.answerCallback(update.callbackId, "Only an owner or admin can resolve approvals");
+      await this.telegram.answerCallback(
+        update.callbackId,
+        "Решать по запросам разрешения может только владелец или админ",
+      );
       this.store.completeEvent(eventKey);
       return;
     }
     const decision =
       match[2] === "1" ? "accept" : match[2] === "s" ? "acceptForSession" : "decline";
-    // Answer the callback first, like every other branch: a throw further down
-    // must not leave the button spinning forever.
-    await this.telegram.answerCallback(update.callbackId, decision.startsWith("accept") ? "Allowed" : "Denied");
-    await this.broker.respondApproval({
-      threadId: approval.threadId,
-      approvalId: approval.t3ApprovalId,
-      commandId: `callback:${update.callbackId}`,
-      decision,
-    });
-    this.store.resolveApproval(approval.id, decision);
-    this.observeApprovalWait(approval.id);
+    // Claim before anything else: a local compare-and-set cannot hang, and it
+    // makes the maintenance sweep back off this row.
+    if (!this.store.resolveApproval(approval.id, "deciding", "pending")) {
+      await this.telegram.answerCallback(update.callbackId, "Запрос уже неактивен");
+      if (approval.chatId !== undefined && approval.messageId !== undefined) {
+        this.enqueueKeyboardCleanup(approval.chatId, approval.messageId, approval.threadId, eventKey);
+        await this.flushTelegramOutbox();
+      }
+      this.store.completeEvent(eventKey);
+      return;
+    }
+    // Answer first, like every other branch, so a throw below cannot leave the
+    // button spinning — but neutrally: "Разрешено" before T3 has taken the
+    // decision would be a promise we cannot keep. Telegram allows one answer
+    // per callback, so the outcome is reported by the card, not a second toast.
+    await this.telegram.answerCallback(update.callbackId, "Принимаю…");
+    try {
+      await this.broker.respondApproval({
+        threadId: approval.threadId,
+        approvalId: approval.t3ApprovalId,
+        commandId: `callback:${update.callbackId}`,
+        decision,
+        timeoutMs: APPROVAL_DISPATCH_TIMEOUT_MS,
+      });
+    } catch (error) {
+      // The keyboard deliberately stays live: pressing again is the recovery.
+      this.store.resolveApproval(approval.id, "pending", "deciding");
+      this.store.appendEvent("approval.decision.failed", {
+        threadId: approval.threadId,
+        payload: { approvalId: approval.id, decision, errorCode: classifyOperationalError(error, "t3").code },
+      });
+      this.logger.warn(
+        { err: error, threadId: approval.threadId, approvalId: approval.id, decision },
+        "Approval decision could not be delivered to T3; the keyboard stays live",
+      );
+      this.enqueueTelegramOutbox(
+        `telegram:approval:${approval.id}:decision-failed:${update.callbackId}`,
+        update.chatId,
+        "rich",
+        {
+          text: "Не удалось передать решение воркеру. Нажмите кнопку ещё раз.",
+          options: {},
+          threadId: approval.threadId,
+          messageType: "approval_decision_failed",
+          correlationId: eventKey,
+        },
+      );
+      this.store.completeEvent(eventKey);
+      await this.flushTelegramOutbox();
+      return;
+    }
+    this.store.resolveApproval(approval.id, decision, "deciding");
+    this.observeApprovalWait(approval.id, "answered");
     this.store.appendEvent("approval.resolved", { threadId: approval.threadId, payload: { decision } });
     if (approval.chatId !== undefined && approval.messageId !== undefined) {
       this.enqueueKeyboardCleanup(approval.chatId, approval.messageId, approval.threadId, eventKey);

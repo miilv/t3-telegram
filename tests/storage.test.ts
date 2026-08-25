@@ -33,6 +33,45 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("hands a pending approval to exactly one claimant and filters pending rows by chat", () => {
+    const store = tempStore();
+    const backdated = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
+    store.saveApproval({
+      id: "approval_a",
+      t3ApprovalId: "t3_a",
+      threadId: "th_1",
+      payload: { summary: "a" },
+      chatId: 7,
+      createdAt: backdated,
+    });
+    store.saveApproval({
+      id: "approval_b",
+      t3ApprovalId: "t3_b",
+      threadId: "th_1",
+      payload: { summary: "b" },
+      chatId: 8,
+    });
+
+    expect(store.listPendingApprovals(7).map((entry) => entry.id)).toEqual(["approval_a"]);
+    expect(store.listPendingApprovals().map((entry) => entry.id)).toEqual(["approval_a", "approval_b"]);
+
+    // Two racing claimants, one winner: the loser must not also talk to T3.
+    expect(store.resolveApproval("approval_a", "expiring", "pending")).toBe(true);
+    expect(store.resolveApproval("approval_a", "deciding", "pending")).toBe(false);
+    expect(store.getApproval("approval_a")?.status).toBe("expiring");
+    expect(store.listPendingApprovals(7)).toHaveLength(0);
+
+    // A claim only becomes a resolution from the state it claimed.
+    expect(store.resolveApproval("approval_a", "expired", "expiring")).toBe(true);
+    expect(store.getApproval("approval_a")?.status).toBe("expired");
+
+    store.resolveApproval("approval_b", "expiring", "pending");
+    expect(store.listStaleApprovalClaims(new Date(Date.now() - 60_000).toISOString())).toHaveLength(0);
+    expect(store.listStaleApprovalClaims(new Date(Date.now() + 60_000).toISOString()).map((e) => e.id)).toEqual([
+      "approval_b",
+    ]);
+  });
+
   it("persists message mappings idempotently and restores reply context", () => {
     const store = tempStore();
     const createdAt = nowIso();

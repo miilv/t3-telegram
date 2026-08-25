@@ -1782,6 +1782,404 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("keeps an expired approval pending and silent while T3 is unreachable, then retries next tick", async () => {
+    const home = tempDirectory("daemon-approval-ttl-outage-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    class OutageBroker extends FakeBroker {
+      failures = 1;
+      override async respondApproval(input: ApprovalDecision): Promise<void> {
+        if (this.failures > 0) {
+          this.failures -= 1;
+          throw new Error("connect ECONNREFUSED 127.0.0.1:1");
+        }
+        await super.respondApproval(input);
+      }
+    }
+    const broker = new OutageBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_outage",
+      t3ApprovalId: "t3_outage",
+      threadId: "th_outage",
+      payload: { summary: "Delete generated database" },
+      chatId: 7,
+      messageId: 561,
+      createdAt: new Date(Date.now() - 7 * 60 * 60 * 1_000).toISOString(),
+    });
+    const run = daemon.run();
+
+    await scheduler.trigger();
+
+    // Nothing was told to the owner and nothing was told to T3, so the request
+    // is still the owner's to answer.
+    expect(broker.approvalResponses).toHaveLength(0);
+    expect(store.getApproval("approval_outage")?.status).toBe("pending");
+    expect(telegram.sent.some((entry) => entry.messageId === 561)).toBe(false);
+    expect(telegram.keyboardClears).not.toContain(561);
+
+    await scheduler.trigger();
+
+    expect(broker.approvalResponses).toHaveLength(1);
+    expect(broker.approvalResponses[0]).toMatchObject({ decision: "decline", reason: "approval expired" });
+    expect(store.getApproval("approval_outage")?.status).toBe("expired");
+    expect(telegram.keyboardClears).toContain(561);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("retires an expired approval exactly once across repeated maintenance ticks", async () => {
+    const home = tempDirectory("daemon-approval-ttl-idempotent-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_once",
+      t3ApprovalId: "t3_once",
+      threadId: "th_once",
+      payload: { summary: "Delete generated database" },
+      chatId: 7,
+      messageId: 562,
+      createdAt: new Date(Date.now() - 7 * 60 * 60 * 1_000).toISOString(),
+    });
+    const run = daemon.run();
+
+    await scheduler.trigger();
+    const editsAfterFirstTick = telegram.sent.filter((entry) => entry.messageId === 562).length;
+    const clearsAfterFirstTick = telegram.keyboardClears.filter((id) => id === 562).length;
+    await scheduler.trigger();
+    await scheduler.trigger();
+
+    expect(broker.approvalResponses).toHaveLength(1);
+    expect(editsAfterFirstTick).toBe(1);
+    expect(telegram.sent.filter((entry) => entry.messageId === 562)).toHaveLength(editsAfterFirstTick);
+    expect(telegram.keyboardClears.filter((id) => id === 562)).toHaveLength(clearsAfterFirstTick);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("lets a button press lose cleanly to a sweep that is already declining the same request", async () => {
+    const home = tempDirectory("daemon-approval-sweep-race-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    let releaseExpiry: (() => void) | undefined;
+    const expiryInFlight = new Promise<void>((resolve) => {
+      releaseExpiry = resolve;
+    });
+    let sawExpiryDispatch: (() => void) | undefined;
+    const expiryStarted = new Promise<void>((resolve) => {
+      sawExpiryDispatch = resolve;
+    });
+    class GatedBroker extends FakeBroker {
+      override async respondApproval(input: ApprovalDecision): Promise<void> {
+        if (input.reason === "approval expired") {
+          sawExpiryDispatch?.();
+          await expiryInFlight;
+        }
+        await super.respondApproval(input);
+      }
+    }
+    const broker = new GatedBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_race",
+      t3ApprovalId: "t3_race",
+      threadId: "th_race",
+      payload: { summary: "Delete generated database" },
+      chatId: 7,
+      messageId: 565,
+      createdAt: new Date(Date.now() - 7 * 60 * 60 * 1_000).toISOString(),
+    });
+    const run = daemon.run();
+
+    // The sweep is mid-flight to T3 with the decline when the owner finally
+    // presses "Разрешить" from a card their client still shows as live.
+    const tick = scheduler.trigger();
+    await expiryStarted;
+    telegram.push(callback(1, "cb_race", 565, `a:${compactCallbackToken("approval_race")}:1`));
+    await waitFor(() => telegram.callbackAnswers.length === 1);
+    releaseExpiry?.();
+    await tick;
+
+    // One decision reaches T3, and it is the sweep's — an accept dispatched
+    // here would be applied by the worker and then overwritten by "expired".
+    expect(telegram.callbackAnswers).toEqual(["Запрос уже неактивен"]);
+    expect(broker.approvalResponses).toHaveLength(1);
+    expect(broker.approvalResponses[0]).toMatchObject({ decision: "decline", reason: "approval expired" });
+    expect(store.getApproval("approval_race")?.status).toBe("expired");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("evicts exactly one approval when two threads hit the cap at the same moment", async () => {
+    const home = tempDirectory("daemon-approval-cap-race-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /policy/u, title: "Cap race" }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      ...["race_1", "race_2", "race_3", "race_4"].map(
+        (approvalId): WorkerEvent => ({
+          type: "approval_required",
+          threadId: "th_1",
+          approvalId,
+          summary: `Delete generated database ${approvalId}`,
+          requestKind: "command",
+          requestType: "command_execution_approval",
+          detail: "rm -rf data",
+        }),
+      ),
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "run a policy cap race test"));
+    await waitFor(() => store.listPendingApprovals().length === 4);
+
+    // Two independent worker events reaching the concurrent event queue at the
+    // same instant against a chat that is already full.
+    const ask = (approvalId: string): Promise<void> =>
+      (daemon as unknown as {
+        requestApproval(chatId: number, event: WorkerEvent): Promise<void>;
+      }).requestApproval(7, {
+        type: "approval_required",
+        threadId: "th_1",
+        approvalId,
+        summary: `Delete generated database ${approvalId}`,
+        requestKind: "command",
+        requestType: "command_execution_approval",
+        detail: "rm -rf data",
+      });
+    await Promise.all([ask("race_5"), ask("race_6")]);
+
+    // Six requests, a cap of four: exactly two evictions, each a single decline.
+    expect(broker.approvalResponses).toHaveLength(2);
+    expect(broker.approvalResponses.map((entry) => entry.approvalId)).toEqual(["race_1", "race_2"]);
+    expect(broker.approvalResponses.every((entry) => entry.reason === "approval superseded")).toBe(true);
+    const pending = store.listPendingApprovals();
+    expect(pending).toHaveLength(4);
+    expect(pending.map((entry) => entry.t3ApprovalId)).toEqual(["race_3", "race_4", "race_5", "race_6"]);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("keeps the buttons live and says so when an approval decision cannot reach T3", async () => {
+    const home = tempDirectory("daemon-approval-dispatch-fail-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const order: string[] = [];
+    class FailingDispatchBroker extends FakeBroker {
+      override async respondApproval(input: ApprovalDecision): Promise<void> {
+        order.push(`broker:${input.decision}`);
+        throw new Error("T3 503 Service Unavailable");
+      }
+    }
+    class OrderedTelegram extends FakeTelegram {
+      override async answerCallback(callbackId: string, text?: string): Promise<void> {
+        order.push(`answer:${text ?? ""}`);
+        await super.answerCallback(callbackId, text);
+      }
+    }
+    const broker = new FailingDispatchBroker();
+    const telegram = new OrderedTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_dispatch_fail",
+      t3ApprovalId: "t3_dispatch_fail",
+      threadId: "th_fail",
+      payload: { summary: "Run tests" },
+      chatId: 7,
+      messageId: 779,
+    });
+    const run = daemon.run();
+
+    telegram.push(callback(1, "cb_fail", 779, `a:${compactCallbackToken("approval_dispatch_fail")}:1`));
+    await waitFor(() =>
+      telegram.sent.some((entry) => entry.text.includes("Не удалось передать решение воркеру")),
+    );
+
+    // Neutral acknowledgement first, no false "Разрешено", keyboard untouched.
+    expect(order).toEqual(["answer:Принимаю…", "broker:accept"]);
+    expect(telegram.callbackAnswers).toEqual(["Принимаю…"]);
+    expect(store.getApproval("approval_dispatch_fail")?.status).toBe("pending");
+    expect(telegram.keyboardClears).not.toContain(779);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("expires a quarter-hour TTL and names the deadline in minutes", async () => {
+    const home = tempDirectory("daemon-approval-ttl-minutes-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    const testConfig = { ...config(home), approval: { autoAllow: [], ttlHours: 0.25 } };
+    daemon = new OperatorDaemon(testConfig, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_minutes",
+      t3ApprovalId: "t3_minutes",
+      threadId: "th_minutes",
+      payload: { summary: "Delete generated database" },
+      chatId: 7,
+      messageId: 563,
+      createdAt: new Date(Date.now() - 20 * 60 * 1_000).toISOString(),
+    });
+    const run = daemon.run();
+
+    await scheduler.trigger();
+
+    expect(store.getApproval("approval_minutes")?.status).toBe("expired");
+    expect(
+      telegram.sent.some(
+        (entry) =>
+          entry.messageId === 563 && entry.text.includes("Запрос истёк без ответа (15 мин) — действие отклонено."),
+      ),
+    ).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("tells the owner an expired card is no longer active instead of pretending to act", async () => {
+    const home = tempDirectory("daemon-approval-expired-press-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    store.saveApproval({
+      id: "approval_gone",
+      t3ApprovalId: "t3_gone",
+      threadId: "th_gone",
+      payload: { summary: "Delete generated database" },
+      chatId: 7,
+      messageId: 564,
+      createdAt: new Date(Date.now() - 7 * 60 * 60 * 1_000).toISOString(),
+    });
+    const run = daemon.run();
+
+    await scheduler.trigger();
+    expect(store.getApproval("approval_gone")?.status).toBe("expired");
+
+    telegram.push(callback(1, "cb_gone", 564, `a:${compactCallbackToken("approval_gone")}:1`));
+    await waitFor(() => telegram.callbackAnswers.includes("Запрос уже неактивен"));
+
+    // The expiry decline stays the only thing T3 ever heard about this request.
+    expect(broker.approvalResponses).toHaveLength(1);
+    expect(broker.approvalResponses[0]).toMatchObject({ decision: "decline", reason: "approval expired" });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("caps pending approvals per chat at four by auto-denying the oldest instead of hiding the newest", async () => {
     const home = tempDirectory("daemon-approval-cap-");
     const store = tempStore();
@@ -1893,7 +2291,7 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(callback(1, "cb_order", 778, `a:${compactCallbackToken("approval_order")}:1`));
     await waitFor(() => broker.approvalResponses.length === 1);
 
-    expect(order).toEqual(["answer:Allowed", "broker:accept"]);
+    expect(order).toEqual(["answer:Принимаю…", "broker:accept"]);
 
     telegram.finish();
     await run;

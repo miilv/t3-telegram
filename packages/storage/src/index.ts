@@ -1126,6 +1126,7 @@ export class OperatorStore {
     payload: unknown;
     chatId?: number;
     messageId?: number;
+    /** Test-only backdating; production callers let the store stamp the row. */
     createdAt?: string;
   }): void {
     const now = input.createdAt ?? nowIso();
@@ -1148,8 +1149,21 @@ export class OperatorStore {
       );
   }
 
-  resolveApproval(id: string, status: string): void {
-    this.db.prepare("UPDATE pending_approvals SET status=?,updated_at=? WHERE id=?").run(status, nowIso(), id);
+  /**
+   * Compare-and-set on status. The maintenance sweep and a button press run on
+   * different queues, so whoever loses the race must not also talk to T3: only
+   * a transition that actually claimed the row returns true.
+   */
+  resolveApproval(id: string, status: string, expected: string | readonly string[] = "pending"): boolean {
+    const allowed = typeof expected === "string" ? [expected] : [...expected];
+    const result = this.db
+      .prepare(
+        `UPDATE pending_approvals SET status=?,updated_at=? WHERE id=? AND status IN (${allowed
+          .map(() => "?")
+          .join(",")})`,
+      )
+      .run(status, nowIso(), id, ...allowed);
+    return result.changes > 0;
   }
 
   updateApprovalPayload(id: string, payload: unknown): void {
@@ -1207,11 +1221,35 @@ export class OperatorStore {
     return row ? this.getApproval(String(row.id)) : undefined;
   }
 
-  listPendingApprovals(): Array<NonNullable<ReturnType<OperatorStore["getApproval"]>>> {
+  listPendingApprovals(chatId?: number): Array<NonNullable<ReturnType<OperatorStore["getApproval"]>>> {
+    const rows = (chatId === undefined
+      ? this.db
+          .prepare("SELECT id FROM pending_approvals WHERE status='pending' ORDER BY created_at ASC, id ASC")
+          .all()
+      : this.db
+          .prepare(
+            "SELECT id FROM pending_approvals WHERE status='pending' AND telegram_chat_id=? ORDER BY created_at ASC, id ASC",
+          )
+          .all(chatId)) as Row[];
+    return rows.flatMap((row) => {
+      const approval = this.getApproval(String(row.id));
+      return approval ? [approval] : [];
+    });
+  }
+
+  /**
+   * Claims whose owner died mid-flight. Releasing them costs one extra sweep;
+   * leaving them would strand a keyboard in a status nobody looks at.
+   */
+  listStaleApprovalClaims(
+    claimedBefore: string,
+  ): Array<NonNullable<ReturnType<OperatorStore["getApproval"]>>> {
     return (
       this.db
-        .prepare("SELECT * FROM pending_approvals WHERE status='pending' ORDER BY created_at ASC, id ASC")
-        .all() as Row[]
+        .prepare(
+          "SELECT id FROM pending_approvals WHERE status='expiring' AND updated_at < ? ORDER BY created_at ASC, id ASC",
+        )
+        .all(claimedBefore) as Row[]
     ).flatMap((row) => {
       const approval = this.getApproval(String(row.id));
       return approval ? [approval] : [];
