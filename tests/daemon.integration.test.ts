@@ -683,7 +683,9 @@ describe("OperatorDaemon product flow", () => {
 
     telegram.push(message(2, "исправь race condition в auth и прогони тесты"));
     await waitFor(() => broker.turns.length === 1);
-    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу; тесты прошли")));
+    // Package 1.2: the completion reaches the owner ONLY as the Operator's own
+    // retelling — no template, no worker text.
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Работа «Auth race fix» готова")));
     expect(broker.projects).toHaveLength(1);
     expect(broker.threads).toHaveLength(1);
     const traceRows = store.db
@@ -1091,7 +1093,7 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("delivers an approval promptly while a burst of completions waits for normalization (bug №41)", async () => {
+  it("delivers an approval promptly while a burst of completions waits for the Operator's voice (bug №41, package 1.2)", async () => {
     const home = tempDirectory("daemon-approval-priority-");
     const store = tempStore();
     let releaseNormalization!: () => void;
@@ -1103,7 +1105,7 @@ describe("OperatorDaemon product flow", () => {
         prompt: string;
         toolAccess?: OperatorToolAccess;
       }): AsyncIterable<OperatorEvent> {
-        if (input.prompt.includes("Normalize this completed")) {
+        if (input.prompt.includes("system message from thread")) {
           this.normalizations += 1;
           await normalizationGate;
         }
@@ -1140,8 +1142,9 @@ describe("OperatorDaemon product flow", () => {
 
     const project = await broker.createProject({ name: "Acme", workspaceRoot: `${home}/acme` });
     store.upsertProject(project);
-    // 8 threads complete at once: every completion parks on the serial
-    // Operator runtime inside result normalization.
+    // 8 threads complete at once: their interpretation parks on the serial
+    // Operator runtime (package 1.2 — the single voice), and the monitors must
+    // not be held hostage by it.
     for (let position = 1; position <= 8; position += 1) {
       const thread = await broker.createThread({ projectId: "prj_1", title: `Job ${position}` });
       broker.eventsByThread.set(thread.id, [
@@ -1175,14 +1178,19 @@ describe("OperatorDaemon product flow", () => {
       context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: 9, operatorTurnId: "opturn_9" },
     });
     await waitFor(() => telegram.approvals.length === 1);
-    // The normalization gate is still closed: no completion has been delivered.
-    expect(telegram.sent.filter((entry) => entry.text.includes("Worker завершил"))).toHaveLength(0);
+    // The Operator is still blocked: not one completion has reached the chat.
+    expect(telegram.sent.filter((entry) => entry.text.includes("Работа «Job"))).toHaveLength(0);
     expect(telegram.approvals[0]?.text).toContain("Drop the staging database");
 
     releaseNormalization();
+    // Every finished work is eventually named — in one message or in a few,
+    // because the digest coalesces whatever accumulated while a turn ran.
     await waitFor(
-      () => telegram.sent.filter((entry) => entry.text.includes("Worker завершил")).length === 8,
-      10_000,
+      () =>
+        Array.from({ length: 8 }, (_, index) => `Работа «Job ${index + 1}»`).every((title) =>
+          telegram.sent.some((entry) => entry.text.includes(title)),
+        ),
+      15_000,
     );
 
     telegram.finish();
@@ -2491,10 +2499,12 @@ describe("OperatorDaemon product flow", () => {
     const run = daemon.run();
 
     telegram.push(message(1, "implement refresh-token locking and run regression tests"));
-    await waitFor(() => store.getThreadSummary("th_1")?.currentState.includes("тесты прошли") === true);
+    // Package 1.2: the summary keeps the worker's own report (bounded) instead
+    // of a normalization pass the daemon no longer runs — the Operator is the
+    // one who interprets, and it does so in its turn, not in a side call.
+    await waitFor(() => store.getThreadSummary("th_1")?.currentState.includes("Tests pass") === true);
     expect(store.getThreadSummary("th_1")).toMatchObject({
       purpose: "implement refresh-token locking and run regression tests",
-      importantDecisions: ["Use single-flight refresh locking."],
       openIssues: [],
     });
 
@@ -2607,9 +2617,14 @@ describe("OperatorDaemon product flow", () => {
       () => store.listThreads({ statuses: ["completed"] }).length === 3,
       5_000,
     );
+    // Package 1.2: each finished scope is named by the Operator, in one
+    // message or in a few — never by a daemon template.
     await waitFor(
-      () => telegram.sent.filter((entry) => entry.text.includes("Worker завершил задачу")).length === 3,
-      5_000,
+      () =>
+        ["Backend profiling", "Database analysis", "Git history"].every((scope) =>
+          telegram.sent.some((entry) => entry.text.includes(`Работа «${scope}» готова`)),
+        ),
+      10_000,
     );
 
     telegram.finish();
@@ -2660,9 +2675,16 @@ describe("OperatorDaemon product flow", () => {
     broker.releaseTerminal();
     await waitFor(() => store.getThread("th_1")?.status === "completed");
 
-    // The daemon's own turn is mirrored; the external turn is announced once
-    // and its narration and result stay out of the chat.
-    expect(telegram.sent.some((entry) => entry.text.includes("Начинаю свою часть работы."))).toBe(true);
+    // Package 1.2: our own turn's narration reaches the OPERATOR (digested,
+    // fenced as worker data) and never the chat; the external turn is announced
+    // once and its narration and result stay out of both.
+    // The progress digest waits out its quiet window before it wakes a turn.
+    await waitFor(
+      () => runtime.prompts.some((prompt) => prompt.includes("Начинаю свою часть работы.")),
+      10_000,
+    );
+    expect(telegram.sent.some((entry) => entry.text.includes("Начинаю свою часть работы."))).toBe(false);
+    expect(runtime.prompts.some((prompt) => prompt.includes("Шаг коллаборатора"))).toBe(false);
     expect(telegram.sent.some((entry) => entry.text.includes("Шаг коллаборатора"))).toBe(false);
     expect(telegram.sent.some((entry) => entry.text.includes("Collaborative turn finished"))).toBe(false);
     expect(telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу"))).toBe(false);
@@ -4130,17 +4152,17 @@ describe("OperatorDaemon product flow", () => {
 
     broker.releaseTerminal();
     await waitFor(
-      () => telegram.richByChat.some((entry) => entry.chatId === 8 && entry.text.includes("Worker завершил задачу")),
-      5_000,
+      () => telegram.richByChat.some((entry) => entry.chatId === 8 && entry.text.includes("Работа «Steered work» готова")),
+      10_000,
     );
     expect(
-      telegram.richByChat.filter((entry) => entry.chatId === 7 && entry.text.includes("Worker завершил задачу")),
+      telegram.richByChat.filter((entry) => entry.chatId === 7 && entry.text.includes("Работа «Steered work» готова")),
     ).toHaveLength(0);
 
     telegram.finish();
     await run;
     await daemon.stop();
-  });
+  }, 30_000);
 
   it("resubscribes a worker monitor after a subscription failure instead of dying silently (bug №12)", async () => {
     const home = tempDirectory("daemon-monitor-retry-");
@@ -4168,8 +4190,8 @@ describe("OperatorDaemon product flow", () => {
     // The first subscription dies mid-flight; the monitor backs off (1s),
     // resubscribes, and still delivers the terminal result.
     await waitFor(
-      () => telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу")),
-      6_000,
+      () => telegram.sent.some((entry) => entry.text.includes("Работа «Auth race fix» готова")),
+      10_000,
     );
     expect(broker.subscribeCalls).toBeGreaterThanOrEqual(2);
     expect(store.getThread("th_1")?.status).toBe("completed");
@@ -4273,8 +4295,8 @@ describe("OperatorDaemon product flow", () => {
 
     telegram.push(message(1, "implement the race-sensitive follow-up"));
     await waitFor(
-      () => telegram.sent.some((entry) => entry.text.includes("Worker завершил задачу")),
-      5_000,
+      () => telegram.sent.some((entry) => entry.text.includes("готова — worker всё сделал")),
+      10_000,
     );
     expect(store.getThread("th_1")?.status).toBe("completed");
 
@@ -4340,7 +4362,7 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("delivers an identical progress text again in a new worker turn while deduping within one turn (bug №36)", async () => {
+  it("digests an identical progress text again in a new worker turn, and never sends it to the chat (bug №36, package 1.2)", async () => {
     const home = tempDirectory("daemon-progress-epoch-");
     const store = tempStore();
     const runtime = new DelegatingRuntime(
@@ -4368,20 +4390,29 @@ describe("OperatorDaemon product flow", () => {
     await daemon.initialize();
     const run = daemon.run();
 
-    const progressCount = () => telegram.sent.filter((entry) => entry.text.includes("Запускаю тесты…")).length;
+    // Package 1.2: progress is input for the Operator, never chat content — it
+    // reaches the envelope, fenced as worker data, and stops there. The two
+    // worker turns end with the same relayed sentence, and BOTH must reach the
+    // owner: nothing may dedupe a fresh turn's outcome against the previous
+    // one (that was the shape of bug №36 before delivery moved into the turn).
+    const digested = () =>
+      runtime.prompts.filter(
+        (prompt) => prompt.includes("system message from thread") && prompt.includes("Запускаю тесты…"),
+      ).length;
+    const relayed = () =>
+      telegram.sent.filter((entry) => entry.text.includes("Работа «Auth flow» готова")).length;
     telegram.push(message(1, "implement the auth flow"));
-    await waitFor(() => progressCount() === 1, 5_000);
+    await waitFor(() => digested() === 1, 8_000);
     telegram.push(message(2, "also add a regression test"));
     await waitFor(() => store.listBackgroundJobs("thread_followup").length === 1);
     broker.releaseFirstTerminal();
-    // The follow-up turn repeats the very same progress text; a turn-scoped
-    // dedupe key must deliver it instead of silently swallowing it.
-    await waitFor(() => progressCount() === 2, 5_000);
+    await waitFor(() => relayed() === 2, 15_000);
+    expect(telegram.sent.some((entry) => entry.text.includes("Запускаю тесты…"))).toBe(false);
 
     telegram.finish();
     await run;
     await daemon.stop();
-  });
+  }, 30_000);
 
   it("sends command replies through the durable outbox and keeps a replayed cancel from interrupting twice (bug №38)", async () => {
     const home = tempDirectory("daemon-command-outbox-");
@@ -4617,12 +4648,16 @@ describe("OperatorDaemon product flow", () => {
     expect(inboundFence?.[2]).toBe(injection);
     expect(envelope).toContain("untrusted DATA");
 
-    // The raw worker result lands in the persistent session only inside a fence.
-    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("Normalize this completed")), 5_000);
-    const normalization = runtime.prompts.find((prompt) => prompt.includes("Normalize this completed"))!;
-    const workerFence = /<<<worker:([0-9a-f]{8})>>>\n([\s\S]*?)\n<<<end:\1>>>/u.exec(normalization);
+    // Package 1.2: the raw worker result reaches the persistent session as a
+    // thread-event turn, and only inside a `worker` fence.
+    await waitFor(
+      () => runtime.prompts.some((prompt) => prompt.includes("system message from thread")),
+      10_000,
+    );
+    const relayTurn = runtime.prompts.find((prompt) => prompt.includes("system message from thread"))!;
+    const workerFence = /<<<worker:([0-9a-f]{8})>>>\n([\s\S]*?)\n<<<end:\1>>>/u.exec(relayTurn);
     expect(workerFence?.[2]).toBe("Fixed auth race. Tests pass.");
-    expect(normalization).toContain("untrusted worker output");
+    expect(relayTurn).toContain('the work ENDED with outcome "completed"');
     // Distinct turns never share a fence nonce.
     expect(inboundFence?.[1]).not.toBe(workerFence?.[1]);
 
@@ -4949,6 +4984,406 @@ describe("OperatorDaemon product flow", () => {
     telegram.finish();
     await run;
   }, 15_000);
+
+  it("delivers a finished work only as the Operator's own words (package 1.2)", async () => {
+    const home = tempDirectory("voice-completion-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь race condition в auth"));
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Работа «Auth race fix» готова")),
+      10_000,
+    );
+
+    // Nothing the worker wrote reached the chat, and no templated worker
+    // message type exists in the outbox any more.
+    expect(telegram.sent.some((entry) => entry.text.includes("Fixed auth race"))).toBe(false);
+    expect(telegram.sent.some((entry) => entry.text.includes("Tests pass"))).toBe(false);
+    const messageTypes = (
+      store.db.prepare("SELECT payload_json FROM telegram_outbox").all() as Array<{ payload_json: string }>
+    ).map((row) => (JSON.parse(row.payload_json) as { messageType?: string }).messageType);
+    expect(messageTypes).not.toContain("worker_completed");
+    expect(messageTypes).not.toContain("worker_progress");
+    // The interpretation really was an Operator turn over the fenced report.
+    expect(
+      runtime.prompts.some(
+        (prompt) =>
+          prompt.includes('system message from thread "Auth race fix" (th_1)') &&
+          prompt.includes("<<<worker:"),
+      ),
+    ).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("keeps worker progress out of the chat and inside the Operator's envelope (package 1.2)", async () => {
+    // Tripwire: the direct-delivery paths must stay deleted, not merely unused.
+    const daemonSource = readFileSync(
+      new URL("../apps/daemon/src/operator-daemon.ts", import.meta.url),
+      "utf8",
+    );
+    expect(daemonSource).not.toContain('messageType: "worker_progress"');
+    expect(daemonSource).not.toContain('messageType: "worker_completed"');
+    expect(daemonSource).not.toContain('messageType: "worker_failed"');
+    expect(daemonSource).not.toContain('messageType: "worker_cancelled"');
+    expect(daemonSource).not.toContain("renderWorkerResult(");
+    expect(daemonSource).not.toContain("normalizeWorkerResult(");
+    expect(daemonSource).not.toContain("fallbackWorkerResult(");
+
+    const home = tempDirectory("voice-progress-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "progress", threadId: "th_1", summary: "Читаю логи CI…" },
+      { type: "agent_message", threadId: "th_1", text: "Пока не вижу причины." },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь flaky тест"));
+    await waitFor(
+      () =>
+        runtime.prompts.some(
+          (prompt) => prompt.includes("Читаю логи CI…") && prompt.includes("Пока не вижу причины."),
+        ),
+      10_000,
+    );
+    // The Operator had nothing worth saying, so the owner heard nothing at all.
+    expect(telegram.sent.some((entry) => entry.text.includes("Читаю логи CI…"))).toBe(false);
+    expect(telegram.sent.some((entry) => entry.text.includes("Пока не вижу причины."))).toBe(false);
+    expect(
+      store.db
+        .prepare("SELECT COUNT(*) AS count FROM daemon_events WHERE event_type='operator.turn.silent'")
+        .get() as { count: number },
+    ).toMatchObject({ count: 1 });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("falls back to one templated notice per terminal when the Operator cannot speak (package 1.2)", async () => {
+    const home = tempDirectory("voice-fallback-");
+    const store = tempStore();
+    class DeadProviderRuntime extends FakeRuntime {
+      override async *sendTurn(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        this.prompts.push(input.prompt);
+        await Promise.resolve();
+        throw new Error("provider CLI is not running");
+        yield { type: "result", text: "", sessionId: input.sessionId };
+      }
+    }
+    const runtime = new DeadProviderRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    const settings = config(home);
+    const impatient: Config = {
+      ...settings,
+      operator: { ...settings.operator, voiceFallbackMs: 0 },
+    };
+    daemon = new OperatorDaemon(impatient, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: `${home}/acme` });
+    store.upsertProject(project);
+    const thread = await broker.createThread({ projectId: project.id, title: "Отчёт по логам" });
+    await daemon.trackOperatorToolThread({
+      threadId: thread.id,
+      context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: 1, operatorTurnId: "opturn_1" },
+    });
+
+    const notices = () =>
+      telegram.sent.filter((entry) => entry.text.includes("Работа **Отчёт по логам** завершилась"));
+    await waitFor(() => notices().length === 1, 10_000);
+    expect(notices()[0]!.text).toContain("(успешно)");
+    expect(notices()[0]!.text).toContain("Подробности расскажу, когда восстановлюсь.");
+    // No worker content travels with the degraded notice.
+    expect(notices()[0]!.text).not.toContain("Fixed auth race");
+    // Several sweeps later it is still exactly one notice: the terminal epoch
+    // key and the cleared record both hold.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(notices()).toHaveLength(1);
+    expect(store.listRuntimeState("voice_pending_terminal:")).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 25_000);
+
+  it("tells the owner a work failed instead of dressing it up (audit №14, package 1.2)", async () => {
+    const home = tempDirectory("voice-failure-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "failed", threadId: "th_1", error: "compile error in auth.ts:42" },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь сборку"));
+    await waitFor(() => store.getThread("th_1") !== undefined, 5_000);
+    // The one automatic recovery attempt is spent, so this failure is final.
+    store.setRuntimeState("thread_failure_recovery_count:th_1", "1");
+
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("упала с ошибкой")),
+      10_000,
+    );
+    // The Operator was told, unambiguously, that the work FAILED — that is what
+    // audit finding №14 was about: a failure that read like a success.
+    const envelope = runtime.prompts.find((prompt) =>
+      prompt.includes('system message from thread "Auth race fix"'),
+    )!;
+    expect(envelope).toContain('the work ENDED with outcome "failed"');
+    expect(store.getThread("th_1")?.status).toBe("failed");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 25_000);
+
+  it("never lets an owner message discard a thread-event turn (package 1.2)", async () => {
+    const home = tempDirectory("voice-preempt-");
+    const store = tempStore();
+    let releaseRelay!: () => void;
+    const relayGate = new Promise<void>((resolve) => (releaseRelay = resolve));
+    let relayStarted = false;
+    class GatedRelayRuntime extends FakeRuntime {
+      interrupts = 0;
+      override async *sendTurn(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        if (input.prompt.includes("system message from thread")) {
+          this.prompts.push(input.prompt);
+          relayStarted = true;
+          await relayGate;
+          const text = threadEventRelay(input.prompt)!;
+          yield { type: "text_delta", text };
+          yield { type: "result", text, sessionId: input.sessionId };
+          return;
+        }
+        yield* super.sendTurn(input);
+      }
+      override async interrupt(): Promise<void> {
+        this.interrupts += 1;
+      }
+    }
+    const runtime = new GatedRelayRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: `${home}/acme` });
+    store.upsertProject(project);
+    const thread = await broker.createThread({ projectId: project.id, title: "Ночная сборка" });
+    await daemon.trackOperatorToolThread({
+      threadId: thread.id,
+      context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: 1, operatorTurnId: "opturn_1" },
+    });
+    await waitFor(() => relayStarted, 10_000);
+
+    // The owner writes while the interpretation is running. Their message wins
+    // the QUEUE, but it must not discard the finished work's turn: a work that
+    // ended stays ended, and its story is still owed to them.
+    telegram.push(message(2, "столица Франции?"));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    releaseRelay();
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Работа «Ночная сборка» готова")),
+      10_000,
+    );
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 10_000);
+    expect(runtime.interrupts).toBe(0);
+    expect(
+      store.db
+        .prepare("SELECT COUNT(*) AS count FROM daemon_events WHERE event_type='operator.turn.dropped'")
+        .get() as { count: number },
+    ).toMatchObject({ count: 0 });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 25_000);
+
+  it("replays a completion whose interpretation a restart interrupted (package 1.2)", async () => {
+    const home = tempDirectory("voice-restart-");
+    const store = tempStore();
+    let hangStarted = false;
+    class HangingRelayRuntime extends FakeRuntime {
+      override async *sendTurn(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        if (input.prompt.includes("system message from thread")) {
+          this.prompts.push(input.prompt);
+          hangStarted = true;
+          await new Promise(() => undefined);
+        }
+        yield* super.sendTurn(input);
+      }
+    }
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const settings = config(home);
+    let first: OperatorDaemon;
+    const firstTools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => first.trackOperatorToolThread(input),
+    });
+    first = new OperatorDaemon(
+      settings,
+      store,
+      new HangingRelayRuntime(),
+      broker,
+      telegram,
+      artifacts,
+      new DailyScheduler(() => first.compact(), logger),
+      logger,
+      firstTools,
+    );
+    await first.initialize();
+    const firstRun = first.run();
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: `${home}/acme` });
+    store.upsertProject(project);
+    const thread = await broker.createThread({ projectId: project.id, title: "Миграция каталога" });
+    await first.trackOperatorToolThread({
+      threadId: thread.id,
+      context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: 1, operatorTurnId: "opturn_1" },
+    });
+    // The completion is durable before it is interpreted…
+    await waitFor(() => hangStarted, 10_000);
+    expect(store.listRuntimeState("voice_pending_terminal:")).toHaveLength(1);
+    expect(telegram.sent.some((entry) => entry.text.includes("Работа «Миграция каталога» готова"))).toBe(false);
+    telegram.finish();
+    await firstRun;
+    await first.stop(500);
+
+    // …so the next process still owes the owner the story, and tells it.
+    const restarted = new FakeTelegram();
+    let second: OperatorDaemon;
+    const secondTools = new OperatorToolServer({
+      broker,
+      store,
+      telegram: restarted,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => second.trackOperatorToolThread(input),
+    });
+    second = new OperatorDaemon(
+      settings,
+      store,
+      new DelegatingRuntime(delegatingScript({ workPattern: /никогда/u })),
+      broker,
+      restarted,
+      artifacts,
+      new DailyScheduler(() => second.compact(), logger),
+      logger,
+      secondTools,
+    );
+    await second.initialize();
+    const secondRun = second.run();
+    await waitFor(
+      () => restarted.sent.some((entry) => entry.text.includes("Работа «Миграция каталога» готова")),
+      10_000,
+    );
+    expect(store.listRuntimeState("voice_pending_terminal:")).toHaveLength(0);
+
+    restarted.finish();
+    await secondRun;
+    await second.stop();
+  }, 30_000);
 });
 
 /** Every distinct fence marker opened in a prompt (roadmap 0.5). */
@@ -4987,6 +5422,9 @@ function config(home: string): Config {
       interruptGraceMs: 8_000,
       envPassthrough: [],
       mediationTimeoutMs: 250,
+      // Package 1.2: tests that exercise the degraded fallback move the clock
+      // themselves; this only has to be a real, non-zero deadline.
+      voiceFallbackMs: 5 * 60_000,
       fullAccess: false,
       home,
       runtimeDir: `${home}/runtime`,
@@ -5155,12 +5593,9 @@ class FakeRuntime implements OperatorRuntime {
   }): AsyncIterable<OperatorEvent> {
     this.prompts.push(input.prompt);
     if (input.toolAccess) this.toolAccesses.push(input.toolAccess);
-    const text = input.prompt.includes("Normalize this completed")
-      ? JSON.stringify({
-          summary: "Worker завершил задачу; тесты прошли.",
-          status: "success",
-          importantDecisions: ["Use single-flight refresh locking."],
-        })
+    const relay = threadEventRelay(input.prompt);
+    const text = relay !== undefined
+      ? relay
       : input.prompt.includes("Prepare durable memory maintenance")
         ? JSON.stringify({
             notes: [
@@ -5302,6 +5737,30 @@ class DelegatingRuntime extends FakeRuntime {
     yield { type: "text_delta", text };
     yield { type: "result", text, sessionId: input.sessionId };
   }
+}
+
+/**
+ * Package 1.2: the fake Operator INTERPRETS thread events instead of echoing
+ * them — a terminal event becomes a sentence naming the work, and a
+ * progress-only digest ends the turn with empty text (which must send nothing).
+ */
+function threadEventRelay(prompt: string): string | undefined {
+  if (!prompt.includes("system message from thread")) return undefined;
+  const ended = [
+    ...prompt.matchAll(
+      /system message from thread "([^"]+)" \(([^)]+)\) — the work ENDED with outcome "(\w+)"/gu,
+    ),
+  ];
+  if (!ended.length) return "";
+  return ended
+    .map(([, title, , outcome]) =>
+      outcome === "completed"
+        ? `Работа «${title}» готова — worker всё сделал.`
+        : outcome === "failed"
+          ? `Работа «${title}» упала с ошибкой, разбираюсь.`
+          : `Работа «${title}» остановлена.`,
+    )
+    .join(" ");
 }
 
 function userText(envelope: string): string {

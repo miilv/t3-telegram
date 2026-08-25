@@ -210,7 +210,7 @@ without being explained to the model.
 | Site | What is fenced | Label |
 | --- | --- | --- |
 | daemon turn envelope | the inbound user text | `inbound` |
-| daemon `normalizeWorkerResult` | the raw worker result | `worker` |
+| daemon thread-event turn (`enqueueThreadEventTurn`) | every digested worker event — progress, the worker's notes, and the final report of a finished work — under ONE marker for the whole turn | `worker` |
 | daemon `mediateUserInput` / `mediateApproval` | the worker's questions, approval request, and thread context — its intermediate words on the way into the operator LLM (the Telegram delivery path is untouched) | `worker` |
 | daemon `buildOperatorMemorySnapshot` | thread titles, short summaries, and every prose field of the structured summaries, under one marker for the whole snapshot | `worker` |
 | `t3.get_thread_status` / `get_thread_summary` / `get_thread` / `search_threads` / `memory.search` | worker-written titles and summary prose | `worker` |
@@ -536,6 +536,13 @@ Polling mode, when it does run, emits only `started`, `progress` and
 `approval_required` — no `agent_message`, no `user_input_required`, no
 resolution events.
 
+Package 1.2 — what the monitor does with an event: `started` observes turn
+ownership; `approval_required` / `user_input_required` and their resolutions
+keep their own mediation path (unchanged, they are questions to the owner);
+`progress`, `agent_message` and the three terminal types go to the
+`ThreadEventDigest` and reach the owner only through an Operator turn (§14).
+Nothing in this path writes to the chat directly any more.
+
 Monitor resubscribe: 10 attempts, 1 s base, 60 s cap. Exhaustion →
 `Потерял связь с тредом **<title>** после нескольких попыток переподключения.
 Восстановлю подписку при следующем maintenance.`
@@ -696,6 +703,14 @@ effectively global — 20 simultaneous jams are reported over 20 minutes. This i
 deliberate: the alerts are a signal that something is stuck, and the durable
 messages themselves are never dropped, only delayed.
 
+Package 1.2 — the messages that may still be enqueued about a WORK are the
+degraded terminal notice (`worker_terminal_fallback`), the monitor-lost notice,
+the external-turn notice, requested artifacts (files, `artifact_sent`) and the
+dispatch acks of the t3 dispatch path. The templated `worker_progress`,
+`worker_completed`, `worker_failed` and `worker_cancelled` messages — and the
+anchored edits that used to fold a completion into the `worker_started` bubble —
+no longer exist; a tripwire test greps the daemon source for them.
+
 `notifyAutomationPaused` does **not** use this path — it is an addressed,
 actionable message (`/automation resume <id>`) and goes through the durable
 outbox, where a jam delays it instead of losing it.
@@ -769,7 +784,7 @@ with host and origin validation.
 
 **The lease is minted at exactly one call site** — `answerDirect`. Every
 internal `askOperator` call (compaction restore, memory maintenance,
-worker-result normalization, failure-recovery decision, provider-switch restore)
+failure-recovery decision, provider-switch restore)
 runs with **no MCP tools at all**.
 
 Result shaping: `MAX_TOOL_RESULT_CHARS = 16 000`, over which the payload becomes
@@ -787,27 +802,84 @@ role` · `project access denied for mutation|read` · `automation not found` /
 
 ---
 
-## 14. Worker results
+## 14. Worker results — the single voice (package 1.2)
+
+Nothing a worker produces reaches the owner as itself. Every worker event is an
+INPUT to the Operator, and the only thing the chat ever sees is the Operator's
+own turn about it.
 
 ```
-worker completes → askOperator normalizes into {status, summary, files, checks, …}
-├─ parse succeeds → renderWorkerResult:
-│     summary + **Изменённые файлы** / **Проверки** / **Осталось** / **Дальше**
-│     ⚠ `status` is NEVER rendered — a `blocked` or `failed` normalized result
-│       is byte-identical to a success in the chat
-└─ parse fails or askOperator throws → fallbackWorkerResult:
-      safeExcerpt(raw, 3_000) sent VERBATIM, status forced to "success",
-      the thread stored as completed
-      ⚠ this is the one path where raw worker tool chatter reaches the user
+worker event (progress | agent_message | completed | failed | cancelled)
+└─ monitorThread
+   ├─ external turn (a collaborator drives the thread in the T3 UI) → recorded, never relayed
+   ├─ progress   → ThreadEventDigest, throttled by policy.progressIntervalMs
+   ├─ agent_message → ThreadEventDigest (excerpt ≤ 4 000)
+   └─ terminal   → thread status + summary + audit event
+                   → requested artifacts (files only, no worker prose)
+                   → runtime_state `voice_pending_terminal:<threadId>:<epoch>`
+                   → ThreadEventDigest, flushed IMMEDIATELY
+
+ThreadEventDigest (3 s quiet window, coalescing per §1.1)
+└─ flush → one synthetic ingress job per chat, threadEvents[] attached
+   └─ LaneQueue lane `thread-events` → answerDirect
+      envelope: `system message from thread "<title>" (<threadId>) — …`
+                + the event text inside ONE <<<worker:…>>> fence for the turn
+      ├─ non-empty final → the Operator's own words go to the chat
+      ├─ EMPTY final     → nothing is sent (a deliberate silence, event
+      │                    `operator.turn.silent`), terminals still settled
+      └─ turn throws     → the ingress job retries with backoff; on give-up the
+                           digest is dropped SILENTLY (no "не удалось обработать")
 ```
 
-**Every worker failure is phrased as a provider failure.** `deliverFailure`
-always classifies with subsystem `"provider"`, so a deterministic test or
-compile failure produces `Работа **<title>** завершилась ошибкой. Worker
-завершился ошибкой провайдера. Код: PROVIDER_FAILED.` The real error string
-reaches neither the chat nor the thread summary. Relatedly,
-`classifyOperationalError` has no branches for the `t3` subsystem at all — every
-T3 error is `T3_UNAVAILABLE, retryable: true`.
+A thread-event turn differs from an owner turn in four ways: no draft/preview is
+started, no typing is shown, it is not registered in `activeOperatorTurns` (so an
+owner message never supersedes it — a work that ended stays ended), and it
+borrows the correlation id of the thread it speaks for, keeping the audit chain
+`telegram.received → worker.completed → telegram.outbox.delivered` intact.
+
+Lane discipline is enforced at the job table, not only in the queue: the `user`
+lane drain claims ingress jobs WITHOUT `threadEvents`, the `thread-events` lane
+claims only those with them. The background pump and the startup replay claim
+anything left, so nothing can be stranded.
+
+### Degraded fallback — the one template that survives
+
+`voice_pending_terminal:<threadId>:<epoch>` is written before the digest and
+cleared only when a turn of the Operator's has actually spoken for that terminal
+(`settleThreadEventTurn`). The reliability pump sweeps it every second; a record
+older than `OPERATOR_VOICE_FALLBACK_MINUTES` (default 5) produces exactly one
+durable message:
+
+```
+Работа **<title>** завершилась (<успешно|с ошибкой|остановлена>).
+Подробности расскажу, когда восстановлюсь.
+```
+
+No worker content travels with it. The outbox dedupe key is
+`telegram:thread:<threadId>:terminal:<epoch>`, so restarts and retries cannot
+repeat it, and the record is deleted as it fires. Progress digests have NO
+fallback by design: while the Operator is down the owner simply hears nothing
+about steps, and the durable ingress job replays the story when it returns.
+
+Two durability layers, deliberately: the ingress job covers a restart in the
+middle of an interpretation (the same mechanism automations ride on), while the
+runtime-state record covers what a job cannot — the window before the digest
+flushed, and a provider that never comes back.
+
+What the daemon may still say on its own: mediated worker questions and approval
+cards, command replies, the finals of Operator turns, delivery alerts (§11), the
+automation-pause notice, the monitor-lost and external-turn notices, and this
+one degraded terminal notice. Everything else about a work comes from the
+Operator's mouth.
+
+Failures keep their single automatic recovery attempt
+(`tryRecoverFailedWorker`); only a final failure is digested, as
+`outcome: "failed"` with the classified code and the raw error in the fenced
+section, so the Operator can tell the owner honestly what broke (audit №14).
+`classifyOperationalError` still has no `t3` branches — every T3 error is
+`T3_UNAVAILABLE, retryable: true`, and a worker failure is still classified with
+subsystem `"provider"`; what changed is that the owner now gets a human
+retelling instead of `PROVIDER_FAILED`.
 
 ---
 
