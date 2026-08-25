@@ -164,6 +164,14 @@ export class OperatorDaemon {
   private readonly operatorRuntimeQueue = new SerialQueue();
   private readonly ingressQueue = new SerialQueue();
   private readonly workerEventQueue = new ConcurrentQueue(8);
+  /**
+   * Terminal worker events (completed/failed/cancelled) wait on the serial
+   * Operator runtime for result normalization. Parked in workerEventQueue they
+   * occupied all 8 slots at once and approvals/user-input of other threads
+   * queued behind them for minutes (bug №41) — so terminal events accumulate
+   * here instead and workerEventQueue stays free for interactive delivery.
+   */
+  private readonly workerCompletionQueue = new ConcurrentQueue(8);
   private readonly maintenanceQueue = new SerialQueue();
   private readonly outboxQueue = new SerialQueue();
   private readonly t3DispatchQueue = new SerialQueue();
@@ -326,6 +334,7 @@ export class OperatorDaemon {
     await this.operatorInputQueue.idle();
     await this.operatorRuntimeQueue.idle();
     await this.workerEventQueue.idle();
+    await this.workerCompletionQueue.idle();
     await this.maintenanceQueue.idle();
     await this.outboxQueue.idle();
     await this.t3DispatchQueue.idle();
@@ -1158,7 +1167,15 @@ export class OperatorDaemon {
         for await (const event of this.broker.subscribeThread(threadId, controller.signal)) {
           resubscribeAttempt = 0;
           const route = currentRoute();
-          await this.workerEventQueue.run(async () => {
+          // Bug №41: terminal events go to their own accumulator queue so a
+          // burst of completions never occupies the interactive slots. This
+          // for-await still awaits every event, so one thread's events —
+          // including its terminal one — keep their order.
+          const queue =
+            event.type === "completed" || event.type === "failed" || event.type === "cancelled"
+              ? this.workerCompletionQueue
+              : this.workerEventQueue;
+          await queue.run(async () => {
             this.store.appendEvent(`worker.${event.type}`, {
               correlationId: this.store.getRuntimeState(`thread_correlation_id:${threadId}`) ?? `thread:${threadId}`,
               threadId,

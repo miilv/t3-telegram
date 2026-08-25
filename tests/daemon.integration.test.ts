@@ -1079,6 +1079,105 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("delivers an approval promptly while a burst of completions waits for normalization (bug №41)", async () => {
+    const home = tempDirectory("daemon-approval-priority-");
+    const store = tempStore();
+    let releaseNormalization!: () => void;
+    const normalizationGate = new Promise<void>((resolvePromise) => (releaseNormalization = resolvePromise));
+    class BlockedNormalizationRuntime extends FakeRuntime {
+      normalizations = 0;
+      override async *sendTurn(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        if (input.prompt.includes("Normalize this completed")) {
+          this.normalizations += 1;
+          await normalizationGate;
+        }
+        yield* super.sendTurn(input);
+      }
+    }
+    class PerThreadBroker extends FakeBroker {
+      readonly eventsByThread = new Map<string, WorkerEvent[]>();
+      override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+        for (const event of this.eventsByThread.get(threadId) ?? []) {
+          await Promise.resolve();
+          yield event;
+        }
+      }
+    }
+    const runtime = new BlockedNormalizationRuntime();
+    const broker = new PerThreadBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: `${home}/acme` });
+    store.upsertProject(project);
+    // 8 threads complete at once: every completion parks on the serial
+    // Operator runtime inside result normalization.
+    for (let position = 1; position <= 8; position += 1) {
+      const thread = await broker.createThread({ projectId: "prj_1", title: `Job ${position}` });
+      broker.eventsByThread.set(thread.id, [
+        { type: "started", threadId: thread.id },
+        { type: "completed", threadId: thread.id, result: `done ${position}` },
+      ]);
+      await daemon.trackOperatorToolThread({
+        threadId: thread.id,
+        context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: position, operatorTurnId: `opturn_${position}` },
+      });
+    }
+    await waitFor(() => runtime.normalizations >= 1);
+
+    // A ninth thread asks for an approval. Before the fix all 8 interactive
+    // slots were occupied by completions awaiting the serial runtime, so this
+    // stayed queued until the whole burst normalized.
+    const approvalThread = await broker.createThread({ projectId: "prj_1", title: "Needs approval" });
+    broker.eventsByThread.set(approvalThread.id, [
+      { type: "started", threadId: approvalThread.id },
+      {
+        type: "approval_required",
+        threadId: approvalThread.id,
+        approvalId: "ap_priority",
+        summary: "Drop the staging database",
+        requestKind: "command",
+        requestType: "command_execution_approval",
+      },
+    ]);
+    await daemon.trackOperatorToolThread({
+      threadId: approvalThread.id,
+      context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: 9, operatorTurnId: "opturn_9" },
+    });
+    await waitFor(() => telegram.approvals.length === 1);
+    // The normalization gate is still closed: no completion has been delivered.
+    expect(telegram.sent.filter((entry) => entry.text.includes("Worker завершил"))).toHaveLength(0);
+    expect(telegram.approvals[0]?.text).toContain("Drop the staging database");
+
+    releaseNormalization();
+    await waitFor(
+      () => telegram.sent.filter((entry) => entry.text.includes("Worker завершил")).length === 8,
+      10_000,
+    );
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("returns a requested worker artifact through one validated Telegram document send", async () => {
     const home = tempDirectory("daemon-document-out-");
     const workspaceRoot = `${home}/acme-files`;
