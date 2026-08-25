@@ -1427,10 +1427,14 @@ export class OperatorStore {
       // A re-emitted event that lands on a dead row means the caller still
       // needs the delivery: revive it with the fresh payload for a new attempt
       // cycle instead of letting DO NOTHING swallow it forever (bug №3).
+      // The revive is a fresh life for this row: the payload is replaced (so
+      // every payload-level marker, including the delivery-alert flags, starts
+      // clear) and the attempt counter restarts, so stall accounting measures
+      // this cycle rather than the failures of the previous one.
       if (String(row.status) === "dead") {
         this.db
           .prepare(`
-            UPDATE telegram_outbox SET status='pending',payload_json=?,next_attempt_at=NULL,
+            UPDATE telegram_outbox SET status='pending',payload_json=?,attempts=0,next_attempt_at=NULL,
               last_error_code=NULL,last_error_detail=NULL,updated_at=? WHERE id=?
           `)
           .run(JSON.stringify(input.payload), now, String(row.id));
@@ -1441,10 +1445,16 @@ export class OperatorStore {
     });
   }
 
+  /**
+   * Payload bookkeeping only — chunk progress, delivery-alert markers. It
+   * deliberately leaves `updated_at` alone: that column means "the delivery
+   * state changed", and a per-chunk payload write used to forge it and hide how
+   * long an item had really been stuck.
+   */
   updateTelegramOutboxPayload<T>(id: string, payload: T): void {
     this.db
-      .prepare("UPDATE telegram_outbox SET payload_json=?,updated_at=? WHERE id=?")
-      .run(JSON.stringify(payload), nowIso(), id);
+      .prepare("UPDATE telegram_outbox SET payload_json=? WHERE id=?")
+      .run(JSON.stringify(payload), id);
   }
 
   getTelegramOutbox<T>(idOrDedupeKey: string): TelegramOutboxItem<T> | undefined {
@@ -1495,14 +1505,17 @@ export class OperatorStore {
   }
 
   /**
-   * Chat-head outbox items that have been parked in retry backoff for at least
-   * `waitingMs` while other pending messages queue up behind them. Delivery
-   * order is a deliberate trade-off (bug №37): the queue is not reordered, but
-   * the blockage must be visible to operators.
+   * Chat-head outbox items parked in retry backoff, with other pending messages
+   * queued up behind them and at least `waitingMs` of silence still to come.
+   * Delivery order is a deliberate trade-off (bug №37): the queue is not
+   * reordered, but the blockage must be visible.
+   *
+   * "Parked long" is measured on `next_attempt_at` alone — how much longer this
+   * chat stays silent. `updated_at` cannot answer that: any payload write used
+   * to push it forward and delay detection indefinitely.
    */
   listBlockedTelegramOutboxHeads<T>(waitingMs = 60_000, limit = 20): TelegramOutboxItem<T>[] {
-    const now = nowIso();
-    const cutoff = new Date(Date.now() - waitingMs).toISOString();
+    const cutoff = new Date(Date.now() + waitingMs).toISOString();
     const boundedLimit = Math.max(1, Math.min(limit, 100));
     return (
       this.db
@@ -1510,8 +1523,7 @@ export class OperatorStore {
           SELECT head.* FROM telegram_outbox head
           WHERE head.status='pending'
             AND head.next_attempt_at IS NOT NULL
-            AND head.next_attempt_at>?
-            AND head.updated_at<=?
+            AND head.next_attempt_at>=?
             AND NOT EXISTS (
               SELECT 1 FROM telegram_outbox earlier
               WHERE earlier.chat_id=head.chat_id
@@ -1527,7 +1539,7 @@ export class OperatorStore {
           ORDER BY head.created_at
           LIMIT ?
         `)
-        .all(now, cutoff, boundedLimit) as Row[]
+        .all(cutoff, boundedLimit) as Row[]
     ).map((row) => rowToTelegramOutbox<T>(row));
   }
 

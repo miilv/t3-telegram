@@ -500,20 +500,30 @@ non-idempotent → `uncertain`, requeued once with
 отправку…`.
 
 Silence during those endless retries is broken by out-of-band alerts
-(package 0.7). After 10 failed attempts of one item the owner gets exactly one
-`Не могу доставить сообщение уже N мин (<код>) — продолжаю пытаться.`
-(`stallNoticeSent` in the payload), and retries continue unchanged.
+(package 0.7). After 10 failed attempts of one item: `Не могу доставить
+сообщение уже N мин (<код>) — продолжаю пытаться.` Minutes are counted from
+`firstFailureAt` (this life's first failure), not from `createdAt`, so a revived
+row does not report the days it spent `dead`.
 
 `claimNextTelegramOutbox` refuses any candidate with an earlier
 `pending|sending` row in the same chat. Head-of-line blocking is by design; the
-log warning is joined by one alert per blocked head
-(`Доставка в этот чат застряла…`, `blockedHeadNoticeSent` in the payload).
+log warning is joined by an alert `Доставка в этот чат застряла…`.
+`listBlockedTelegramOutboxHeads` measures the jam on `next_attempt_at` only —
+`updated_at` is not evidence, and `updateTelegramOutboxPayload` no longer
+touches it.
 
-Both alerts go through `transport.sendAlert`: outside the outbox (they would
+Both alerts share one payload marker, `deliveryAlertSent`: two ways of noticing
+the same jam produce one complaint, and a revive clears it with the payload.
+
+Alerts go through `transport.sendAlert`: outside the outbox (they would
 otherwise queue behind the very item they report on) **and** outside the
 per-chat lock, one attempt, no inline flood wait, `undefined` when dropped.
-A shared 60 s per-chat throttle collapses concurrent alerts; a throttled alert
-leaves its flag unset, so a later attempt says it instead.
+The recipient is `owner_chat_id` (falling back to the stuck chat), never the
+choking chat itself, and topic ids travel only when those coincide. Dispatch is
+fire-and-forget — the reliability pump also drains ingress and must not wait on
+a Telegram round trip. The 60 s per-recipient throttle is spent on the attempt,
+the marker only on success: a dropped alert is offered again a window later.
+`notifyAutomationPaused` uses the same path.
 
 Chunk-level resume: `sentChunkCount` is written back after every chunk, and a
 retry skips what already went out.

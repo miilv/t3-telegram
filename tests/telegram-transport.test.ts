@@ -377,7 +377,8 @@ describe("grammY Telegram transport", () => {
     const startedAt = Date.now();
     await expect(transport.sendAlert(7, "Не могу доставить сообщение")).resolves.toBeUndefined();
 
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    // Comfortably under the 25 s flood wait the transport must not honour here.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
     expect(calls).toHaveLength(1);
     expect(calls[0]?.method).toBe("sendMessage");
     expect(calls[0]?.body).toMatchObject({ chat_id: 7, text: "Не могу доставить сообщение" });

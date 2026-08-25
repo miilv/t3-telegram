@@ -40,6 +40,7 @@ import { OperatorStore } from "../packages/storage/src/index.js";
 import type {
   SentMessage,
   StreamDraft,
+  TelegramDestination,
   TelegramInbound,
   TelegramTransport,
   TelegramUserInputChoice,
@@ -521,7 +522,9 @@ describe("OperatorDaemon product flow", () => {
       await daemon.maintain(`test dispatch failure ${attempt}`);
     }
     expect(store.getAutomation(broken.id)).toMatchObject({ status: "paused", consecutiveFailures: 5 });
-    const pauseNotice = telegram.sent.find((entry) => entry.text.includes("приостановлена"));
+    // The pause notice takes the out-of-band alert path (package 0.7), not the
+    // per-chat send lock it might have queued behind.
+    const pauseNotice = telegram.alerts.find((entry) => entry.text.includes("приостановлена"));
     expect(pauseNotice?.text).toContain("Broken brief");
     expect(pauseNotice?.text).toContain(`/automation resume ${broken.id}`);
     expect(
@@ -2271,11 +2274,14 @@ describe("OperatorDaemon product flow", () => {
     const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
     daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
 
+    store.setRuntimeState("owner_chat_id", "42");
+    // The stuck message lives in a forum topic of a group chat: its topic id is
+    // meaningless in the owner's private chat and must not travel with the alert.
     const item = store.enqueueTelegramOutbox({
-      dedupeKey: "telegram:operator:chat7:stalled",
-      chatId: 7,
+      dedupeKey: "telegram:operator:group:stalled",
+      chatId: -1_001,
       operation: "rich",
-      payload: { text: "Ответ готов.", options: {}, messageType: "operator_answer" },
+      payload: { text: "Ответ готов.", options: { messageThreadId: 9 }, messageType: "operator_answer" },
     });
     // Nine attempts already burned; the next 429 is the tenth.
     const rewind = (): void =>
@@ -2288,28 +2294,31 @@ describe("OperatorDaemon product flow", () => {
     const run = daemon.run();
 
     await waitFor(() => telegram.alerts.length > 0, 15_000);
-    expect(telegram.alerts[0]?.chatId).toBe(7);
+    // Blocker: the alert goes to the owner, never into the choking chat.
+    expect(telegram.alerts[0]?.chatId).toBe(42);
+    expect(telegram.alerts[0]?.options).toEqual({});
     expect(telegram.alerts[0]?.text).toMatch(
       /^Не могу доставить сообщение уже \d+ мин \(TELEGRAM_RATE_LIMIT\) — продолжаю пытаться\.$/u,
     );
-    // The alert is an out-of-band signal, not an outbox message: nothing was
-    // enqueued behind the stuck head, and the head itself still retries.
+    // Out-of-band signal, not an outbox message: nothing was enqueued behind
+    // the stuck head, and the head itself keeps retrying.
     expect(store.listTelegramOutbox(["pending", "sending"]).map((row) => row.dedupeKey)).toEqual([
-      "telegram:operator:chat7:stalled",
+      "telegram:operator:group:stalled",
     ]);
-    const stalled = store.getTelegramOutbox<{ stallNoticeSent?: boolean }>(item.id);
-    expect(stalled?.status).toBe("pending");
-    expect(stalled?.attempts).toBeGreaterThanOrEqual(10);
-    expect(stalled?.payload.stallNoticeSent).toBe(true);
+    await waitFor(
+      () => store.getTelegramOutbox<{ deliveryAlertSent?: boolean }>(item.id)?.payload.deliveryAlertSent === true,
+      15_000,
+    );
+    expect(store.getTelegramOutbox(item.id)?.status).toBe("pending");
     expect(telegram.sent.some((entry) => entry.text.startsWith("Ответ готов."))).toBe(false);
 
-    // Further failures must stay silent: one notice per item, retries continue.
-    for (let round = 0; round < 3; round += 1) {
+    // Further failures stay silent: one notice per jam, retries continue. The
+    // fake's own attempt counter is the ground truth here — reading attempts
+    // back from the row would race with the rewinds.
+    const attemptsBefore = telegram.richAttempts;
+    while (telegram.richAttempts < attemptsBefore + 4) {
       rewind();
-      await waitFor(
-        () => (store.getTelegramOutbox(item.id)?.attempts ?? 0) >= 10,
-        15_000,
-      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
     expect(telegram.alerts).toHaveLength(1);
 
@@ -2318,9 +2327,75 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   }, 60_000);
 
-  it("says out of band why a chat went silent behind a blocked outbox head (package 0.7)", async () => {
-    const home = tempDirectory("daemon-blocked-head-");
+  it("offers the delivery alert again when the first attempt does not get through (package 0.7)", async () => {
+    const home = tempDirectory("daemon-dropped-alert-");
     const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new RateLimitedTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    // A short throttle window keeps the retry observable inside a test.
+    daemon = new OperatorDaemon(
+      config(home),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      undefined,
+      undefined,
+      undefined,
+      100,
+    );
+
+    store.setRuntimeState("owner_chat_id", "42");
+    telegram.dropAlerts = true;
+    const item = store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:operator:chat7:dropped-alert",
+      chatId: 7,
+      operation: "rich",
+      payload: { text: "Ответ готов.", options: {}, messageType: "operator_answer" },
+    });
+    const rewind = (): void =>
+      void store.db
+        .prepare("UPDATE telegram_outbox SET attempts=9,next_attempt_at=NULL WHERE id=?")
+        .run(item.id);
+    rewind();
+
+    await daemon.initialize();
+    const run = daemon.run();
+
+    await waitFor(() => telegram.alerts.length > 0, 15_000);
+    // The alert never left Telegram, so the jam must not be marked as told.
+    expect(store.getTelegramOutbox<{ deliveryAlertSent?: boolean }>(item.id)?.payload.deliveryAlertSent)
+      .toBeUndefined();
+
+    telegram.dropAlerts = false;
+    while (telegram.alerts.length < 2) {
+      rewind();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await waitFor(
+      () => store.getTelegramOutbox<{ deliveryAlertSent?: boolean }>(item.id)?.payload.deliveryAlertSent === true,
+      15_000,
+    );
+    expect(telegram.alerts[1]?.chatId).toBe(42);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 60_000);
+
+  it("says out of band why a chat went silent behind a blocked outbox head, once per jam (package 0.7)", async () => {
+    const home = tempDirectory("daemon-blocked-head-");
+    const databasePath = `${home}/operator.db`;
+    const store = new OperatorStore(databasePath);
+    store.migrate();
     const runtime = new FakeRuntime();
     const broker = new FakeBroker();
     const telegram = new RateLimitedTelegram();
@@ -2330,54 +2405,80 @@ describe("OperatorDaemon product flow", () => {
     const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
     daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
 
+    store.setRuntimeState("owner_chat_id", "42");
     const head = store.enqueueTelegramOutbox({
-      dedupeKey: "telegram:operator:chat7:head",
-      chatId: 7,
+      dedupeKey: "telegram:operator:group:head",
+      chatId: -1_001,
       operation: "rich",
-      payload: { text: "Первый ответ.", options: {}, messageType: "operator_answer" },
+      payload: { text: "Первый ответ.", options: { messageThreadId: 9 }, messageType: "operator_answer" },
     });
     store.enqueueTelegramOutbox({
-      dedupeKey: "telegram:operator:chat7:behind",
-      chatId: 7,
+      dedupeKey: "telegram:operator:group:behind",
+      chatId: -1_001,
       operation: "rich",
-      payload: { text: "Второй ответ.", options: {}, messageType: "operator_answer" },
+      payload: { text: "Второй ответ.", options: { messageThreadId: 9 }, messageType: "operator_answer" },
     });
-    // The head is parked in a long flood-wait backoff, so nothing in this chat
-    // can move and the user sees pure silence.
+    // The head is parked in a long flood wait, so nothing in this chat can move
+    // and the user sees pure silence. Detection reads next_attempt_at only, so a
+    // later payload write cannot postpone it.
     store.db
       .prepare(`
         UPDATE telegram_outbox
-        SET attempts=3,next_attempt_at=?,updated_at=?,last_error_code='TELEGRAM_RATE_LIMIT'
+        SET attempts=3,next_attempt_at=?,last_error_code='TELEGRAM_RATE_LIMIT'
         WHERE id=?
       `)
-      .run(
-        new Date(Date.now() + 300_000).toISOString(),
-        new Date(Date.now() - 120_000).toISOString(),
-        head.id,
-      );
+      .run(new Date(Date.now() + 300_000).toISOString(), head.id);
 
     await daemon.initialize();
     const run = daemon.run();
 
     await waitFor(() => telegram.alerts.length > 0, 15_000);
-    expect(telegram.alerts[0]?.chatId).toBe(7);
+    expect(telegram.alerts[0]?.chatId).toBe(42);
+    expect(telegram.alerts[0]?.options).toEqual({});
     expect(telegram.alerts[0]?.text).toContain("Доставка в этот чат застряла");
     expect(telegram.alerts[0]?.text).toContain("TELEGRAM_RATE_LIMIT");
     // Direct path: the alert arrived while both queued messages are still stuck.
     expect(telegram.sent).toHaveLength(0);
-    const blocked = store.getTelegramOutbox<{ blockedHeadNoticeSent?: boolean }>(head.id);
-    expect(blocked?.status).toBe("pending");
-    expect(blocked?.payload.blockedHeadNoticeSent).toBe(true);
+    await waitFor(
+      () => store.getTelegramOutbox<{ deliveryAlertSent?: boolean }>(head.id)?.payload.deliveryAlertSent === true,
+      15_000,
+    );
 
-    // One notice per blocked head, however many times the pump sees it.
-    await waitFor(() => telegram.alerts.length > 1, 3_000).catch(() => undefined);
+    // One notice per jam, however many times the pump sees the blocked head.
+    await waitForPumpPasses(store, 3);
     expect(telegram.alerts).toHaveLength(1);
 
     telegram.finish();
     await run;
     await daemon.stop();
-  }, 60_000);
 
+    // The marker is durable: a restarted daemon inspects the same jam and stays
+    // quiet instead of complaining about it a second time.
+    const restartedStore = new OperatorStore(databasePath);
+    restartedStore.migrate();
+    const restartedTelegram = new RateLimitedTelegram();
+    const restartedArtifacts = new ArtifactRegistry(`${home}/artifacts`, restartedStore);
+    let restarted: OperatorDaemon;
+    const restartedScheduler = new DailyScheduler(() => restarted.maintain(), logger);
+    restarted = new OperatorDaemon(
+      config(home),
+      restartedStore,
+      new FakeRuntime(),
+      new FakeBroker(),
+      restartedTelegram,
+      restartedArtifacts,
+      restartedScheduler,
+      logger,
+    );
+    await restarted.initialize();
+    const restartedRun = restarted.run();
+    await waitForPumpPasses(restartedStore, 3);
+    expect(restartedTelegram.alerts).toHaveLength(0);
+
+    restartedTelegram.finish();
+    await restartedRun;
+    await restarted.stop();
+  }, 60_000);
   it("resumes a durably accepted Telegram request after mapping-time crash without creating a second worker", async () => {
     const home = tempDirectory("daemon-ingress-restart-");
     const databasePath = `${home}/operator.db`;
@@ -4220,9 +4321,16 @@ class FakeTelegram implements TelegramTransport {
     this.sent.push({ messageId, text, at });
     return [{ chatId: 7, messageId }];
   }
-  readonly alerts: Array<{ chatId: number; text: string }> = [];
-  async sendAlert(chatId: number, text: string): Promise<SentMessage | undefined> {
-    this.alerts.push({ chatId, text });
+  readonly alerts: Array<{ chatId: number; text: string; options: TelegramDestination }> = [];
+  /** When true every alert attempt is recorded but reports itself as undelivered. */
+  dropAlerts = false;
+  async sendAlert(
+    chatId: number,
+    text: string,
+    options: TelegramDestination = {},
+  ): Promise<SentMessage | undefined> {
+    this.alerts.push({ chatId, text, options });
+    if (this.dropAlerts) return undefined;
     return { chatId, messageId: this.nextMessageId++ };
   }
   async startDraft(chatId: number): Promise<StreamDraft> {
@@ -4458,7 +4566,11 @@ class AmbiguousSendTelegram extends FakeTelegram {
 
 /** Every rich delivery is rejected with a server-confirmed 429: retryable forever. */
 class RateLimitedTelegram extends FakeTelegram {
+  /** Rich delivery attempts made — the fake-side ground truth for retry counting. */
+  richAttempts = 0;
+
   override async sendRich(): Promise<SentMessage[]> {
+    this.richAttempts += 1;
     throw new GrammyError(
       "Call to 'sendMessage' failed!",
       { ok: false, error_code: 429, description: "Too Many Requests: retry later", parameters: { retry_after: 0 } },
@@ -4494,6 +4606,26 @@ class AsyncInputQueue<T> implements AsyncIterable<T> {
         return new Promise((resolve) => (this.waiter = resolve));
       },
     };
+  }
+}
+
+/**
+ * Waits until the reliability pump has swept blocked outbox heads `passes`
+ * times, so "still exactly one alert" is asserted on observed pump work rather
+ * than on a wall-clock guess.
+ */
+async function waitForPumpPasses(store: OperatorStore, passes: number): Promise<void> {
+  const spied = store as unknown as { listBlockedTelegramOutboxHeads: unknown };
+  const original = spied.listBlockedTelegramOutboxHeads as (...args: unknown[]) => unknown;
+  let seen = 0;
+  spied.listBlockedTelegramOutboxHeads = (...args: unknown[]) => {
+    seen += 1;
+    return original.apply(store, args);
+  };
+  try {
+    await waitFor(() => seen >= passes, 20_000);
+  } finally {
+    spied.listBlockedTelegramOutboxHeads = original;
   }
 }
 

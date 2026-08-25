@@ -267,23 +267,31 @@ describe("OperatorStore", () => {
       operation: "rich",
       payload: { text: "первый" },
     });
-    // Alone in its chat and freshly backed off: nothing to report yet.
+    // Alone in its chat: whatever the backoff, nobody is waiting behind it.
     store.retryTelegramOutbox(head.id, "TELEGRAM_RATE_LIMIT", "flood wait", 300_000);
     expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(0);
 
-    store.enqueueTelegramOutbox({
+    const behind = store.enqueueTelegramOutbox({
       dedupeKey: "message:behind",
       chatId: 7,
       operation: "rich",
       payload: { text: "второй" },
     });
-    expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(0);
-    store.db
-      .prepare("UPDATE telegram_outbox SET updated_at=? WHERE id=?")
-      .run(new Date(Date.now() - 90_000).toISOString(), head.id);
     const blocked = store.listBlockedTelegramOutboxHeads();
     expect(blocked).toHaveLength(1);
     expect(blocked[0]).toMatchObject({ id: head.id, lastErrorCode: "TELEGRAM_RATE_LIMIT" });
+
+    // A payload write (chunk progress, delivery-alert markers) must not push
+    // detection away: staleness is read off next_attempt_at, not updated_at.
+    store.updateTelegramOutboxPayload(head.id, { text: "первый", sentChunkCount: 1 });
+    expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(1);
+
+    // A short backoff is not a jam: the chat goes quiet for seconds, not minutes.
+    store.db
+      .prepare("UPDATE telegram_outbox SET next_attempt_at=? WHERE id=?")
+      .run(new Date(Date.now() + 5_000).toISOString(), head.id);
+    expect(store.listBlockedTelegramOutboxHeads()).toHaveLength(0);
+    expect(behind.status).toBe("pending");
     store.close();
   });
 
