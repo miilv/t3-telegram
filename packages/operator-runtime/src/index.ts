@@ -2,14 +2,22 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { chmod, mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import type { Logger } from "pino";
 import type {
   OperatorEvent,
   OperatorRuntime,
   OperatorSession,
   OperatorToolAccess,
 } from "../../shared/src/index.js";
+import { DAEMON_SECRET_ENV_NAMES } from "../../shared/src/config.js";
 
-export interface ClaudeCliRuntimeOptions {
+/** Extra environment names inherited by the child, parsed by `loadConfig`. */
+interface EnvironmentFilterOptions {
+  envPassthrough?: readonly string[];
+  logger?: Logger;
+}
+
+export interface ClaudeCliRuntimeOptions extends EnvironmentFilterOptions {
   binary: string;
   cwd: string;
   model: string;
@@ -20,7 +28,7 @@ export interface ClaudeCliRuntimeOptions {
   fullAccess?: boolean;
 }
 
-export interface CodexCliRuntimeOptions {
+export interface CodexCliRuntimeOptions extends EnvironmentFilterOptions {
   binary: string;
   cwd: string;
   model: string;
@@ -121,7 +129,19 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
   private defaultSystemPrompt = "";
   private lastUsage?: { contextTokens: number; contextWindow?: number; percentUsed?: number };
 
+  private environmentLogged = false;
+
   constructor(private readonly options: CodexCliRuntimeOptions) {}
+
+  /** Sanitized child environment; logs the filtered names once per runtime. */
+  private childEnvironment(): NodeJS.ProcessEnv {
+    const passthrough = this.options.envPassthrough ?? [];
+    if (!this.environmentLogged) {
+      this.environmentLogged = true;
+      logFilteredEnvironment(this.options.logger, "codex", process.env, passthrough);
+    }
+    return sanitizedEnvironment(process.env, passthrough);
+  }
 
   async start(input: { systemPrompt: string }): Promise<OperatorSession> {
     await this.prepareRuntimeDirectory();
@@ -173,7 +193,7 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
     const args = isNew
       ? ["exec", ...commonArgs, "-C", this.options.cwd, "-"]
       : ["exec", "resume", ...commonArgs, input.sessionId, "-"];
-    const environment = sanitizedEnvironment(process.env);
+    const environment = this.childEnvironment();
     if (input.toolAccess) environment[tokenEnvName] = input.toolAccess.token;
     const child = spawn(this.options.binary, args, {
       cwd: this.options.cwd,
@@ -332,7 +352,7 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
   }> {
     return new Promise((resolve) => {
       const child = spawn(this.options.binary, ["--version"], {
-        env: sanitizedEnvironment(process.env),
+        env: this.childEnvironment(),
         stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
@@ -368,7 +388,19 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   private currentSessionId?: string;
   private lastUsage?: { contextTokens: number; contextWindow?: number; percentUsed?: number };
 
+  private environmentLogged = false;
+
   constructor(private readonly options: ClaudeCliRuntimeOptions) {}
+
+  /** Sanitized child environment; logs the filtered names once per runtime. */
+  private childEnvironment(): NodeJS.ProcessEnv {
+    const passthrough = this.options.envPassthrough ?? [];
+    if (!this.environmentLogged) {
+      this.environmentLogged = true;
+      logFilteredEnvironment(this.options.logger, "claude", process.env, passthrough);
+    }
+    return sanitizedEnvironment(process.env, passthrough);
+  }
 
   async start(input: { systemPrompt: string }): Promise<OperatorSession> {
     await this.prepareRuntimeDirectory();
@@ -426,7 +458,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     ];
     const child = spawn(this.options.binary, args, {
       cwd: this.options.cwd,
-      env: sanitizedEnvironment(process.env),
+      env: this.childEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.active = child;
@@ -519,7 +551,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     ];
     const child = spawn(this.options.binary, args, {
       cwd: this.options.cwd,
-      env: sanitizedEnvironment(process.env),
+      env: this.childEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
     });
     child.stdin.end(input.prompt);
@@ -607,7 +639,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   }> {
     return new Promise((resolve) => {
       const child = spawn(this.options.binary, ["--version"], {
-        env: sanitizedEnvironment(process.env),
+        env: this.childEnvironment(),
         stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
@@ -758,30 +790,99 @@ function numeric(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
-// Bug №43: with OPERATOR_FULL_ACCESS the CLI's Bash tool sees the whole daemon
-// environment, and a fixed blocklist misses every credential added after it was
-// written (OPENROUTER_API_KEY and friends). Strip anything whose *name* looks
-// like a credential instead. Benign variables (PATH, HOME, NODE_*, LANG, LC_*,
-// TERM, TMPDIR, XDG_*, …) never match the pattern and pass through untouched.
-const SECRET_LIKE_ENVIRONMENT_NAME = /TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL|BEARER/i;
-// The CLI's own authentication is the one credential family the spawned
-// process legitimately needs (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN and
-// their endpoint overrides); everything else credential-shaped stays home.
-const CLI_AUTH_ENVIRONMENT_PREFIXES = ["ANTHROPIC_", "CLAUDE_"];
-// The per-turn MCP capability is injected explicitly after sanitizing; a value
-// inherited from the daemon's own environment must never reach a child.
-const NEVER_INHERITED_ENVIRONMENT_NAMES = new Set(["T3_OPERATOR_MCP_CAPABILITY"]);
+// Allowlist, not denylist: a name-shaped denylist always leaks the variable
+// nobody thought of (SSH_AUTH_SOCK, DATABASE_URL, SENTRY_DSN, *_WEBHOOK_URL)
+// while stripping credentials the child legitimately needs (OPENAI_API_KEY for
+// the Codex provider). Everything not named here stays in the daemon.
+const OPERATOR_ENV_ALLOWED_NAMES = new Set([
+  "PATH",
+  "HOME",
+  "PWD",
+  "LANG",
+  "TZ",
+  "TERM",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  // NODE_ENV only. NODE_OPTIONS is denied outright below; NODE_PATH and
+  // NODE_REPL_EXTERNAL_MODULE likewise redirect module resolution into
+  // attacker-chosen code, so no blanket NODE_ prefix.
+  "NODE_ENV",
+  // Egress: a host that reaches the provider only through a proxy, and a host
+  // whose TLS trust lives in a custom bundle, must pass both down or the child
+  // simply cannot make its own API calls. Both cases, in both spellings —
+  // undici and curl read the lowercase names.
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  // Adds a trust anchor; unlike NODE_OPTIONS it executes nothing.
+  "NODE_EXTRA_CA_CERTS",
+  "CURL_CA_BUNDLE",
+  "REQUESTS_CA_BUNDLE",
+  "BASH_DEFAULT_TIMEOUT_MS",
+  "BASH_MAX_TIMEOUT_MS",
+]);
 
-function sanitizedEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+const OPERATOR_ENV_ALLOWED_PREFIXES = ["LC_", "XDG_", "ANTHROPIC_", "CLAUDE_", "OPENAI_"];
+
+// Hard denials, checked before the allowlist and before any passthrough match:
+// the per-turn MCP capability (injected explicitly after sanitizing, so an
+// ambient value must never shadow it), NODE_OPTIONS (injects code into the
+// child), and every secret the daemon reads for itself, derived from the config
+// schema. A passthrough prefix such as `GROQ_*` therefore cannot walk a daemon
+// credential back into the child.
+const OPERATOR_ENV_NEVER_INHERITED = new Set([
+  "T3_OPERATOR_MCP_CAPABILITY",
+  "NODE_OPTIONS",
+  ...DAEMON_SECRET_ENV_NAMES,
+]);
+
+function isInheritableEnvName(key: string, passthrough: readonly string[]): boolean {
+  if (OPERATOR_ENV_NEVER_INHERITED.has(key)) return false;
+  if (OPERATOR_ENV_ALLOWED_NAMES.has(key)) return true;
+  if (OPERATOR_ENV_ALLOWED_PREFIXES.some((prefix) => key.startsWith(prefix))) return true;
+  return passthrough.some((pattern) =>
+    pattern.endsWith("*") ? key.startsWith(pattern.slice(0, -1)) : pattern === key,
+  );
+}
+
+function sanitizedEnvironment(
+  env: NodeJS.ProcessEnv,
+  passthrough: readonly string[] = [],
+): NodeJS.ProcessEnv {
   // Cap individual Bash tool commands: one runaway scan must not consume the
   // whole turn budget (the per-turn watchdog is the outer bound).
   env = { ...env, BASH_DEFAULT_TIMEOUT_MS: env.BASH_DEFAULT_TIMEOUT_MS ?? "300000", BASH_MAX_TIMEOUT_MS: env.BASH_MAX_TIMEOUT_MS ?? "300000" };
   return Object.fromEntries(
-    Object.entries(env).filter(([key]) => {
-      if (NEVER_INHERITED_ENVIRONMENT_NAMES.has(key)) return false;
-      if (!SECRET_LIKE_ENVIRONMENT_NAME.test(key)) return true;
-      return CLI_AUTH_ENVIRONMENT_PREFIXES.some((prefix) => key.startsWith(prefix));
-    }),
+    Object.entries(env).filter(([key]) => isInheritableEnvName(key, passthrough)),
+  );
+}
+
+/**
+ * Names, never values. Without this line "the variable is missing" and "the
+ * filter ate it" look identical from inside the child.
+ */
+function logFilteredEnvironment(
+  logger: Logger | undefined,
+  provider: string,
+  env: NodeJS.ProcessEnv,
+  passthrough: readonly string[],
+): void {
+  if (!logger) return;
+  const filtered = Object.keys(env)
+    .filter((key) => !isInheritableEnvName(key, passthrough))
+    .sort();
+  logger.info(
+    { provider, filtered, passthrough: [...passthrough] },
+    "Operator child environment filtered to the allowlist",
   );
 }
 

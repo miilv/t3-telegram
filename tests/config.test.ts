@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../packages/shared/src/config.js";
+import { DAEMON_SECRET_ENV_NAMES, loadConfig } from "../packages/shared/src/config.js";
 
 describe("media configuration", () => {
   it("loads safe codec defaults without requiring a cloud provider", () => {
@@ -123,5 +123,46 @@ describe("media configuration", () => {
     });
     expect(config.connectors.google.accessToken).toBe("workspace-test");
     expect(config.dashboard).toEqual({ enabled: true, port: 43_100 });
+  });
+});
+
+describe("child environment passthrough configuration", () => {
+  const base = {
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_ALLOWED_USER_ID: "42",
+    OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+  };
+
+  it("parses exact names and prefix patterns, and defaults to nothing extra", () => {
+    expect(loadConfig({ ...base }).operator.envPassthrough).toEqual([]);
+    expect(
+      loadConfig({ ...base, OPERATOR_ENV_PASSTHROUGH: " WF_* , WORKFLOW_PROFILE ,WF_*" }).operator
+        .envPassthrough,
+    ).toEqual(["WF_*", "WORKFLOW_PROFILE"]);
+  });
+
+  it("rejects a bare wildcard and an empty prefix at load time", () => {
+    expect(() => loadConfig({ ...base, OPERATOR_ENV_PASSTHROUGH: "*" })).toThrow(
+      /must name a variable or a non-empty prefix/,
+    );
+    expect(() => loadConfig({ ...base, OPERATOR_ENV_PASSTHROUGH: "WF_*,*" })).toThrow(
+      /must name a variable or a non-empty prefix/,
+    );
+  });
+
+  it("derives the daemon secret denylist from the schema, minus provider credentials", () => {
+    expect(DAEMON_SECRET_ENV_NAMES).toEqual(
+      expect.arrayContaining([
+        "TELEGRAM_BOT_TOKEN",
+        "T3_BEARER_TOKEN",
+        "OPENROUTER_API_KEY",
+        "GOOGLE_WORKSPACE_ACCESS_TOKEN",
+        "GROQ_API_KEY",
+        "DEEPGRAM_API_KEY",
+        "ELEVENLABS_API_KEY",
+      ]),
+    );
+    // The Codex provider authenticates with this one; it is not a daemon-only secret.
+    expect(DAEMON_SECRET_ENV_NAMES).not.toContain("OPENAI_API_KEY");
   });
 });

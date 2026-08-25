@@ -3443,6 +3443,7 @@ function config(home: string): Config {
       effort: "high",
       compactThresholdPercent: 80,
       turnTimeoutMs: 600_000,
+      envPassthrough: [],
       mediationTimeoutMs: 250,
       fullAccess: false,
       home,

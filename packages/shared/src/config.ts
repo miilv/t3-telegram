@@ -31,6 +31,11 @@ const envSchema = z.object({
   CODEX_EFFORT: z.enum(["low", "medium", "high", "xhigh"]).default("high"),
   OPERATOR_COMPACT_THRESHOLD_PERCENT: z.coerce.number().min(50).max(95).default(80),
   OPERATOR_TURN_TIMEOUT_MS: z.coerce.number().int().min(30_000).max(3_600_000).default(600_000),
+  /**
+   * Extra environment names inherited by provider subprocesses on top of the
+   * runtime allowlist. Comma-separated; a trailing `*` matches by prefix.
+   */
+  OPERATOR_ENV_PASSTHROUGH: z.string().default(""),
   // Budget for the out-of-session mediation pass over worker questions and
   // approvals (bug №49). On timeout the raw prompt is shown directly.
   OPERATOR_MEDIATION_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
@@ -128,6 +133,46 @@ const envSchema = z.object({
   DASHBOARD_PORT: z.coerce.number().int().min(0).max(65_535).default(0),
 });
 
+/**
+ * Credential families a provider subprocess legitimately authenticates with:
+ * the Claude CLI's own auth and, for the Codex provider, `OPENAI_API_KEY`.
+ * Everything else credential-shaped in the schema is the daemon's own secret.
+ */
+const PROVIDER_CREDENTIAL_ENV_PREFIXES = ["ANTHROPIC_", "CLAUDE_", "OPENAI_"];
+
+/**
+ * Secrets the daemon reads for itself, derived from this schema rather than
+ * from a hand-kept list — a credential added to the schema tomorrow is denied
+ * to provider subprocesses the moment it is declared, with no second edit.
+ */
+export const DAEMON_SECRET_ENV_NAMES: readonly string[] = Object.freeze(
+  Object.keys(envSchema.shape)
+    .filter((name) => /(_TOKEN|_API_KEY|_SECRET|_SALT|_PASSWORD)$/.test(name))
+    .filter((name) => !PROVIDER_CREDENTIAL_ENV_PREFIXES.some((prefix) => name.startsWith(prefix)))
+    .sort(),
+);
+
+/**
+ * A bare `*` (or a pattern that is only a wildcard) would hand the child the
+ * entire daemon environment, which is exactly what the allowlist exists to
+ * prevent. Reject it at load rather than silently narrowing it later.
+ */
+export function parseEnvPassthrough(raw: string): string[] {
+  const patterns = raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  for (const pattern of patterns) {
+    const prefix = pattern.endsWith("*") ? pattern.slice(0, -1) : pattern;
+    if (!prefix) {
+      throw new Error(
+        'OPERATOR_ENV_PASSTHROUGH entries must name a variable or a non-empty prefix; a bare "*" would inherit the whole daemon environment',
+      );
+    }
+  }
+  return [...new Set(patterns)];
+}
+
 const approvalRiskCategory = z.enum([
   "safe-read",
   "safe-write-in-project",
@@ -174,6 +219,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       return [key, cost];
     }),
   );
+  const envPassthrough = parseEnvPassthrough(parsed.OPERATOR_ENV_PASSTHROUGH);
   if (parsed.OPERATOR_PROVIDER === "codex" && parsed.OPERATOR_CODEX_ENABLED !== "true") {
     throw new Error("OPERATOR_PROVIDER=codex requires OPERATOR_CODEX_ENABLED=true");
   }
@@ -216,6 +262,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       fullAccess: parsed.OPERATOR_FULL_ACCESS === "true",
       compactThresholdPercent: parsed.OPERATOR_COMPACT_THRESHOLD_PERCENT,
       turnTimeoutMs: parsed.OPERATOR_TURN_TIMEOUT_MS,
+      envPassthrough,
       mediationTimeoutMs: parsed.OPERATOR_MEDIATION_TIMEOUT_MS,
       home: operatorHome,
       runtimeDir: resolve(operatorHome, "runtime"),
