@@ -212,6 +212,12 @@ export interface TelegramTransport {
     options?: TelegramSendOptions,
     progress?: TelegramSendProgress,
   ): Promise<SentMessage[]>;
+  /**
+   * Best-effort out-of-band notice: one attempt, no per-chat lock and no
+   * inline flood wait, resolving to `undefined` when it does not get through.
+   * Used for delivery alerts that must not queue behind the stuck delivery.
+   */
+  sendAlert(chatId: number, text: string, options?: TelegramDestination): Promise<SentMessage | undefined>;
   startDraft(chatId: number, options?: TelegramSendOptions & { phase?: StreamPhase }): Promise<StreamDraft>;
   updateDraft(draft: StreamDraft, text: string): Promise<void>;
   finalizeDraft(draft: StreamDraft, text: string): Promise<SentMessage[]>;

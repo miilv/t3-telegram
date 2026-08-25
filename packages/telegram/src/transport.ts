@@ -281,6 +281,40 @@ export class TelegramBotTransport implements TelegramTransport {
     return sent;
   }
 
+  /**
+   * Best-effort out-of-band notice (delivery stalls, head-of-line blocking).
+   *
+   * Deliberately bypasses `outbound`: no per-chat lock, so an alert about a
+   * jammed chat cannot queue behind the jam itself, and exactly one attempt
+   * with no inline flood wait, so it never parks for the 30 s a rate-limited
+   * send is allowed to hold. Plain text with no parse mode — nothing here can
+   * fail on formatting. A dropped alert is acceptable: the durable retry loop
+   * keeps running either way, and the caller gets `undefined`.
+   */
+  async sendAlert(
+    chatId: number,
+    text: string,
+    options: TelegramDestination = {},
+  ): Promise<SentMessage | undefined> {
+    const startedAt = Date.now();
+    try {
+      const message = await this.bot.api.sendMessage(chatId, text.slice(0, 4_000), {
+        ...destinationOptions(options),
+        link_preview_options: { is_disabled: true },
+      });
+      metrics.observe("telegram_update_latency_ms", Date.now() - startedAt, { direction: "outbound_api" });
+      return sentMessage(chatId, message.message_id, options);
+    } catch (error) {
+      const disposition = classifyTelegramDeliveryError(error);
+      metrics.increment("telegram_errors_total", { code: disposition.code });
+      this.logger.warn(
+        { chatId, errorCode: disposition.code },
+        "Best-effort delivery alert was dropped",
+      );
+      return undefined;
+    }
+  }
+
   async startDraft(
     chatId: number,
     options: TelegramSendOptions & { phase?: StreamDraft["phase"] } = {},
