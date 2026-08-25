@@ -22,7 +22,13 @@ export class DashboardServer {
 
   async start(): Promise<void> {
     if (this.server) return;
-    const server = createServer((request, response) => void this.handle(request, response));
+    // Package 0.1 (H1): a terminal catcher. An unhandled rejection from a
+    // dashboard request would now take the whole daemon down.
+    const server = createServer((request, response) => {
+      void this.handle(request, response).catch((error: unknown) => {
+        this.options.logger.error({ err: error }, "Dashboard request failed");
+      });
+    });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(this.options.port ?? 0, "127.0.0.1", () => {

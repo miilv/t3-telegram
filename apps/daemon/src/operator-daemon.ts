@@ -46,6 +46,11 @@ import {
   resolveProjectReference,
   updateFocus,
 } from "../../../packages/router/src/index.js";
+import {
+  SHUTDOWN_DEADLINE_MS,
+  awaitShutdownSteps,
+  resolveStartupProvider,
+} from "./lifecycle.js";
 import type { ArtifactRegistry } from "../../../packages/artifacts/src/index.js";
 import type {
   SentMessage,
@@ -170,149 +175,6 @@ const MONITOR_RESUBSCRIBE_BASE_DELAY_MS = 1_000;
 const MONITOR_RESUBSCRIBE_MAX_DELAY_MS = 60_000;
 /** Terminal events within this window of our own dispatch are never suppressed (bug №27). */
 const OWN_DISPATCH_GRACE_MS = 120_000;
-/**
- * Package 0.1: how long stop() waits for queues, the reliability loop and the
- * monitors before it gives up. Without a deadline a single wedged task keeps
- * the graceful-exit marker unwritten and the next boot falsely reports a crash.
- */
-export const SHUTDOWN_DEADLINE_MS = 15_000;
-
-/** One awaited stage of a graceful shutdown. */
-export interface ShutdownStep {
-  name: string;
-  wait: () => Promise<unknown>;
-}
-
-/**
- * Package 0.1: runs the shutdown steps in order but under a single wall-clock
- * deadline, and reports the ones that never completed. A step that throws is
- * logged through `onStepError`, counted as unfinished and does not abort the
- * rest — shutdown must always reach the marker.
- */
-export async function awaitShutdownSteps(
-  steps: readonly ShutdownStep[],
-  deadlineMs: number,
-  onStepError?: (name: string, error: unknown) => void,
-): Promise<string[]> {
-  const unfinished = new Set(steps.map((step) => step.name));
-  let expired = false;
-  const sequence = (async () => {
-    for (const step of steps) {
-      if (expired) return;
-      try {
-        await step.wait();
-      } catch (error) {
-        onStepError?.(step.name, error);
-        continue;
-      }
-      unfinished.delete(step.name);
-    }
-  })();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<void>((resolve) => {
-    timer = setTimeout(() => {
-      expired = true;
-      resolve();
-    }, deadlineMs);
-    timer.unref?.();
-  });
-  await Promise.race([sequence, deadline]);
-  clearTimeout(timer);
-  return [...unfinished];
-}
-
-/**
- * Package 0.1: the boot-time provider guard. A runtime_state pointing at a
- * provider that is no longer wired up (codex remembered, then disabled) used to
- * throw out of initialize() and could only be fixed by editing the database by
- * hand. Fall back instead: the configured default when it is available, else
- * whatever the runtime does offer.
- */
-export function resolveStartupProvider(
-  requested: string,
-  available: readonly string[],
-  configured: string,
-): string {
-  if (available.length === 0 || available.includes(requested)) return requested;
-  if (available.includes(configured)) return configured;
-  return available[0]!;
-}
-
-/** Everything the signal handler needs; injected so exit paths stay testable. */
-export interface ShutdownControllerHooks {
-  stop: () => Promise<void>;
-  /** Writes the graceful-exit marker when stop() cannot be relied on. */
-  markCleanShutdown: () => void;
-  logger: Pick<Logger, "info" | "warn" | "error">;
-  exit: (code: number) => void;
-}
-
-/**
- * Package 0.1: SIGINT/SIGTERM. The first signal asks for a graceful stop; a
- * second one, arriving while the first is still draining, forces the exit
- * itself — registered through `process.on`, so Node's default handler (an
- * abrupt kill that leaves no marker) never takes over.
- */
-export function createShutdownController(hooks: ShutdownControllerHooks): (signal: string) => void {
-  let stopping = false;
-  let forced = false;
-  return (signal: string) => {
-    if (stopping) {
-      if (forced) return;
-      forced = true;
-      hooks.logger.warn({ signal }, "Second shutdown signal; forcing exit");
-      hooks.markCleanShutdown();
-      hooks.exit(0);
-      return;
-    }
-    stopping = true;
-    hooks.logger.info({ signal }, "Shutting down Operator");
-    void hooks.stop().then(
-      () => hooks.exit(0),
-      (error: unknown) => {
-        hooks.logger.error({ err: error, signal }, "Graceful shutdown failed; exiting anyway");
-        hooks.markCleanShutdown();
-        hooks.exit(1);
-      },
-    );
-  };
-}
-
-/** Everything the fatal-error handler needs; injected so exit paths stay testable. */
-export interface FatalErrorHandlerHooks {
-  /** Records that this run did not end gracefully (clean_shutdown = ""). */
-  markCrashed: () => void;
-  logger: Pick<Logger, "fatal">;
-  exit: (code: number) => void;
-}
-
-/**
- * Package 0.1: `uncaughtException` / `unhandledRejection`. Previously absent, so
- * a stray rejection killed the daemon without a log line and without clearing
- * the graceful-exit marker. Every side effect is best-effort: the process must
- * reach a non-zero exit even if logging or the database is already broken.
- */
-export function createFatalErrorHandler(
-  hooks: FatalErrorHandlerHooks,
-): (error: unknown, origin: string) => void {
-  let handled = false;
-  return (error: unknown, origin: string) => {
-    if (handled) return;
-    handled = true;
-    try {
-      hooks.logger.fatal({ err: error, origin }, "Operator daemon is exiting on a fatal error");
-    } catch {
-      // A broken logger must not swallow the exit.
-    }
-    try {
-      hooks.markCrashed();
-    } catch {
-      // Best effort: the next boot simply loses the crash notice.
-    }
-    hooks.exit(1);
-  };
-}
-
 export class OperatorDaemon {
   private readonly operatorInputQueue = new SerialQueue();
   private readonly operatorRuntimeQueue = new SerialQueue();
@@ -378,7 +240,7 @@ export class OperatorDaemon {
     const existingSession = this.store.getRuntimeState("operator_session_id");
     const storedProvider = this.store.getRuntimeState("operator_provider")
       ?? this.config.operator.provider;
-    const existingProvider = this.recoverStuckProvider(storedProvider);
+    const existingProvider = this.resolveUnavailableProvider(storedProvider);
     if (existingSession) {
       // The system prompt travels with resume so a runtime that seeds future
       // fresh sessions from it (Codex compaction) never restarts with an
@@ -432,7 +294,11 @@ export class OperatorDaemon {
     await this.recoverWorkers();
     await this.maintain("startup");
     this.scheduler.start();
-    this.reliabilityTask = this.reliabilityLoop();
+    // Package 0.1 (H1): a terminal catcher, so a pump that dies outside its own
+    // per-iteration try/catch is logged instead of floating as a rejection.
+    this.reliabilityTask = this.reliabilityLoop().catch((error: unknown) => {
+      this.logger.error({ err: error }, "Reliability pump died");
+    });
   }
 
   async run(): Promise<void> {
@@ -446,7 +312,7 @@ export class OperatorDaemon {
         isCancelIntent(update.text) &&
         this.mayInterruptOperatorTurn(update.chatId, update.userId)
       ) {
-        void this.runtime.interrupt();
+        this.interruptQuietly();
       }
       const receivedAt = Date.now();
       void this.ingressQueue
@@ -485,6 +351,21 @@ export class OperatorDaemon {
     }
   }
 
+  /**
+   * Package 0.1 (H1): interrupting a dead provider CLI raises EPERM/ESRCH, and
+   * `interrupt()` is not declared async — it can throw synchronously as well as
+   * reject. A user typing a cancel word must never be able to kill the daemon.
+   */
+  private interruptQuietly(): void {
+    try {
+      void Promise.resolve(this.runtime.interrupt()).catch((error: unknown) => {
+        this.logger.warn({ err: error }, "Operator interrupt failed");
+      });
+    } catch (error) {
+      this.logger.warn({ err: error }, "Operator interrupt threw synchronously");
+    }
+  }
+
   async stop(deadlineMs = SHUTDOWN_DEADLINE_MS): Promise<void> {
     this.shutdown.abort();
     this.scheduler.stop();
@@ -493,7 +374,16 @@ export class OperatorDaemon {
     for (const controller of this.monitors.values()) controller.abort();
     const unfinished = await awaitShutdownSteps(
       [
-        { name: "scheduler", wait: () => this.scheduler.idle() },
+        {
+          name: "scheduler",
+          wait: async () => {
+            await this.scheduler.idle();
+            // A maintenance tick can register monitors while it drains. They
+            // see the aborted shutdown signal and return early, but abort once
+            // more so anything that slipped through cannot outlive the drain.
+            for (const controller of this.monitors.values()) controller.abort();
+          },
+        },
         { name: "ingressQueue", wait: () => this.ingressQueue.idle() },
         { name: "operatorInputQueue", wait: () => this.operatorInputQueue.idle() },
         { name: "operatorRuntimeQueue", wait: () => this.operatorRuntimeQueue.idle() },
@@ -510,17 +400,21 @@ export class OperatorDaemon {
       deadlineMs,
       (name, error) => this.logger.warn({ err: error, step: name }, "Shutdown step failed"),
     );
+    // The graceful-exit marker: its absence at the next initialize() means the
+    // previous run did not drain and the owner should hear about it (bug №7).
+    // A deadline that expired is exactly that case — work was abandoned, so the
+    // next boot must recover it rather than trust a clean-exit claim.
+    this.store.setRuntimeState("clean_shutdown", unfinished.length ? "" : "1");
     if (unfinished.length) {
-      // Package 0.1: say what refused to settle, then write the marker anyway —
-      // a stuck queue must not make the next boot report a phantom crash.
       this.logger.warn(
         { unfinished, deadlineMs },
         "Shutdown deadline expired; exiting with work still in flight",
       );
+      // Abandoned steps still hold this connection. Closing it under them turns
+      // every late write into a throw; the process is exiting anyway, so let the
+      // operating system reclaim the handle.
+      return;
     }
-    // The graceful-exit marker: its absence at the next initialize() means the
-    // previous run crashed and the owner should hear about it (bug №7).
-    this.store.setRuntimeState("clean_shutdown", "1");
     this.store.close();
   }
 
@@ -531,7 +425,7 @@ export class OperatorDaemon {
    * instead, persist the correction, and tell the owner in one line so the
    * silent downgrade is not a surprise.
    */
-  private recoverStuckProvider(storedProvider: string): string {
+  private resolveUnavailableProvider(storedProvider: string): string {
     const available = this.runtime.availableProviders?.() ?? [];
     const resolved = resolveStartupProvider(
       storedProvider,
@@ -550,7 +444,9 @@ export class OperatorDaemon {
     const ownerChatId = Number(this.store.getRuntimeState("owner_chat_id"));
     if (Number.isSafeInteger(ownerChatId) && ownerChatId !== 0) {
       this.enqueueTelegramOutbox(
-        `telegram:provider-fallback:${storedProvider}:${nowIso()}`,
+        // No timestamp in the key: a crash loop against a read-only database
+        // would otherwise enqueue a fresh notice on every boot.
+        `telegram:provider-fallback:${storedProvider}:${resolved}`,
         ownerChatId,
         "rich",
         {
@@ -1478,6 +1374,10 @@ export class OperatorDaemon {
     originMessageId?: number,
     destination: TelegramDestination = {},
   ): void {
+    // Package 0.1 (H2): a maintenance tick draining inside stop() must not
+    // register a fresh, un-aborted monitor — it would hold the monitorTasks
+    // step for the whole shutdown deadline.
+    if (this.shutdown.signal.aborted) return;
     // Bug №11: refresh the delivery route on EVERY call, so steering an
     // already-monitored thread from another chat retargets the live monitor
     // instead of hitting the early return with a stale closure destination.
@@ -1651,9 +1551,18 @@ export class OperatorDaemon {
           this.monitorThread(threadId, route.chatId, route.originMessageId, route.destination);
         }
       }
-    })();
+    })().catch((error: unknown) => {
+      // Package 0.1 (H1): the monitor's own finally block can throw
+      // (performance bookkeeping, follow-up dispatch), and a rejection here
+      // used to float. Terminal catcher: `task` never rejects.
+      this.logger.error({ err: error, threadId }, "Worker monitor crashed");
+    });
     this.monitorTasks.add(task);
-    void task.finally(() => this.monitorTasks.delete(task));
+    void task
+      .finally(() => this.monitorTasks.delete(task))
+      .catch(() => {
+        // .finally() hands back a fresh promise; nothing may float off it.
+      });
   }
 
   /** Bug №12: durable owner notice + marker when a monitor could not resubscribe. */
