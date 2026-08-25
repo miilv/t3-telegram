@@ -357,6 +357,7 @@ describe("MediaProcessor", () => {
           expect(String(url)).toBe("https://openrouter.ai/api/v1/audio/transcriptions");
           expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer or-key");
           expect((init?.body as FormData).get("model")).toBe("openai/whisper-large-v3-turbo");
+          expect((init?.body as FormData).get("language")).toBe("ru");
           return new Response(JSON.stringify({ text: "привет из openrouter" }), {
             status: 200,
             headers: { "content-type": "application/json" },
@@ -493,6 +494,7 @@ function mediaConfig(overrides: Partial<MediaProcessorConfig> = {}): MediaProces
     maxInputBytes: 20 * 1024 * 1024,
     sttMaxUploadBytes: 20 * 1024 * 1024,
     sttSegmentSeconds: 900,
+    sttLanguage: "ru",
     longTimeoutMs: 1_800_000,
     ...overrides,
   };

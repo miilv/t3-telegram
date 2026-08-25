@@ -1737,6 +1737,7 @@ function config(home: string): Config {
       maxInputBytes: 20 * 1024 * 1024,
       sttMaxUploadBytes: 20 * 1024 * 1024,
       sttSegmentSeconds: 900,
+      sttLanguage: "ru",
       longTimeoutMs: 1_800_000,
       openrouter: undefined,
       docling: undefined,

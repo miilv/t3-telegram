@@ -22,6 +22,13 @@ export interface MediaProcessorConfig {
   sttMaxUploadBytes: number;
   /** Segment length used when a recording is still too large after re-encoding. */
   sttSegmentSeconds: number;
+  /**
+   * ISO-639-1 code forced on every STT provider. Whisper autodetects from the
+   * first seconds otherwise, and noise or a clipped opening phrase is enough to
+   * make it "translate" a Russian recording into another language. Leave
+   * undefined to restore autodetection.
+   */
+  sttLanguage?: string | undefined;
   /** Deadline for long recordings, which outlive the interactive media budget. */
   longTimeoutMs: number;
   /** Telegram upload ceiling: 50 MiB on the cloud API, up to 2000 MiB locally. */
@@ -944,6 +951,7 @@ export class MediaProcessor {
     form.append("file", new Blob([bytes], { type: artifact.mimeType ?? "application/octet-stream" }), filename);
     form.append("model", model);
     form.append("response_format", "json");
+    if (this.config.sttLanguage) form.append("language", this.config.sttLanguage);
     const response = await this.fetchImpl(endpoint, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}` },
@@ -962,6 +970,7 @@ export class MediaProcessor {
     const url = new URL("https://api.deepgram.com/v1/listen");
     url.searchParams.set("model", provider.model);
     url.searchParams.set("smart_format", "true");
+    if (this.config.sttLanguage) url.searchParams.set("language", this.config.sttLanguage);
     const response = await this.fetchImpl(url, {
       method: "POST",
       headers: {
@@ -1002,15 +1011,14 @@ export class MediaProcessor {
       if (binaryName.includes("whisper-cli") || binaryName === "main") {
         if (!provider.model) throw new Error("WHISPER_MODEL is required for whisper.cpp");
         const outputBase = join(directory, "transcript");
-        await runCommand(
-          provider.binary,
-          ["-m", provider.model, "-f", wavPath, "-otxt", "-of", outputBase, "-np"],
-          remaining(deadline),
-        );
+        const cppArgs = ["-m", provider.model, "-f", wavPath, "-otxt", "-of", outputBase, "-np"];
+        if (this.config.sttLanguage) cppArgs.push("-l", this.config.sttLanguage);
+        await runCommand(provider.binary, cppArgs, remaining(deadline));
         return readFile(`${outputBase}.txt`, "utf8");
       }
       const args = [wavPath, "--output_format", "txt", "--output_dir", directory];
       if (provider.model) args.push("--model", provider.model);
+      if (this.config.sttLanguage) args.push("--language", this.config.sttLanguage);
       await runCommand(provider.binary, args, remaining(deadline));
       return readFile(join(directory, "audio.txt"), "utf8");
     } finally {

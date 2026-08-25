@@ -84,6 +84,8 @@ const envSchema = z.object({
     .default(1_800_000),
   OPENROUTER_API_KEY: z.string().min(1).optional(),
   OPENROUTER_TRANSCRIPTION_MODEL: z.string().min(1).default("openai/whisper-large-v3-turbo"),
+  /** ISO-639-1 code forced on every STT call; "auto" restores provider autodetection. */
+  STT_LANGUAGE: z.string().min(1).default("ru"),
   OCR_ENABLED: z.enum(["true", "false"]).default("true"),
   TESSERACT_BIN: z.string().min(1).default("tesseract"),
   PDFTOTEXT_BIN: z.string().min(1).default("pdftotext"),
@@ -233,6 +235,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       maxInputBytes: parsed.MEDIA_MAX_INPUT_BYTES,
       sttMaxUploadBytes: parsed.MEDIA_STT_MAX_UPLOAD_BYTES,
       sttSegmentSeconds: parsed.MEDIA_STT_SEGMENT_SECONDS,
+      sttLanguage: parsed.STT_LANGUAGE === "auto" ? undefined : parsed.STT_LANGUAGE,
       longTimeoutMs: parsed.MEDIA_LONG_TIMEOUT_MS,
       openrouter: parsed.OPENROUTER_API_KEY
         ? { apiKey: parsed.OPENROUTER_API_KEY, model: parsed.OPENROUTER_TRANSCRIPTION_MODEL }
