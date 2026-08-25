@@ -7,6 +7,52 @@ import { OperatorStore } from "../packages/storage/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
 
 describe("OperatorStore", () => {
+  it("freezes a thread's terminal verdict but still lets a finished thread run again (package 1.3)", () => {
+    const store = tempStore();
+    const timestamp = nowIso();
+    store.upsertProject({
+      id: "prj_acme",
+      t3ProjectId: "prj_acme",
+      name: "Acme API",
+      workspaceRoot: "/tmp/acme",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    store.upsertThread({
+      id: "th_done",
+      t3ThreadId: "th_done",
+      projectId: "prj_acme",
+      provider: "claude",
+      model: "claude-opus-5",
+      title: "Finished work",
+      shortSummary: "done",
+      keywords: [],
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    });
+
+    store.updateThreadStatus("th_done", "completed", { summary: "shipped" });
+    expect(store.getThread("th_done")?.status).toBe("completed");
+
+    // How a work ended is history. A late cancellation — the stale-focus hatch
+    // is the way one reaches this — must not rewrite it into something else.
+    store.updateThreadStatus("th_done", "cancelled");
+    expect(store.getThread("th_done")?.status).toBe("completed");
+    store.updateThreadStatus("th_done", "failed");
+    expect(store.getThread("th_done")?.status).toBe("completed");
+
+    // Terminal → non-terminal is a different thing entirely: a finished thread
+    // that is continued really does run again, and must be allowed to.
+    store.updateThreadStatus("th_done", "running");
+    expect(store.getThread("th_done")?.status).toBe("running");
+    store.updateThreadStatus("th_done", "cancelled");
+    expect(store.getThread("th_done")?.status).toBe("cancelled");
+  });
+
+
   it("persists team roles and filters shared projects by membership", () => {
     const store = tempStore();
     const timestamp = nowIso();

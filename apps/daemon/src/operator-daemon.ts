@@ -1672,8 +1672,12 @@ export class OperatorDaemon {
           ].join("\n"),
           // Package 1.3: no focus line. focus_state survives as the machine
           // binding for relatedThreadIds and the cancel hatch, but the owner
-          // never reads about it and the model is not told to steer it. Phase 2
-          // fills this slot with the now-state render.
+          // never reads about it and the model is not told to steer it.
+          // Nothing takes this position: the phase-2 now-state is pushed at the
+          // HEAD of the envelope (memory-design §4: now-state → memory index →
+          // do-not-reopen → gap → synthetic → turn instruction → message), and
+          // these lines become the turn instruction. Empty layers there render
+          // as explicit placeholders, not as omissions.
         ]
           .filter((line): line is string => Boolean(line))
           .join("\n\n")
@@ -1696,8 +1700,11 @@ export class OperatorDaemon {
       replyThread
         ? `This message replies to work thread "${replyThread.title}" (threadId ${replyThread.id}, project ${replyProject?.name ?? replyThread.projectId}, status ${replyThread.status}). Continue that thread unless the user clearly asks otherwise.`
         : undefined,
-      // Package 1.3: the focus line is gone from the envelope (see the
-      // thread-event branch above); phase 2 puts the now-state here.
+      // Package 1.3: the focus line is gone from here too — same reasoning as
+      // the thread-event branch above, and the same non-replacement: the
+      // phase-2 now-state belongs at the head of the envelope, not in this
+      // slot (memory-design §4). Both branches render the same layers when
+      // that lands, which is why they are worth keeping in step.
       supersededNote,
       priorJobThreads.length
         ? `Recovery note: a previous attempt of THIS SAME request already dispatched work to thread(s) ${priorJobThreads
@@ -3570,8 +3577,24 @@ export class OperatorDaemon {
       await this.commandReply(update, "Не вижу активной работы, которую нужно остановить.");
       return;
     }
+    // Package 1.3: the focus binding is durable and deliberately NOT cleared
+    // when a thread ends (relatedThreadIds and reply-continuation still need
+    // it), so by the time a bare cancel word arrives it may well point at work
+    // that finished hours ago. Without this guard the hatch interrupts a dead
+    // thread, rewrites completed → cancelled, and tells the owner "Остановил X"
+    // while their real workers keep running — and /focus clear no longer exists
+    // to escape it. A stale binding is the same situation as no binding at all.
+    const bound = this.store.getThread(threadId);
+    if (!bound) {
+      await this.commandReply(update, "Не вижу активной работы, которую нужно остановить.");
+      return;
+    }
     if (!this.canEditThread(update.userId, threadId)) {
       await this.commandReply(update, "У вас нет прав на остановку этой работы.");
+      return;
+    }
+    if (["completed", "failed", "cancelled"].includes(bound.status)) {
+      await this.commandReply(update, "Не вижу активной работы, которую нужно остановить.");
       return;
     }
     // Bug №38: a replayed ingress job must not interrupt the thread a second

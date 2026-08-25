@@ -32,7 +32,7 @@ Always-on team AI Operator in Telegram. It answers quick questions itself throug
 - Telegram approval buttons (`Allow once`, `Allow session`, `Deny`) backed by an explicit eight-category risk policy.
 - Sequential structured T3 questions in Telegram, including single-select, multi-select, and custom text answers.
 - Provider-aware follow-ups: immediate live steering when supported, otherwise a durable queue dispatched after the current turn.
-- Natural-language durable remember/recall plus `/status`, `/projects`, `/work`, `/focus`, `/memory`, `/stop`/`/cancel`, `/team`, `/share`, `/help`, and `/debug`.
+- Natural-language durable remember/recall plus `/status`, `/projects`, `/work`, `/memory`, `/team`, `/share`, `/help`, and `/debug`. Stopping work is asked for in words (the Operator interrupts the thread itself); a bare cancel word stays a deterministic emergency hatch that works even when the model cannot answer.
 - Minute maintenance ticks coalesce safely and enforce daily context compaction, bounded authoritative context restoration, T3 worker reconciliation, note expiry, and managed artifact retention cleanup.
 - Restart recovery for running workers, pending routing clarifications/interactions, interrupted T3 dispatches and group synthesis, and terminal results that arrived while the daemon was down. T3 command receipts and anchored Telegram edits make retries idempotent.
 - Secret-redacted structured logs, hashed chat identities, cross-component correlation IDs, owner diagnostics, classified errors and in-process latency/error/queue metrics.

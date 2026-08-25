@@ -184,9 +184,14 @@ Eight lines, `undefined` filtered, joined by blank lines:
 8. `New project workspaces belong under <operator.home>/workspaces.`
 
 Package 1.3 removed the focus line that used to sit at position 7 (`Current
-durable work focus: …` / `No current durable work focus.`). Nothing replaces it
-yet — the slot stays empty, not blank-filled, until phase 2 puts the now-state
-render there. `focus_state` itself is untouched: it is the machine binding for
+durable work focus: …` / `No current durable work focus.`). Nothing takes that
+position: the phase-2 now-state is pushed at the **head** of the envelope, not
+here — `now-state → memory index → do-not-reopen → [gap: …] → synthetic → turn
+instruction → fenced message` (memory-design §4), which turns these eight lines
+into the "turn instruction" segment. Empty layers there render as explicit
+placeholders (`No current work items.`), never as silence.
+
+`focus_state` itself is untouched: it is the machine binding for
 `relatedThreadIds` on outgoing messages and for path B of §4, and the model
 neither reads nor writes it (`memory.update_focus` is gone too). The agent
 identifies "that work" from the conversation, the reply line, or

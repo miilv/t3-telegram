@@ -667,13 +667,28 @@ export class OperatorStore {
     status: ThreadStatus,
     fields: { summary?: string; result?: string } = {},
   ): void {
+    // Package 1.3: how a work ENDED is history, and history is not overwritten.
+    // A thread that already reached a terminal state keeps the outcome it
+    // reached; a late cancellation must not turn a completed work into a
+    // cancelled one. Terminal → non-terminal stays allowed on purpose: that is
+    // a finished thread being continued, which genuinely runs again. Summary and
+    // result fields still update either way — only the verdict is frozen.
+    const current = this.db
+      .prepare("SELECT status FROM threads WHERE id=? OR t3_thread_id=? LIMIT 1")
+      .get(threadId, threadId) as { status?: ThreadStatus } | undefined;
+    const terminal: ThreadStatus[] = ["completed", "failed", "cancelled"];
+    const settled = current?.status;
+    const nextStatus: ThreadStatus =
+      settled !== undefined && terminal.includes(settled) && terminal.includes(status)
+        ? settled
+        : status;
     this.db
       .prepare(`
         UPDATE threads SET status=?, short_summary=COALESCE(?,short_summary),
           last_result_summary=COALESCE(?,last_result_summary),last_activity_at=?,updated_at=?
         WHERE id=? OR t3_thread_id=?
       `)
-      .run(status, fields.summary ?? null, fields.result ?? null, nowIso(), nowIso(), threadId, threadId);
+      .run(nextStatus, fields.summary ?? null, fields.result ?? null, nowIso(), nowIso(), threadId, threadId);
   }
 
   updateThreadIntent(threadId: string, intent: string): void {
