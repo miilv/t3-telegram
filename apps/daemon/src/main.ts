@@ -15,7 +15,11 @@ import { OperatorToolServer } from "../../../packages/operator-tools/src/index.j
 import { MediaProcessor } from "../../../packages/media/src/index.js";
 import { GoogleWorkspaceConnectors } from "../../../packages/connectors/src/index.js";
 import { DashboardServer } from "../../../packages/dashboard/src/index.js";
-import { OperatorDaemon } from "./operator-daemon.js";
+import {
+  OperatorDaemon,
+  createFatalErrorHandler,
+  createShutdownController,
+} from "./operator-daemon.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -122,13 +126,36 @@ async function main(): Promise<void> {
     dashboard,
   );
 
-  const shutdown = async (signal: string) => {
-    logger.info({ signal }, "Shutting down Operator");
-    await daemon.stop();
-    process.exit(0);
+  // Best effort by design: the marker is a hint for the next boot, never a
+  // reason to keep a dying process alive.
+  const writeShutdownMarker = (value: "1" | "") => {
+    try {
+      store.setRuntimeState("clean_shutdown", value);
+    } catch (error) {
+      logger.warn({ err: error }, "Could not write the shutdown marker");
+    }
   };
-  process.once("SIGINT", () => void shutdown("SIGINT"));
-  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+
+  // Package 0.1: without these a stray rejection killed the daemon silently and
+  // left the graceful-exit marker in place, so the crash never got reported.
+  const onFatal = createFatalErrorHandler({
+    logger,
+    markCrashed: () => writeShutdownMarker(""),
+    exit: (code) => process.exit(code),
+  });
+  process.on("uncaughtException", (error) => onFatal(error, "uncaughtException"));
+  process.on("unhandledRejection", (reason) => onFatal(reason, "unhandledRejection"));
+
+  // process.on, not process.once: the second signal must reach our forcing
+  // handler instead of Node's default kill.
+  const onSignal = createShutdownController({
+    logger,
+    stop: () => daemon.stop(),
+    markCleanShutdown: () => writeShutdownMarker("1"),
+    exit: (code) => process.exit(code),
+  });
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
 
   await daemon.initialize();
   await daemon.run();

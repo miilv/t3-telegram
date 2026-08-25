@@ -3413,6 +3413,47 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   });
+
+  it("writes the graceful-exit marker even when a queue never settles (package 0.1)", async () => {
+    const home = tempDirectory("daemon-stop-deadline-");
+    const databasePath = `${home}/operator.db`;
+    const store = new OperatorStore(databasePath);
+    store.migrate();
+    const runtime = new BlockingRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // The Operator turn wedges the runtime queue and is never released.
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => runtime.turnStarted);
+
+    const startedAt = Date.now();
+    await daemon.stop(50);
+    // Without a deadline this would hang on the wedged queue forever.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+
+    const reopened = new OperatorStore(databasePath);
+    expect(reopened.getRuntimeState("clean_shutdown")).toBe("1");
+    reopened.close();
+
+    telegram.finish();
+    await run;
+  }, 15_000);
 });
 
 function config(home: string): Config {
