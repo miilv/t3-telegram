@@ -20,6 +20,8 @@ export interface Automation {
   status: "active" | "paused" | "running" | "completed" | "deleted";
   nextRunAt?: string;
   lastRunAt?: string;
+  /** Consecutive dispatch failures; drives retry backoff and auto-pause. */
+  consecutiveFailures?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -434,4 +436,23 @@ export function newId(prefix: string): string {
 
 export function unique<T>(values: readonly T[]): T[] {
   return [...new Set(values)];
+}
+
+/**
+ * Targeted secret masking for text that ends up in logs or durable storage.
+ * Unlike blanket field redaction, it keeps surrounding prose readable so a
+ * failure reason stays diagnosable while credentials are masked.
+ */
+export function redactSecrets(value: string): string {
+  return value
+    .replace(
+      /-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi,
+      "[REDACTED PRIVATE KEY]",
+    )
+    .replace(/\b\d{5,12}:[A-Za-z0-9_-]{30,}\b/g, "[REDACTED BOT TOKEN]")
+    .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(/\b(api[-_ ]?key|token|secret|password|authorization)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .replace(/\b(?:sk|ghp|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{12,}\b/g, "[REDACTED TOKEN]")
+    .replace(/\b[a-f0-9]{40,}\b/gi, "[REDACTED HEX]")
+    .replace(/(?<![\w/+=])[A-Za-z0-9+]{48,}={0,2}(?![\w/+=])/g, "[REDACTED BASE64]");
 }
