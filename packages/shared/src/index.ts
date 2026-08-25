@@ -447,6 +447,10 @@ export interface ApprovalDecision {
   approvalId: string;
   commandId?: string;
   decision: "accept" | "acceptForSession" | "decline" | "cancel";
+  /** Human-readable cause carried to the worker, e.g. "approval expired". */
+  reason?: string;
+  /** Bounds the dispatch so a dead T3 cannot hang a maintenance sweep. */
+  timeoutMs?: number;
 }
 
 export interface UserInputDecision {

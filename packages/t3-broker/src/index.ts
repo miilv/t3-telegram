@@ -472,18 +472,26 @@ export class HttpT3Broker implements T3Broker {
 
   async respondApproval(input: ApprovalDecision): Promise<void> {
     const commandId = input.commandId ?? newId("cmd");
-    await this.dispatch({
-      type: "thread.approval.respond",
-      commandId,
-      threadId: input.threadId,
-      requestId: input.approvalId,
-      decision: input.decision,
-      createdAt: nowIso(),
-    });
+    await this.dispatch(
+      {
+        type: "thread.approval.respond",
+        commandId,
+        threadId: input.threadId,
+        requestId: input.approvalId,
+        decision: input.decision,
+        ...(input.reason ? { reason: input.reason } : {}),
+        createdAt: nowIso(),
+      },
+      input.timeoutMs,
+    );
     this.store.appendEvent("thread.approval.responded", {
       correlationId: commandId,
       threadId: input.threadId,
-      payload: { approvalId: input.approvalId, decision: input.decision },
+      payload: {
+        approvalId: input.approvalId,
+        decision: input.decision,
+        ...(input.reason ? { reason: input.reason } : {}),
+      },
     });
   }
 
@@ -529,8 +537,12 @@ export class HttpT3Broker implements T3Broker {
     return this.request<T3ThreadSnapshot>(`/api/orchestration/threads/${encodeURIComponent(threadId)}?turnLimit=25`);
   }
 
-  private async dispatch(command: Record<string, unknown>): Promise<void> {
-    await this.request("/api/orchestration/dispatch", { method: "POST", body: JSON.stringify(command) });
+  private async dispatch(command: Record<string, unknown>, timeoutMs?: number): Promise<void> {
+    await this.request("/api/orchestration/dispatch", {
+      method: "POST",
+      body: JSON.stringify(command),
+      ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+    });
   }
 
   private async request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {

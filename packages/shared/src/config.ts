@@ -79,6 +79,9 @@ const envSchema = z.object({
   ARTIFACT_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   T3_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(30_000).default(1500),
   APPROVAL_AUTO_ALLOW: z.string().default("safe-read"),
+  // Hours, not minutes: the owner may be asleep when a worker asks, and a
+  // request that dies in ten minutes is worse than no request at all.
+  APPROVAL_TTL_HOURS: z.coerce.number().min(0.25).max(168).default(6),
   FFMPEG_BIN: z.string().min(1).default("ffmpeg"),
   FFPROBE_BIN: z.string().min(1).default("ffprobe"),
   MEDIA_TIMEOUT_MS: z.coerce.number().int().min(5_000).max(180_000).default(45_000),
@@ -302,7 +305,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
           }
         : undefined,
     },
-    approval: { autoAllow: approvalAutoAllow },
+    approval: { autoAllow: approvalAutoAllow, ttlHours: parsed.APPROVAL_TTL_HOURS },
     policy: {
       maxParallelWorkers: parsed.MAX_PARALLEL_WORKERS,
       progressIntervalMs: parsed.PROGRESS_INTERVAL_MS,

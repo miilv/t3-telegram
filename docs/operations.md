@@ -240,4 +240,10 @@ The adapter targets the current upstream endpoints:
 
 It sends the upstream command discriminators (`project.create`, `project.meta.update`, `thread.create`, `thread.turn.start`, `thread.turn.interrupt`, `thread.approval.respond`, and `thread.user-input.respond`). The default subscription path uses T3's Effect RPC protocol over WebSocket with sequence resume. Snapshot polling remains an explicit compatibility mode for legacy/test servers.
 
+`APPROVAL_TTL_HOURS` (default `6`, range `0.25`–`168`) bounds how long an unanswered approval keyboard stays live. The 60 s maintenance tick actively sweeps expired requests: each one is declined to T3 with reason `approval expired`, its keyboard is removed, and its message is rewritten to «Запрос истёк без ответа (6 ч) — действие отклонено». The deadline is named in minutes below two hours («15 мин») and with one decimal above it («12,5 ч»), so the text never rounds a missed deadline into a different one. Expiry is deliberately measured in hours, not minutes — the owner may be asleep — and expired requests are never redrawn after a restart.
+
+A chat keeps at most four pending approvals **across all threads**: a fifth request is shown and the oldest unanswered one is declined with reason `approval superseded`, so nothing is silently dropped. Eviction is a real decline for the worker, not a deferral.
+
+Both paths claim the row (`pending` → `expiring`) before dispatching to T3, so a sweep and a button press can never send two different decisions for the same request; a claim whose owner died is released after a five-minute lease and retried on a later tick. The expiry dispatch is bounded by a 15 s timeout, and after five failed attempts the request is retired locally — the keyboard is removed and the card says the decline could not be delivered — instead of warning every minute forever.
+
 `APPROVAL_AUTO_ALLOW` is an explicit comma-separated allowlist. Its default is only `safe-read`; dangerous, cross-project, secret-sensitive, process, package, and network actions continue to require Telegram confirmation unless the owner deliberately changes the policy.

@@ -470,13 +470,36 @@ failed auto-approve warns and falls through to the buttons.
 Buttons `Разрешить` / `Разрешить на сессию` / `Отклонить` →
 `a:<sha256(id).base64url[0:24]>:1|s|0`.
 
-**There is no expiry.** No TTL, no sweeper, no age check anywhere on
-`pending_approvals`. A keyboard stays live indefinitely and is redrawn after
-restart.
+**Expiry is active, measured in hours.** `APPROVAL_TTL_HOURS` (default 6) bounds
+the life of a keyboard; the 60 s maintenance tick sweeps `pending_approvals` and
+retires anything older. A retired request is declined to T3 with reason
+`approval expired` (the worker would otherwise wait forever), its keyboard is
+cleared, its message is rewritten to «Запрос истёк без ответа (N ч) — действие
+отклонено», and its row is marked `expired`. The sweep also runs before startup
+redraw, so an expired keyboard is never resurrected. Expiry is never lazy: a
+button that still looks live and answers "already inactive" is worse than one
+that visibly closed.
 
-On the successful decision branch `answerCallback` runs *after* `completeEvent`,
-so a throw there leaves the event complete and the user with a spinning button.
-Every other callback branch answers first.
+**At most four pending approvals per chat, counted across all threads.** A fifth
+request is still shown; the oldest unanswered one is declined with reason
+`approval superseded`, with a notice both in its own (already scrolled past)
+message and on the new card. Eviction is a `decline` delivered to the worker —
+that branch of work is lost, not postponed, and nobody will ask again.
+
+Both retirement paths and the button press take a compare-and-set claim on
+`status` before talking to T3 (`pending` → `expiring` / `deciding`), so a sweep
+and a press can never send two decisions for one request; the loser is told
+«Запрос уже неактивен». A claim stranded by a crash is released after a
+five-minute lease. Expiry dispatch carries a 15 s timeout and a five-attempt
+fuse, after which the request is retired locally with «Не удалось передать отказ
+воркеру».
+
+On the decision branch `answerCallback` runs *first*, like every other callback
+branch, so a throw further down cannot leave the button spinning — but it answers
+neutrally («Принимаю…»), because Telegram allows one answer per callback and
+promising «Разрешено» before T3 accepts would be a lie. A failed dispatch rolls
+the claim back, leaves the keyboard live and says «Не удалось передать решение
+воркеру. Нажмите кнопку ещё раз.»
 
 ---
 

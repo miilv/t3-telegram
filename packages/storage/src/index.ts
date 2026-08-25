@@ -1126,8 +1126,10 @@ export class OperatorStore {
     payload: unknown;
     chatId?: number;
     messageId?: number;
+    /** Test-only backdating; production callers let the store stamp the row. */
+    createdAt?: string;
   }): void {
-    const now = nowIso();
+    const now = input.createdAt ?? nowIso();
     this.db
       .prepare(`
         INSERT OR REPLACE INTO pending_approvals(
@@ -1147,8 +1149,21 @@ export class OperatorStore {
       );
   }
 
-  resolveApproval(id: string, status: string): void {
-    this.db.prepare("UPDATE pending_approvals SET status=?,updated_at=? WHERE id=?").run(status, nowIso(), id);
+  /**
+   * Compare-and-set on status. The maintenance sweep and a button press run on
+   * different queues, so whoever loses the race must not also talk to T3: only
+   * a transition that actually claimed the row returns true.
+   */
+  resolveApproval(id: string, status: string, expected: string | readonly string[] = "pending"): boolean {
+    const allowed = typeof expected === "string" ? [expected] : [...expected];
+    const result = this.db
+      .prepare(
+        `UPDATE pending_approvals SET status=?,updated_at=? WHERE id=? AND status IN (${allowed
+          .map(() => "?")
+          .join(",")})`,
+      )
+      .run(status, nowIso(), id, ...allowed);
+    return result.changes > 0;
   }
 
   updateApprovalPayload(id: string, payload: unknown): void {
@@ -1172,6 +1187,7 @@ export class OperatorStore {
         threadId: string;
         status: string;
         payload: unknown;
+        createdAt: string;
         chatId?: number;
         messageId?: number;
       }
@@ -1184,6 +1200,7 @@ export class OperatorStore {
       threadId: String(row.thread_id),
       status: String(row.status),
       payload: JSON.parse(String(row.payload_json)),
+      createdAt: String(row.created_at),
       ...(row.telegram_chat_id !== null && row.telegram_chat_id !== undefined
         ? { chatId: Number(row.telegram_chat_id) }
         : {}),
@@ -1204,9 +1221,39 @@ export class OperatorStore {
     return row ? this.getApproval(String(row.id)) : undefined;
   }
 
-  listPendingApprovals(): Array<NonNullable<ReturnType<OperatorStore["getApproval"]>>> {
+  listPendingApprovals(chatId?: number): Array<NonNullable<ReturnType<OperatorStore["getApproval"]>>> {
+    const rows = (chatId === undefined
+      ? this.db
+          .prepare("SELECT id FROM pending_approvals WHERE status='pending' ORDER BY created_at ASC, id ASC")
+          .all()
+      : this.db
+          .prepare(
+            "SELECT id FROM pending_approvals WHERE status='pending' AND telegram_chat_id=? ORDER BY created_at ASC, id ASC",
+          )
+          .all(chatId)) as Row[];
+    return rows.flatMap((row) => {
+      const approval = this.getApproval(String(row.id));
+      return approval ? [approval] : [];
+    });
+  }
+
+  /**
+   * Claims whose owner died mid-flight. Releasing them costs one extra sweep;
+   * leaving them would strand a keyboard in a status nobody looks at.
+   */
+  listStaleApprovalClaims(
+    claimedBefore: string,
+  ): Array<NonNullable<ReturnType<OperatorStore["getApproval"]>>> {
     return (
-      this.db.prepare("SELECT * FROM pending_approvals WHERE status='pending'").all() as Row[]
+      this.db
+        .prepare(
+          // Both claim states: a crash between the `deciding` claim and the
+          // broker dispatch would otherwise strand the row forever — invisible
+          // to listPendingApprovals, the sweep and the restart redraw, with a
+          // live keyboard in the chat and a worker waiting in T3.
+          "SELECT id FROM pending_approvals WHERE status IN ('expiring','deciding') AND updated_at < ? ORDER BY created_at ASC, id ASC",
+        )
+        .all(claimedBefore) as Row[]
     ).flatMap((row) => {
       const approval = this.getApproval(String(row.id));
       return approval ? [approval] : [];
