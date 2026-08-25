@@ -414,13 +414,22 @@ failed auto-approve warns and falls through to the buttons.
 Buttons `Разрешить` / `Разрешить на сессию` / `Отклонить` →
 `a:<sha256(id).base64url[0:24]>:1|s|0`.
 
-**There is no expiry.** No TTL, no sweeper, no age check anywhere on
-`pending_approvals`. A keyboard stays live indefinitely and is redrawn after
-restart.
+**Expiry is active, measured in hours.** `APPROVAL_TTL_HOURS` (default 6) bounds
+the life of a keyboard; the 60 s maintenance tick sweeps `pending_approvals` and
+retires anything older. A retired request is declined to T3 with reason
+`approval expired` (the worker would otherwise wait forever), its keyboard is
+cleared, its message is rewritten to «Запрос истёк без ответа (N ч) — действие
+отклонено», and its row is marked `expired`. The sweep also runs before startup
+redraw, so an expired keyboard is never resurrected. Expiry is never lazy: a
+button that still looks live and answers "already inactive" is worse than one
+that visibly closed.
 
-On the successful decision branch `answerCallback` runs *after* `completeEvent`,
-so a throw there leaves the event complete and the user with a spinning button.
-Every other callback branch answers first.
+**At most four pending approvals per chat.** A fifth request is still shown; the
+oldest unanswered one is declined with reason `approval superseded` and a notice
+in its own message.
+
+On the successful decision branch `answerCallback` runs *first*, like every other
+callback branch, so a throw further down cannot leave the button spinning.
 
 ---
 
