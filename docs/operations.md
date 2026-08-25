@@ -2,10 +2,15 @@
 
 ## Health and status
 
-- `/status` — active workers, one aggregate card per fan-out group, pending approvals, pending structured questions, and current focus.
-- `/focus` — current and recent work contexts; `/focus clear` resets them explicitly.
+- `/status` — active workers, one aggregate card per fan-out group, pending approvals, and pending structured questions.
 - `/memory` — active durable notes and the latest compaction. Subcommands: `remember [category:] text`, `search query`, `forget note_id`, and `compact`.
-- `/stop` — interrupts the focused worker; when focus is a fan-out group, it interrupts every active member and suppresses a later duplicate synthesis.
+
+Stopping work is not a command (package 1.3 removed `/stop`, `/cancel` and
+`/focus`). Ask for it in words — «останови сборку» — and the Operator interrupts
+the thread itself. A bare cancel word («стоп», «отмена», «хватит», `stop`,
+`cancel`) stays the deterministic emergency hatch that works even when the model
+cannot answer: it interrupts the running turn, and, when it replies to a work
+message, the work behind it (dialogue-flow §4).
 - `/debug` — hashed owner identity, Operator session/context size, Telegram/T3/Claude health, Telegram capability states, subscriptions, SQLite integrity/size/event count, durable queue counts, recent classified errors, and metrics.
 - `/operator` — current conversational provider and configured providers;
   `/operator switch <provider>` performs a durable summary/snapshot handoff.

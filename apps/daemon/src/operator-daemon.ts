@@ -1013,7 +1013,7 @@ export class OperatorDaemon {
     }
 
     if (this.roleForUser(update.userId) === "viewer" && !isViewerSafeMessage(update.text)) {
-      await this.commandReply(update, "Ваша роль viewer разрешает только `/status`, `/projects`, `/work`, `/focus` и `/help`.");
+      await this.commandReply(update, "Ваша роль viewer разрешает только `/status`, `/projects`, `/work` и `/help`.");
       return;
     }
 
@@ -1653,7 +1653,6 @@ export class OperatorDaemon {
     const supersededNote = this.consumeSupersededNote(update, turn);
     const replyThread = replyThreadId ? this.store.getThread(replyThreadId) : undefined;
     const replyProject = replyThread ? this.store.getProject(replyThread.projectId) : undefined;
-    const focusThread = focus.primary?.threadId ? this.store.getThread(focus.primary.threadId) : undefined;
     const prompt = isThreadEventTurn
       ? [
           // Package 1.2: the envelope of a thread-events turn. The sections are
@@ -1671,9 +1670,14 @@ export class OperatorDaemon {
             "- If there is nothing to say, END THE TURN WITH EMPTY TEXT. An empty answer sends nothing to the chat, which is the correct outcome for routine progress.",
             "- You may use your tools (for example to check a thread) before deciding.",
           ].join("\n"),
-          focus.primary
-            ? `Current durable work focus: ${focus.primary.topic}${focusThread ? ` (thread "${focusThread.title}", threadId ${focusThread.id})` : ""}.`
-            : "No current durable work focus.",
+          // Package 1.3: no focus line. focus_state survives as the machine
+          // binding for relatedThreadIds and the cancel hatch, but the owner
+          // never reads about it and the model is not told to steer it.
+          // Nothing takes this position: the phase-2 now-state is pushed at the
+          // HEAD of the envelope (memory-design §4: now-state → memory index →
+          // do-not-reopen → gap → synthetic → turn instruction → message), and
+          // these lines become the turn instruction. Empty layers there render
+          // as explicit placeholders, not as omissions.
         ]
           .filter((line): line is string => Boolean(line))
           .join("\n\n")
@@ -1696,9 +1700,11 @@ export class OperatorDaemon {
       replyThread
         ? `This message replies to work thread "${replyThread.title}" (threadId ${replyThread.id}, project ${replyProject?.name ?? replyThread.projectId}, status ${replyThread.status}). Continue that thread unless the user clearly asks otherwise.`
         : undefined,
-      focus.primary
-        ? `Current durable work focus: ${focus.primary.topic}${focusThread ? ` (thread "${focusThread.title}", threadId ${focusThread.id})` : ""}. Follow-ups refer to it; do not change it for unrelated side questions.`
-        : "No current durable work focus.",
+      // Package 1.3: the focus line is gone from here too — same reasoning as
+      // the thread-event branch above, and the same non-replacement: the
+      // phase-2 now-state belongs at the head of the envelope, not in this
+      // slot (memory-design §4). Both branches render the same layers when
+      // that lands, which is why they are worth keeping in step.
       supersededNote,
       priorJobThreads.length
         ? `Recovery note: a previous attempt of THIS SAME request already dispatched work to thread(s) ${priorJobThreads
@@ -3571,8 +3577,24 @@ export class OperatorDaemon {
       await this.commandReply(update, "Не вижу активной работы, которую нужно остановить.");
       return;
     }
+    // Package 1.3: the focus binding is durable and deliberately NOT cleared
+    // when a thread ends (relatedThreadIds and reply-continuation still need
+    // it), so by the time a bare cancel word arrives it may well point at work
+    // that finished hours ago. Without this guard the hatch interrupts a dead
+    // thread, rewrites completed → cancelled, and tells the owner "Остановил X"
+    // while their real workers keep running — and /focus clear no longer exists
+    // to escape it. A stale binding is the same situation as no binding at all.
+    const bound = this.store.getThread(threadId);
+    if (!bound) {
+      await this.commandReply(update, "Не вижу активной работы, которую нужно остановить.");
+      return;
+    }
     if (!this.canEditThread(update.userId, threadId)) {
       await this.commandReply(update, "У вас нет прав на остановку этой работы.");
+      return;
+    }
+    if (["completed", "failed", "cancelled"].includes(bound.status)) {
+      await this.commandReply(update, "Не вижу активной работы, которую нужно остановить.");
       return;
     }
     // Bug №38: a replayed ingress job must not interrupt the thread a second
@@ -3722,7 +3744,6 @@ export class OperatorDaemon {
       const active = this.threadsVisibleToUser(update.userId, this.store.listThreads({
         statuses: ["queued", "running", "waiting_approval", "waiting_user"],
       }));
-      const focus = this.store.getFocus(String(update.userId));
       const approvals = this.store.listPendingApprovals().filter((item) => visibleThreadIds.has(item.threadId));
       const userInputs = this.store.listPendingUserInputs().filter((item) => visibleThreadIds.has(item.threadId));
       const recentCompletions = visibleThreads
@@ -3745,7 +3766,6 @@ export class OperatorDaemon {
           ),
         );
       }
-      if (focus.primary) lines.push("", `Текущий фокус: ${focus.primary.topic}`);
       await this.commandReply(update, lines.join("\n"));
       return true;
     }
@@ -3764,57 +3784,16 @@ export class OperatorDaemon {
           : "Рабочих тредов пока нет.");
       return true;
     }
-    if (command === "/focus") {
-      const action = update.text.trim().split(/\s+/).slice(1).join(" ").toLocaleLowerCase();
-      if (action === "clear" || action === "reset" || action === "очистить") {
-        if (this.roleForUser(update.userId) === "viewer") {
-          await this.commandReply(update, "Роль viewer не может изменять фокус.");
-          return true;
-        }
-        this.store.setFocus(String(update.userId), { secondary: [] });
-        await this.commandReply(update, "Рабочий фокус очищен.");
-        return true;
-      }
-      const focus = this.store.getFocus(String(update.userId));
-      if (!focus.primary || !this.canReadProject(update.userId, focus.primary.projectId)) {
-        await this.commandReply(update, "Текущего рабочего фокуса нет.");
-        return true;
-      }
-      const primaryProject = this.store.getProject(focus.primary.projectId);
-      const primaryThread = focus.primary.threadId
-        ? this.store.getThread(focus.primary.threadId)
-        : undefined;
-      const lines = [
-        "## Фокус",
-        "",
-        `**${escapeMarkdownText(primaryProject?.name ?? focus.primary.projectId)}**${primaryThread ? ` — ${escapeMarkdownText(primaryThread.title)}` : ""}`,
-        escapeMarkdownText(focus.primary.topic),
-      ];
-      const secondary = focus.secondary.filter((item) => this.canReadProject(update.userId, item.projectId));
-      if (secondary.length) {
-        lines.push(
-          "",
-          "**Недавние контексты**",
-          ...secondary.map((item) => {
-            const project = this.store.getProject(item.projectId);
-            const thread = item.threadId ? this.store.getThread(item.threadId) : undefined;
-            return `- ${escapeMarkdownText(project?.name ?? item.projectId)}${thread ? ` — ${escapeMarkdownText(thread.title)}` : ""}`;
-          }),
-        );
-      }
-      await this.commandReply(update, lines.join("\n"));
-      return true;
-    }
+    // Package 1.3: /focus is gone — focus is an internal binding, not a user
+    // surface (memory-design §2.2). /stop and /cancel are gone too: a semantic
+    // stop is the Operator's job via t3.interrupt_thread, and the deterministic
+    // emergency hatch is the bare cancel word (dialogue-flow §4, paths A and B).
     if (command === "/memory") {
       if (!this.isAdministrator(update.userId)) {
         await this.commandReply(update, "Память Operator доступна только owner/admin.");
         return true;
       }
       await this.handleMemoryCommand(update);
-      return true;
-    }
-    if (command === "/stop" || command === "/cancel") {
-      await this.cancelBoundWork(update, this.store.getFocus(String(update.userId)).primary?.threadId);
       return true;
     }
     if (command === "/automation" || command === "/automations") {
@@ -3853,9 +3832,7 @@ export class OperatorDaemon {
           "- `/status` — активная и недавняя работа",
           "- `/projects` — проекты",
           "- `/work` — work threads",
-          "- `/focus` — текущий контекст; `/focus clear` — очистить",
           "- `/memory` — durable notes; `remember`, `search`, `forget`, `restore`, `compact`",
-          "- `/stop` или `/cancel` — остановить focused work",
           "- `/team` — роли команды (owner/admin)",
           "- `/share <project> <user-id> <editor|viewer>` — доступ к проекту",
           "- `/automation` — proactive scheduled work",
@@ -5700,8 +5677,8 @@ export function syntheticNegativeMessageId(seed: string): number {
 
 function isViewerSafeMessage(text: string): boolean {
   const normalized = text.trim();
-  return /^\/(?:status|projects|work|help|start)(?:@\w+)?(?:\s|$)/iu.test(normalized) ||
-    /^\/focus(?:@\w+)?$/iu.test(normalized);
+  // Package 1.3: /focus dropped from the wall with the command itself.
+  return /^\/(?:status|projects|work|help|start)(?:@\w+)?(?:\s|$)/iu.test(normalized);
 }
 
 function isTeamRole(value: string): value is TeamRole {

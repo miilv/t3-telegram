@@ -12,7 +12,7 @@ real Telegram + T3 gate remains tracked in `spec-compliance.md` and
 | 3 | Complex work creates/continues T3 thread | Operator `t3.*` tools + `trackOperatorToolThread` | daemon product flow; broker commands | PROVED |
 | 4 | Long worker does not block new messages | independent ingress/operator/worker queues | blocked-turn approval and product-flow tests | PROVED |
 | 5 | At least three concurrent workers | agent fan-out via `t3.*` tools + per-thread monitors | three-worker fan-out test | PROVED |
-| 6 | Context/focus attaches typical follow-up | durable focus in the Operator envelope | follow-up queue/live-steer daemon tests | PROVED |
+| 6 | Context attaches typical follow-up | reply→thread line in the envelope + `t3.search_threads` (the durable-focus line was removed in package 1.3; focus is now an internal binding only) | reply-boundary test; steer-from-another-chat test (asserts the follow-up found its thread by search, not by a second thread) | PROVED |
 | 7 | Telegram Reply continues mapped thread | reply mapping + deterministic reply signal | exact daemon reply-boundary test | PROVED |
 | 8 | Existing project is reused, not duplicated | Operator project catalog (`t3.list_projects`) | outbound-document daemon test (reuses seeded project) | PROVED |
 | 9 | Missing project gets a durable workspace project | `t3.create_project` under the operator workspaces root | daemon product flow | PROVED |

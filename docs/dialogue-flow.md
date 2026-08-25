@@ -27,6 +27,14 @@ constant or the verbatim string, not the number.
 | 3 | Forum topic | `message_thread_id` | yes |
 | 4 | Direct-messages topic | `direct_messages_topic.topic_id` | yes |
 | 5 | Slash command | `text.startsWith("/")` | yes |
+
+Entry 5 is a *dispatch attempt*, not a separate fate: `handleCommand` is a chain
+of exact-match branches, and text that matches none of them falls through to the
+ordinary Operator turn. Since package 1.3 that is what `/stop`, `/cancel` and
+`/focus` do — they are deleted commands, so they reach the agent as plain text
+(and preempt the running turn like any other message). A semantic stop
+(«останови сборку») is the Operator's own job via `t3.interrupt_thread`; the
+deterministic hatch is the bare cancel word of §4.
 | 6 | Approval callback | `/^a:([A-Za-z0-9_-]+):(1\|s\|0)$/` | **no** — inline |
 | 7 | User-input callback | `/^ui:([^:]+):(\d+):(o\d+\|s\|c)$/` | **no** |
 | 8 | `ask_choices` callback | `/^route:([\w-]+):(\d+)$/` | **no**, but replays as a synthetic durable message |
@@ -82,17 +90,17 @@ so `TELEGRAM_ALLOWED_USERS="9:owner"` mints a second full owner permanently.
 
 ```
 if roleForUser === "viewer" && !isViewerSafeMessage(text)
-   → "Ваша роль viewer разрешает только `/status`, `/projects`, `/work`, `/focus` и `/help`."
+   → "Ваша роль viewer разрешает только `/status`, `/projects`, `/work` и `/help`."
    → return
 ```
 
-`isViewerSafeMessage` admits `/status`, `/projects`, `/work`, `/help`, `/start`
-(with args) and **bare** `/focus` only.
+`isViewerSafeMessage` admits `/status`, `/projects`, `/work`, `/help` and
+`/start` (with args) only.
 
 Consequence: a viewer never reaches `answerDirect`, therefore never receives an
-MCP tool lease. Two in-command refusals are unreachable because of it
-(`Роль viewer не может изменять фокус`, `…не может управлять automations`), as
-is the `requireTeamMutation` viewer branch in the tool layer.
+MCP tool lease. The in-command refusal `…не может управлять automations` is
+unreachable because of it, as is the `requireTeamMutation` viewer branch in the
+tool layer.
 
 ### Every rejection string
 
@@ -164,7 +172,7 @@ duplicate callback        → beginEvent false → silent return
 
 ## 3. The turn envelope
 
-Nine lines, `undefined` filtered, joined by blank lines:
+Eight lines, `undefined` filtered, joined by blank lines:
 
 1. Handle the message; answer quick questions yourself, route durable work with `t3.*`.
 2. Reply strictly in the owner's language; **no preamble before tool calls**; streamed text must be only the final answer.
@@ -172,9 +180,22 @@ Nine lines, `undefined` filtered, joined by blank lines:
 4. The user message, structurally fenced (below).
 5. `Registered attachments (use artifact tools by id when needed): …` or `No attachments.`
 6. *(only when the message replies to a mapped thread)* continue that thread unless clearly asked otherwise.
-7. Focus line, or `No current durable work focus.`
-8. *(only on a replayed job)* recovery note naming the already-dispatched threads.
-9. `New project workspaces belong under <operator.home>/workspaces.`
+7. *(only on a replayed job)* recovery note naming the already-dispatched threads.
+8. `New project workspaces belong under <operator.home>/workspaces.`
+
+Package 1.3 removed the focus line that used to sit at position 7 (`Current
+durable work focus: …` / `No current durable work focus.`). Nothing takes that
+position: the phase-2 now-state is pushed at the **head** of the envelope, not
+here — `now-state → memory index → do-not-reopen → [gap: …] → synthetic → turn
+instruction → fenced message` (memory-design §4), which turns these eight lines
+into the "turn instruction" segment. Empty layers there render as explicit
+placeholders (`No current work items.`), never as silence.
+
+`focus_state` itself is untouched: it is the machine binding for
+`relatedThreadIds` on outgoing messages and for path B of §4, and the model
+neither reads nor writes it (`memory.update_focus` is gone too). The agent
+identifies "that work" from the conversation, the reply line, or
+`t3.search_threads`.
 
 ### Structural fencing
 
@@ -303,7 +324,9 @@ new turn on the `user` lane. The first message of a burst frees the turn slot
 while the rest of the burst is still being glued into the one job that replaces
 it.
 
-Three cancellation paths remain on top of preemption as the emergency hatch.
+Two cancellation paths remain on top of preemption as the emergency hatch. They
+are deterministic on purpose: stopping may not depend on a successful LLM turn,
+because a rate limit or a dead provider must never cost the owner their stop.
 
 ```
 A. RUNTIME PREEMPTION — a bare cancel word
@@ -320,7 +343,11 @@ B. BOUND-WORK CANCEL — replyContext.primaryThreadId ?? focus.primary.threadId
    !canEditThread→ "У вас нет прав на остановку этой работы."
    else          → interruptThread, mark runtime state, "Остановил **<title>**."
 
-C. /stop | /cancel → cancelBoundWork(FOCUS thread) — reply context ignored
+(Package 1.3 deleted path C — `/stop` and `/cancel` as slash commands. Only the
+slash forms died: both word paths above are intact, and `cancelBoundWork` still
+backs path B. A stop expressed in ordinary language — «останови сборку» — is now
+the Operator's judgement call via `t3.interrupt_thread`, stated in the policy
+prompt.)
 ```
 
 **Mid-turn message:** batched within a 2 s quiet window, then queued on the

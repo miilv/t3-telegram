@@ -157,7 +157,8 @@ Before completion:
 - Parallel planning is validated to 2–4 non-duplicate worker scopes. Group
   membership and normalized `WorkerResult` evidence are durable, synthesis is
   atomically claimed after every member becomes terminal, `/status` aggregates
-  the group, and `/stop` cancels all active members. A Telegram-send/SQLite
+  the group, and a stop asked for in words has the Operator interrupt the
+  active members via `t3.interrupt_thread`. A Telegram-send/SQLite
   commit crash window still prevents an exactly-once claim.
 - Structured thread memory is updated on delegation/completion/failure and
   consumed by handoff. Durable Operator notes are FTS-searchable, deduplicated,
