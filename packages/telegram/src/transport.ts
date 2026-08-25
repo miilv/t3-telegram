@@ -1303,6 +1303,9 @@ export function mergeInboundBatch(messages: TelegramMessageInbound[]): TelegramM
             messageId: message.messageId,
             text: message.text,
             ...(message.replyToMessageId ? { replyToMessageId: message.replyToMessageId } : {}),
+            // Package 1.4: the quote traveling with its own part, so a reply
+            // that is not the first message of the batch keeps its context.
+            ...(message.reply ? { reply: message.reply } : {}),
             ...(message.forwardOrigin ? { forwarded: true } : {}),
           })),
         }

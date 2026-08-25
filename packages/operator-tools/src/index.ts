@@ -1117,12 +1117,15 @@ export class OperatorToolServer {
       schema: textSchema,
       handler: async ({ text, threadId }, capability) => {
         this.requireTeamMutation(capability, "send Telegram messages");
-        const boundThreadId = await this.resolveOutgoingThread(capability, threadId);
-        return this.recordSent(await this.options.telegram.sendRich(
-          capability.context.chatId,
-          text,
-          destination(capability.context),
-        ), capability, "operator_tool_message", [], boundThreadId);
+        const bound = await this.resolveOutgoingThread(capability, threadId);
+        return {
+          ...this.recordSent(await this.options.telegram.sendRich(
+            capability.context.chatId,
+            text,
+            destination(capability.context),
+          ), capability, "operator_tool_message", [], bound.threadId),
+          ...(bound.thread ? { thread: bound.thread } : {}),
+        };
       },
     });
     this.addTool(server, token, {
@@ -1132,11 +1135,14 @@ export class OperatorToolServer {
       schema: textSchema,
       handler: async ({ text, threadId }, capability) => {
         this.requireTeamMutation(capability, "send Telegram replies");
-        const boundThreadId = await this.resolveOutgoingThread(capability, threadId);
-        return this.recordSent(await this.options.telegram.sendRich(capability.context.chatId, text, {
-          ...destination(capability.context),
-          replyToMessageId: capability.context.originMessageId,
-        }), capability, "operator_tool_reply", [], boundThreadId);
+        const bound = await this.resolveOutgoingThread(capability, threadId);
+        return {
+          ...this.recordSent(await this.options.telegram.sendRich(capability.context.chatId, text, {
+            ...destination(capability.context),
+            replyToMessageId: capability.context.originMessageId,
+          }), capability, "operator_tool_reply", [], bound.threadId),
+          ...(bound.thread ? { thread: bound.thread } : {}),
+        };
       },
     });
     this.addTool(server, token, {
@@ -1459,18 +1465,44 @@ export class OperatorToolServer {
   private async resolveOutgoingThread(
     capability: TurnCapability,
     threadId?: string,
-  ): Promise<string | undefined> {
-    if (!threadId) return undefined;
-    try {
-      const local = this.options.store.getThread(threadId);
-      if (local) {
+  ): Promise<{ threadId?: string; thread?: { status: "bound" | "dropped"; reason?: string } }> {
+    if (!threadId) return {};
+    const drop = (reason: string) => {
+      this.options.logger.warn(
+        { errorCode: "OPERATOR_THREAD_BINDING_DROPPED", reason, threadId },
+        "Telegram message sent without the thread binding the agent asked for",
+      );
+      return { thread: { status: "dropped" as const, reason } };
+    };
+    const local = this.options.store.getThread(threadId);
+    if (local) {
+      try {
         this.requireProjectAccess(capability, local.projectId, false);
-        return local.id;
+      } catch {
+        return drop("access_denied");
       }
-      return (await this.requireThreadAccess(capability, threadId, false)).id;
-    } catch {
-      return undefined;
+      return { threadId: local.id, thread: { status: "bound" as const } };
     }
+    let remote;
+    try {
+      remote = await this.options.broker.getThread(threadId);
+    } catch (error) {
+      // A thread that does not exist is the agent's mistake and costs only the
+      // binding. A T3 outage is NOT: swallowing it would drop a perfectly valid
+      // binding for a reason that has nothing to do with the request, so it
+      // surfaces as a tool error the agent can retry.
+      if (!isMissingThreadError(error)) throw error;
+      return drop("not_found");
+    }
+    try {
+      this.requireProjectAccess(capability, remote.projectId, false);
+    } catch {
+      return drop("access_denied");
+    }
+    // The daemon's reply routing reads the LOCAL store, so a binding it does
+    // not know about would never route a thing. Persist what the broker knows.
+    this.options.store.upsertThread(remote);
+    return { threadId: remote.id, thread: { status: "bound" as const } };
   }
 
   private recordSent(
@@ -1715,6 +1747,15 @@ function boundedJsonText(value: unknown, stringLimit: number): string {
 }
 
 /** Truncate to `limit` code units inclusive of the ellipsis marker. */
+/**
+ * Package 1.4: "this thread does not exist" versus "T3 is down right now".
+ * Only the first may cost the agent its thread binding silently.
+ */
+function isMissingThreadError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error ?? "")).toLowerCase();
+  return /not found|no such thread|unknown thread|does not exist|\b404\b/.test(message);
+}
+
 function boundedText(value: string, limit: number, json = false): string {
   if (value.length <= limit) return value;
   return `${safeSlice(value, limit - 1, json)}…`;

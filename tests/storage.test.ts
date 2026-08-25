@@ -150,6 +150,28 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("never lets a weaker relation overwrite a more specific one (package 1.4)", () => {
+    const store = tempStore();
+    // A worker's question card, later touched by a delivery pass that only
+    // knows it as "a message of ours about that thread".
+    store.linkMessageThread(10, 30, "th_deploy", "user_input");
+    store.linkMessageThread(10, 30, "th_deploy", "primary");
+    store.linkMessageThread(10, 30, "th_deploy", "related");
+    expect(store.getMessageThreadLinks(10, 30)).toEqual([
+      { threadId: "th_deploy", relation: "user_input" },
+    ]);
+    // A stronger relation still upgrades a weak one, and an equal one rewrites.
+    store.linkMessageThread(10, 31, "th_deploy", "related");
+    store.linkMessageThread(10, 31, "th_deploy", "primary");
+    expect(store.getMessageThreadLinks(10, 31)).toEqual([
+      { threadId: "th_deploy", relation: "primary" },
+    ]);
+    // Links of DIFFERENT threads on one message stay independent.
+    store.linkMessageThread(10, 31, "th_other", "related");
+    expect(store.getMessageThreadLinks(10, 31)).toHaveLength(2);
+    store.close();
+  });
+
   it("indexes thread titles and summaries for reuse", () => {
     const store = tempStore();
     const timestamp = nowIso();

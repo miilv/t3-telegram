@@ -16,11 +16,13 @@
  *    payload cannot inflate a result past its cap.
  */
 
-export const UNTRUSTED_LABELS = ["inbound", "worker", "tool"] as const;
+export const UNTRUSTED_LABELS = ["inbound", "quote", "worker", "tool"] as const;
 
 /**
- * Provenance labels. `inbound` is the owner's own message, `worker` is anything
- * a T3 worker wrote, `tool` is anything a tool result carried in from outside.
+ * Provenance labels. `inbound` is the owner's own message, `quote` is a message
+ * the owner replied to (ours, theirs, or a third participant's — package 1.4),
+ * `worker` is anything a T3 worker wrote, `tool` is anything a tool result
+ * carried in from outside.
  * Every member must also be described to the model — see the label contract
  * test in tests/fencing.test.ts.
  */
