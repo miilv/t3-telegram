@@ -17,7 +17,9 @@ export type MetricName =
   | "provider_errors_total"
   | "approval_wait_ms"
   | "telegram_outbox_pending"
-  | "telegram_outbox_uncertain";
+  | "telegram_outbox_uncertain"
+  /** Package 1.1: Operator turns preempted by a newer owner message. */
+  | "operator_turns_superseded_total";
 
 export interface MetricSummary {
   count: number;

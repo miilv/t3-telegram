@@ -31,6 +31,7 @@ import type { Fence } from "../../../packages/shared/src/index.js";
 import {
   fenceUntrusted,
   knownFenceNonces,
+  LaneQueue,
   newId,
   nowIso,
   openFence,
@@ -209,8 +210,28 @@ const STALLED_DELIVERY_ATTEMPTS = 10;
 /** At most one delivery alert per chat per minute, whatever produced it. */
 const DELIVERY_ALERT_THROTTLE_MS = 60_000;
 
+/**
+ * Package 1.1: an in-flight direct Operator turn, as seen from outside the
+ * `answerDirect` call that owns it. `superseded` is the preemption flag — the
+ * turn keeps running until the interrupted provider returns, but its final is
+ * no longer allowed to reach the chat.
+ */
+interface ActiveOperatorTurn {
+  chatId: number;
+  userId: number;
+  /** Durable ingress job this turn is processing, for the supersede audit trail. */
+  ingressJobId: string;
+  operatorTurnId?: string;
+  superseded: boolean;
+}
+
 export class OperatorDaemon {
-  private readonly operatorInputQueue = new SerialQueue();
+  /**
+   * Package 1.1: the operator input queue is lane-priced. Still exactly one
+   * turn at a time; what changed is which waiting drain goes next — an owner
+   * message no longer queues behind a reliability-pump or digest drain.
+   */
+  private readonly operatorInputQueue = new LaneQueue();
   private readonly operatorRuntimeQueue = new SerialQueue();
   private readonly ingressQueue = new SerialQueue();
   private readonly workerEventQueue = new ConcurrentQueue(8);
@@ -235,8 +256,8 @@ export class OperatorDaemon {
    * the existing monitor instead of leaking progress into the old chat.
    */
   private readonly monitorRoutes = new Map<string, MonitorRoute>();
-  /** Chat/initiator of each in-flight direct Operator turn (bug №1). */
-  private readonly activeOperatorTurns = new Set<{ chatId: number; userId: number }>();
+  /** Chat/initiator of each in-flight direct Operator turn (bug №1, package 1.1). */
+  private readonly activeOperatorTurns = new Set<ActiveOperatorTurn>();
   /** Rate-limits the bug-№37 head-of-line warnings per outbox item. */
   private readonly blockedOutboxWarnedAt = new Map<string, number>();
   /** Shared throttle for out-of-band delivery alerts, keyed by recipient chat (package 0.7). */
@@ -262,7 +283,13 @@ export class OperatorDaemon {
     private readonly dashboard?: DashboardServer,
     /** Overridable so tests can exercise the retry-after-a-dropped-alert path. */
     private readonly deliveryAlertThrottleMs = DELIVERY_ALERT_THROTTLE_MS,
-  ) {}
+  ) {
+    // Package 1.1: wired in the constructor, not in initialize(), so preemption
+    // is live for any consumer that starts run() on its own.
+    this.telegram.onInboundMessage?.((message) =>
+      this.preemptOperatorTurn(message.chatId, message.userId),
+    );
+  }
 
   async initialize(): Promise<void> {
     this.store.migrate();
@@ -332,7 +359,9 @@ export class OperatorDaemon {
     );
     await this.flushTelegramOutbox();
     await this.drainT3Dispatches();
-    await this.operatorInputQueue.run(() => this.drainTelegramIngress());
+    // Startup replay is background work: nothing else can be queued yet, and if
+    // a live message beats it to the queue that message goes first by design.
+    await this.operatorInputQueue.run("background", () => this.drainTelegramIngress());
     await this.recoverPendingInteractions();
     await this.recoverWorkers();
     await this.maintain("startup");
@@ -374,7 +403,7 @@ export class OperatorDaemon {
               { id: jobId, dedupeKey: jobId },
             );
             void this.operatorInputQueue
-              .run(() => this.drainTelegramIngress())
+              .run("user", () => this.drainTelegramIngress())
               .catch((error) => this.logUpdateFailure(error, update.updateId))
               .finally(() => {
                 metrics.observe("telegram_update_latency_ms", Date.now() - receivedAt, {
@@ -1145,10 +1174,22 @@ export class OperatorDaemon {
     // itself and routes durable work through the t3.* tools per its system
     // prompt. Mechanical facts (reply thread, focus, forwarded separation)
     // travel in the envelope; judgment stays with the agent.
-    const turnOrigin = { chatId: update.chatId, userId: update.userId };
+    const turnOrigin: ActiveOperatorTurn = {
+      chatId: update.chatId,
+      userId: update.userId,
+      ingressJobId: telegramIngressJobId(update),
+      superseded: false,
+    };
     this.activeOperatorTurns.add(turnOrigin);
     try {
-      await this.answerDirect(update, focus, enrichedArtifacts, replyContext?.primaryThreadId);
+      await this.answerDirect(
+        update,
+        focus,
+        enrichedArtifacts,
+        replyContext?.primaryThreadId,
+        0,
+        turnOrigin,
+      );
     } finally {
       this.activeOperatorTurns.delete(turnOrigin);
     }
@@ -1202,12 +1243,54 @@ export class OperatorDaemon {
     );
   }
 
+  /**
+   * Bug №1: the turns this user may stop in this chat — an active turn started
+   * from this very chat, and either the sender is an administrator or the turn
+   * is their own. Worker threads are never in scope here.
+   */
+  private interruptibleTurns(chatId: number, userId: number): ActiveOperatorTurn[] {
+    const sameChatTurns = [...this.activeOperatorTurns].filter((turn) => turn.chatId === chatId);
+    if (!sameChatTurns.length) return [];
+    if (this.isAdministrator(userId)) return sameChatTurns;
+    return sameChatTurns.filter((turn) => turn.userId === userId);
+  }
+
   /** Bug №1: cancel-scope check for the global Operator runtime interrupt. */
   private mayInterruptOperatorTurn(chatId: number, userId: number): boolean {
-    const sameChatTurns = [...this.activeOperatorTurns].filter((turn) => turn.chatId === chatId);
-    if (!sameChatTurns.length) return false;
-    if (this.isAdministrator(userId)) return true;
-    return sameChatTurns.some((turn) => turn.userId === userId);
+    return this.interruptibleTurns(chatId, userId).length > 0;
+  }
+
+  /**
+   * Package 1.1 — preemption. Single-voice: the owner's newest message is the
+   * conversation, so ANY message of theirs arriving while a turn of theirs runs
+   * in this chat wins. The running turn is marked superseded (it will neither
+   * deliver its half-written final nor replay), the provider gets an interrupt,
+   * and the message itself continues down the ordinary ingress path — durable
+   * job, batching, new turn. Nothing is said in the chat about it.
+   *
+   * This fires on the RAW message, before the 2 s batch window closes, so the
+   * first message of a burst frees the turn slot while the rest of the burst is
+   * still being glued into the one job that will replace it.
+   *
+   * Worker threads are untouched: this is `runtime.interrupt()`, never
+   * `broker.interruptThread`.
+   */
+  private preemptOperatorTurn(chatId: number, userId: number): void {
+    const turns = this.interruptibleTurns(chatId, userId).filter((turn) => !turn.superseded);
+    if (!turns.length) return;
+    for (const turn of turns) {
+      turn.superseded = true;
+      this.store.appendEvent("operator.turn.superseded", {
+        correlationId: turn.operatorTurnId ?? `chat:${chatId}`,
+        payload: {
+          ...(turn.operatorTurnId ? { operatorTurnId: turn.operatorTurnId } : {}),
+          ingressJobId: turn.ingressJobId,
+          reason: "owner_message",
+        },
+      });
+    }
+    metrics.increment("operator_turns_superseded_total");
+    this.interruptQuietly();
   }
 
   private async answerDirect(
@@ -1216,8 +1299,10 @@ export class OperatorDaemon {
     artifacts: ArtifactRef[],
     replyThreadId?: string,
     attempt = 0,
+    turn?: ActiveOperatorTurn,
   ): Promise<void> {
     const operatorTurnId = stableExternalId("opturn", stableUpdateOperationKey(update));
+    if (turn) turn.operatorTurnId = operatorTurnId;
     const finalDedupeKey = `telegram:operator:${operatorTurnId}:final${attempt ? `:retry${attempt}` : ""}`;
     const existingFinal = this.store.getTelegramOutbox(finalDedupeKey);
     if (existingFinal) {
@@ -1392,6 +1477,22 @@ export class OperatorDaemon {
       toolLease?.revoke();
     }
 
+    // Package 1.1: preemption. A newer owner message replaced this turn while
+    // it ran, so whatever the interrupted provider left behind is not an answer
+    // to anything the owner is still waiting for — it must not be delivered and
+    // must not be replayed. The check sits between the runtime and the outbox
+    // on purpose: once the final row exists the answer is durable and a later
+    // message only starts the next turn (memory-design §1 — preemption after
+    // send never rolls back what the session already accepted).
+    if (turn?.superseded) {
+      this.store.appendEvent("operator.turn.dropped", {
+        correlationId,
+        payload: { operatorTurnId, attempt, reason: "superseded" },
+      });
+      await this.discardDraft(writer);
+      return;
+    }
+
     this.enqueueTelegramOutbox(finalDedupeKey, update.chatId, "rich", {
       text: finalText,
       options: replyOptions(update),
@@ -1412,9 +1513,30 @@ export class OperatorDaemon {
       // the serial input queue on purpose: the runtime is busy-or-limited
       // anyway, and shutdown aborts the delay immediately.
       await delay(retryDelayMs, this.shutdown.signal);
-      if (!this.shutdown.signal.aborted) {
-        await this.answerDirect(update, focus, artifacts, replyThreadId, attempt + 1);
+      // A message that arrived during the pause has already taken over; the
+      // replay would answer a question the owner has moved on from.
+      if (!this.shutdown.signal.aborted && !turn?.superseded) {
+        await this.answerDirect(update, focus, artifacts, replyThreadId, attempt + 1, turn);
       }
+    }
+  }
+
+  /**
+   * Package 1.1: a superseded turn owns a live draft that will never become a
+   * final. An ephemeral draft expires on its own, but the `edit` fallback mode
+   * is a REAL chat message holding "⏳ Работаю…" or half-streamed text, and the
+   * outbox will never edit it now — so it is deleted. Best-effort by design:
+   * the next turn is already starting and must not wait on Telegram.
+   */
+  private async discardDraft(writer: DraftWriter | undefined): Promise<void> {
+    if (!writer) return;
+    try {
+      await this.telegram.discardDraft?.(writer.draft);
+    } catch (error) {
+      this.logger.debug(
+        { errorCode: classifyOperationalError(error, "telegram").code },
+        "Superseded Operator draft could not be discarded",
+      );
     }
   }
 
@@ -2278,7 +2400,8 @@ export class OperatorDaemon {
     );
     await this.flushTelegramOutbox();
     void this.operatorInputQueue
-      .run(() => this.drainTelegramIngress())
+      // A button press is the owner acting in the chat: same lane as a message.
+      .run("user", () => this.drainTelegramIngress())
       .catch((error) => this.logUpdateFailure(error, update.updateId));
   }
 
@@ -3940,7 +4063,9 @@ export class OperatorDaemon {
         await this.flushTelegramOutbox();
         this.warnBlockedTelegramOutboxHeads();
         await this.drainT3Dispatches();
-        await this.operatorInputQueue.run(() => this.drainTelegramIngress());
+        // The 1 s safety pump is background: it exists to catch what the user
+        // lane already tried, so it must never sit in front of a live message.
+        await this.operatorInputQueue.run("background", () => this.drainTelegramIngress());
       } catch (error) {
         this.logger.warn(
           { errorCode: classifyOperationalError(error).code },

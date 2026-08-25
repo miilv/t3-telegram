@@ -3542,11 +3542,13 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(message(1, "подумай хорошенько над архитектурой миграции"));
     await waitFor(() => runtime.turnStarted);
 
-    // A viewer in the same chat, the owner from ANOTHER chat, and a sentence
-    // that merely starts with "stop" must all leave the runtime alone.
+    // A viewer in the same chat, the owner from ANOTHER chat, and a viewer's
+    // sentence that merely starts with "stop" must all leave the runtime alone.
+    // (The owner's OWN non-cancel message now preempts the turn by design —
+    // package 1.1; the token rule itself is covered in tests/router.test.ts.)
     telegram.push(messageAs(2, "стоп", 43));
     telegram.push({ ...message(3, "стоп"), chatId: 8 });
-    telegram.push(message(4, "stop писать тесты после каждого шага и просто закончи"));
+    telegram.push(messageAs(4, "stop писать тесты после каждого шага и просто закончи", 43));
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(runtime.interrupts).toBe(0);
 
@@ -3555,6 +3557,101 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() => runtime.interrupts === 1);
 
     runtime.releaseTurn();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("preempts the running turn on the owner's next message and never delivers its unfinished final (package 1.1)", async () => {
+    const home = tempDirectory("daemon-preempt-");
+    const store = tempStore();
+    const runtime = new PreemptibleRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "первый вопрос про архитектуру миграции"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("первый вопрос")));
+
+    // The owner changes their mind mid-turn. No cancel word — an ordinary
+    // message is enough, and it preempts before any batching window closes.
+    telegram.push(message(2, "второй вопрос, забудь предыдущий"));
+    await waitFor(() => runtime.interrupts === 1);
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Ответ на второй вопрос")));
+
+    // (а) the superseded turn delivers nothing and leaves no live draft behind.
+    expect(telegram.sent.some((sent) => sent.text.includes("Половина ответа"))).toBe(false);
+    expect(telegram.discardedDrafts).toHaveLength(1);
+    expect(
+      store.db
+        .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.superseded'")
+        .get(),
+    ).toMatchObject({ count: 1 });
+
+    // (б) its durable job is completed, so a restart replays nothing.
+    expect(store.listBackgroundJobs("telegram_ingress", "pending")).toHaveLength(0);
+    expect(store.listBackgroundJobs("telegram_ingress", "running")).toHaveLength(0);
+    expect(store.listBackgroundJobs("telegram_ingress", "failed")).toHaveLength(0);
+    expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(2);
+    expect(store.resetInterruptedBackgroundJobs("telegram_ingress")).toBe(0);
+
+    // (д) worker threads are none of preemption's business.
+    expect(broker.interrupts).toBe(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("keeps the cancel word working on top of preemption, without a thread to stop (package 1.1)", async () => {
+    const home = tempDirectory("daemon-preempt-cancel-");
+    const store = tempStore();
+    const runtime = new PreemptibleRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "первый вопрос про архитектуру миграции"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("первый вопрос")));
+
+    // Path A still interrupts the runtime, and path B still answers about the
+    // bound work — the emergency hatch survives the new default behaviour.
+    telegram.push(message(2, "стоп"));
+    await waitFor(() => runtime.interrupts >= 1);
+    await waitFor(() =>
+      telegram.sent.some((sent) => sent.text.includes("Не вижу активной работы")),
+    );
+    expect(telegram.sent.some((sent) => sent.text.includes("Половина ответа"))).toBe(false);
+    expect(broker.interrupts).toBe(0);
+
     telegram.finish();
     await run;
     await daemon.stop();
@@ -5117,10 +5214,26 @@ class FakeTelegram implements TelegramTransport {
   readonly keyboardClears: number[] = [];
   readonly approvals: Array<{ messageId: number; text: string; approvalId: string }> = [];
   readonly sentDocuments: Array<{ path: string; caption?: string }> = [];
+  /** Drafts dropped because their turn was superseded (package 1.1). */
+  readonly discardedDrafts: number[] = [];
   private readonly queue = new AsyncInputQueue<TelegramInbound>();
   private nextMessageId = 100;
+  private inboundObserver: ((message: { chatId: number; userId: number }) => void) | undefined;
+
+  onInboundMessage(handler: (message: { chatId: number; userId: number }) => void): void {
+    this.inboundObserver = handler;
+  }
+
+  async discardDraft(draft: StreamDraft): Promise<void> {
+    if (draft.messageId) this.discardedDrafts.push(draft.messageId);
+  }
 
   push(update: TelegramInbound): void {
+    // Mirrors the real transport: the observer sees an accepted message before
+    // it is batched and long before it becomes an update on the stream.
+    if (update.type === "message") {
+      this.inboundObserver?.({ chatId: update.chatId, userId: update.userId });
+    }
     this.queue.push(update);
   }
   finish(): void {
@@ -5321,6 +5434,47 @@ class RepeatedProgressBroker extends FakeBroker {
     yield { type: "progress", threadId, summary: "Запускаю тесты…" };
     if (session === 1 && this.firstTerminalGate) await this.firstTerminalGate;
     yield { type: "completed", threadId, result: `Turn ${session} finished.` };
+  }
+}
+
+/**
+ * Package 1.1: a provider that hangs on the first real turn until it is
+ * interrupted — exactly what a SIGINT'd CLI does, half-written answer included.
+ */
+class PreemptibleRuntime extends FakeRuntime {
+  interrupts = 0;
+  private blocked = false;
+  private release: (() => void) | undefined;
+  private readonly gate = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+
+  override async interrupt(): Promise<void> {
+    this.interrupts += 1;
+    this.release?.();
+  }
+
+  override async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (input.prompt.includes("первый вопрос") && !this.blocked) {
+      this.blocked = true;
+      this.prompts.push(input.prompt);
+      yield { type: "text_delta", text: "Половина ответа на первый вопрос" };
+      await this.gate;
+      yield { type: "result", text: "Половина ответа на первый вопрос", sessionId: input.sessionId };
+      return;
+    }
+    if (input.prompt.includes("второй вопрос")) {
+      this.prompts.push(input.prompt);
+      const text = "Ответ на второй вопрос.";
+      yield { type: "text_delta", text };
+      yield { type: "result", text, sessionId: input.sessionId };
+      return;
+    }
+    yield* super.sendTurn(input);
   }
 }
 

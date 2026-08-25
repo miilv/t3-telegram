@@ -1,3 +1,13 @@
+export { LaneQueue, OPERATOR_LANES } from "./lane-queue.js";
+export type { OperatorLane } from "./lane-queue.js";
+export { ThreadEventDigest } from "./thread-digest.js";
+export type {
+  ThreadDigestEvent,
+  ThreadDigestItem,
+  ThreadDigestKind,
+  ThreadEventDigestOptions,
+  ThreadTerminalOutcome,
+} from "./thread-digest.js";
 export {
   DEFAULT_TIME_ZONE,
   isValidTimeZone,

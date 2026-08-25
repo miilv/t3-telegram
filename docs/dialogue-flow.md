@@ -233,9 +233,34 @@ to fan out. The deterministic routing cascade was deliberately deleted.
 
 ---
 
-## 4. Cancellation and mid-turn messages
+## 4. Preemption, cancellation and mid-turn messages
 
-Three distinct paths.
+**Preemption is the default** (package 1.1). Any message from the owner that
+arrives while an Operator turn of theirs runs in that chat supersedes it — no
+cancel word needed:
+
+```
+transport.onInboundMessage(chatId, userId)   fires on the ACCEPTED raw message,
+                                             before the 2 s batch window closes
+   └─ scope: same guard as path A (an active turn in THIS chat, AND
+             isAdministrator OR the turn's own initiator)
+   └─ effect: turn.superseded = true  +  runtime.interrupt() via interruptQuietly
+              worker threads untouched; nothing is said in the chat
+   └─ the superseded turn: no final enqueued (the check sits between the runtime
+              and the outbox), an `edit`-mode draft is deleted, the retry replay
+              is skipped, `operator.turn.superseded` + `operator.turn.dropped`
+              are recorded, and its ingress job still completes — so a restart
+              replays nothing (resetInterruptedBackgroundJobs sees no `running`)
+   └─ after the final row exists the answer is durable: a later message only
+              starts the next turn, it never rolls back what was sent
+```
+
+The message itself takes the ordinary path: batching, durable ingress job, and a
+new turn on the `user` lane. The first message of a burst frees the turn slot
+while the rest of the burst is still being glued into the one job that replaces
+it.
+
+Three cancellation paths remain on top of preemption as the emergency hatch.
 
 ```
 A. RUNTIME PREEMPTION — a bare cancel word
@@ -256,9 +281,22 @@ C. /stop | /cancel → cancelBoundWork(FOCUS thread) — reply context ignored
 ```
 
 **Mid-turn message:** batched within a 2 s quiet window, then queued on the
-serial `operatorInputQueue`. It never preempts except via path A, and the user
-is told nothing about the queueing — they see only the live draft of the turn
-already running.
+`operatorInputQueue`. Since package 1.1 that queue is a `LaneQueue` with three
+strictly prioritized lanes and the same one-task-at-a-time invariant (one
+Operator turn at a time is a session invariant, not a queue detail):
+
+| Lane | Producers |
+|---|---|
+| `user` | live message updates, `ask_choices` button answers |
+| `thread-events` | digested worker events (package 1.2 connects the feed) |
+| `background` | startup ingress replay, the 1 s reliability pump |
+
+Starvation of the background lane is deliberate: every background producer is a
+repeating pump, so a skipped round retries. The digest accumulator
+(`ThreadEventDigest`, `packages/shared/src/thread-digest.ts`) coalesces per
+thread inside its quiet window — repeated `progress` collapses to the newest
+frame, a `completion` evicts that thread's pending progress, each distinct
+`agent_message` survives.
 
 ---
 

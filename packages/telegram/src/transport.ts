@@ -212,6 +212,8 @@ export class TelegramBotTransport implements TelegramTransport {
   private richDraftAvailable: boolean | undefined;
   private draftAvailable: boolean | undefined;
   private richFinalAvailable: boolean | undefined;
+  /** Package 1.1: preemption observer, notified on every accepted message. */
+  private inboundObserver: ((message: { chatId: number; userId: number }) => void) | undefined;
 
   constructor(
     private readonly token: string,
@@ -241,6 +243,27 @@ export class TelegramBotTransport implements TelegramTransport {
     this.bot.catch((error) => {
       this.logger.error({ err: error.error, updateId: error.ctx.update.update_id }, "Telegram handler failed; polling continues");
     });
+  }
+
+  onInboundMessage(handler: (message: { chatId: number; userId: number }) => void): void {
+    this.inboundObserver = handler;
+  }
+
+  /**
+   * Package 1.1: a draft of a superseded turn. `rich-draft`/`draft` previews
+   * are ephemeral and expire once nobody updates them; the `edit` fallback is a
+   * real message and would otherwise sit in the chat forever showing "⏳
+   * Работаю…", so it is deleted. A message Telegram already dropped (or one we
+   * may no longer touch) is not an error here.
+   */
+  async discardDraft(draft: StreamDraft): Promise<void> {
+    if (draft.mode !== "edit" || !draft.messageId) return;
+    const messageId = draft.messageId;
+    try {
+      await this.outbound(draft.chatId, () => this.bot.api.deleteMessage(draft.chatId, messageId));
+    } catch (error) {
+      this.logger.debug({ err: error, chatId: draft.chatId, messageId }, "Draft discard skipped");
+    }
   }
 
   async *updates(signal?: AbortSignal): AsyncIterable<TelegramInbound> {
@@ -789,6 +812,18 @@ export class TelegramBotTransport implements TelegramTransport {
     if (normalized.type !== "message") {
       this.inbound.push(normalized);
       return;
+    }
+    // Package 1.1: the preemption signal fires here — the update is authorized
+    // (normalizeTelegramUpdate applied the access policy) but has not yet been
+    // held for batching, so the running turn is freed on the first message of a
+    // burst rather than up to 2 s later. Observer errors are the observer's
+    // problem: they must never abort ingestion of the message itself.
+    if (this.inboundObserver) {
+      try {
+        this.inboundObserver({ chatId: normalized.chatId, userId: normalized.userId });
+      } catch (error) {
+        this.logger.warn({ err: error }, "Inbound message observer failed");
+      }
     }
     // Albums arrive as separate updates sharing a media_group_id; collapse them
     // first, then let the collapsed envelope join the chat-level batch.

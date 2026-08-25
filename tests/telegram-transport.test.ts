@@ -851,6 +851,48 @@ describe("Telegram inbound normalization", () => {
     expect(captioned.textIsMediaPlaceholder).toBeUndefined();
   });
 
+  it("signals every accepted message to the preemption observer while the burst still batches (package 1.1)", async () => {
+    vi.useFakeTimers();
+    const transport = new TelegramBotTransport(
+      "test-token",
+      { users: { 42: "owner" }, allowGroups: false },
+      1,
+      logger,
+    );
+    const internals = transport as unknown as {
+      acceptUpdate(update: unknown): void;
+      inbound: { push(item: unknown): void };
+    };
+    const delivered: TelegramMessageInbound[] = [];
+    internals.inbound.push = (item) => delivered.push(item as TelegramMessageInbound);
+    const observed: Array<{ chatId: number; userId: number }> = [];
+    transport.onInboundMessage((message) => observed.push(message));
+
+    // The first message of the series is observed immediately — the running
+    // turn is freed while the rest of the burst is still being glued together.
+    internals.acceptUpdate(rawTextUpdate(1, 1));
+    expect(observed).toEqual([{ chatId: 7, userId: 42 }]);
+    expect(delivered).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    internals.acceptUpdate(rawTextUpdate(2, 2));
+    expect(observed).toHaveLength(2);
+    expect(delivered).toHaveLength(0);
+
+    // …and the series still leaves as ONE update, exactly as before.
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.messageIds).toEqual([1, 2]);
+
+    // An unauthorized sender is filtered before the observer, so no stranger
+    // can preempt the owner's turn.
+    internals.acceptUpdate({
+      ...rawTextUpdate(3, 3),
+      message: { ...rawTextUpdate(3, 3).message, from: { id: 99, first_name: "X" } },
+    });
+    expect(observed).toHaveLength(2);
+  });
+
   it("holds an album open across getUpdates page boundaries instead of splitting it", async () => {
     vi.useFakeTimers();
     const transport = new TelegramBotTransport("test-token", 42, 1, logger);

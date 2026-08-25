@@ -206,6 +206,20 @@ export type TelegramFileRef = { localPath: string } | { bytes: Uint8Array };
 
 export interface TelegramTransport {
   updates(signal?: AbortSignal): AsyncIterable<TelegramInbound>;
+  /**
+   * Package 1.1: fires as soon as an authorized inbound message is accepted —
+   * before the 2 s batch window closes and long before it becomes an update on
+   * `updates()`. The daemon uses it to preempt the running Operator turn on the
+   * FIRST message of a burst while the rest of the burst is still being glued
+   * into one job. Observer only: it must not consume or alter the update.
+   */
+  onInboundMessage?(handler: (message: { chatId: number; userId: number }) => void): void;
+  /**
+   * Package 1.1: drop a draft that will never be finalized (a superseded turn).
+   * Ephemeral drafts expire by themselves; the `edit` fallback is a real
+   * message and is deleted. Best-effort — never throws for a missing message.
+   */
+  discardDraft?(draft: StreamDraft): Promise<void>;
   sendRich(
     chatId: number,
     text: string,
