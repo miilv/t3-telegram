@@ -319,6 +319,77 @@ describe("OperatorToolServer", () => {
       store.close();
     }
   });
+
+  it("refuses t3.send_turn past maxParallelWorkers with an error the agent can relay (bug №13)", async () => {
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${tempDirectory("operator-tools-limit-")}/artifacts`, store);
+    await artifacts.initialize();
+    const project = projectFixture();
+    const thread = threadFixture(project.id);
+    store.upsertProject(project);
+    store.upsertThread(thread);
+    const turns: Array<{ threadId: string; text: string }> = [];
+    const broker = {
+      getProject: async () => project,
+      getThread: async () => thread,
+      getProviders: async () => [],
+      sendTurn: async (input: { threadId: string; text: string }) => {
+        turns.push(input);
+        return { threadId: input.threadId, commandId: "cmd_1" };
+      },
+      health: async () => ({ healthy: true }),
+    } as unknown as T3Broker;
+    const occupancy = { count: 2, threadIds: ["th_busy_a", "th_busy_b"] };
+    const server = new OperatorToolServer({
+      broker,
+      store,
+      telegram: new ToolTelegram() as unknown as TelegramTransport,
+      artifacts,
+      getPolicy: () => ({
+        approvalAutoAllow: [],
+        maxParallelWorkers: 2,
+        progressIntervalMs: 60_000,
+        providerOptimizationEnabled: false,
+        providerCostWeight: 0.35,
+        providerLatencyWeight: 0.35,
+        providerReliabilityWeight: 0.3,
+      }),
+      activeWorkers: () => occupancy,
+      logger: pino({ enabled: false }),
+    });
+    await server.start();
+    const lease = server.issue({
+      chatId: 777,
+      ownerId: "42",
+      teamRole: "owner",
+      originMessageId: 91,
+      operatorTurnId: "opturn_limit",
+    });
+    const client = new Client({ name: "operator-tools-limit-test", version: "1.0.0" });
+    try {
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(lease.access.url), {
+          requestInit: { headers: { Authorization: `Bearer ${lease.access.token}` } },
+        }),
+      );
+      // A fresh thread past the ceiling is refused; nothing reaches the broker.
+      await expect(
+        callJson(client, "t3.send_turn", { threadId: thread.id, text: "новая работа" }),
+      ).rejects.toThrow(/Parallel worker limit reached \(2 of 2 running\)/);
+      expect(turns).toHaveLength(0);
+      expect(store.getRuntimeState(`thread_own_dispatch_pending:${thread.id}`)).toBeFalsy();
+
+      // An already-monitored thread adds no parallelism and stays allowed.
+      occupancy.threadIds = ["th_busy_a", thread.id];
+      await callJson(client, "t3.send_turn", { threadId: thread.id, text: "продолжай" });
+      expect(turns).toHaveLength(1);
+    } finally {
+      lease.revoke();
+      await client.close().catch(() => undefined);
+      await server.stop();
+      store.close();
+    }
+  });
 });
 
 async function callJson(

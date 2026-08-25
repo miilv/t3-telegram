@@ -303,9 +303,38 @@ function streamItemSequence(item: unknown): number | undefined {
   return undefined;
 }
 
-function isPermanentRpcError(error: unknown): boolean {
+/**
+ * Only structurally identified failures stop the resubscribe loop. Free-text
+ * "not found" is deliberately NOT permanent: transient wrappers (ticket
+ * endpoints, proxies, DNS) phrase outages with those words too, and treating
+ * them as fatal used to kill a live thread monitor for good (bug №12). The
+ * server's RPC errors are unknown-schema tagged values, so we look for the
+ * tag/code fields Effect RPC actually transports (`_tag`, `code`, `name`)
+ * across the error's cause chain. Exported for tests.
+ */
+export function isPermanentRpcError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /EnvironmentAuthorization|missing required scope|not found|invalid.*thread/i.test(message);
+  if (/EnvironmentAuthorization|missing required scope/i.test(message)) return true;
+  for (const candidate of errorChain(error)) {
+    for (const field of ["_tag", "code", "name"] as const) {
+      const value = candidate[field];
+      if (
+        typeof value === "string" &&
+        /^(?:Thread|Project|Environment|Session)?NotFound(?:Error)?$|^InvalidThread(?:Id)?(?:Error)?$/i.test(value)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function* errorChain(error: unknown): Generator<Record<string, unknown>> {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && isRecord(current); depth += 1) {
+    yield current;
+    current = current.cause;
+  }
 }
 
 function rpcErrorForLog(error: unknown): { name: string; message: string } {

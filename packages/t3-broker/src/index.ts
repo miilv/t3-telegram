@@ -23,7 +23,7 @@ import { metrics } from "../../observability/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 import { EffectT3RpcClient, type T3LiveClient } from "./rpc.js";
 
-export { EffectT3RpcClient, resolveT3WebSocketUrl } from "./rpc.js";
+export { EffectT3RpcClient, isPermanentRpcError, resolveT3WebSocketUrl } from "./rpc.js";
 export type {
   EffectT3RpcClientOptions,
   T3LiveClient,
