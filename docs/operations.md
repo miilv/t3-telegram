@@ -136,6 +136,58 @@ replay. Provider failures are classified without raw provider text, and the
 Operator chooses one bounded recovery action: retry once, start a recovery
 thread, switch to an advertised provider, or report.
 
+## Running under systemd
+
+The production deployment is a systemd user unit with `Restart=always`, so the
+process itself comes back after a crash. Two additional layers make a failure
+*visible* instead of silent (bug №7):
+
+1. On startup the daemon detects an unclean previous exit (the durable
+   `clean_shutdown` marker was never written) and sends the owner a short
+   «перезапустился после сбоя, восстановлено задач: N» notice through the
+   durable outbox.
+2. An `OnFailure=` companion unit notifies the owner even when the daemon
+   cannot start at all (crash loop, broken config, dead Node): systemd triggers
+   it whenever the main unit enters the failed state.
+
+Main unit additions (`~/.config/systemd/user/t3-telegram-operator.service`):
+
+```ini
+[Unit]
+Description=T3 Telegram Operator
+OnFailure=t3-telegram-operator-failed.service
+
+[Service]
+Restart=always
+RestartSec=5
+# StartLimitIntervalSec/StartLimitBurst turn a crash loop into a hard failed
+# state, which is what actually fires OnFailure.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+```
+
+Notifier unit (`~/.config/systemd/user/t3-telegram-operator-failed.service`) —
+a one-shot `curl` straight to the Bot API, deliberately independent of the
+daemon's own code and dependencies:
+
+```ini
+[Unit]
+Description=Notify the owner that the T3 Telegram Operator failed
+
+[Service]
+Type=oneshot
+# Mode-0600 file with TELEGRAM_BOT_TOKEN and OWNER_CHAT_ID; never inline tokens.
+EnvironmentFile=%h/.operator/notify.env
+ExecStart=/usr/bin/curl -sS -m 15 \
+  --data-urlencode "chat_id=${OWNER_CHAT_ID}" \
+  --data-urlencode "text=T3 Telegram Operator упал и не поднялся — нужен ручной разбор: systemctl --user status t3-telegram-operator" \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+```
+
+After editing units run `systemctl --user daemon-reload`. Test the wiring with
+`systemctl --user start t3-telegram-operator-failed` (the message should
+arrive) and by killing the daemon repeatedly to exhaust the start limit.
+
 ## Running under launchd
 
 Create `~/Library/LaunchAgents/com.local.t3-telegram-operator.plist` with an explicit working directory and environment file wrapper. Do not place the Telegram/T3 tokens directly in a world-readable plist. A minimal wrapper can load a mode-`0600` env file and execute:

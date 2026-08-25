@@ -70,6 +70,7 @@ import {
   hashChatId,
   metrics,
 } from "../../../packages/observability/src/index.js";
+import type { OperationalErrorCode } from "../../../packages/observability/src/index.js";
 import type { DailyScheduler } from "../../../packages/scheduler/src/index.js";
 import type {
   OperatorToolServer,
@@ -186,6 +187,14 @@ export class OperatorDaemon {
       await this.createOperatorSession();
     }
 
+    // A previous run that never reached stop() died mid-flight. Silence here
+    // means a crash-looping bot just looks ignored, so tell the owner what
+    // happened and what was recovered (bug №7). The notice goes through the
+    // durable outbox and is rate-limited so a crash loop cannot flood the chat.
+    this.reportUncleanRestart(interruptedOutbox + interruptedDispatches + interruptedAutomations);
+    this.store.setRuntimeState("daemon_started_at", nowIso());
+    this.store.setRuntimeState("clean_shutdown", "");
+
     const [telegramHealth, t3Health, runtimeHealth] = await Promise.all([
       this.telegram.health(),
       this.broker.health(),
@@ -278,7 +287,35 @@ export class OperatorDaemon {
     await Promise.allSettled([...this.monitorTasks]);
     await this.operatorTools?.stop();
     await this.dashboard?.stop();
+    // The graceful-exit marker: its absence at the next initialize() means the
+    // previous run crashed and the owner should hear about it (bug №7).
+    this.store.setRuntimeState("clean_shutdown", "1");
     this.store.close();
+  }
+
+  private reportUncleanRestart(recoveredCount: number): void {
+    const previousStartedAt = this.store.getRuntimeState("daemon_started_at");
+    if (!previousStartedAt || this.store.getRuntimeState("clean_shutdown") === "1") return;
+    const ownerChatId = Number(this.store.getRuntimeState("owner_chat_id"));
+    if (!Number.isSafeInteger(ownerChatId) || ownerChatId === 0) return;
+    const lastNoticeAt = Date.parse(this.store.getRuntimeState("restart_notice_at") ?? "");
+    if (Number.isFinite(lastNoticeAt) && Date.now() - lastNoticeAt < 10 * 60_000) return;
+    this.store.setRuntimeState("restart_notice_at", nowIso());
+    this.enqueueTelegramOutbox(
+      `telegram:restart-notice:${previousStartedAt}`,
+      ownerChatId,
+      "rich",
+      {
+        text: recoveredCount
+          ? `Перезапустился после сбоя, восстановлено задач: ${recoveredCount}. Продолжаю работу.`
+          : "Перезапустился после сбоя. Незавершённых задач не нашёл, продолжаю работу.",
+        options: {},
+        messageType: "daemon_restart_notice",
+      },
+    );
+    this.store.appendEvent("daemon.unclean_restart", {
+      payload: { recoveredCount, previousStartedAt },
+    });
   }
 
   async trackOperatorToolThread(input: ToolStartedThread): Promise<void> {
@@ -552,6 +589,19 @@ export class OperatorDaemon {
       return;
     }
 
+    if (!update.synthetic) {
+      // Where the crash-restart notice goes (bug №7): the owner's latest live chat.
+      if (update.userId === this.config.telegram.allowedUserId) {
+        this.store.setRuntimeState("owner_chat_id", String(update.chatId));
+      }
+      // Instant sign of life: media enrichment below can take a while before
+      // any preview exists, and the base ~2 s batching already ate the
+      // "human" reaction window (bugs №18/№48). Best-effort only.
+      void this.telegram
+        .sendChatAction(update.chatId, "typing", destinationFromUpdate(update))
+        .catch(() => undefined);
+    }
+
     // The cloud Bot API refuses getFile above 20 MB with a permanent error;
     // retrying it for two minutes only to surface a generic failure helps
     // nobody. Skip the download up front and tell the agent why the file is
@@ -772,9 +822,10 @@ export class OperatorDaemon {
     focus: ReturnType<OperatorStore["getFocus"]>,
     artifacts: ArtifactRef[],
     replyThreadId?: string,
+    attempt = 0,
   ): Promise<void> {
     const operatorTurnId = stableExternalId("opturn", stableUpdateOperationKey(update));
-    const finalDedupeKey = `telegram:operator:${operatorTurnId}:final`;
+    const finalDedupeKey = `telegram:operator:${operatorTurnId}:final${attempt ? `:retry${attempt}` : ""}`;
     const existingFinal = this.store.getTelegramOutbox(finalDedupeKey);
     if (existingFinal) {
       if (existingFinal.status === "pending") await this.flushTelegramOutbox();
@@ -839,31 +890,47 @@ export class OperatorDaemon {
       .join("\n\n");
     const operatorStartedAt = Date.now();
     let toolSteps = 0;
+    let previewTouched = false;
     // Keep the ephemeral draft alive while the model works silently; without
-    // this the preview vanishes from the chat mid-turn.
+    // this the preview vanishes from the chat mid-turn. It also runs before the
+    // first tool call now: a pure reasoning turn used to be dead air for up to
+    // ten minutes (bug №18) — «Думаю…» is the sign of life until then.
     const heartbeat = setInterval(() => {
-      if (!toolSteps) return;
-      const seconds = Math.round((Date.now() - operatorStartedAt) / 1000);
-      const elapsed = seconds < 90 ? `${seconds} с` : `${Math.round(seconds / 60)} мин`;
-      writer?.refresh(`⏳ Работаю… ${elapsed}, шагов: ${toolSteps}`);
+      previewTouched = true;
+      writer?.refresh(operatorHeartbeatText(Date.now() - operatorStartedAt, toolSteps));
     }, 15_000);
     heartbeat.unref();
+    // Telegram's typing indicator expires after ~5 s; repeat it until the first
+    // preview edit takes over so the chat is alive from the first second (№48).
+    const typingDestination = destinationFromUpdate(update);
+    const sendTyping = () => {
+      if (previewTouched || update.synthetic) return;
+      void this.telegram
+        .sendChatAction(update.chatId, "typing", typingDestination)
+        .catch(() => undefined);
+    };
+    sendTyping();
+    const typing = setInterval(sendTyping, 4_000);
+    typing.unref();
     let observedFirstToken = false;
     let finalText: string;
     let messageType = "operator_answer";
-    try {
-      const answer = await this.askOperator(
+    let retryDelayMs: number | undefined;
+    const runTurn = () =>
+      this.askOperator(
         prompt,
         (delta) => {
           if (!observedFirstToken) {
             observedFirstToken = true;
             metrics.observe("operator_first_token_latency_ms", Date.now() - operatorStartedAt);
           }
+          previewTouched = true;
           writer?.append(delta);
         },
         toolLease?.access,
         () => {
           toolSteps += 1;
+          previewTouched = true;
           // Only the preamble before the very first tool call is throwaway
           // narration ("I'll take a look"). Everything the model writes between
           // later tool calls is real commentary and stays in the live preview,
@@ -871,24 +938,39 @@ export class OperatorDaemon {
           if (toolSteps === 1) writer?.reset("⏳ Работаю…");
         },
       );
+    try {
+      const answer = await runTurn();
       if (writer && !writer.text && answer) writer.append(answer);
       finalText = answer || writer?.text || "Не смог сформировать ответ.";
       this.store.appendEvent("operator.turn.completed", {
         correlationId,
-        payload: { operatorTurnId },
+        payload: { operatorTurnId, attempt },
       });
     } catch (error) {
-      const classified = classifyOperationalError(error, "provider");
-      metrics.increment("provider_errors_total", { code: classified.code });
-      this.logger.error({ errorCode: classified.code }, "Direct Operator turn failed");
-      finalText = "Не удалось ответить из-за ошибки Operator runtime. Попробуйте ещё раз.";
-      messageType = "operator_error";
+      // A faceless «Не удалось ответить…» explains nothing; classify the
+      // failure into human terms and give transient classes (rate limit,
+      // network, timeout) one automatic replay of the turn (bug №20).
+      const failure = describeOperatorTurnFailure(error, attempt);
+      metrics.increment("provider_errors_total", { code: failure.code });
+      this.logger.error(
+        { errorCode: failure.code, attempt, willRetry: failure.retryDelayMs !== undefined },
+        "Direct Operator turn failed",
+      );
+      finalText = failure.userText;
+      messageType = failure.retryDelayMs !== undefined ? "operator_retry_notice" : "operator_error";
+      retryDelayMs = failure.retryDelayMs;
       this.store.appendEvent("operator.turn.failed", {
         correlationId,
-        payload: { operatorTurnId, errorCode: classified.code },
+        payload: {
+          operatorTurnId,
+          errorCode: failure.code,
+          attempt,
+          willRetry: retryDelayMs !== undefined,
+        },
       });
     } finally {
       clearInterval(heartbeat);
+      clearInterval(typing);
       await writer?.closePreview().catch((error) => {
         this.logger.debug(
           { errorCode: classifyOperationalError(error, "telegram").code },
@@ -912,6 +994,16 @@ export class OperatorDaemon {
       messageType,
     });
     await this.flushTelegramOutbox();
+
+    if (retryDelayMs !== undefined && !this.shutdown.signal.aborted) {
+      // One replay of the whole turn after the promised pause. The wait sits on
+      // the serial input queue on purpose: the runtime is busy-or-limited
+      // anyway, and shutdown aborts the delay immediately.
+      await delay(retryDelayMs, this.shutdown.signal);
+      if (!this.shutdown.signal.aborted) {
+        await this.answerDirect(update, focus, artifacts, replyThreadId, attempt + 1);
+      }
+    }
   }
 
   private monitorThread(
@@ -3848,6 +3940,75 @@ function destinationFromOptions(options: TelegramSendOptions): TelegramDestinati
     ...(options.directMessagesTopicId
       ? { directMessagesTopicId: options.directMessagesTopicId }
       : {}),
+  };
+}
+
+/** The live-preview placeholder while the Operator works: reasoning vs tool phase (bug №18). */
+export function operatorHeartbeatText(elapsedMs: number, toolSteps: number): string {
+  const seconds = Math.round(elapsedMs / 1000);
+  const elapsed = seconds < 90 ? `${seconds} с` : `${Math.round(seconds / 60)} мин`;
+  return toolSteps ? `⏳ Работаю… ${elapsed}, шагов: ${toolSteps}` : `⏳ Думаю… ${elapsed}`;
+}
+
+interface OperatorTurnFailure {
+  code: OperationalErrorCode;
+  userText: string;
+  /** Set only when the turn should be replayed once after this pause. */
+  retryDelayMs?: number;
+}
+
+/**
+ * Human-readable failure texts per error class, plus one automatic replay for
+ * transient classes — rate limit, timeout, network (bug №20). The watchdog's
+ * "timed out" message is not matched by the provider classifier, so timeouts
+ * are recognized here from the raw message.
+ */
+function describeOperatorTurnFailure(error: unknown, attempt: number): OperatorTurnFailure {
+  const classified = classifyOperationalError(error, "provider");
+  const message = (error instanceof Error ? error.message : String(error ?? "")).toLowerCase();
+  const timedOut = /timed[\s_-]?out|timeout/.test(message);
+  const network = /network|socket|econn|connection|reset|fetch failed/.test(message);
+  const canRetry = attempt === 0;
+  if (classified.code === "PROVIDER_RATE_LIMIT") {
+    return canRetry
+      ? {
+          code: classified.code,
+          userText: "Уперся в лимит модели — повторю через минуту.",
+          retryDelayMs: 60_000,
+        }
+      : {
+          code: classified.code,
+          userText: "Провайдер всё ещё ограничивает запросы. Попробуйте ещё раз чуть позже.",
+        };
+  }
+  if (timedOut) {
+    return canRetry
+      ? {
+          code: classified.code,
+          userText: "Ответ занял слишком много времени, я его прервал — пробую ещё раз.",
+          retryDelayMs: 2_000,
+        }
+      : {
+          code: classified.code,
+          userText:
+            "Ответ снова занял слишком много времени, я его прервал. Попробуйте упростить запрос или повторить позже.",
+        };
+  }
+  if (network || classified.code === "PROVIDER_TRANSIENT") {
+    return canRetry
+      ? {
+          code: classified.code,
+          userText: "Проблема с сетью до провайдера — пробую ещё раз.",
+          retryDelayMs: 2_000,
+        }
+      : {
+          code: classified.code,
+          userText: "Провайдер так и не ответил из-за проблем с сетью. Попробуйте ещё раз позже.",
+        };
+  }
+  return {
+    code: classified.code,
+    userText: "Не удалось ответить из-за ошибки Operator runtime. Попробуйте ещё раз.",
   };
 }
 

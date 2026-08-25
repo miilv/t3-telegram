@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
-import { OperatorDaemon } from "../apps/daemon/src/operator-daemon.js";
+import { OperatorDaemon, operatorHeartbeatText } from "../apps/daemon/src/operator-daemon.js";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
 import { compactCallbackToken } from "../packages/telegram/src/index.js";
 import { createAutomation } from "../packages/automations/src/index.js";
@@ -1951,6 +1951,187 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("shows typing from the first second and a «Думаю…» heartbeat before any tool call", async () => {
+    // The heartbeat no longer skips the pre-tool phase (bug №18): a pure
+    // reasoning turn shows «Думаю…», a tool turn keeps the step counter.
+    expect(operatorHeartbeatText(5_000, 0)).toBe("⏳ Думаю… 5 с");
+    expect(operatorHeartbeatText(30_000, 3)).toBe("⏳ Работаю… 30 с, шагов: 3");
+    expect(operatorHeartbeatText(240_000, 0)).toBe("⏳ Думаю… 4 мин");
+
+    const home = tempDirectory("daemon-typing-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    // The typing action bridges the batching gap before the first preview
+    // edit exists (bug №48).
+    expect(telegram.chatActions.some((entry) => entry.action === "typing")).toBe(true);
+    expect(telegram.chatActions[0]!.at).toBeLessThanOrEqual(telegram.visible[0]!.at);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("explains a provider network failure in human terms and replays the turn once", async () => {
+    const home = tempDirectory("daemon-turn-retry-");
+    const store = tempStore();
+    const runtime = new FlakyProviderRuntime(new TypeError("fetch failed: connection reset by peer"));
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Проблема с сетью до провайдера")),
+      4_000,
+    );
+    // One automatic replay of the whole turn (bug №20) delivers the answer.
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 8_000);
+    expect(runtime.prompts.filter((prompt) => prompt.includes("User message:"))).toHaveLength(2);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 15_000);
+
+  it("reports a provider rate limit in the owner's language and promises the retry", async () => {
+    const home = tempDirectory("daemon-rate-limit-text-");
+    const store = tempStore();
+    // Never recovers: only the first, human-readable notice is asserted; the
+    // 60 s backoff is aborted by shutdown.
+    const runtime = new FlakyProviderRuntime(new Error("429 Too Many Requests: rate limit exceeded"), Infinity);
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() =>
+      telegram.sent.some((entry) => entry.text === "Уперся в лимит модели — повторю через минуту."),
+    );
+    expect(telegram.sent.every((entry) => !entry.text.includes("Не удалось ответить из-за ошибки"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("notifies the owner after an unclean restart and stays silent after a clean one", async () => {
+    const home = tempDirectory("daemon-restart-notice-");
+    const databasePath = `${home}/operator.db`;
+    const logger = pino({ enabled: false });
+    const openStore = () => {
+      const store = new OperatorStore(databasePath);
+      store.migrate();
+      return store;
+    };
+    const boot = async (store: OperatorStore) => {
+      const telegram = new FakeTelegram();
+      const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+      let daemon: OperatorDaemon;
+      const tools = new OperatorToolServer({
+        broker: new FakeBroker(),
+        store,
+        telegram,
+        artifacts,
+        logger,
+        onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+      });
+      const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+      daemon = new OperatorDaemon(
+        config(home),
+        store,
+        new FakeRuntime(),
+        new FakeBroker(),
+        telegram,
+        artifacts,
+        scheduler,
+        logger,
+        tools,
+      );
+      await daemon.initialize();
+      return { daemon, telegram };
+    };
+
+    // Run 1 records the owner's chat and exits cleanly.
+    const first = await boot(openStore());
+    const run1 = first.daemon.run();
+    first.telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => first.telegram.sent.some((entry) => entry.text === "Париж."));
+    first.telegram.finish();
+    await run1;
+    await first.daemon.stop();
+
+    // Run 2 follows a clean stop: no crash notice.
+    const second = await boot(openStore());
+    expect(second.telegram.sent.every((entry) => !entry.text.includes("Перезапустился"))).toBe(true);
+    const run2 = second.daemon.run();
+    second.telegram.finish();
+    await run2;
+    await second.daemon.stop();
+
+    // Simulate a crash: the graceful-exit marker never got written.
+    const crashed = openStore();
+    crashed.setRuntimeState("clean_shutdown", "");
+    crashed.close();
+
+    // Run 3 announces the unclean restart to the owner (bug №7).
+    const third = await boot(openStore());
+    await waitFor(() =>
+      third.telegram.sent.some((entry) => entry.text.includes("Перезапустился после сбоя")),
+    );
+    const run3 = third.daemon.run();
+    third.telegram.finish();
+    await run3;
+    await third.daemon.stop();
+  }, 15_000);
+
   it("reports owner diagnostics with capabilities, queues, SQLite health, metrics, and no raw chat id", async () => {
     const home = tempDirectory("daemon-debug-");
     const store = tempStore();
@@ -2212,6 +2393,29 @@ class FakeRuntime implements OperatorRuntime {
   async resume(): Promise<void> {}
   async health(): Promise<{ healthy: boolean }> {
     return { healthy: true };
+  }
+}
+
+/** Fails direct Operator envelopes with the given error a set number of times. */
+class FlakyProviderRuntime extends FakeRuntime {
+  constructor(
+    private readonly error: Error,
+    private failures = 1,
+  ) {
+    super();
+  }
+
+  override async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (input.prompt.includes("User message:") && this.failures > 0) {
+      this.failures -= 1;
+      this.prompts.push(input.prompt);
+      throw this.error;
+    }
+    yield* super.sendTurn(input);
   }
 }
 
@@ -2682,7 +2886,10 @@ class FakeTelegram implements TelegramTransport {
     return new Uint8Array();
   }
   async react(): Promise<void> {}
-  async sendChatAction(): Promise<void> {}
+  readonly chatActions: Array<{ action: string; at: number }> = [];
+  async sendChatAction(_chatId: number, action: string): Promise<void> {
+    this.chatActions.push({ action, at: Date.now() });
+  }
   async health(): Promise<{ healthy: boolean; username: string }> {
     return { healthy: true, username: "operator_test_bot" };
   }

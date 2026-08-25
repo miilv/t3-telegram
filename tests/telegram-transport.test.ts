@@ -9,7 +9,7 @@ import {
   pruneLocalBotApiFiles,
   TelegramBotTransport,
 } from "../packages/telegram/src/index.js";
-import type { TelegramInbound, TelegramMessageInbound } from "../packages/telegram/src/index.js";
+import type { StreamDraft, TelegramInbound, TelegramMessageInbound } from "../packages/telegram/src/index.js";
 import { tempDirectory } from "./helpers.js";
 
 const logger = pino({ level: "silent" });
@@ -71,6 +71,52 @@ describe("grammY Telegram transport", () => {
       rich_message: { markdown: "complete" },
       reply_parameters: { message_id: 11 },
     });
+  });
+
+  it("keeps fallback previews below the plain 4096 cap so streaming never freezes", async () => {
+    // Rich drafts are unavailable: the transport falls back to plain
+    // sendMessageDraft, whose hard cap is 4096 — an oversized preview used to
+    // die with MESSAGE_TOO_LONG and freeze (bug №21).
+    const calls: ApiCall[] = [];
+    let id = 100;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        if (call.method === "sendRichMessageDraft") {
+          return telegramResponse(
+            { ok: false, error_code: 404, description: "Not Found: method not found" },
+            404,
+          );
+        }
+        if (call.method === "sendMessageDraft") return telegramResponse({ ok: true, result: true });
+        return telegramResponse(messageResult(id++));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const draft = await transport.startDraft(7);
+    expect(draft.mode).toBe("draft");
+
+    const longText = Array.from({ length: 400 }, (_, index) => `строка ${index} ${"x".repeat(20)}`).join("\n");
+    expect(longText.length).toBeGreaterThan(4_096);
+    await transport.updateDraft(draft, longText);
+    const plainDraft = calls.filter((call) => call.method === "sendMessageDraft").at(-1)!;
+    const previewText = plainDraft.body.text as string;
+    expect(previewText.length).toBeLessThanOrEqual(4_096);
+    expect(previewText).toContain("earlier output trimmed");
+    expect(previewText.endsWith(`строка 399 ${"x".repeat(20)}`)).toBe(true);
+
+    // The editable-message fallback obeys the same cap.
+    const editable: StreamDraft = { mode: "edit", phase: "text", chatId: 7, draftId: 1, messageId: 55, text: "…" };
+    await transport.updateDraft(editable, longText);
+    const edit = calls.filter((call) => call.method === "editMessageText").at(-1)!;
+    expect((edit.body.text as string).length).toBeLessThanOrEqual(4_096);
+
+    // The final answer is not truncated — it goes out in full.
+    await transport.finalizeDraft(draft, longText);
+    const final = calls.filter((call) => call.method === "sendRichMessage").at(-1)!;
+    expect((final.body.rich_message as { markdown: string }).markdown).toBe(longText);
   });
 
   it("falls back for a rejected rich payload but not for an ambiguous network failure", async () => {

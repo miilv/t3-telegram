@@ -267,6 +267,48 @@ process.stdin.on("end", () => {
       }
     }
   });
+
+  it("kills a hung Codex turn with the same watchdog as the Claude path", async () => {
+    const directory = tempDirectory("hung-codex-");
+    const binary = join(directory, "codex");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+if (process.argv.includes("--version")) {
+  console.log("codex-cli-test 1.0");
+  process.exit(0);
+}
+// Emit a session, then hang forever: without the watchdog this blocks the
+// daemon's serial runtime queue permanently (bug №10).
+console.log(JSON.stringify({ type: "thread.started", thread_id: "hung-session" }));
+setInterval(() => {}, 1_000);
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new CodexCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "gpt-test",
+      effort: "high",
+      turnTimeoutMs: 300,
+    });
+    const session = await runtime.start({ systemPrompt: "policy" });
+    const consume = async () => {
+      for await (const event of runtime.sendTurn({ sessionId: session.id, prompt: "hang" })) {
+        void event;
+      }
+    };
+    await expect(consume()).rejects.toThrow(/timed out after 300ms and was killed/);
+    // The slot is released, so the next turn is not blocked by the dead one.
+    await expect(
+      (async () => {
+        for await (const event of runtime.sendTurn({ sessionId: session.id, prompt: "again" })) {
+          void event;
+        }
+      })(),
+    ).rejects.toThrow(/timed out/);
+  });
 });
 
 describe("SwitchableOperatorRuntime", () => {

@@ -43,6 +43,7 @@ async function main(): Promise<void> {
       cwd: config.operator.runtimeDir,
       model: config.operator.codex.model,
       effort: config.operator.codex.effort,
+      turnTimeoutMs: config.operator.turnTimeoutMs,
     });
   }
   const runtime = new SwitchableOperatorRuntime(providers, config.operator.provider);
