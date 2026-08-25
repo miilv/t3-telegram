@@ -341,11 +341,11 @@ default                         → "Не удалось ответить из-�
 `askOperator` additionally catches `/session|resume|conversation.*not found/i`,
 creates a fresh session and replays the same prompt once.
 
-**A stale provider bricks startup.** If `/operator` switched to codex and
-`OPERATOR_CODEX_ENABLED` later returns to `false`, `initialize()` resumes with
-`operator_provider="codex"`, finds no such provider, and throws
-`configured Operator provider is unavailable: codex`. The daemon will not boot
-until `runtime_state` is edited by hand.
+**A stale provider no longer bricks startup** (package 0.1). If `/operator`
+switched to codex and `OPERATOR_CODEX_ENABLED` later returns to `false`,
+`resolveUnavailableProvider` falls back to the configured default (else any
+available provider), persists the correction, logs a warning and sends the
+owner one line — boot continues.
 
 **A hung CLI hangs boot.** Runtime health is `spawn(binary, ["--version"])` with
 no watchdog. A non-zero exit aborts boot with one unattributed line; a binary
@@ -811,11 +811,15 @@ withheld and Telegram re-delivers.
 `worker_group_members`, `thread_handoffs` and `routing_clarifications` are
 DDL-only with zero readers or writers.
 
-There are **no `uncaughtException` / `unhandledRejection` handlers anywhere**, so
-a stray rejection kills the daemon. `stop()` writes `clean_shutdown = "1"` only
-after awaiting eight queues, the reliability task and every monitor; if any never
-settles, the marker is never written and the next boot posts a crash notice.
-`SIGINT`/`SIGTERM` use `process.once`, so a second signal hard-kills mid-shutdown.
+**Process lifecycle (package 0.1).** `installProcessGuards` (lifecycle.ts)
+registers `uncaughtException`/`unhandledRejection` handlers: log fatal, clear
+`clean_shutdown`, exit 1 — and the known floating promises (monitor tails, the
+cancel path, the reliability loop, transport/dashboard chains) carry terminal
+catches so a benign rejection does not become a restart. `stop()` runs its 13
+steps under a 15 s deadline; on expiry it logs the unfinished steps and writes
+`clean_shutdown = ""` (honest: abandoned work is not a clean exit), so the next
+boot reports it. `SIGINT`/`SIGTERM` use `process.on`: the first signal starts a
+graceful stop, a second forces the marker write and exits, a third is inert.
 
 ---
 
