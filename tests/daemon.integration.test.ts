@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { dirname } from "node:path";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import pino from "pino";
+import type { Logger } from "pino";
 import { describe, expect, it } from "vitest";
 import {
   OperatorDaemon,
@@ -3413,6 +3414,139 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   });
+
+  it("boots on a fallback provider instead of refusing when the remembered one is gone (package 0.1)", async () => {
+    const home = tempDirectory("daemon-provider-fallback-");
+    const store = tempStore();
+    const runtime = new SingleProviderRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+
+    // A previous run switched to codex; this build no longer wires codex up.
+    store.setRuntimeState("operator_session_id", "operator-session");
+    store.setRuntimeState("operator_provider", "codex");
+    store.setRuntimeState("owner_chat_id", "7");
+
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await expect(daemon.initialize()).resolves.toBeUndefined();
+
+    // Resume never sees the unavailable id, and the correction is persisted so
+    // the next boot does not repeat the fallback.
+    expect(runtime.resumedProviders).toEqual(["claude"]);
+    expect(store.getRuntimeState("operator_provider")).toBe("claude");
+    await waitFor(() =>
+      telegram.sent.some((entry) => entry.text.includes("Провайдер «codex» недоступен")),
+    );
+    expect(
+      telegram.sent.filter((entry) => entry.text.includes("Провайдер «codex» недоступен")),
+    ).toHaveLength(1);
+
+    const run = daemon.run();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("never starts a worker monitor once shutdown has begun (package 0.1)", async () => {
+    const home = tempDirectory("daemon-shutdown-monitor-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+
+    // The scheduler step of stop() awaits a maintenance tick, and maintenance
+    // resubscribes monitors. Before the guard, that tick could register a fresh
+    // monitor with a controller nobody had aborted, and the monitorTasks step
+    // then burned the whole shutdown deadline waiting for it.
+    const scheduler = new MaintainOnIdleScheduler(() => daemon.maintain("shutdown drain"), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // A thread the maintenance pass will want to re-monitor.
+    const project = await broker.createProject({ name: "ops", workspaceRoot: `${home}/ws` });
+    store.upsertProject(project);
+    const thread = await broker.createThread({ projectId: project.id, title: "долгая задача" });
+    thread.status = "running";
+    store.upsertThread(thread);
+    store.setRuntimeState(`thread_chat:${thread.id}`, "7");
+    broker.subscriptions.length = 0;
+
+    const startedAt = Date.now();
+    await daemon.stop(500);
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    // The drain never opened a new subscription, so nothing outlived shutdown.
+    expect(broker.subscriptions).toEqual([]);
+
+    telegram.finish();
+    await run;
+  }, 15_000);
+
+  it("writes the graceful-exit marker even when a queue never settles (package 0.1)", async () => {
+    const home = tempDirectory("daemon-stop-deadline-");
+    const databasePath = `${home}/operator.db`;
+    const store = new OperatorStore(databasePath);
+    store.migrate();
+    const runtime = new BlockingRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // The Operator turn wedges the runtime queue and is never released.
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => runtime.turnStarted);
+
+    const startedAt = Date.now();
+    await daemon.stop(50);
+    // Without a deadline this would hang on the wedged queue forever.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+
+    // A deadline that expired means work was abandoned, so the run is recorded
+    // as unclean and the next boot recovers it instead of trusting the exit.
+    const reopened = new OperatorStore(databasePath);
+    expect(reopened.getRuntimeState("clean_shutdown")).toBe("");
+    reopened.close();
+
+    telegram.finish();
+    await run;
+  }, 15_000);
 });
 
 function config(home: string): Config {
@@ -3643,7 +3777,7 @@ class FakeRuntime implements OperatorRuntime {
     this.compactReasons.push(reason);
     return { sessionId: "operator-session", summary: "compact" };
   }
-  async resume(): Promise<void> {}
+  async resume(_sessionId?: string, _providerId?: string): Promise<void> {}
   async health(): Promise<{ healthy: boolean }> {
     return { healthy: true };
   }
@@ -3859,6 +3993,40 @@ class BlockingRuntime extends FakeRuntime {
   }
 }
 
+/**
+ * Runs an arbitrary task inside idle(), which is what stop() awaits — the stand
+ * -in for a maintenance tick that is still draining when shutdown starts.
+ */
+class MaintainOnIdleScheduler extends DailyScheduler {
+  constructor(
+    private readonly onIdle: () => Promise<void>,
+    logger: Logger,
+  ) {
+    super(async () => {}, logger);
+  }
+
+  override async idle(): Promise<void> {
+    await this.onIdle();
+  }
+}
+
+/** Only claude is wired up, and every resume records the provider it was handed. */
+class SingleProviderRuntime extends FakeRuntime {
+  readonly resumedProviders: Array<string | undefined> = [];
+
+  currentProvider(): string {
+    return "claude";
+  }
+
+  availableProviders(): string[] {
+    return ["claude"];
+  }
+
+  override async resume(_sessionId?: string, providerId?: string): Promise<void> {
+    this.resumedProviders.push(providerId);
+  }
+}
+
 class ProviderSwitchRuntime extends FakeRuntime {
   private provider = "claude";
   readonly switches: string[] = [];
@@ -3897,6 +4065,7 @@ class FakeBroker implements T3Broker {
   readonly threads: WorkThread[] = [];
   readonly turns: SendThreadTurnInput[] = [];
   readonly turnAttempts: SendThreadTurnInput[] = [];
+  readonly subscriptions: string[] = [];
   readonly userInputResponses: UserInputDecision[] = [];
   readonly approvalResponses: ApprovalDecision[] = [];
   readonly threadInputs: CreateThreadInput[] = [];
@@ -3992,6 +4161,7 @@ class FakeBroker implements T3Broker {
     (await this.getThread(threadId)).status = "cancelled";
   }
   async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+    this.subscriptions.push(threadId);
     if (this.workerEvents) {
       for (const event of this.workerEvents) {
         if (

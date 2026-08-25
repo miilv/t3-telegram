@@ -16,6 +16,7 @@ import { MediaProcessor } from "../../../packages/media/src/index.js";
 import { GoogleWorkspaceConnectors } from "../../../packages/connectors/src/index.js";
 import { DashboardServer } from "../../../packages/dashboard/src/index.js";
 import { OperatorDaemon } from "./operator-daemon.js";
+import { installProcessGuards, resolveStartupProvider } from "./lifecycle.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -50,7 +51,21 @@ async function main(): Promise<void> {
       logger,
     });
   }
-  const runtime = new SwitchableOperatorRuntime(providers, config.operator.provider);
+  // Package 0.1: OPERATOR_PROVIDER may name a provider this build did not wire
+  // up (codex configured, OPERATOR_CODEX_ENABLED=false). Start on something
+  // that exists instead of leaving the switchable runtime pointing at nothing.
+  const defaultProvider = resolveStartupProvider(
+    config.operator.provider,
+    Object.keys(providers),
+    "claude",
+  );
+  if (defaultProvider !== config.operator.provider) {
+    logger.warn(
+      { requested: config.operator.provider, resolved: defaultProvider },
+      "Configured Operator provider is not enabled; starting on the fallback",
+    );
+  }
+  const runtime = new SwitchableOperatorRuntime(providers, defaultProvider);
   const broker = new HttpT3Broker(
     {
       baseUrl: config.t3.baseUrl,
@@ -126,13 +141,19 @@ async function main(): Promise<void> {
     dashboard,
   );
 
-  const shutdown = async (signal: string) => {
-    logger.info({ signal }, "Shutting down Operator");
-    await daemon.stop();
-    process.exit(0);
-  };
-  process.once("SIGINT", () => void shutdown("SIGINT"));
-  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+  // Package 0.1: crash and signal handling. Best effort by design — the marker
+  // is a hint for the next boot, never a reason to keep a dying process alive.
+  installProcessGuards({
+    logger,
+    stop: () => daemon.stop(),
+    markShutdownOutcome: (clean) => {
+      try {
+        store.setRuntimeState("clean_shutdown", clean ? "1" : "");
+      } catch (error) {
+        logger.warn({ err: error }, "Could not write the shutdown marker");
+      }
+    },
+  });
 
   await daemon.initialize();
   await daemon.run();

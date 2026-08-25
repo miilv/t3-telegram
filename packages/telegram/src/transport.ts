@@ -250,7 +250,16 @@ export class TelegramBotTransport implements TelegramTransport {
       if (this.bot.isRunning()) void this.bot.stop();
     };
     signal?.addEventListener("abort", stop, { once: true });
-    void this.pollWithRecovery(signal).finally(() => this.inbound.end());
+    // Package 0.1 (H1): a terminal catcher. The daemon now exits on unhandled
+    // rejections, so the polling loop and the stream close must not float.
+    void this.pollWithRecovery(signal)
+      .catch((error: unknown) => {
+        this.logger.error({ err: error }, "Telegram polling loop crashed");
+      })
+      .finally(() => this.inbound.end())
+      .catch((error: unknown) => {
+        this.logger.error({ err: error }, "Telegram inbound stream failed to close");
+      });
     try {
       for await (const update of this.inbound) yield update;
     } finally {

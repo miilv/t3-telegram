@@ -46,6 +46,11 @@ import {
   resolveProjectReference,
   updateFocus,
 } from "../../../packages/router/src/index.js";
+import {
+  SHUTDOWN_DEADLINE_MS,
+  awaitShutdownSteps,
+  resolveStartupProvider,
+} from "./lifecycle.js";
 import type { ArtifactRegistry } from "../../../packages/artifacts/src/index.js";
 import type {
   SentMessage,
@@ -170,7 +175,6 @@ const MONITOR_RESUBSCRIBE_BASE_DELAY_MS = 1_000;
 const MONITOR_RESUBSCRIBE_MAX_DELAY_MS = 60_000;
 /** Terminal events within this window of our own dispatch are never suppressed (bug №27). */
 const OWN_DISPATCH_GRACE_MS = 120_000;
-
 export class OperatorDaemon {
   private readonly operatorInputQueue = new SerialQueue();
   private readonly operatorRuntimeQueue = new SerialQueue();
@@ -234,8 +238,9 @@ export class OperatorDaemon {
     await this.dashboard?.start();
 
     const existingSession = this.store.getRuntimeState("operator_session_id");
-    const existingProvider = this.store.getRuntimeState("operator_provider")
+    const storedProvider = this.store.getRuntimeState("operator_provider")
       ?? this.config.operator.provider;
+    const existingProvider = this.resolveUnavailableProvider(storedProvider);
     if (existingSession) {
       // The system prompt travels with resume so a runtime that seeds future
       // fresh sessions from it (Codex compaction) never restarts with an
@@ -289,7 +294,11 @@ export class OperatorDaemon {
     await this.recoverWorkers();
     await this.maintain("startup");
     this.scheduler.start();
-    this.reliabilityTask = this.reliabilityLoop();
+    // Package 0.1 (H1): a terminal catcher, so a pump that dies outside its own
+    // per-iteration try/catch is logged instead of floating as a rejection.
+    this.reliabilityTask = this.reliabilityLoop().catch((error: unknown) => {
+      this.logger.error({ err: error }, "Reliability pump died");
+    });
   }
 
   async run(): Promise<void> {
@@ -303,7 +312,7 @@ export class OperatorDaemon {
         isCancelIntent(update.text) &&
         this.mayInterruptOperatorTurn(update.chatId, update.userId)
       ) {
-        void this.runtime.interrupt();
+        this.interruptQuietly();
       }
       const receivedAt = Date.now();
       void this.ingressQueue
@@ -342,27 +351,112 @@ export class OperatorDaemon {
     }
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Package 0.1 (H1): interrupting a dead provider CLI raises EPERM/ESRCH, and
+   * `interrupt()` is not declared async — it can throw synchronously as well as
+   * reject. A user typing a cancel word must never be able to kill the daemon.
+   */
+  private interruptQuietly(): void {
+    try {
+      void Promise.resolve(this.runtime.interrupt()).catch((error: unknown) => {
+        this.logger.warn({ err: error }, "Operator interrupt failed");
+      });
+    } catch (error) {
+      this.logger.warn({ err: error }, "Operator interrupt threw synchronously");
+    }
+  }
+
+  async stop(deadlineMs = SHUTDOWN_DEADLINE_MS): Promise<void> {
     this.shutdown.abort();
     this.scheduler.stop();
-    await this.scheduler.idle();
+    // Monitors are aborted up front rather than after the scheduler settles, so
+    // a wedged scheduler cannot keep them subscribed for the whole deadline.
     for (const controller of this.monitors.values()) controller.abort();
-    await this.ingressQueue.idle();
-    await this.operatorInputQueue.idle();
-    await this.operatorRuntimeQueue.idle();
-    await this.workerEventQueue.idle();
-    await this.workerCompletionQueue.idle();
-    await this.maintenanceQueue.idle();
-    await this.outboxQueue.idle();
-    await this.t3DispatchQueue.idle();
-    await this.reliabilityTask;
-    await Promise.allSettled([...this.monitorTasks]);
-    await this.operatorTools?.stop();
-    await this.dashboard?.stop();
+    const unfinished = await awaitShutdownSteps(
+      [
+        {
+          name: "scheduler",
+          wait: async () => {
+            await this.scheduler.idle();
+            // A maintenance tick can register monitors while it drains. They
+            // see the aborted shutdown signal and return early, but abort once
+            // more so anything that slipped through cannot outlive the drain.
+            for (const controller of this.monitors.values()) controller.abort();
+          },
+        },
+        { name: "ingressQueue", wait: () => this.ingressQueue.idle() },
+        { name: "operatorInputQueue", wait: () => this.operatorInputQueue.idle() },
+        { name: "operatorRuntimeQueue", wait: () => this.operatorRuntimeQueue.idle() },
+        { name: "workerEventQueue", wait: () => this.workerEventQueue.idle() },
+        { name: "workerCompletionQueue", wait: () => this.workerCompletionQueue.idle() },
+        { name: "maintenanceQueue", wait: () => this.maintenanceQueue.idle() },
+        { name: "outboxQueue", wait: () => this.outboxQueue.idle() },
+        { name: "t3DispatchQueue", wait: () => this.t3DispatchQueue.idle() },
+        { name: "reliabilityTask", wait: async () => this.reliabilityTask },
+        { name: "monitorTasks", wait: () => Promise.allSettled([...this.monitorTasks]) },
+        { name: "operatorTools", wait: async () => this.operatorTools?.stop() },
+        { name: "dashboard", wait: async () => this.dashboard?.stop() },
+      ],
+      deadlineMs,
+      (name, error) => this.logger.warn({ err: error, step: name }, "Shutdown step failed"),
+    );
     // The graceful-exit marker: its absence at the next initialize() means the
-    // previous run crashed and the owner should hear about it (bug №7).
-    this.store.setRuntimeState("clean_shutdown", "1");
+    // previous run did not drain and the owner should hear about it (bug №7).
+    // A deadline that expired is exactly that case — work was abandoned, so the
+    // next boot must recover it rather than trust a clean-exit claim.
+    this.store.setRuntimeState("clean_shutdown", unfinished.length ? "" : "1");
+    if (unfinished.length) {
+      this.logger.warn(
+        { unfinished, deadlineMs },
+        "Shutdown deadline expired; exiting with work still in flight",
+      );
+      // Abandoned steps still hold this connection. Closing it under them turns
+      // every late write into a throw; the process is exiting anyway, so let the
+      // operating system reclaim the handle.
+      return;
+    }
     this.store.close();
+  }
+
+  /**
+   * Package 0.1: a remembered provider that is no longer wired up (codex in
+   * runtime_state after OPERATOR_CODEX_ENABLED=false) used to abort the boot
+   * with "configured Operator provider is unavailable". Boot on the default
+   * instead, persist the correction, and tell the owner in one line so the
+   * silent downgrade is not a surprise.
+   */
+  private resolveUnavailableProvider(storedProvider: string): string {
+    const available = this.runtime.availableProviders?.() ?? [];
+    const resolved = resolveStartupProvider(
+      storedProvider,
+      available,
+      this.config.operator.provider,
+    );
+    if (resolved === storedProvider) return storedProvider;
+    this.store.setRuntimeState("operator_provider", resolved);
+    this.logger.warn(
+      { errorCode: "OPERATOR_PROVIDER_UNAVAILABLE", requested: storedProvider, resolved, available },
+      "Configured Operator provider is unavailable; falling back to an available one",
+    );
+    this.store.appendEvent("operator.provider.fallback", {
+      payload: { requested: storedProvider, resolved, available },
+    });
+    const ownerChatId = Number(this.store.getRuntimeState("owner_chat_id"));
+    if (Number.isSafeInteger(ownerChatId) && ownerChatId !== 0) {
+      this.enqueueTelegramOutbox(
+        // No timestamp in the key: a crash loop against a read-only database
+        // would otherwise enqueue a fresh notice on every boot.
+        `telegram:provider-fallback:${storedProvider}:${resolved}`,
+        ownerChatId,
+        "rich",
+        {
+          text: `Провайдер «${storedProvider}» недоступен, продолжаю работу на «${resolved}».`,
+          options: {},
+          messageType: "provider_fallback_notice",
+        },
+      );
+    }
+    return resolved;
   }
 
   private reportUncleanRestart(recoveredCount: number): void {
@@ -1280,6 +1374,10 @@ export class OperatorDaemon {
     originMessageId?: number,
     destination: TelegramDestination = {},
   ): void {
+    // Package 0.1 (H2): a maintenance tick draining inside stop() must not
+    // register a fresh, un-aborted monitor — it would hold the monitorTasks
+    // step for the whole shutdown deadline.
+    if (this.shutdown.signal.aborted) return;
     // Bug №11: refresh the delivery route on EVERY call, so steering an
     // already-monitored thread from another chat retargets the live monitor
     // instead of hitting the early return with a stale closure destination.
@@ -1453,9 +1551,18 @@ export class OperatorDaemon {
           this.monitorThread(threadId, route.chatId, route.originMessageId, route.destination);
         }
       }
-    })();
+    })().catch((error: unknown) => {
+      // Package 0.1 (H1): the monitor's own finally block can throw
+      // (performance bookkeeping, follow-up dispatch), and a rejection here
+      // used to float. Terminal catcher: `task` never rejects.
+      this.logger.error({ err: error, threadId }, "Worker monitor crashed");
+    });
     this.monitorTasks.add(task);
-    void task.finally(() => this.monitorTasks.delete(task));
+    void task
+      .finally(() => this.monitorTasks.delete(task))
+      .catch(() => {
+        // .finally() hands back a fresh promise; nothing may float off it.
+      });
   }
 
   /** Bug №12: durable owner notice + marker when a monitor could not resubscribe. */
