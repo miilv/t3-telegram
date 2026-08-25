@@ -10,6 +10,7 @@ import type {
   AutomationSchedule,
   ConversationCompaction,
   FocusState,
+  InteractionMediation,
   OperatorNote,
   Project,
   ProviderPerformance,
@@ -42,6 +43,8 @@ export interface PendingUserInput {
   status: string;
   chatId?: number;
   messageId?: number;
+  /** Cached mediation result so recovery/redraw never re-run the LLM pass. */
+  mediation?: InteractionMediation;
 }
 
 export interface BackgroundJob<T = unknown> {
@@ -137,6 +140,10 @@ export class OperatorStore {
     const automationColumns = this.db.prepare("PRAGMA table_info(automations)").all() as Row[];
     if (automationColumns.length && !automationColumns.some((column) => column.name === "consecutive_failures")) {
       this.db.exec("ALTER TABLE automations ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0");
+    }
+    const pendingUserInputColumns = this.db.prepare("PRAGMA table_info(pending_user_inputs)").all() as Row[];
+    if (pendingUserInputColumns.length && !pendingUserInputColumns.some((column) => column.name === "mediation_json")) {
+      this.db.exec("ALTER TABLE pending_user_inputs ADD COLUMN mediation_json TEXT");
     }
     const processedEventColumns = this.db.prepare("PRAGMA table_info(processed_events)").all() as Row[];
     if (processedEventColumns.length && !processedEventColumns.some((column) => column.name === "status")) {
@@ -1110,6 +1117,12 @@ export class OperatorStore {
     this.db.prepare("UPDATE pending_approvals SET status=?,updated_at=? WHERE id=?").run(status, nowIso(), id);
   }
 
+  updateApprovalPayload(id: string, payload: unknown): void {
+    this.db
+      .prepare("UPDATE pending_approvals SET payload_json=?,updated_at=? WHERE id=?")
+      .run(JSON.stringify(payload), nowIso(), id);
+  }
+
   updateApprovalMessage(id: string, chatId: number, messageId: number): void {
     this.db
       .prepare(`
@@ -1178,9 +1191,9 @@ export class OperatorStore {
     this.db
       .prepare(`
         INSERT OR REPLACE INTO pending_user_inputs(
-          id,t3_request_id,thread_id,questions_json,draft_answers_json,current_question,status,
+          id,t3_request_id,thread_id,questions_json,draft_answers_json,mediation_json,current_question,status,
           telegram_chat_id,telegram_message_id,created_at,updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
       `)
       .run(
         input.id,
@@ -1188,6 +1201,7 @@ export class OperatorStore {
         input.threadId,
         JSON.stringify(input.questions),
         "{}",
+        null,
         0,
         "pending",
         input.chatId ?? null,
@@ -1204,6 +1218,7 @@ export class OperatorStore {
       currentQuestion?: number;
       messageId?: number;
       status?: string;
+      mediation?: InteractionMediation;
     },
   ): void {
     this.db
@@ -1212,7 +1227,8 @@ export class OperatorStore {
           draft_answers_json=COALESCE(?,draft_answers_json),
           current_question=COALESCE(?,current_question),
           telegram_message_id=COALESCE(?,telegram_message_id),
-          status=COALESCE(?,status),updated_at=?
+          status=COALESCE(?,status),
+          mediation_json=COALESCE(?,mediation_json),updated_at=?
         WHERE id=?
       `)
       .run(
@@ -1220,6 +1236,7 @@ export class OperatorStore {
         input.currentQuestion ?? null,
         input.messageId ?? null,
         input.status ?? null,
+        input.mediation ? JSON.stringify(input.mediation) : null,
         nowIso(),
         id,
       );
@@ -1920,6 +1937,9 @@ function rowToPendingUserInput(row: Row): PendingUserInput {
       : {}),
     ...(row.telegram_message_id !== null && row.telegram_message_id !== undefined
       ? { messageId: Number(row.telegram_message_id) }
+      : {}),
+    ...(row.mediation_json
+      ? { mediation: JSON.parse(String(row.mediation_json)) as InteractionMediation }
       : {}),
   };
 }

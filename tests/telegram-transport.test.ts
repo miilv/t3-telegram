@@ -146,8 +146,8 @@ describe("grammY Telegram transport", () => {
         inline_keyboard: [
           [{ text: "EU", callback_data: "ui:input_123:0:o0" }],
           [{ text: "US", callback_data: "ui:input_123:0:o1" }],
-          [{ text: "Write another answer", callback_data: "ui:input_123:0:c" }],
-          [{ text: "Submit selected", callback_data: "ui:input_123:0:s" }],
+          [{ text: "Ответить своим текстом", callback_data: "ui:input_123:0:c" }],
+          [{ text: "Отправить выбранное", callback_data: "ui:input_123:0:s" }],
         ],
       },
     });

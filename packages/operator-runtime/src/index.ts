@@ -66,6 +66,14 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
     return this.current().compact(reason);
   }
 
+  async oneShot(input: { prompt: string; timeoutMs?: number }): Promise<string> {
+    const current = this.current();
+    if (!current.oneShot) {
+      throw new Error(`Operator provider ${this.providerId} has no one-shot side channel`);
+    }
+    return current.oneShot(input);
+  }
+
   async resume(sessionId: string, providerId?: string): Promise<void> {
     if (providerId) {
       if (!this.providers[providerId]) throw new Error(`configured Operator provider is unavailable: ${providerId}`);
@@ -445,6 +453,74 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
 
   async interrupt(): Promise<void> {
     this.active?.kill("SIGINT");
+  }
+
+  /**
+   * One `claude -p` call with no resume, no MCP, no tools, and a small budget.
+   * Deliberately independent from the main session's `active` slot so a busy
+   * Operator turn never blocks (or is blocked by) mediation.
+   */
+  async oneShot(input: { prompt: string; timeoutMs?: number }): Promise<string> {
+    await this.prepareRuntimeDirectory();
+    const timeoutMs = input.timeoutMs ?? 15_000;
+    const args = [
+      "-p",
+      "--output-format",
+      "json",
+      "--model",
+      this.options.model,
+      "--effort",
+      "low",
+      "--permission-mode",
+      "dontAsk",
+      "--setting-sources",
+      "",
+      "--disable-slash-commands",
+      "--tools",
+      "",
+      "--strict-mcp-config",
+    ];
+    const child = spawn(this.options.binary, args, {
+      cwd: this.options.cwd,
+      env: sanitizedEnvironment(process.env),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.stdin.end(input.prompt);
+    return new Promise<string>((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      const watchdog = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
+      watchdog.unref();
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => (stdout += chunk));
+      child.stderr.on("data", (chunk: string) => (stderr += chunk));
+      child.once("error", (error) => {
+        clearTimeout(watchdog);
+        reject(error);
+      });
+      child.once("close", (code) => {
+        clearTimeout(watchdog);
+        if (timedOut) {
+          reject(new Error(`Claude CLI one-shot timed out after ${timeoutMs}ms and was killed`));
+          return;
+        }
+        if (code !== 0) {
+          reject(new Error(`Claude CLI one-shot exited ${code}: ${stderr.slice(-1200)}`));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(stdout) as Record<string, unknown>;
+          resolve(typeof parsed.result === "string" ? parsed.result : "");
+        } catch {
+          reject(new Error("Claude CLI one-shot returned unparseable output"));
+        }
+      });
+    });
   }
 
   async compact(reason = "scheduled daily compaction"): Promise<{ sessionId: string; summary?: string }> {

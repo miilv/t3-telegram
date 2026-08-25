@@ -27,6 +27,9 @@ const envSchema = z.object({
   CODEX_EFFORT: z.enum(["low", "medium", "high", "xhigh"]).default("high"),
   OPERATOR_COMPACT_THRESHOLD_PERCENT: z.coerce.number().min(50).max(95).default(80),
   OPERATOR_TURN_TIMEOUT_MS: z.coerce.number().int().min(30_000).max(3_600_000).default(600_000),
+  // Budget for the out-of-session mediation pass over worker questions and
+  // approvals (bug №49). On timeout the raw prompt is shown directly.
+  OPERATOR_MEDIATION_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
   MAX_PARALLEL_WORKERS: z.coerce.number().int().min(2).max(4).default(4),
   PROGRESS_INTERVAL_MS: z.coerce.number().int().min(5_000).max(600_000).default(60_000),
   PROVIDER_OPTIMIZATION_ENABLED: z.enum(["true", "false"]).default("true"),
@@ -205,6 +208,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       fullAccess: parsed.OPERATOR_FULL_ACCESS === "true",
       compactThresholdPercent: parsed.OPERATOR_COMPACT_THRESHOLD_PERCENT,
       turnTimeoutMs: parsed.OPERATOR_TURN_TIMEOUT_MS,
+      mediationTimeoutMs: parsed.OPERATOR_MEDIATION_TIMEOUT_MS,
       home: operatorHome,
       runtimeDir: resolve(operatorHome, "runtime"),
       artifactDir: resolve(operatorHome, "artifacts"),
