@@ -36,6 +36,13 @@ import type {
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
 const CAPTION_LIMIT = 1024;
+/**
+ * Plain Telegram messages cap at 4096 characters; fallback previews
+ * (sendMessageDraft/editMessageText) must stay below it or the edit fails with
+ * MESSAGE_TOO_LONG and the preview silently freezes (bug №21). Keep headroom
+ * for the truncation marker.
+ */
+const PLAIN_PREVIEW_LIMIT = 4_000;
 const ALBUM_WINDOW_MS = 650;
 /**
  * Ceiling for keeping an album open across getUpdates page boundaries. An
@@ -324,19 +331,24 @@ export class TelegramBotTransport implements TelegramTransport {
         const failure = classifyRichFailure(error);
         if (failure === "fatal" && !isDraftDestinationError(error)) throw error;
         if (failure === "capability" && isMethodUnavailable(error)) this.richDraftAvailable = false;
-        if (await this.tryPlainDraft(draft, preview)) return;
-        await this.createEditableDraft(draft, preview);
+        const plainPreview = truncateRichPreview(text, PLAIN_PREVIEW_LIMIT);
+        if (await this.tryPlainDraft(draft, plainPreview)) return;
+        await this.createEditableDraft(draft, plainPreview);
         return;
       }
     }
+    // Fallback modes go through plain sendMessageDraft/editMessageText, whose
+    // hard cap is 4096 rather than the rich 30k; re-truncate for them so the
+    // preview keeps moving. The final answer is chunked in full regardless.
+    const plainPreview = truncateRichPreview(text, PLAIN_PREVIEW_LIMIT);
     if (draft.mode === "draft") {
-      if (await this.tryPlainDraft(draft, preview)) return;
-      await this.createEditableDraft(draft, preview);
+      if (await this.tryPlainDraft(draft, plainPreview)) return;
+      await this.createEditableDraft(draft, plainPreview);
       return;
     }
     if (!draft.messageId) throw new Error("Editable Telegram draft has no message id");
     await this.outbound(draft.chatId, () =>
-      this.bot.api.editMessageText(draft.chatId, draft.messageId!, preview, {
+      this.bot.api.editMessageText(draft.chatId, draft.messageId!, plainPreview, {
         link_preview_options: { is_disabled: true },
       }),
     );

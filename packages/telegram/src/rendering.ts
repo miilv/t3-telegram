@@ -117,11 +117,14 @@ function splitDetailsBlock(block: string, limit: number): string[] {
 
 export function truncateRichPreview(text: string, limit = RICH_SAFE_LIMIT): string {
   if (text.length <= limit) return text || "…";
-  const tail = "\n\n… _stream continues_";
-  let preview = text.slice(text.length - Math.max(1, limit - tail.length));
+  // It is the beginning of the stream that gets dropped, so the marker says
+  // so, leads the preview, and stays outside the sliced tail so no final
+  // slice can ever cut the marker itself (bug №39).
+  const marker = "_… earlier output trimmed …_\n\n";
+  let preview = text.slice(text.length - Math.max(1, limit - marker.length));
   const firstLineBreak = preview.indexOf("\n");
   if (firstLineBreak > 0 && firstLineBreak < 300) preview = preview.slice(firstLineBreak + 1);
-  return `${tail.trimStart()}\n\n${preview}`.slice(-limit);
+  return `${marker}${preview}`;
 }
 
 export function renderStreamPhase(phase: "thinking" | "tools" | "text", text: string): string {

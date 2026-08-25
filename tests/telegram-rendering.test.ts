@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { DraftWriter, markdownToTelegramHtml, splitRichText } from "../packages/telegram/src/index.js";
+import {
+  DraftWriter,
+  markdownToTelegramHtml,
+  splitRichText,
+  truncateRichPreview,
+} from "../packages/telegram/src/index.js";
 
 describe("Telegram rich rendering", () => {
   it("renders headings, emphasis, code and links to supported HTML", () => {
@@ -38,6 +43,20 @@ describe("Telegram rich rendering", () => {
     expect(chunks.filter((chunk) => chunk.startsWith("<details")).every((chunk) => chunk.endsWith("</details>"))).toBe(true);
     expect(chunks.some((chunk) => chunk.includes("![chart](attachment://chart.png)"))).toBe(true);
     expect(chunks.every((chunk) => chunk.length <= 180)).toBe(true);
+  });
+
+  it("marks head truncation with a leading marker that the slice can never cut", () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `line ${index}: ${"x".repeat(30)}`);
+    const text = lines.join("\n");
+    const preview = truncateRichPreview(text, 2_000);
+    // It is the beginning of the stream that was dropped, so the marker says
+    // so and leads the preview instead of trailing it (bug №39).
+    expect(preview.startsWith("_… earlier output trimmed …_\n\n")).toBe(true);
+    expect(preview.length).toBeLessThanOrEqual(2_000);
+    // The freshest output survives intact.
+    expect(preview.endsWith(lines.at(-1)!)).toBe(true);
+    // Short text passes through untouched.
+    expect(truncateRichPreview("короткий ответ", 2_000)).toBe("короткий ответ");
   });
 
   it("splits whitespace-free payloads at the limit instead of one-character chunks", () => {
