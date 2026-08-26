@@ -944,7 +944,10 @@ export class OperatorStore {
   }
 
   listOperatorNotes(input: { status?: OperatorNote["status"]; limit?: number } = {}): OperatorNote[] {
-    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
+    // Package 4.3 review: the ceiling is 201, not 200, so a caller that shows
+    // 200 can ask for one more and TELL the reader there are older notes
+    // instead of silently presenting a truncated list as the whole memory.
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 201));
     const rows = input.status
       ? this.db
           .prepare("SELECT * FROM operator_notes WHERE status=? ORDER BY updated_at DESC LIMIT ?")

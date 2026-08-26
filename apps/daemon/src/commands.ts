@@ -138,7 +138,7 @@ const SPEC_BY_NAME = new Map<string, OperatorCommandSpec>(
  * path (`/tmp/x.log`) or a Cyrillic «/статус» is deliberately not a command and
  * still reaches the agent as ordinary text.
  */
-const COMMAND_TOKEN = /^\/([a-z0-9_]{1,32})(?:@[a-zA-Z0-9_]{1,32})?(?=\s|$)/u;
+const COMMAND_TOKEN = /^\/([a-z0-9_]{1,32})(?:@[a-zA-Z0-9_]{1,32})?(?=\s|$)/iu;
 
 /**
  * Package 1.3 retired these, and it retired them into ordinary text on
@@ -153,7 +153,17 @@ const RETIRED_COMMANDS: ReadonlySet<string> = new Set(["stop", "cancel", "focus"
 
 /** The bare command name (no slash, no `@bot`) opening this text, if any. */
 export function commandNameOf(text: string): string | undefined {
-  return COMMAND_TOKEN.exec(text.trim().toLocaleLowerCase())?.[1];
+  return COMMAND_TOKEN.exec(text.trim())?.[1]?.toLocaleLowerCase();
+}
+
+/**
+ * Everything after the leading `/command` (or `/command@bot`) token — the other
+ * half of reading a command, kept beside the token regex so the two can never
+ * disagree about where the name ends. Package 4.3 review: there were four
+ * hand-rolled parsers of this shape; this is the only one now.
+ */
+export function commandArguments(text: string): string {
+  return text.trim().replace(COMMAND_TOKEN, "").trim();
 }
 
 /**
@@ -204,7 +214,13 @@ export function isViewerSafeMessage(text: string): boolean {
   return Boolean(spec && spec.minRole === "viewer");
 }
 
-/** The wall's own text, so the list it quotes can never drift from the table. */
+/**
+ * The wall's own text, so the list it quotes can never drift from the table.
+ *
+ * Filtered on `help`, which deliberately drops `/start`: the wall ADMITS it
+ * (Telegram sends it on the first open of a chat), but naming it in a sentence
+ * about what a person may type would be noise rather than information.
+ */
 export function viewerWallText(): string {
   const allowed = OPERATOR_COMMANDS.filter((spec) => spec.minRole === "viewer" && spec.help)
     .map((spec) => `\`/${spec.name}\``);
@@ -274,7 +290,9 @@ export function suggestCommand(name: string, role: TeamRole): string | undefined
   let best: { name: string; distance: number } | undefined;
   for (const candidate of new Set(candidates)) {
     const distance = editDistance(name, candidate);
-    if (distance > COMMAND_SUGGESTION_MAX_DISTANCE) continue;
+    // Distance 0 is the name itself: «/status? похоже на /status?» is nonsense,
+    // and the caller already knows this name did not dispatch.
+    if (distance === 0 || distance > COMMAND_SUGGESTION_MAX_DISTANCE) continue;
     if (!best || distance < best.distance) best = { name: candidate, distance };
   }
   return best?.name;

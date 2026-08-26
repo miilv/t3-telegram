@@ -129,6 +129,18 @@ export interface TelegramMessageInbound extends TelegramDestination {
    */
   parts?: TelegramInboundBatchPart[];
   /**
+   * Package 4.3: transcripts and file notes derived from this envelope's
+   * attachments, kept apart from `text` so they survive being re-queued.
+   *
+   * A batch's attachments cannot be attributed to a part of it — `attachments`
+   * is flat — so when the daemon splits a command off a batch that also carried
+   * media, this travels with the remainder: the turn that is actually going to
+   * the model. It rides the envelope rather than a call argument because a
+   * burst can be split more than once («/status» + «/work» + a document), and a
+   * second split rebuilds `text` from the parts, which never held it.
+   */
+  mediaContext?: string[];
+  /**
    * Package 4.3: this envelope is what was left of a batch after another part
    * of it was handled on its own (a slash command, or an answer to a worker's
    * question), and this is the newest message id of that original batch.
