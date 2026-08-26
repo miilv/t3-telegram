@@ -68,14 +68,34 @@ suggestion within distance 2 plus a pointer to `/help`; it never costs a turn.
 
 `/stop`, `/cancel` and `/focus` are the one exception: package 1.3 deleted them
 *into ordinary text* deliberately, so `dispatchableCommandName` refuses to claim
-them and they still reach the agent (and preempt the running turn like any other
-message). A semantic stop («останови сборку») is the Operator's own job via
-`t3.interrupt_thread`; the deterministic hatch is the bare cancel word of §4.
+them. `/focus clear` therefore reaches the agent (and preempts the running turn
+like any other message), while `/stop` and `/cancel` are caught one step later by
+the cancel hatch of §4 — which strips the leading slash since package 4.3, so a
+panic does not buy an LLM turn. A semantic stop («останови сборку») is still the
+Operator's own job via `t3.interrupt_thread`.
+
+Ordering matters for one role. The viewer wall (§1) runs long before this split,
+so it judges the COMMAND part of a burst rather than the glued text: otherwise a
+viewer's «спасибо» + «/status» met the wall and never ran the command at all —
+and a viewer has nothing but commands. The remainder is not waved through; it
+returns as its own ingress job with no command in it and meets the same wall on
+that pass.
 
 The remainder of a split batch carries `batchWatermarkId` — the newest message
 id of the batch it came from — so the package 1.1 staleness rule judges it by
 its batch and not by its own ids. Without it, a burst whose command arrived
 *last* would have its prose discarded the instant it was re-queued.
+`seedInboundWatermarkFromPendingJobs` reads the mark the same way, so a pending
+remainder cannot seed a lower mark than it answers to.
+
+It also carries `mediaContext` — the transcripts and file notes derived from the
+batch's attachments. Those cannot be attributed to a part (`attachments` is
+flat), so they follow the remainder, which is the turn actually going to the
+model. They ride the envelope rather than a call argument because a burst can be
+split more than once, and each split rebuilds `text` from the parts, which never
+held them. Two side effects worth naming: the reply path of bug №35 now carries
+media context too (it never passed any), and a remainder that a zombie turn left
+behind is retried by `retryAfterZombie` like any other ingress job.
 
 ---
 
@@ -473,7 +493,7 @@ because a rate limit or a dead provider must never cost the owner their stop.
 ```
 A. RUNTIME PREEMPTION — a bare cancel word
    isCancelIntent: ≤3 whitespace tokens, only the first is matched, NFKC-lowered,
-                   trailing punctuation stripped, against
+                   punctuation stripped from BOTH ends (package 4.3), against
                    {стоп, отмена, отмени, хватит, cancel, stop}
    guard mayInterruptOperatorTurn: an active turn in THIS chat, AND
                                    (isAdministrator OR the turn's own initiator)
@@ -485,11 +505,15 @@ B. BOUND-WORK CANCEL — replyContext.primaryThreadId ?? focus.primary.threadId
    !canEditThread→ "У вас нет прав на остановку этой работы."
    else          → interruptThread, mark runtime state, "Остановил **<title>**."
 
-(Package 1.3 deleted path C — `/stop` and `/cancel` as slash commands. Only the
-slash forms died: both word paths above are intact, and `cancelBoundWork` still
-backs path B. A stop expressed in ordinary language — «останови сборку» — is now
-the Operator's judgement call via `t3.interrupt_thread`, stated in the policy
-prompt.)
+(Package 1.3 deleted path C — `/stop` and `/cancel` as slash COMMANDS, and both
+word paths above are intact. Package 4.3 finished the thought: because the first
+token is now stripped of punctuation at both ends, «/stop» and «/cancel» are
+cancel WORDS and take paths A and B. Until then they were the one spelling of a
+panic that bought a full LLM turn — the worst possible outcome for the phrase a
+person types when something is wrong. «/focus clear» is not a cancel word and
+still reaches the agent as ordinary text. A stop expressed in ordinary language
+— «останови сборку» — remains the Operator's judgement call via
+`t3.interrupt_thread`, stated in the policy prompt.)
 ```
 
 **Mid-turn message:** batched within a 2 s quiet window, then queued on the
