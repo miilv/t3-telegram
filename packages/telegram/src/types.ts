@@ -51,6 +51,21 @@ export interface TelegramReplyContext {
   forwardOrigin?: TelegramForwardOrigin;
 }
 
+/** Package 4.3: one row of Telegram's command menu. */
+export interface TelegramBotCommand {
+  /** 1–32 chars of lowercase ASCII letters, digits and underscores; no slash. */
+  command: string;
+  /** 1–256 chars of plain text. */
+  description: string;
+}
+
+/**
+ * Which audience a published command list applies to. `chat` is one specific
+ * chat — for a private chat the chat id equals the user id, which is how an
+ * owner-only menu stays off everyone else's keyboard.
+ */
+export type TelegramCommandScope = { type: "default" } | { type: "chat"; chatId: number };
+
 export interface TelegramDestination {
   messageThreadId?: number;
   directMessagesTopicId?: number;
@@ -113,6 +128,19 @@ export interface TelegramMessageInbound extends TelegramDestination {
    * by its own message only instead of the whole glued text (bug №35).
    */
   parts?: TelegramInboundBatchPart[];
+  /**
+   * Package 4.3: this envelope is what was left of a batch after another part
+   * of it was handled on its own (a slash command, or an answer to a worker's
+   * question), and this is the newest message id of that original batch.
+   *
+   * The watermark rule of package 1.1 — "the owner has already spoken again, so
+   * this turn is stale" — must judge a remainder by its BATCH, not by its own
+   * ids: the owner never replaced these messages, the daemon split them off. A
+   * batch whose command arrived LAST («посмотри оплату» then «/status») would
+   * otherwise have its prose dropped as superseded the instant it was
+   * re-queued, which is the very disappearance this package exists to fix.
+   */
+  batchWatermarkId?: number;
   /** Daemon-created proactive ingress; never passed through Telegram normalization. */
   synthetic?: boolean;
   automationRunId?: string;
@@ -335,6 +363,14 @@ export interface TelegramTransport {
   fetchFile?: ((fileId: string) => Promise<TelegramFileRef>) | undefined;
   react(chatId: number, messageId: number, emoji: string): Promise<void>;
   sendChatAction(chatId: number, action: TelegramChatAction, destination?: TelegramDestination): Promise<void>;
+  /**
+   * Package 4.3: publish the command menu (finding «команды №1» — the commands
+   * existed only inside the `/help` text, so Telegram offered neither
+   * autocomplete nor a «Меню» button). Optional so alternative transports and
+   * test fakes need not implement it; the daemon treats its absence as "this
+   * transport has no menu".
+   */
+  setMyCommands?(commands: TelegramBotCommand[], scope?: TelegramCommandScope): Promise<void>;
   health(): Promise<TelegramHealth>;
 }
 

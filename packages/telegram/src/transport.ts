@@ -17,8 +17,10 @@ import type {
   StreamDraft,
   TelegramAttachment,
   TelegramAccessPolicy,
+  TelegramBotCommand,
   TelegramCallbackInbound,
   TelegramChatAction,
+  TelegramCommandScope,
   TelegramDestination,
   TelegramFileRef,
   TelegramForwardOrigin,
@@ -743,6 +745,23 @@ export class TelegramBotTransport implements TelegramTransport {
     destination: TelegramDestination = {},
   ): Promise<void> {
     await this.outbound(chatId, () => this.bot.api.sendChatAction(chatId, action, destinationOptions(destination)));
+  }
+
+  /**
+   * Package 4.3, finding «команды №1»: publish the command menu so Telegram
+   * shows autocomplete and the «Меню» button. Scoped, so an owner's private
+   * chat gets the full list while everyone else sees only the viewer-safe
+   * default — Telegram resolves the most specific scope that matches the chat.
+   */
+  async setMyCommands(
+    commands: TelegramBotCommand[],
+    scope: TelegramCommandScope = { type: "default" },
+  ): Promise<void> {
+    await this.outbound(scope.type === "chat" ? scope.chatId : 0, () =>
+      this.bot.api.setMyCommands(commands, {
+        scope: scope.type === "chat" ? { type: "chat", chat_id: scope.chatId } : { type: "default" },
+      }),
+    );
   }
 
   async health(): Promise<TelegramHealth> {
