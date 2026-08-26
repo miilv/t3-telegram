@@ -344,9 +344,11 @@ describe("layer renderers and their budgets", () => {
     expect(rendered).toMatch(/🙂…/u);
     expect(rendered).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
     // …and the cut still honours the per-item cap, counted the same way the
-    // write linter counts it.
-    const line = /^- (.+)$/mu.exec(rendered)![1]!;
-    expect([...line].length).toBeLessThanOrEqual(NOW_ITEM_CONTENT_CHARS);
+    // write linter counts it: the content is 199 emoji plus the ellipsis, and
+    // the annotations that follow it are the daemon's own words, not content.
+    expect([...rendered].filter((point) => point === "🙂")).toHaveLength(
+      NOW_ITEM_CONTENT_CHARS - 1,
+    );
   });
 
   it("indexes legacy notes as ~100 characters of content pointing at the id (§6.4)", () => {

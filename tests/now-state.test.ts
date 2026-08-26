@@ -10,6 +10,7 @@ import {
   NOW_HINT_CLOSE_NEEDS_ID,
   NOW_HINT_CODE_BLOCK,
   NOW_HINT_CREATE_NEEDS_FIELDS,
+  NOW_HINT_DAEMON_CLOSE,
   NOW_HINT_DAEMON_CONTENT,
   NOW_HINT_EMPTY,
   NOW_HINT_TOO_LONG,
@@ -252,6 +253,72 @@ describe("closing a now item archives it (memory-design §2.2)", () => {
   });
 });
 
+describe("reopening a daemon item (review B2)", () => {
+  it("brings an archived item back without a second birthday or a stale archive", () => {
+    const store = tempStore();
+    const item = store.createNowItem({
+      ownerId: OWNER,
+      section: "active",
+      content: "[Acme] Рефакторинг API",
+      source: "daemon",
+      threadRef: "th_1",
+      createdAt: "2026-08-20T08:00:00.000Z",
+    });
+    const closed = store.closeNowItem(item.id, {
+      slugBase: journalSlugBase("2026-08-24", "[Acme] Рефакторинг API"),
+      day: "2026-08-24",
+      body: "Closed",
+      source: "daemon",
+    })!;
+    const reopened = store.reopenNowItem(item.id, {
+      section: "active",
+      content: "[Acme] Рефакторинг API: второй заход",
+    })!;
+    expect(reopened.status).toBe("open");
+    // The item is no longer archived…
+    expect(reopened.journalRef).toBeUndefined();
+    // …but the entry recording the close that DID happen stays in the journal.
+    expect(store.getJournalEntry(closed.entry.slug)).toBeDefined();
+    // The work started when it started: focus ranks by that (§2.2), and a new
+    // birthday would silently reshuffle which work counts as current.
+    expect(reopened.createdAt).toBe("2026-08-20T08:00:00.000Z");
+    expect(store.listNowItems({ ownerId: OWNER })).toHaveLength(1);
+  });
+});
+
+describe("what counts as a turn that mutated (memory-design §2.4.2)", () => {
+  it("says no for a turn that only read", () => {
+    const store = tempStore();
+    store.appendEvent("operator.tool.completed", {
+      correlationId: "opturn_1",
+      payload: { tool: "memory.search", durationMs: 4 },
+    });
+    expect(store.turnHadMutations("opturn_1")).toBe(false);
+  });
+
+  it("says yes for a mutating call that FAILED (review L7)", () => {
+    const store = tempStore();
+    // `addTool` journals `args` for mutating tools on the failure path too, and
+    // a turn that tried to act and could not is still a turn that owes the
+    // state an explanation — dropping it would let a whole class of turns skip
+    // the check by failing.
+    store.appendEvent("operator.tool.failed", {
+      correlationId: "opturn_2",
+      payload: { tool: "t3.send_turn", durationMs: 9, args: '{"threadId":"th_1"}', error: "boom" },
+    });
+    expect(store.turnHadMutations("opturn_2")).toBe(true);
+  });
+
+  it("does not confuse one turn's calls with another's", () => {
+    const store = tempStore();
+    store.appendEvent("operator.tool.completed", {
+      correlationId: "opturn_3",
+      payload: { tool: "t3.send_turn", args: "{}", result: "ok" },
+    });
+    expect(store.turnHadMutations("opturn_4")).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The ranking render (memory-design §2.2)
 // ---------------------------------------------------------------------------
@@ -295,6 +362,55 @@ describe("now-layer selection and ranking (memory-design §2.2)", () => {
     expect(byId.get("n_dblocked")?.pinned).toBe(true);
     expect(byId.get("n_dwaiting")?.pinned).toBe(false);
     expect(byId.get("n_aactive")?.pinned).toBe(false);
+  });
+
+  /**
+   * Review S6: the line has to carry what the agent is expected to act on. The
+   * 2.1 render was the content alone, so `half` was invisible (blick's `[~]`
+   * semantics never reached the model), correcting an item meant a `now.get`
+   * round trip for an id the envelope already had, and a TTL was a trapdoor.
+   */
+  it("renders an item the way §2.2's example does", () => {
+    const rendered = renderNowState(
+      selectNowItemsForRender(
+        [
+          ledgerItem("now_a", {
+            section: "active",
+            content: "[Acme] Рефакторинг API: воркер пишет тесты",
+            source: "daemon",
+            threadRef: "th_9f2",
+            updatedAt: "2026-08-26T11:02:00.000Z",
+          }),
+          ledgerItem("now_b", {
+            section: "blocked",
+            content: "Деплой staging ждёт токен от Дани; остаток: прогнать миграции",
+            status: "half",
+            journalRef: "2026-08-25-staging",
+          }),
+          ledgerItem("now_c", {
+            section: "next",
+            content: "Ответить бухгалтеру про НДС",
+            validUntil: "2026-08-28T21:00:00.000Z",
+          }),
+        ],
+        new Date("2026-08-26T12:00:00.000Z"),
+      ),
+      { timeZone: "Europe/Moscow" },
+    );
+    expect(rendered).toContain("ACTIVE");
+    // The id, so a correction needs no round trip; the thread, so the agent can
+    // tell which item is the work it is about to continue.
+    expect(rendered).toContain("(now_a, thread th_9f2, updated 2026-08-26 14:02)");
+    // `half` is blick's `[~]`, and the remainder is in the content (§2.2).
+    expect(rendered).toContain("- [~] Деплой staging ждёт токен от Дани");
+    expect(rendered).toContain("→ journal 2026-08-25-staging");
+    // The deadline is stated, not silently enforced.
+    expect(rendered).toContain("hidden after 2026-08-29 00:00");
+    // Owner-local, per persona rule 11 — 11:02 UTC is 14:02 in Moscow, and the
+    // 21:00 UTC deadline is already the 29th there.
+    expect(rendered).not.toContain("11:02");
+    // An `open` item prints no status box: the default is not information.
+    expect(rendered).toMatch(/- Ответить бухгалтеру/u);
   });
 
   it("keeps the pinned daemon work and names what the budget dropped", () => {
@@ -470,6 +586,86 @@ describe("now.update / now.get over MCP (memory-design §2.2)", () => {
     });
   });
 
+  /**
+   * Review B2, first half. Closing a daemon item used to succeed and erased the
+   * work permanently: the reconciliation skipped the closed row and the unique
+   * `thread_ref` refused a replacement, so the thread was gone from the state
+   * and from the focus derivation for good.
+   */
+  it("refuses to close a daemon item and points at the tool that really stops work", async () => {
+    await withTools(async ({ call, store }) => {
+      const daemonItem = store.createNowItem({
+        ownerId: OWNER,
+        section: "active",
+        content: "[Acme] Рефакторинг API",
+        source: "daemon",
+        threadRef: "th_1",
+      });
+      expect(await call("now.update", { id: daemonItem.id, status: "closed" })).toEqual({
+        ok: false,
+        hint: NOW_HINT_DAEMON_CLOSE,
+      });
+      expect(store.getNowItem(daemonItem.id)?.status).toBe("open");
+      // Nothing was archived either — a refused close must not leave a journal
+      // entry describing work that is still running.
+      expect(store.listJournalEntries()).toHaveLength(0);
+      expect(NOW_HINT_DAEMON_CLOSE).toContain("t3.interrupt_thread");
+    });
+  });
+
+  it("treats an already-archived item as gone rather than resurrecting it", async () => {
+    await withTools(async ({ call, store }) => {
+      const created = (await call("now.update", {
+        section: "next",
+        content: "Ответить Дане",
+      })) as { item: { id: string } };
+      await call("now.update", { id: created.item.id, status: "closed" });
+      // Review L9: its journal entry already describes it in the past tense.
+      expect(await call("now.update", { id: created.item.id, section: "debt" })).toEqual({
+        ok: false,
+        hint: NOW_HINT_UNKNOWN_ITEM,
+      });
+      expect(store.getNowItem(created.item.id)?.status).toBe("closed");
+      expect(store.listJournalEntries()).toHaveLength(1);
+    });
+  });
+
+  it("lets a deadline be taken back off (review L10)", async () => {
+    await withTools(async ({ call, store }) => {
+      const created = (await call("now.update", {
+        section: "next",
+        content: "Ответить бухгалтеру",
+        validUntil: "2026-08-28T21:00:00.000Z",
+      })) as { item: { id: string } };
+      expect(store.getNowItem(created.item.id)?.validUntil).toBe("2026-08-28T21:00:00.000Z");
+      // `null` clears; `undefined` (an omitted field) would have left it alone.
+      const cleared = (await call("now.update", {
+        id: created.item.id,
+        validUntil: null,
+      })) as { ok: boolean; item: Record<string, unknown> };
+      expect(cleared.ok).toBe(true);
+      expect(cleared.item.validUntil).toBeUndefined();
+      expect(store.getNowItem(created.item.id)?.validUntil).toBeUndefined();
+    });
+  });
+
+  /**
+   * Review S5: persona rule 6 sends the agent here when it does NOT trust its
+   * memory of the state, and the description promises the complete state — so
+   * answering out of a ledger the daemon has not reconciled is the one failure
+   * this tool cannot afford.
+   */
+  it("reconciles the daemon's half before answering", async () => {
+    let reconciled = 0;
+    await withTools(
+      async ({ call }) => {
+        await call("now.get", {});
+        expect(reconciled).toBe(1);
+      },
+      { reconcileNowItems: () => (reconciled += 1) },
+    );
+  });
+
   it("answers now.get with the whole ledger and hides what expired", async () => {
     await withTools(async ({ call, store }) => {
       await call("now.update", { section: "active", content: "живой пункт" });
@@ -610,7 +806,10 @@ interface ToolHarness {
 }
 
 /** One MCP server, one owner capability, torn down whatever the test does. */
-async function withTools(body: (harness: ToolHarness) => Promise<void>): Promise<void> {
+async function withTools(
+  body: (harness: ToolHarness) => Promise<void>,
+  options: { reconcileNowItems?: () => void } = {},
+): Promise<void> {
   const store = tempStore();
   const artifacts = new ArtifactRegistry(`${tempDirectory("now-tools-")}/artifacts`, store);
   await artifacts.initialize();
@@ -620,6 +819,7 @@ async function withTools(body: (harness: ToolHarness) => Promise<void>): Promise
     telegram: {} as unknown as TelegramTransport,
     artifacts,
     ownerTimeZone: () => "Europe/Moscow",
+    ...(options.reconcileNowItems ? { reconcileNowItems: options.reconcileNowItems } : {}),
     logger: pino({ enabled: false }),
   });
   await server.start();

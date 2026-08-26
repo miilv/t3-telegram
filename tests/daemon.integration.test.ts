@@ -8411,6 +8411,7 @@ describe("Now-state ledger (package 2.2)", () => {
       artifacts,
       logger,
       ownerTimeZone: () => "Europe/Moscow",
+      reconcileNowItems: () => daemon.reconcileNowState(),
       onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
     });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
@@ -8457,6 +8458,11 @@ describe("Now-state ledger (package 2.2)", () => {
     expect(opened[0]).toMatchObject({ source: "daemon", section: "active", status: "open" });
     expect(opened[0]?.threadRef).toBe(harness.broker.threads[0]?.id);
     expect(opened[0]?.content).toContain("Логирование");
+    // Review L8: the item is as old as the WORK, not as old as the sweep that
+    // noticed it. Focus ranks by this instant (§2.2), so stamping it with the
+    // reconciliation time would let a daemon restart silently reorder which
+    // work counts as current.
+    expect(opened[0]?.createdAt).toBe(harness.broker.threads[0]?.createdAt);
 
     // The terminal event closes it — and the close is an ARCHIVE, not a delete.
     broker.releaseTerminal();
@@ -8539,6 +8545,143 @@ describe("Now-state ledger (package 2.2)", () => {
     await harness.daemon.stop();
   }, 30_000);
 
+  /**
+   * Review B1, the reviewer's own probe: the owner starts two works, comes back
+   * to the first, and types "стоп". Under pure §2.2 ranking (last STARTED item)
+   * the focus was still on the second work, so the cancel hatch would have
+   * stopped the wrong one — and §2.2 calls that binding a deterministic
+   * emergency hatch, which is the one thing it may not get wrong.
+   */
+  it("follows the work the agent just continued, not the one started last", async () => {
+    // Message 1 and 2 open a thread each; message 3 continues the FIRST one.
+    const started: string[] = [];
+    const script: OperatorScript = async (envelope, call) => {
+      const task = userText(envelope);
+      if (/вернись/u.test(task)) {
+        await call("t3.send_turn", { threadId: started[0]!, text: task });
+        return "Вернулся к первой работе.";
+      }
+      if (!/исправь/u.test(task)) return "Париж.";
+      const projects = (await call("t3.list_projects", {})) as Array<{ id: string }>;
+      const project =
+        projects[0] ??
+        ((await call("t3.create_project", {
+          name: "Operator Work",
+          workspaceRoot: `${/New project workspaces belong under (\S+)\./u.exec(envelope)?.[1] ?? "/tmp"}/w`,
+        })) as { id: string });
+      const thread = (await call("t3.create_thread", {
+        projectId: project.id,
+        title: `Работа ${started.length + 1}`,
+      })) as { id: string };
+      started.push(thread.id);
+      await call("t3.send_turn", { threadId: thread.id, text: task });
+      return `Запустил работу ${started.length}.`;
+    };
+    const harness = await boot("daemon-now-b1-", new DelegatingRuntime(script), {
+      keepWorkRunning: true,
+    });
+    const { store, telegram } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => telegram.sent.length >= 1, 10_000);
+    telegram.push(message(2, "исправь ретраи"));
+    await waitFor(() => telegram.sent.length >= 2, 10_000);
+    expect(store.getFocus("42").primary?.threadId).toBe(started[1]);
+
+    telegram.push(message(3, "вернись к логированию"));
+    await waitFor(() => telegram.sent.length >= 3, 10_000);
+    // An explicit send_turn is the agent acting for the owner exactly as a
+    // start is, so the binding a bare "стоп" would use follows it.
+    expect(store.getFocus("42").primary?.threadId).toBe(started[0]);
+    // …and the passive ranking of §2.2 still holds for everything else: both
+    // items are open and neither was reordered by the daemon's own refresh.
+    expect(store.listNowItems({ ownerId: "42" })).toHaveLength(2);
+
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  /**
+   * Review B2, second half. The projection's advantage over hooks is that it
+   * converges on reality — including the case package 1.3 explicitly supports,
+   * a finished thread running again.
+   */
+  it("reopens the item of a work that came back to life", async () => {
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "completed", threadId: "th_1", result: "Готово" },
+    ];
+    const harness = await boot(
+      "daemon-now-reopen-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, title: "Логирование" })),
+      { broker },
+    );
+    const { store, telegram, daemon } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(
+      () => store.listNowItems({ ownerId: "42", includeClosed: true })[0]?.status === "closed",
+      10_000,
+    );
+    const archived = store.listNowItems({ ownerId: "42", includeClosed: true })[0]!;
+    expect(archived.journalRef).toBeDefined();
+
+    // The work runs again. Without the reopen the unique thread_ref refuses a
+    // replacement and the thread is gone from the state for good.
+    store.updateThreadStatus(archived.threadRef!, "running");
+    daemon.reconcileNowState();
+    const live = store.listNowItems({ ownerId: "42" });
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ id: archived.id, status: "open", section: "active" });
+    expect(live[0]?.journalRef).toBeUndefined();
+    // The earlier close is still on the record.
+    expect(store.getJournalEntry(archived.journalRef!)).toBeDefined();
+
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  /**
+   * Review S3. §2.4 builds the daily summary and the monthly rollup out of
+   * `day`, so filing by the reconciliation instant makes both fiction: a daemon
+   * down over a weekend would file Friday's work under Monday.
+   */
+  it("files the archive under the day the work ended, not the day it was noticed", async () => {
+    const harness = await boot(
+      "daemon-now-journal-day-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, title: "Логирование" })),
+      { keepWorkRunning: true },
+    );
+    const { store, telegram, daemon } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => store.listNowItems({ ownerId: "42" }).length > 0, 10_000);
+    const item = store.listNowItems({ ownerId: "42" })[0]!;
+
+    // The work ended two days ago; nobody looked until now.
+    store.updateThreadStatus(item.threadRef!, "completed", { result: "готово" });
+    store.db
+      .prepare("UPDATE threads SET updated_at=? WHERE id=?")
+      .run("2026-08-24T18:30:00.000Z", item.threadRef!);
+    daemon.reconcileNowState();
+
+    const closed = store.listNowItems({ ownerId: "42", includeClosed: true })[0]!;
+    const entry = store.getJournalEntry(closed.journalRef!)!;
+    // 18:30 UTC is 21:30 in Europe/Moscow — still the 24th, and the logical day
+    // of §2.7 does not roll until 03:00.
+    expect(entry.day).toBe("2026-08-24");
+    expect(entry.source).toBe("daemon");
+
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
   it("nudges a mutating turn that recorded nothing, at most twice in a row", async () => {
     // Every message dispatches work and none of them calls now.update — the
     // exact habit §2.4.2 is meant to correct.
@@ -8583,6 +8726,16 @@ describe("Now-state ledger (package 2.2)", () => {
         .listDaemonEvents({ typePrefixes: ["memory.now_check."] })
         .map((event) => event.eventType),
     ).toContain("memory.now_check.exhausted");
+
+    // Review S4: and it STAYS handed over. Resetting the counter at the
+    // ceiling made the anti-loop a two-on-one-off cycle that nagged forever —
+    // which is exactly what §2.4.2(b) is written to stop.
+    for (const [index, text] of ["исправь алерты", "исправь дашборд"].entries()) {
+      telegram.push(message(5 + index, text));
+      await answered(5 + index);
+      expect(directEnvelopes(runtime).at(-1)).not.toContain("[state check:");
+    }
+    expect(store.getRuntimeState("now_check_streak")).toBe("2");
 
     // Let the held work finish before teardown: a monitor parked on the gate
     // would otherwise keep the shutdown waiting for its full grace period.
