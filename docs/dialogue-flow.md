@@ -877,6 +877,28 @@ on success; only `false` is sticky, and only a restart re-probes.
 Semantic splitting keeps fenced blocks, `<details>` blocks and Markdown tables
 atomic, re-emits a table header per chunk, and hard-cuts only as a last resort.
 
+Package 4.2 — the legacy converter no longer leaks markup: `<details>` becomes
+`<blockquote expandable>` with the summary in bold (quotes inside it are
+flattened, since same-kind entities cannot nest), Markdown tables become an
+aligned `<pre>` box, single `*`/`_` become `<i>`, and `![alt](url)` becomes a
+link — or bare alt text for `attachment://`. Token markers carry a per-call
+random nonce, so nothing the user types can be swapped for another fragment's
+content, and expansion uses `split/join` so a literal `$&` in a code block
+stays literal.
+
+Nesting is impossible by construction, not by pattern: after token expansion a
+single depth-aware pass drops any `<blockquote>` opening at depth ≥ 1 together
+with its matching close (`<pre>` regions skipped whole), and a spoiler lifted
+off a quoted line loses that line's `> ` marker so the expandable quote — the
+more useful of the two entities — is what survives.
+
+`expandableQuote` is a fourth latched capability, reported by `health()`.
+Every legacy send **and edit** goes through one degradation path —
+HTML → flat spoiler → plain — so an edit no longer loses all its markup at
+the first formatting error. The latch only turns `false` when the flat retry
+actually succeeds: a flat retry that fails too proves the spoiler was
+innocent, and the capability returns to `unknown`.
+
 **Anchored edits** resolve at delivery time and are discarded if the anchor's
 chat differs. `"message is not modified"` counts as delivered. On a
 `TELEGRAM_BAD_REQUEST` that is not ambiguous, an edit falls back to a fresh

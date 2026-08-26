@@ -157,19 +157,19 @@ export function classifyOperationalError(
       return classified("PROVIDER_AUTH", false, false, "Провайдер отклонил авторизацию; требуется проверить его подключение в T3.");
     }
     if (/context.{0,12}(limit|length|window)|too many tokens/.test(normalized)) {
-      return classified("PROVIDER_CONTEXT_LIMIT", false, false, "Контекст worker превысил лимит провайдера.");
+      return classified("PROVIDER_CONTEXT_LIMIT", false, false, "Контекст работы превысил лимит провайдера.");
     }
     if (/timeout|temporar|overload|unavailable|connection|reset|5\d\d/.test(normalized)) {
       return classified("PROVIDER_TRANSIENT", true, false, "Провайдер временно недоступен; можно безопасно повторить работу.");
     }
-    return classified("PROVIDER_FAILED", false, false, "Worker завершился ошибкой провайдера.");
+    return classified("PROVIDER_FAILED", false, false, "Работа завершилась ошибкой провайдера.");
   }
 
   if (subsystem === "artifact") {
     return classified("ARTIFACT_REJECTED", false, false, "Файл не прошёл проверку безопасности или ограничений размера.");
   }
   if (subsystem === "operator") {
-    return classified("OPERATOR_UNAVAILABLE", true, false, "Operator runtime временно недоступен.");
+    return classified("OPERATOR_UNAVAILABLE", true, false, "Движок временно недоступен.");
   }
   return classified("UNKNOWN", false, false, "Произошла внутренняя ошибка; подробности сохранены в диагностике.");
 }

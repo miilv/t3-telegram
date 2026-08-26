@@ -21,6 +21,7 @@ import type { MediaProcessor } from "../packages/media/src/index.js";
 import type { Config } from "../packages/shared/src/config.js";
 import type {
   ApprovalDecision,
+  ApprovalRiskCategory,
   ArtifactRef,
   CreateProjectInput,
   CreateThreadInput,
@@ -38,7 +39,7 @@ import type {
   WorkThread,
   WorkerEvent,
 } from "../packages/shared/src/index.js";
-import { nowIso } from "../packages/shared/src/index.js";
+import { APPROVAL_RISK_RU, nowIso } from "../packages/shared/src/index.js";
 import { DailyScheduler } from "../packages/scheduler/src/index.js";
 import { OperatorStore } from "../packages/storage/src/index.js";
 import type {
@@ -441,7 +442,7 @@ describe("OperatorDaemon product flow", () => {
     // cannot reach anything beyond the safe list survives in this form.
     telegram.push(messageAs(3, "/focus clear", 11));
     await waitFor(() =>
-      telegram.sent.some((entry) => entry.text.includes("Ваша роль viewer разрешает только")),
+      telegram.sent.some((entry) => entry.text.includes("Ваша роль `viewer` разрешает только")),
     );
     expect(telegram.sent.at(-1)?.text).not.toContain("/focus");
 
@@ -557,7 +558,7 @@ describe("OperatorDaemon product flow", () => {
     store.saveAutomation(stale);
     const resumeStartedAt = Date.now();
     telegram.push(messageAs(11, `/automation resume ${stale.id}`, 42));
-    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Hourly sync") && entry.text.includes("active")));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Hourly sync") && entry.text.includes("активна")));
     const resumed = store.getAutomation(stale.id);
     expect(resumed?.status).toBe("active");
     expect(Date.parse(resumed!.nextRunAt!)).toBeGreaterThanOrEqual(resumeStartedAt + 59 * 60_000);
@@ -1675,7 +1676,7 @@ describe("OperatorDaemon product flow", () => {
     expect(downloads).toBe(1);
     const prompt = runtime.prompts.at(-1)!;
     expect(prompt).toContain(
-      "[файл meeting.mp4 (25.0 MB) превышает лимит облачного Bot API 20 MB — недоступен]",
+      "[файл meeting.mp4 (25.0 МБ) превышает лимит облачного Bot API 20 МБ — недоступен]",
     );
     expect(prompt).toContain("глянь запись встречи");
     const mapping = store.db
@@ -1793,10 +1794,10 @@ describe("OperatorDaemon product flow", () => {
     expect(downloads).toBe(25);
     const prompt = runtime.prompts.at(-1)!;
     expect(prompt).toContain(
-      "[файл part-26.bin пропущен: суммарный размер батча превышает лимит 512 MB]",
+      "[файл part-26.bin пропущен: суммарный размер батча превышает лимит 512 МБ]",
     );
     expect(prompt).toContain(
-      "[файл part-30.bin пропущен: суммарный размер батча превышает лимит 512 MB]",
+      "[файл part-30.bin пропущен: суммарный размер батча превышает лимит 512 МБ]",
     );
     const mapping = store.db
       .prepare("SELECT artifact_ids_json FROM telegram_messages WHERE chat_id=? AND message_id=?")
@@ -2243,7 +2244,7 @@ describe("OperatorDaemon product flow", () => {
     expect(telegram.approvals[0]?.text).toContain("просит разрешение удалить старую БД");
     expect(telegram.approvals[0]?.text).toContain("Рекомендация: Лучше отклонить");
     expect(telegram.approvals[0]?.text).toContain("Оригинал запроса: Delete legacy database");
-    expect(telegram.approvals[0]?.text).toContain("Категория риска: **destructive**");
+    expect(telegram.approvals[0]?.text).toContain("Категория риска: **необратимые изменения**");
 
     // Pressing the translated button submits the worker's ORIGINAL label.
     telegram.push(callback(2, "cb_strategy", prompt.messageId, `ui:${prompt.inputId}:0:o0`));
@@ -2434,7 +2435,7 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() => broker.approvalResponses.length === 1 && telegram.approvals.length === 1);
     expect(broker.approvalResponses[0]).toMatchObject({ approvalId: "read_1", decision: "accept" });
     expect(broker.approvalResponses[0]?.commandId).toBe("approval:auto:th_1:read_1");
-    expect(telegram.approvals[0]?.text).toContain("Категория риска: **destructive**");
+    expect(telegram.approvals[0]?.text).toContain("Категория риска: **необратимые изменения**");
     telegram.push(
       callback(
         2,
@@ -2467,7 +2468,7 @@ describe("OperatorDaemon product flow", () => {
       requestKind: string;
       requestType: string;
       detail: string;
-      expected: string;
+      expected: ApprovalRiskCategory;
     }> = [
       { approvalId: "safe_read", requestKind: "file-read", requestType: "file_read_approval", detail: "src/index.ts", expected: "safe-read" },
       { approvalId: "safe_write", requestKind: "file-change", requestType: "file_change_approval", detail: "src/index.ts", expected: "safe-write-in-project" },
@@ -2513,7 +2514,11 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(message(1, "run a policy classification test"));
     await waitFor(() => telegram.approvals.length === cases.length);
     for (const [index, entry] of cases.entries()) {
-      expect(telegram.approvals[index]?.text).toContain(`Категория риска: **${entry.expected}**`);
+      expect(telegram.approvals[index]?.text).toContain(
+        `Категория риска: **${APPROVAL_RISK_RU[entry.expected]}**`,
+      );
+      // The English identifier itself never reaches the risk line (package 4.2).
+      expect(telegram.approvals[index]?.text).not.toContain(`Категория риска: **${entry.expected}**`);
     }
 
     telegram.finish();
@@ -3328,7 +3333,7 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(message(2, "/memory remember preference: Always run auth regression tests"));
     await waitFor(() => store.searchOperatorNotes("auth regression").length === 1);
     telegram.push(message(3, "/memory search auth regression"));
-    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Memory search")));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Поиск по памяти")));
     expect(telegram.sent.some((entry) => entry.text.includes("Always run auth regression tests"))).toBe(true);
 
     // Package 1.3: /focus is no longer a command. The card it used to print
@@ -3344,7 +3349,7 @@ describe("OperatorDaemon product flow", () => {
     telegram.push(message(5, "запомни, что production deploy идёт после 22:00 UTC"));
     await waitFor(() => store.searchOperatorNotes("production deploy").length === 1);
     telegram.push(message(6, "что ты помнишь про production deploy?"));
-    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Вот durable notes")));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Вот сохранённые заметки")));
     expect(broker.turns).toHaveLength(1);
 
     for (let index = 0; index < 15; index += 1) {
@@ -6573,7 +6578,7 @@ describe("OperatorDaemon product flow", () => {
     // /memory restore reactivates a wrongly obsoleted note, searchably.
     telegram.push(message(2, `/memory restore ${systemNote.id}`));
     await waitFor(() => store.getOperatorNote(systemNote.id)?.status === "active");
-    expect(telegram.sent.some((entry) => entry.text.includes("снова active"))).toBe(true);
+    expect(telegram.sent.some((entry) => entry.text.includes("снова активна"))).toBe(true);
     expect(store.searchOperatorNotes("migration flag").map((note) => note.id)).toContain(systemNote.id);
 
     telegram.finish();
@@ -6648,10 +6653,10 @@ describe("OperatorDaemon product flow", () => {
     expect(runtime.resumedProviders).toEqual(["claude"]);
     expect(store.getRuntimeState("operator_provider")).toBe("claude");
     await waitFor(() =>
-      telegram.sent.some((entry) => entry.text.includes("Провайдер «codex» недоступен")),
+      telegram.sent.some((entry) => entry.text.includes("Движок «codex» недоступен")),
     );
     expect(
-      telegram.sent.filter((entry) => entry.text.includes("Провайдер «codex» недоступен")),
+      telegram.sent.filter((entry) => entry.text.includes("Движок «codex» недоступен")),
     ).toHaveLength(1);
 
     const run = daemon.run();
@@ -7937,6 +7942,106 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   }, 40_000);
+
+  it("answers commands in Russian and escapes markdown in names (package 4.2)", async () => {
+    const home = tempDirectory("daemon-texts-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_star",
+      t3ProjectId: "prj_star",
+      name: "Ре*лиз_2026",
+      workspaceRoot: `${home}/p`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const thread = (id: string, title: string, status: ThreadStatus): WorkThread => ({
+      id,
+      t3ThreadId: id,
+      projectId: project.id,
+      title,
+      shortSummary: "",
+      keywords: [],
+      status,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    });
+    broker.projects.push(project);
+    store.upsertProject(project);
+    store.upsertThread(thread("th_wait", "Ре*лиз_2026", "waiting_approval"));
+    store.upsertThread(thread("th_queue", "Вторая", "queued"));
+    store.upsertThread(thread("th_done", "Третья", "completed"));
+
+    telegram.push(message(1, "/status"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Работа")));
+    const status = telegram.sent.findLast((entry) => entry.text.startsWith("## Работа"))!.text;
+    expect(status).toContain("ждёт подтверждения");
+    expect(status).toContain("в очереди");
+    expect(status).toContain("завершена");
+    expect(status).not.toMatch(/waiting_approval|queued|completed|workers/u);
+    // The `*` and `_` in a thread name must not open emphasis in the reply.
+    expect(status).toContain("Ре\\*лиз\\_2026");
+
+    telegram.push(message(2, "/work"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Последние работы")));
+    const work = telegram.sent.findLast((entry) => entry.text.startsWith("## Последние работы"))!.text;
+    expect(work).toContain("Ре\\*лиз\\_2026");
+    expect(work).not.toMatch(/waiting_approval|queued/u);
+
+    telegram.push(message(3, "/projects"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Проекты")));
+    expect(telegram.sent.findLast((entry) => entry.text.startsWith("## Проекты"))!.text).toContain(
+      "Ре\\*лиз\\_2026",
+    );
+
+    telegram.push(message(4, "/help"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Operator")));
+    const help = telegram.sent.findLast((entry) => entry.text.startsWith("## Operator"))!.text;
+    for (const english of ["persistent", "durable", "work threads", "proactive", "controls"]) {
+      expect(help).not.toContain(english);
+    }
+
+    // The owner-only surfaces used to be the last English holdouts: they had
+    // no tests, which is exactly why they survived two sweeps (review).
+    telegram.push(message(6, "/policy"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Текущие настройки")));
+    telegram.push(message(7, "/operator"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Движок")));
+    telegram.push(message(8, "/operator switch nope"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Такой движок недоступен")));
+    telegram.push(message(9, "/team"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Команда")));
+    telegram.push(message(10, "/policy set nonsense 1"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Использование: `/policy set")));
+    telegram.push(message(11, "/automation add every 3 nonsense"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Разделите")));
+    for (const english of ["Live policy", "Operator runtime", "Provider недоступен", "Alias", "owner/admin", "invalid"]) {
+      expect(telegram.sent.some((entry) => entry.text.includes(english))).toBe(false);
+    }
+
+    telegram.push(message(5, "/memory compact"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Контекст сжат")));
+    expect(telegram.sent.findLast((entry) => entry.text.startsWith("Контекст сжат"))!.text).not.toMatch(
+      /compacted|durable/u,
+    );
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
 });
 
 describe("answerPartUpdate (package 1.4)", () => {

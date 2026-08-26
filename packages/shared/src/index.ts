@@ -275,6 +275,64 @@ export type ApprovalRiskCategory =
   | "cross-project"
   | "secret-sensitive";
 
+/**
+ * The owner reads Russian, so no snake_case status and no English risk id ever
+ * reaches a chat message (package 4.2). Both lookups accept a plain string:
+ * statuses arrive from storage rows and risks from stored approval payloads,
+ * and an unknown value is shown as-is rather than swallowed.
+ */
+export const THREAD_STATUS_RU: Record<ThreadStatus, string> = {
+  idle: "простаивает",
+  queued: "в очереди",
+  running: "выполняется",
+  waiting_approval: "ждёт подтверждения",
+  waiting_user: "ждёт ответа",
+  completed: "завершена",
+  failed: "ошибка",
+  cancelled: "остановлена",
+};
+
+export const APPROVAL_RISK_RU: Record<ApprovalRiskCategory, string> = {
+  "safe-read": "безопасное чтение",
+  "safe-write-in-project": "запись внутри проекта",
+  network: "доступ в сеть",
+  "package-install": "установка пакетов",
+  "process-control": "управление процессами",
+  destructive: "необратимые изменения",
+  "cross-project": "выход за пределы проекта",
+  "secret-sensitive": "работа с секретами",
+};
+
+export const AUTOMATION_STATUS_RU: Record<Automation["status"], string> = {
+  active: "активна",
+  paused: "на паузе",
+  running: "выполняется",
+  completed: "завершена",
+  deleted: "удалена",
+};
+
+/**
+ * «лимит 1 параллельных работ» is the kind of seam that makes an assistant
+ * read like a form letter. Returns the count together with the right form.
+ */
+export function pluralRu(count: number, one: string, few: string, many: string): string {
+  const abs = Math.abs(Math.trunc(count));
+  const lastTwo = abs % 100;
+  const last = abs % 10;
+  if (lastTwo >= 11 && lastTwo <= 14) return `${count} ${many}`;
+  if (last === 1) return `${count} ${one}`;
+  if (last >= 2 && last <= 4) return `${count} ${few}`;
+  return `${count} ${many}`;
+}
+
+export function threadStatusRu(status: string): string {
+  return THREAD_STATUS_RU[status as ThreadStatus] ?? status;
+}
+
+export function approvalRiskRu(risk: string): string {
+  return APPROVAL_RISK_RU[risk as ApprovalRiskCategory] ?? risk;
+}
+
 export interface ProviderCapabilities {
   liveInput: boolean;
   interrupt: boolean;

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 const LEGACY_SAFE_LIMIT = 4000;
 export const RICH_SAFE_LIMIT = 30_000;
 
@@ -57,7 +59,7 @@ function tokenizeAtomicMarkdownBlocks(text: string): string[] {
     if (
       trimmed.startsWith("|") &&
       index + 1 < lines.length &&
-      /^\s*\|?\s*:?-{3,}/u.test(lines[index + 1]!)
+      isTableDelimiterRow(lines[index + 1]!)
     ) {
       flushPlain();
       let table = line + lines[++index]!;
@@ -80,7 +82,7 @@ function tokenizeAtomicMarkdownBlocks(text: string): string[] {
 
 function isMarkdownTable(value: string): boolean {
   const lines = value.trim().split("\n");
-  return lines.length >= 2 && lines[0]!.trimStart().startsWith("|") && /^\s*\|?\s*:?-{3,}/u.test(lines[1]!);
+  return lines.length >= 2 && lines[0]!.trimStart().startsWith("|") && isTableDelimiterRow(lines[1]!);
 }
 
 function splitMarkdownTable(table: string, limit: number): string[] {
@@ -120,7 +122,11 @@ export function truncateRichPreview(text: string, limit = RICH_SAFE_LIMIT): stri
   // It is the beginning of the stream that gets dropped, so the marker says
   // so, leads the preview, and stays outside the sliced tail so no final
   // slice can ever cut the marker itself (bug №39).
-  const marker = "_… earlier output trimmed …_\n\n";
+  const marker = "_… начало вывода обрезано …_\n\n";
+  // A limit too small to hold the marker plus any text at all must still be
+  // honoured: dropping the marker is better than returning more than asked
+  // for (package 4.2 — the marker used to push the result past the limit).
+  if (limit <= marker.length) return text.slice(text.length - Math.max(1, limit));
   let preview = text.slice(text.length - Math.max(1, limit - marker.length));
   const firstLineBreak = preview.indexOf("\n");
   if (firstLineBreak > 0 && firstLineBreak < 300) preview = preview.slice(firstLineBreak + 1);
@@ -129,43 +135,285 @@ export function truncateRichPreview(text: string, limit = RICH_SAFE_LIMIT): stri
 
 export function renderStreamPhase(phase: "thinking" | "tools" | "text", text: string): string {
   if (phase === "text") return text;
-  const title = phase === "thinking" ? "Thinking" : "Tool activity";
+  const title = phase === "thinking" ? "Размышления" : "Работа инструментов";
   // Keep math outside details: some Telegram Desktop builds have crashed on
   // math nested in a details block (Hermes Agent production guard).
   if (/\$\$|```math|<tg-math/i.test(text)) return `### ${title}\n\n${text}`;
   return `<details><summary>${title}</summary>\n\n${text}\n\n</details>`;
 }
 
-export function markdownToTelegramHtml(markdown: string): string {
-  const codeBlocks: string[] = [];
-  let value = markdown.replace(/```(?:[\w+-]+)?\n?([\s\S]*?)```/g, (_match, code: string) => {
-    const token = `@@CODEBLOCK${codeBlocks.length}@@`;
-    codeBlocks.push(`<pre><code>${escapeHtml(code.trimEnd())}</code></pre>`);
-    return token;
-  });
-  value = escapeHtml(value)
-    .replace(/(?<!\\)`((?:[^`\n\\]|\\[^`\n])+)`/g, (_match, code: string) => {
-      // Inline code is literal content: protect it from the markdown
-      // replacements below and from GFM backslash unescaping alike.
-      const token = `@@CODEBLOCK${codeBlocks.length}@@`;
-      codeBlocks.push(`<code>${code}</code>`);
-      return token;
-    })
+export interface TelegramHtmlOptions {
+  /**
+   * `<blockquote expandable>` is the Telegram expression of a `<details>`
+   * spoiler. Callers latch this to false once a chat has rejected it and get
+   * the degraded «заголовок + текст» shape instead.
+   */
+  expandableBlockquote?: boolean;
+}
+
+/**
+ * A token store for every fragment that must survive the markdown
+ * replacements: fenced code, inline code, tables and spoiler bodies. `plain`
+ * is what the fragment looks like with no markup at all — a table cell renders
+ * inside `<pre>`, where nested entities have no meaning and would only skew
+ * the column widths.
+ *
+ * The token carries a per-call random nonce. A predictable marker could be
+ * typed by the user and would then be swapped for someone else's content —
+ * in the worst case a `<pre>` nested inside a table cell, which Telegram
+ * rejects, costing the whole message its formatting (review B2).
+ */
+interface TokenStore {
+  token: (html: string, plain?: string) => string;
+  resolvePlain: (value: string) => string;
+  expand: (value: string) => string;
+}
+
+function createTokenStore(markdown: string): TokenStore {
+  const blocks: Array<{ html: string; plain: string }> = [];
+  let nonce = "";
+  // Regenerating until the nonce is absent from the input is stronger than
+  // scrubbing look-alikes: no token this call can emit is expressible in the
+  // source text, and the user's own text is never rewritten behind their back.
+  do {
+    nonce = randomUUID().replaceAll("-", "").slice(0, 8);
+  } while (markdown.includes(nonce));
+  const marker = (index: number): string => `@@TG${nonce}_${index}@@`;
+  return {
+    token: (html, plain = "") => {
+      blocks.push({ html, plain });
+      return marker(blocks.length - 1);
+    },
+    resolvePlain: (value) =>
+      blocks.reduce((text, block, index) => text.split(marker(index)).join(block.plain), value),
+    // A token's HTML may contain tokens created before it, so expansion walks
+    // the store backwards. `split/join` — never `replace` — because a literal
+    // `$&` in the user's code block would otherwise be read as a replacement
+    // pattern (review T1).
+    expand: (value) => {
+      let text = value;
+      for (let index = blocks.length - 1; index >= 0; index -= 1) {
+        text = text.split(marker(index)).join(blocks[index]!.html);
+      }
+      return text;
+    },
+  };
+}
+
+export function markdownToTelegramHtml(markdown: string, options: TelegramHtmlOptions = {}): string {
+  const expandable = options.expandableBlockquote !== false;
+  const store = createTokenStore(markdown);
+  const { token } = store;
+  let value = markdown.replace(/```(?:[\w+-]+)?\n?([\s\S]*?)```/g, (_match, code: string) =>
+    token(`<pre><code>${escapeHtml(code.trimEnd())}</code></pre>`, code.trim()),
+  );
+  // Inline code is lifted before anything is parsed: it is literal content,
+  // and a `|` inside it must not be read as a table column border (review M5).
+  value = value.replace(/(?<!\\)`((?:[^`\n\\]|\\[^`\n])+)`/g, (_match, code: string) =>
+    token(`<code>${escapeHtml(code)}</code>`, code),
+  );
+  // Spoilers and tables are lifted before escaping: their markup is structure,
+  // not text the user typed. Innermost spoilers go first — the body pattern
+  // refuses to span another `<details>` — and the loop then lifts the outer
+  // ones, so a nested pair leaves no stray closing tag behind.
+  for (let guard = 0; guard < 8; guard += 1) {
+    const lifted = value.replace(
+      /<details[^>]*>\s*(?:<summary>((?:(?!<\/summary>|<details)[\s\S])*?)<\/summary>)?((?:(?!<details)[\s\S])*?)<\/details>/iu,
+      (_match, summary: string | undefined, body: string) => {
+        const title = `<b>${convertInline(summary?.trim() || "Подробности")}</b>`;
+        // A spoiler quoted with «> » arrives with the prefix on every line;
+        // keeping it would nest a blockquote inside the expandable one and
+        // leave a stray «&gt;» in the text (review M4).
+        const unquoted = body.replace(/^[ \t]*>[ \t]?/gmu, "").trim();
+        const inner = convertInline(replaceMarkdownTables(unquoted, store));
+        if (!expandable) return token(`${title}\n\n${inner}`);
+        // Quotes inside the spoiler are not stripped here: `flattenNestedQuotes`
+        // owns that decision once, at the end, with the real nesting depth in
+        // hand — in flat mode the spoiler is no quote at all and an inner one
+        // is perfectly legal.
+        return token(`<blockquote expandable>${title}\n\n${inner}</blockquote>`);
+      },
+    );
+    if (lifted === value) break;
+    value = lifted;
+  }
+  // Whatever the loop could not pair up is markup the user should not see.
+  value = value.replace(/<\/?details[^>]*>|<\/?summary>/giu, "");
+  // A spoiler that sat on a quoted line leaves its «> » behind. Dropping the
+  // marker keeps the expandable quote itself: wrapping it in the plain quote
+  // would nest, and the flattening pass would then throw the spoiler away —
+  // the less useful of the two entities.
+  value = value.replace(/^[ \t]*&?>[ \t]?(?=@@TG[0-9a-f]{8}_\d+@@\s*$)/gmu, "");
+  value = replaceMarkdownTables(value, store);
+  value = convertInline(value);
+  return flattenNestedQuotes(store.expand(value));
+}
+
+const QUOTE_SCAN = /<pre>[\s\S]*?<\/pre>|<blockquote[^>]*>|<\/blockquote>/giu;
+
+/**
+ * Telegram refuses a blockquote inside a blockquote, and every such rejection
+ * is expensive: the message loses its formatting and — because the flat retry
+ * succeeds — the expandable-quote capability is honestly latched off for every
+ * chat, for good. Nesting has several sources (a spoiler inside a spoiler, a
+ * spoiler quoted with «> », a quote with a blank line before it), so this is a
+ * single depth-aware pass rather than a patch per shape: any blockquote tag
+ * opening at depth ≥ 1 is dropped together with its matching close, and `<pre>`
+ * regions are skipped whole.
+ */
+function flattenNestedQuotes(html: string): string {
+  let out = "";
+  let cursor = 0;
+  let depth = 0;
+  const opened: boolean[] = [];
+  for (const match of html.matchAll(QUOTE_SCAN)) {
+    const tag = match[0];
+    out += html.slice(cursor, match.index);
+    cursor = match.index + tag.length;
+    if (tag.toLocaleLowerCase().startsWith("<pre")) {
+      out += tag;
+      continue;
+    }
+    if (tag.startsWith("</")) {
+      const kept = opened.pop();
+      // An unbalanced close would re-open the very nesting we just removed.
+      if (kept === undefined) continue;
+      if (kept) {
+        depth -= 1;
+        out += tag;
+      }
+      continue;
+    }
+    const keep = depth === 0;
+    opened.push(keep);
+    if (keep) {
+      depth += 1;
+      out += tag;
+    } else {
+      // The quote marker that used to introduce the dropped tag is now litter.
+      out = out.replace(/&gt;[ \t]?$/u, "");
+    }
+  }
+  return out + html.slice(cursor);
+}
+
+function convertInline(markdown: string): string {
+  const value = escapeHtml(markdown)
     .replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>")
     .replace(/^&gt;\s?(.+)$/gm, "<blockquote>$1</blockquote>")
     .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
     .replace(/__(.+?)__/g, "<b>$1</b>")
+    // Single-marker italics, after the double-marker bold so `**x**` is not
+    // eaten by them. Word-adjacency guards keep snake_case identifiers and
+    // list bullets («* item») intact.
+    .replace(/(?<![\w*\\])\*(?!\s)([^*\n]+?)(?<![\s\\])\*(?![\w*])/g, "<i>$1</i>")
+    .replace(/(?<![\w_\\])_(?!\s)([^_\n]+?)(?<![\s\\])_(?![\w_])/g, "<i>$1</i>")
+    // Images have no place in a text message: a real URL becomes a link, an
+    // attachment reference degrades to its alt text. Runs before the link
+    // rule so the leading «!» never survives as litter.
+    .replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_match, alt: string, url: string) =>
+      `<a href="${url}">${alt.trim() || "изображение"}</a>`,
+    )
+    .replace(/!\[([^\]]*)]\([^\s)]*\)/g, (_match, alt: string) => alt.trim() || "изображение")
     .replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
   // The legacy fallback receives the same GFM the rich path shows verbatim, so
   // backslash-escaped punctuation («Готово\.») must render without the
   // backslash here too (bug №23). Runs after the markdown replacements so an
   // escaped marker (\*\*) stays literal text instead of turning into <b>, and
   // covers the HTML-entity forms escapeHtml produced (\&gt; etc.).
-  value = value.replace(/\\(&(?:amp|lt|gt|quot);|[!-/:-@[-`{-~])/g, "$1");
-  codeBlocks.forEach((block, index) => {
-    value = value.replace(`@@CODEBLOCK${index}@@`, block);
-  });
-  return value;
+  return value.replace(/\\(&(?:amp|lt|gt|quot);|[!-/:-@[-`{-~])/g, "$1");
+}
+
+const MAX_TABLE_CELL = 30;
+
+function splitTableRow(row: string): string[] {
+  return row
+    .trim()
+    .replace(/^\|/u, "")
+    .replace(/\|$/u, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+/**
+ * GFM asks for one dash per delimiter cell, with optional alignment colons —
+ * `|:-:|`, `|-|-|` and `|:--|--:|` are all valid and all used in practice.
+ * The old `-{3,}` shape rejected every one of them and left the table as pipe
+ * soup (review B1).
+ */
+export function isTableDelimiterRow(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|") && !/^:?-+:?$/u.test(trimmed)) return false;
+  const cells = splitTableRow(trimmed);
+  return cells.length > 0 && cells.every((cell) => /^:?-+:?$/u.test(cell));
+}
+
+function replaceMarkdownTables(value: string, store: TokenStore): string {
+  const lines = value.split("\n");
+  const out: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const next = lines[index + 1];
+    if (!line.trimStart().startsWith("|") || !next || !isTableDelimiterRow(next)) {
+      out.push(line);
+      continue;
+    }
+    const rows = [line, next];
+    let cursor = index + 2;
+    while (cursor < lines.length && lines[cursor]!.trimStart().startsWith("|")) {
+      rows.push(lines[cursor]!);
+      cursor += 1;
+    }
+    index = cursor - 1;
+    out.push(store.token(tableToPre(rows, store)));
+  }
+  return out.join("\n");
+}
+
+function tableToPre(rows: string[], store: TokenStore): string {
+  const cells = rows.map((row) =>
+    splitTableRow(row).map((cell) => {
+      // Inline code and other lifted fragments come back as their plain text:
+      // the box is monospaced already, and a nested entity here would both
+      // skew the column width and risk a nested-tag rejection.
+      const text = store.resolvePlain(cell).replace(/\*\*|__|[*_`]/gu, "");
+      return text.length > MAX_TABLE_CELL ? `${text.slice(0, MAX_TABLE_CELL - 1)}…` : text;
+    }),
+  );
+  const alignment = splitTableRow(rows[1]!).map((spec) =>
+    spec.startsWith(":") && spec.endsWith(":") ? "center" : spec.endsWith(":") ? "right" : "left",
+  );
+  const body = cells.filter((_row, index) => index !== 1);
+  const columns = Math.max(...body.map((row) => row.length));
+  const widths = Array.from({ length: columns }, (_unused, column) =>
+    Math.max(1, ...body.map((row) => (row[column] ?? "").length)),
+  );
+  // A ragged row keeps its own width: padding it out to the full column count
+  // would leave a trail of empty `|` separators. The last rendered cell of a
+  // left-aligned column is not padded either — those spaces are invisible,
+  // and trimming them blindly would eat a centred cell's other half.
+  const render = (row: string[]): string => {
+    const last = Math.max(0, Math.min(row.length, columns) - 1);
+    return widths
+      .slice(0, last + 1)
+      .map((width, column) => {
+        const cell = row[column] ?? "";
+        const align = alignment[column] ?? "left";
+        return column === last && align === "left" ? cell : pad(cell, width, align);
+      })
+      .join(" | ");
+  };
+  const rendered = body.map(render);
+  const ruler = widths.map((width) => "-".repeat(width)).join("-+-");
+  const lines = [rendered[0] ?? "", ruler, ...rendered.slice(1)];
+  return `<pre>${escapeHtml(lines.join("\n"))}</pre>`;
+}
+
+function pad(value: string, width: number, alignment: "left" | "right" | "center"): string {
+  const gap = Math.max(0, width - value.length);
+  if (alignment === "right") return " ".repeat(gap) + value;
+  if (alignment === "center") return " ".repeat(Math.floor(gap / 2)) + value + " ".repeat(Math.ceil(gap / 2));
+  return value + " ".repeat(gap);
 }
 
 function tokenizeFencedBlocks(text: string): string[] {
