@@ -1276,20 +1276,8 @@ export class OperatorDaemon {
         await this.commandReply(update, "У вас нет прав отвечать за эту работу.");
         return;
       }
-      // Package 1.4: the answering part brings its OWN quote. Spreading the
-      // merged update would hand the worker the first message's reply context
-      // while the ids below say the part's — a mismatch that outlived bug №35.
-      const { reply: _mergedReply, ...mergedBase } = update;
       const answerUpdate: typeof update = update.parts?.length
-        ? {
-            ...mergedBase,
-            text: part.text,
-            messageId: part.messageId,
-            messageIds: [part.messageId],
-            replyToMessageId: part.replyToMessageId!,
-            ...(part.reply ? { reply: part.reply } : {}),
-            parts: [part],
-          }
+        ? answerPartUpdate(update, part)
         : update;
       await this.submitCustomUserInput(answerUpdate, pendingInput);
       const remainder = (update.parts ?? []).filter((other) => other.messageId !== part.messageId);
@@ -6264,6 +6252,31 @@ const TERMINAL_THREAD_STATUSES: string[] = ["completed", "failed", "cancelled"];
  * They only pick the wording — the thread itself is already chosen.
  */
 const EXPLAINING_RELATIONS = ["user_input", "user_input_answer", "approval", "recovery"] as const;
+
+/**
+ * Package 1.4: the single message of a merged batch that answers a worker's
+ * question, shaped as an update of its own.
+ *
+ * The quote must come from THIS part. Spreading the merged update would hand
+ * the answer the first message's reply context while every id says the part's
+ * — a mismatch that outlived bug №35 and would let an unrelated quote ride
+ * into a worker's answer.
+ */
+export function answerPartUpdate(
+  update: Extract<TelegramInbound, { type: "message" }>,
+  part: TelegramInboundBatchPart,
+): Extract<TelegramInbound, { type: "message" }> {
+  const { reply: _mergedReply, ...mergedBase } = update;
+  return {
+    ...mergedBase,
+    text: part.text,
+    messageId: part.messageId,
+    messageIds: [part.messageId],
+    replyToMessageId: part.replyToMessageId!,
+    ...(part.reply ? { reply: part.reply } : {}),
+    parts: [part],
+  };
+}
 
 /**
  * Package 1.4: WHICH message this envelope replies to, and its quote.

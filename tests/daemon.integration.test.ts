@@ -9,6 +9,7 @@ import {
   ingressClaims,
   ingressLane,
   OperatorDaemon,
+  answerPartUpdate,
   operatorHeartbeatText,
   syntheticNegativeMessageId,
 } from "../apps/daemon/src/operator-daemon.js";
@@ -1226,6 +1227,281 @@ describe("OperatorDaemon product flow", () => {
     const envelope = runtime.prompts.at(-1)!;
     expect(envelope).toContain("The owner replies to this quoted message");
     expect(envelope).not.toContain("replies to work thread");
+    expect(envelopeThreadId(envelope)).toBeUndefined();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("delivers an agent message even when the thread it names cannot be resolved", async () => {
+    const home = tempDirectory("daemon-binding-degrade-");
+    const store = tempStore();
+    const results: Array<Record<string, unknown>> = [];
+    const runtime = new DelegatingRuntime(async (_envelope, call) => {
+      results.push((await call("telegram.send_message", {
+        text: "Ща посмотрю, это займёт минуту.",
+        threadId: "th_down",
+      })) as Record<string, unknown>);
+      results.push((await call("telegram.send_message", {
+        text: "И ещё одна мысль.",
+        threadId: "th_ghost",
+      })) as Record<string, unknown>);
+      return "Готово.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // th_down: T3 itself is unreachable. th_ghost: the agent named a thread
+    // that does not exist. Neither may cost the owner the text — the heads-up
+    // is mandatory precisely when the backend is sick.
+    const realGetThread = broker.getThread.bind(broker);
+    broker.getThread = async (id: string) => {
+      if (id === "th_down") throw Object.assign(new Error("ECONNRESET"), { code: "ECONNRESET" });
+      return realGetThread(id);
+    };
+
+    telegram.push(message(1, "посмотри что там"));
+    await waitFor(() => results.length === 2);
+    expect(telegram.sent.some((sent) => sent.text.includes("Ща посмотрю"))).toBe(true);
+    expect(telegram.sent.some((sent) => sent.text.includes("И ещё одна мысль"))).toBe(true);
+    // …and the agent is told why each binding did not happen.
+    expect(results[0]).toMatchObject({ thread: { status: "dropped", reason: "unavailable" } });
+    expect(results[1]).toMatchObject({ thread: { status: "dropped", reason: "not_found" } });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("binds «Остановил X» to X, so a reply to it continues that work", async () => {
+    const home = tempDirectory("daemon-cancel-binding-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /исправь/u, title: "Race fix" }),
+    );
+    const broker = new FakeBroker();
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь гонку в авторизации"));
+    await waitFor(() => broker.turns.length === 1);
+    const dispatched = broker.threads.at(-1)!;
+    telegram.push(message(2, "стоп"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Остановил")));
+    const stopped = telegram.sent.find((sent) => sent.text.includes("Остановил"))!;
+    expect(store.getReplyContext(7, stopped.messageId)?.primaryThreadId).toBe(dispatched.id);
+
+    telegram.push({
+      ...message(3, "а почему остановилось?"),
+      replyToMessageId: stopped.messageId,
+      reply: { messageId: stopped.messageId, fromBot: true, text: "Остановил Race fix.", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("а почему остановилось?")));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("а почему остановилось?"))!;
+    expect(envelope).toContain('replies to work thread "Race fix"');
+    expect(envelopeThreadId(envelope)).toBe(dispatched.id);
+
+    broker.releaseTerminal();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("leaves a fan-out answer unbound rather than picking one of the threads it started", async () => {
+    const home = tempDirectory("daemon-fanout-binding-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      if (userText(envelope).includes("а что там")) return "Оба идут.";
+      const workspacesRoot =
+        /New project workspaces belong under (\S+)\./u.exec(envelope)?.[1] ?? "/tmp/workspaces";
+      const project = (await call("t3.create_project", {
+        name: "Fan Out",
+        workspaceRoot: `${workspacesRoot}/fan-out`,
+      })) as { id: string };
+      for (const title of ["Left half", "Right half"]) {
+        const thread = (await call("t3.create_thread", { projectId: project.id, title })) as { id: string };
+        await call("t3.send_turn", { threadId: thread.id, text: title });
+      }
+      return "Запустил обе работы.";
+    });
+    const broker = new FakeBroker();
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "раздели задачу надвое"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Запустил обе")));
+    const answer = telegram.sent.find((sent) => sent.text.includes("Запустил обе"))!;
+    // Two threads make any primary pick a guess. Both stay as related ids —
+    // the audit trail is complete, the routing claims nothing.
+    expect(store.getReplyContext(7, answer.messageId)?.primaryThreadId).toBeUndefined();
+    expect(store.getMessageThreadLinks(7, answer.messageId).map((link) => link.relation)).toEqual([
+      "related",
+      "related",
+    ]);
+
+    telegram.push({
+      ...message(2, "а что там с ними?"),
+      replyToMessageId: answer.messageId,
+      reply: { messageId: answer.messageId, fromBot: true, text: "Запустил обе работы.", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("а что там с ними?")));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("а что там с ними?"))!;
+    expect(envelope).not.toContain("replies to work thread");
+    expect(envelope).toContain("The owner replies to this quoted message");
+
+    broker.releaseTerminal();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("gives no reply binding at all when the primary thread is closed to this user", async () => {
+    const home = tempDirectory("daemon-reply-acl-");
+    const store = tempStore();
+    const timestamp = nowIso();
+    const secret: Project = {
+      id: "prj_secret",
+      t3ProjectId: "prj_secret",
+      name: "Secret Project",
+      workspaceRoot: `${home}/secret`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const open: Project = {
+      id: "prj_open",
+      t3ProjectId: "prj_open",
+      name: "Open Project",
+      workspaceRoot: `${home}/open`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    for (const project of [secret, open]) mkdirSync(project.workspaceRoot!, { recursive: true });
+    const thread = (projectId: string, id: string, title: string): WorkThread => ({
+      id,
+      t3ThreadId: id,
+      projectId,
+      title,
+      shortSummary: "",
+      keywords: [],
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    });
+    const hidden = thread(secret.id, "th_hidden", "Hidden work");
+    const visible = thread(open.id, "th_visible", "Visible work");
+    const runtime = new DelegatingRuntime(async () => "Ок.");
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    for (const project of [secret, open]) {
+      broker.projects.push(project);
+      store.upsertProject(project);
+    }
+    for (const item of [hidden, visible]) {
+      broker.threads.push(item);
+      store.upsertThread(item);
+    }
+    // A team member (not an admin — admins read everything) who was given the
+    // open project and never the secret one.
+    store.grantProjectAccess(secret.id, "999", "owner");
+    store.grantProjectAccess(open.id, "43", "editor");
+    // The quoted message points primarily at work this user may not read, and
+    // carries a weaker link to work they may. The weak one must NOT be used.
+    store.saveTelegramMessage({
+      chatId: 7,
+      messageId: 800,
+      primaryThreadId: hidden.id,
+      relatedThreadIds: [hidden.id],
+      artifactIds: [],
+      messageType: "operator_answer",
+      createdAt: timestamp,
+    });
+    store.linkMessageThread(7, 800, hidden.id, "primary");
+    store.linkMessageThread(7, 800, visible.id, "operator_output");
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    const base = config(home);
+    daemon = new OperatorDaemon(
+      { ...base, telegram: { ...base.telegram, users: { 42: "owner", 43: "member" } } },
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push({
+      ...messageAs(1, "а тут что?", 43),
+      replyToMessageId: 800,
+      reply: { messageId: 800, fromBot: true, text: "Отчёт по работе.", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.length === 1);
+    const envelope = runtime.prompts.at(-1)!;
+    expect(envelope).not.toContain("replies to work thread");
+    expect(envelope).not.toContain("Hidden work");
+    expect(envelope).not.toContain("Visible work");
     expect(envelopeThreadId(envelope)).toBeUndefined();
 
     telegram.finish();
@@ -6853,6 +7129,44 @@ describe("OperatorDaemon product flow", () => {
   }, 40_000);
 });
 
+describe("answerPartUpdate (package 1.4)", () => {
+  const merged = {
+    type: "message" as const,
+    updateId: 1,
+    edited: false,
+    chatId: 7,
+    chatType: "private" as const,
+    userId: 42,
+    messageId: 31,
+    messageIds: [30, 31],
+    date: 0,
+    text: "мысль\n\nда, первый вариант",
+    attachments: [],
+    // The merged envelope carries the FIRST message's reply — an unrelated
+    // quote as far as the worker's question is concerned.
+    replyToMessageId: 600,
+    reply: { messageId: 600, fromBot: true, text: "Отчёт по другой работе.", attachments: [] },
+    parts: [
+      { messageId: 30, text: "мысль", replyToMessageId: 600, reply: { messageId: 600, fromBot: true, text: "Отчёт по другой работе.", attachments: [] } },
+      { messageId: 31, text: "да, первый вариант", replyToMessageId: 700, reply: { messageId: 700, fromBot: true, text: "Какой вариант?", attachments: [] } },
+    ],
+  };
+
+  it("gives the answering part its own quote and never the batch's", () => {
+    const answer = answerPartUpdate(merged, merged.parts[1]!);
+    expect(answer.messageIds).toEqual([31]);
+    expect(answer.replyToMessageId).toBe(700);
+    expect(answer.reply).toMatchObject({ messageId: 700, text: "Какой вариант?" });
+    expect(answer.text).toBe("да, первый вариант");
+  });
+
+  it("carries no quote at all when the answering part had none", () => {
+    const bare = { messageId: 31, text: "да, первый вариант", replyToMessageId: 700 };
+    const answer = answerPartUpdate({ ...merged, parts: [merged.parts[0]!, bare] }, bare);
+    expect(answer.reply).toBeUndefined();
+  });
+});
+
 /** Just enough of a durable ingress payload for the digest assertions. */
 interface DurableIngressPeek {
   update: { text: string; messageThreadId?: number; threadEvents?: unknown[] };
@@ -7547,8 +7861,15 @@ class FakeBroker implements T3Broker {
       .sort((left, right) => right.score - left.score)
       .slice(0, input.limit ?? 5);
   }
+  /**
+   * Package 1.4: an unknown id FAILS here, the way the real broker fails on a
+   * thread T3 does not have. Returning `undefined!` made every caller's
+   * not-found path show up as a TypeError somewhere else instead.
+   */
   async getThread(id: string): Promise<WorkThread> {
-    return this.threads.find((thread) => thread.id === id)!;
+    const thread = this.threads.find((candidate) => candidate.id === id);
+    if (!thread) throw Object.assign(new Error(`T3 thread not found: ${id}`), { status: 404 });
+    return thread;
   }
   async createThread(input: CreateThreadInput): Promise<WorkThread> {
     this.threadInputs.push(input);

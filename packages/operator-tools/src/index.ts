@@ -1117,13 +1117,17 @@ export class OperatorToolServer {
       schema: textSchema,
       handler: async ({ text, threadId }, capability) => {
         this.requireTeamMutation(capability, "send Telegram messages");
+        // The message is the point, the binding is a bonus: send FIRST, then
+        // resolve. Nothing about naming a thread may cost the owner the text —
+        // least of all a T3 outage during a mandatory heads-up.
+        const sent = await this.options.telegram.sendRich(
+          capability.context.chatId,
+          text,
+          destination(capability.context),
+        );
         const bound = await this.resolveOutgoingThread(capability, threadId);
         return {
-          ...this.recordSent(await this.options.telegram.sendRich(
-            capability.context.chatId,
-            text,
-            destination(capability.context),
-          ), capability, "operator_tool_message", [], bound.threadId),
+          ...this.recordSent(sent, capability, "operator_tool_message", [], bound.threadId),
           ...(bound.thread ? { thread: bound.thread } : {}),
         };
       },
@@ -1135,12 +1139,13 @@ export class OperatorToolServer {
       schema: textSchema,
       handler: async ({ text, threadId }, capability) => {
         this.requireTeamMutation(capability, "send Telegram replies");
+        const sent = await this.options.telegram.sendRich(capability.context.chatId, text, {
+          ...destination(capability.context),
+          replyToMessageId: capability.context.originMessageId,
+        });
         const bound = await this.resolveOutgoingThread(capability, threadId);
         return {
-          ...this.recordSent(await this.options.telegram.sendRich(capability.context.chatId, text, {
-            ...destination(capability.context),
-            replyToMessageId: capability.context.originMessageId,
-          }), capability, "operator_tool_reply", [], bound.threadId),
+          ...this.recordSent(sent, capability, "operator_tool_reply", [], bound.threadId),
           ...(bound.thread ? { thread: bound.thread } : {}),
         };
       },
@@ -1487,13 +1492,13 @@ export class OperatorToolServer {
     try {
       remote = await this.options.broker.getThread(threadId);
     } catch (error) {
-      // A thread that does not exist is the agent's mistake and costs only the
-      // binding. A T3 outage is NOT: swallowing it would drop a perfectly valid
-      // binding for a reason that has nothing to do with the request, so it
-      // surfaces as a tool error the agent can retry.
-      if (!isMissingThreadError(error)) throw error;
-      return drop("not_found");
+      // Neither case may cost the owner the message (it is already sent by the
+      // time we get here), so both degrade to a dropped binding — but they are
+      // reported apart: `not_found` is the agent's own mistake and stays
+      // dropped, `unavailable` is a transient T3 fault the agent may retry.
+      return drop(isMissingThreadError(error) ? "not_found" : "unavailable");
     }
+    if (!remote) return drop("not_found");
     try {
       this.requireProjectAccess(capability, remote.projectId, false);
     } catch {

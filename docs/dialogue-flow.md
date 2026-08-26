@@ -579,7 +579,7 @@ What now carries a binding when it is sent:
 | Outgoing | Primary binding |
 |---|---|
 | Operator final answer | the thread this turn dispatched or continued — but only when there is **exactly one** (`job_thread:<ingressJob>` trail); two or more make any pick a guess, so they all stay related ids. Else the single thread whose events the turn retold, else the thread the owner replied into |
-| `telegram.send_message` / `telegram.reply` | the optional `threadId` the agent passes — validated against the store, then the broker, plus the owner's project access. Unknown or forbidden → dropped with a `logger.warn` and `{thread: {status: "dropped", reason}}` in the tool result; a T3 **outage** is not swallowed, it fails the call so a valid binding is never lost to a transient fault. A thread the broker knows but the store does not is upserted, since reply routing reads the local store |
+| `telegram.send_message` / `telegram.reply` | the optional `threadId` the agent passes. **The message is sent first and bound second**: nothing about naming a thread may cost the owner the text, least of all a T3 outage during a mandatory heads-up. The id is checked against the store, then the broker, plus the owner's project access; every failure degrades to `logger.warn` + `{thread: {status: "dropped", reason}}` in the tool result, with the reasons kept apart — `access_denied`, `not_found` (the agent's own mistake) and `unavailable` (a transient T3 fault, worth a retry). A thread the broker knows but the store does not is upserted, since reply routing reads the local store |
 | `Остановил X` (cancel hatch) | the thread it stopped |
 | worker question card, approval card, recovery notice | their thread, via the relation links |
 
