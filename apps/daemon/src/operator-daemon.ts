@@ -4766,7 +4766,7 @@ export class OperatorDaemon {
       return;
     }
     if (actorRole !== "owner" && (rawRole === "owner" || rawRole === "admin")) {
-      await this.commandReply(update, "Только owner может назначать owner/admin.");
+      await this.commandReply(update, "Только владелец может назначать роли `owner` и `admin`.");
       return;
     }
     this.store.upsertTeamMember(rawUserId, rawRole);

@@ -166,6 +166,72 @@ describe("Telegram rich rendering", () => {
     expect(rows.every((row) => !/[\s|]$/u.test(row))).toBe(true);
   });
 
+  it("never nests a blockquote, in any spoiler shape or mode (review R1/R2)", () => {
+    // Telegram refuses same-kind nested entities. Every rejection costs the
+    // message its formatting and — since the flat retry works — latches the
+    // expandable capability off for every chat, so this is an invariant, not
+    // a per-shape fix.
+    const inspect = (html: string): string | null => {
+      const scan = /<blockquote(?: expandable)?>|<\/blockquote>|<pre>|<\/pre>/gu;
+      let depth = 0;
+      let pre = 0;
+      for (const match of html.matchAll(scan)) {
+        if (match[0] === "</blockquote>") depth -= 1;
+        else if (match[0] === "<pre>") {
+          pre += 1;
+          if (pre > 1) return "nested <pre>";
+        } else if (match[0] === "</pre>") pre -= 1;
+        else {
+          depth += 1;
+          if (depth > 1) return `nested <blockquote> at ${match.index}`;
+        }
+        if (depth < 0 || pre < 0) return "unbalanced";
+      }
+      return depth || pre ? "unbalanced" : null;
+    };
+    const cases: Array<[string, string]> = [
+      ["цитата с абзацем перед спойлером", "> текст до\n>\n> <details><summary>Th</summary>\n> строка 1\n> </details>"],
+      ["цитата без пустой строки", "> текст до\n> <details><summary>Th</summary>\n> строка\n> </details>"],
+      ["голая цитата-спойлер", "> <details><summary>Th</summary>\n> body\n> </details>"],
+      ["цитата с текстом после", "> <details><summary>Th</summary>\n> body\n> </details>\n> текст после"],
+      ["вложенные спойлеры", "<details><summary>A</summary>\n<details><summary>B</summary>\ninner\n</details>\n</details>"],
+      ["три уровня", "<details><summary>A</summary>\n<details><summary>B</summary>\n<details><summary>C</summary>\nz\n</details>\n</details>\n</details>"],
+      ["цитата внутри спойлера", "<details><summary>S</summary>\n\n> q\n\n</details>"],
+      ["таблица внутри спойлера", "<details><summary>S</summary>\n\n| a |\n|---|\n| 1 |\n\n</details>"],
+      ["фенс внутри спойлера", "<details><summary>S</summary>\n\n```\nx\n```\n\n</details>"],
+      // The way it actually reaches production: the phase wrapper around model
+      // output that carries a spoiler of its own (review R1).
+      ["спойлер модели внутри стрим-обёртки", renderStreamPhase("thinking", "<details><summary>Своё</summary>\n\nтело\n\n</details>")],
+    ];
+    for (const [name, markdown] of cases) {
+      for (const expandableBlockquote of [true, false]) {
+        const html = markdownToTelegramHtml(markdown, { expandableBlockquote });
+        expect(`${name} (expandable=${expandableBlockquote}): ${inspect(html)}`).toBe(
+          `${name} (expandable=${expandableBlockquote}): null`,
+        );
+      }
+    }
+  });
+
+  it("keeps the inner spoiler's content when it flattens the nesting (review R1)", () => {
+    const html = markdownToTelegramHtml(
+      "<details><summary>Внешний</summary>\n\nснаружи\n\n<details><summary>Внутренний</summary>\n\nвнутри\n\n</details>\n\n</details>",
+    );
+    expect(html).toContain("<b>Внешний</b>");
+    expect(html).toContain("<b>Внутренний</b>");
+    expect(html).toContain("снаружи");
+    expect(html).toContain("внутри");
+    expect(html.match(/<blockquote expandable>/gu)).toHaveLength(1);
+  });
+
+  it("drops the orphaned quote marker in front of a flattened spoiler (review R2)", () => {
+    const html = markdownToTelegramHtml("> текст до\n>\n> <details><summary>Th</summary>\n> строка 1\n> </details>");
+    expect(html).toContain("текст до");
+    expect(html).toContain("строка 1");
+    expect(html).not.toContain("&gt; <");
+    expect(html).not.toMatch(/&gt;\s*$/u);
+  });
+
   it("never exceeds a limit smaller than the truncation marker", () => {
     const marker = "_… начало вывода обрезано …_\n\n";
     for (const limit of [1, 5, marker.length - 1, marker.length, marker.length + 1, marker.length + 40]) {

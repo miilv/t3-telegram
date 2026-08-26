@@ -227,10 +227,11 @@ export function markdownToTelegramHtml(markdown: string, options: TelegramHtmlOp
         const unquoted = body.replace(/^[ \t]*>[ \t]?/gmu, "").trim();
         const inner = convertInline(replaceMarkdownTables(unquoted, store));
         if (!expandable) return token(`${title}\n\n${inner}`);
-        // Telegram entities of the same kind cannot nest, so a quote inside the
-        // spoiler is flattened rather than risking a formatting error.
-        const flat = inner.replaceAll("<blockquote>", "").replaceAll("</blockquote>", "");
-        return token(`<blockquote expandable>${title}\n\n${flat}</blockquote>`);
+        // Quotes inside the spoiler are not stripped here: `flattenNestedQuotes`
+        // owns that decision once, at the end, with the real nesting depth in
+        // hand — in flat mode the spoiler is no quote at all and an inner one
+        // is perfectly legal.
+        return token(`<blockquote expandable>${title}\n\n${inner}</blockquote>`);
       },
     );
     if (lifted === value) break;
@@ -238,20 +239,62 @@ export function markdownToTelegramHtml(markdown: string, options: TelegramHtmlOp
   }
   // Whatever the loop could not pair up is markup the user should not see.
   value = value.replace(/<\/?details[^>]*>|<\/?summary>/giu, "");
+  // A spoiler that sat on a quoted line leaves its «> » behind. Dropping the
+  // marker keeps the expandable quote itself: wrapping it in the plain quote
+  // would nest, and the flattening pass would then throw the spoiler away —
+  // the less useful of the two entities.
+  value = value.replace(/^[ \t]*&?>[ \t]?(?=@@TG[0-9a-f]{8}_\d+@@\s*$)/gmu, "");
   value = replaceMarkdownTables(value, store);
   value = convertInline(value);
-  value = store.expand(value);
-  // A spoiler on a quoted line still ends up wrapped in the quote it was
-  // lifted out of; same-kind entities cannot nest, so the outer one goes.
-  for (let guard = 0; guard < 4; guard += 1) {
-    const collapsed = value.replace(
-      /<blockquote>\s*(<blockquote expandable>[\s\S]*?<\/blockquote>)\s*<\/blockquote>/gu,
-      "$1",
-    );
-    if (collapsed === value) break;
-    value = collapsed;
+  return flattenNestedQuotes(store.expand(value));
+}
+
+const QUOTE_SCAN = /<pre>[\s\S]*?<\/pre>|<blockquote[^>]*>|<\/blockquote>/giu;
+
+/**
+ * Telegram refuses a blockquote inside a blockquote, and every such rejection
+ * is expensive: the message loses its formatting and — because the flat retry
+ * succeeds — the expandable-quote capability is honestly latched off for every
+ * chat, for good. Nesting has several sources (a spoiler inside a spoiler, a
+ * spoiler quoted with «> », a quote with a blank line before it), so this is a
+ * single depth-aware pass rather than a patch per shape: any blockquote tag
+ * opening at depth ≥ 1 is dropped together with its matching close, and `<pre>`
+ * regions are skipped whole.
+ */
+function flattenNestedQuotes(html: string): string {
+  let out = "";
+  let cursor = 0;
+  let depth = 0;
+  const opened: boolean[] = [];
+  for (const match of html.matchAll(QUOTE_SCAN)) {
+    const tag = match[0];
+    out += html.slice(cursor, match.index);
+    cursor = match.index + tag.length;
+    if (tag.toLocaleLowerCase().startsWith("<pre")) {
+      out += tag;
+      continue;
+    }
+    if (tag.startsWith("</")) {
+      const kept = opened.pop();
+      // An unbalanced close would re-open the very nesting we just removed.
+      if (kept === undefined) continue;
+      if (kept) {
+        depth -= 1;
+        out += tag;
+      }
+      continue;
+    }
+    const keep = depth === 0;
+    opened.push(keep);
+    if (keep) {
+      depth += 1;
+      out += tag;
+    } else {
+      // The quote marker that used to introduce the dropped tag is now litter.
+      out = out.replace(/&gt;[ \t]?$/u, "");
+    }
   }
-  return value;
+  return out + html.slice(cursor);
 }
 
 function convertInline(markdown: string): string {

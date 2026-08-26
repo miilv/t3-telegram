@@ -886,6 +886,12 @@ random nonce, so nothing the user types can be swapped for another fragment's
 content, and expansion uses `split/join` so a literal `$&` in a code block
 stays literal.
 
+Nesting is impossible by construction, not by pattern: after token expansion a
+single depth-aware pass drops any `<blockquote>` opening at depth ≥ 1 together
+with its matching close (`<pre>` regions skipped whole), and a spoiler lifted
+off a quoted line loses that line's `> ` marker so the expandable quote — the
+more useful of the two entities — is what survives.
+
 `expandableQuote` is a fourth latched capability, reported by `health()`.
 Every legacy send **and edit** goes through one degradation path —
 HTML → flat spoiler → plain — so an edit no longer loses all its markup at
