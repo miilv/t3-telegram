@@ -221,6 +221,7 @@ export class TelegramBotTransport implements TelegramTransport {
   private richDraftAvailable: boolean | undefined;
   private draftAvailable: boolean | undefined;
   private richFinalAvailable: boolean | undefined;
+  private expandableQuoteAvailable: boolean | undefined;
   /** Package 1.1: preemption observer, notified on every accepted message. */
   private inboundObserver: ((message: InboundMessageSignal) => void) | undefined;
 
@@ -585,7 +586,7 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
     const message = await this.outbound(chatId, () =>
-      this.bot.api.sendMessage(chatId, markdownToTelegramHtml(text), {
+      this.bot.api.sendMessage(chatId, this.legacyHtml(text), {
         ...messageOptions(options),
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
@@ -603,7 +604,7 @@ export class TelegramBotTransport implements TelegramTransport {
   ): Promise<void> {
     try {
       await this.outbound(chatId, () =>
-        this.bot.api.editMessageText(chatId, messageId, markdownToTelegramHtml(text), {
+        this.bot.api.editMessageText(chatId, messageId, this.legacyHtml(text), {
           parse_mode: "HTML",
           link_preview_options: { is_disabled: true },
           reply_markup: approvalKeyboard(approvalId),
@@ -624,7 +625,7 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
     const message = await this.outbound(chatId, () =>
-      this.bot.api.sendMessage(chatId, markdownToTelegramHtml(text), {
+      this.bot.api.sendMessage(chatId, this.legacyHtml(text), {
         ...messageOptions(options),
         parse_mode: "HTML",
         reply_markup: userInputKeyboard(inputId, questionIndex, choices, multiSelect),
@@ -641,7 +642,7 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
     const message = await this.outbound(chatId, () =>
-      this.bot.api.sendMessage(chatId, markdownToTelegramHtml(text), {
+      this.bot.api.sendMessage(chatId, this.legacyHtml(text), {
         ...messageOptions(options),
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
@@ -661,7 +662,7 @@ export class TelegramBotTransport implements TelegramTransport {
     multiSelect: boolean,
   ): Promise<void> {
     await this.outbound(chatId, () =>
-      this.bot.api.editMessageText(chatId, messageId, markdownToTelegramHtml(text), {
+      this.bot.api.editMessageText(chatId, messageId, this.legacyHtml(text), {
         parse_mode: "HTML",
         reply_markup: userInputKeyboard(inputId, questionIndex, choices, multiSelect),
       }),
@@ -1008,7 +1009,7 @@ export class TelegramBotTransport implements TelegramTransport {
       let message;
       try {
         message = await this.outbound(chatId, () =>
-          this.bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk), {
+          this.bot.api.sendMessage(chatId, this.legacyHtml(chunk), {
             ...messageOptions(chunkOptions),
             parse_mode: "HTML",
             link_preview_options: { is_disabled: true },
@@ -1016,16 +1017,44 @@ export class TelegramBotTransport implements TelegramTransport {
         );
       } catch (error) {
         if (!isFormattingError(error)) throw error;
-        message = await this.outbound(chatId, () =>
-          this.bot.api.sendMessage(chatId, chunk, {
-            ...messageOptions(chunkOptions),
-            link_preview_options: { is_disabled: true },
-          }),
-        );
+        message = await this.sendLegacyDegraded(chatId, chunk, chunkOptions);
       }
       sent.push(sentMessage(chatId, message.message_id, chunkOptions));
     }
     return sent;
+  }
+
+  private legacyHtml(text: string): string {
+    return markdownToTelegramHtml(text, { expandableBlockquote: this.expandableQuoteAvailable !== false });
+  }
+
+  /**
+   * A rejected HTML chunk gets one more chance before losing its formatting
+   * entirely: `<blockquote expandable>` is the newest tag we emit, so a chat
+   * that refuses it is retried with the flat spoiler shape, and the capability
+   * is latched off for the rest of this life.
+   */
+  private async sendLegacyDegraded(chatId: number, chunk: string, options: TelegramSendOptions) {
+    if (this.expandableQuoteAvailable !== false && /<details/iu.test(chunk)) {
+      this.expandableQuoteAvailable = false;
+      try {
+        return await this.outbound(chatId, () =>
+          this.bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk, { expandableBlockquote: false }), {
+            ...messageOptions(options),
+            parse_mode: "HTML",
+            link_preview_options: { is_disabled: true },
+          }),
+        );
+      } catch (error) {
+        if (!isFormattingError(error)) throw error;
+      }
+    }
+    return this.outbound(chatId, () =>
+      this.bot.api.sendMessage(chatId, chunk, {
+        ...messageOptions(options),
+        link_preview_options: { is_disabled: true },
+      }),
+    );
   }
 
   private async editRichSingle(
@@ -1056,7 +1085,7 @@ export class TelegramBotTransport implements TelegramTransport {
     const chunks = splitRichText(text, 4000);
     try {
       await this.outbound(chatId, () =>
-        this.bot.api.editMessageText(chatId, messageId, markdownToTelegramHtml(chunks[0] ?? "…"), {
+        this.bot.api.editMessageText(chatId, messageId, this.legacyHtml(chunks[0] ?? "…"), {
           parse_mode: "HTML",
           link_preview_options: { is_disabled: true },
         }),

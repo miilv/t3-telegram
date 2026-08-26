@@ -104,7 +104,7 @@ describe("grammY Telegram transport", () => {
     const plainDraft = calls.filter((call) => call.method === "sendMessageDraft").at(-1)!;
     const previewText = plainDraft.body.text as string;
     expect(previewText.length).toBeLessThanOrEqual(4_096);
-    expect(previewText).toContain("earlier output trimmed");
+    expect(previewText).toContain("начало вывода обрезано");
     expect(previewText.endsWith(`строка 399 ${"x".repeat(20)}`)).toBe(true);
 
     // The editable-message fallback obeys the same cap.
