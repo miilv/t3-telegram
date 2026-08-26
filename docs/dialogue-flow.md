@@ -26,15 +26,7 @@ constant or the verbatim string, not the number.
 | 2 | Group/supergroup | `allowGroups` (default `false`) | yes |
 | 3 | Forum topic | `message_thread_id` | yes |
 | 4 | Direct-messages topic | `direct_messages_topic.topic_id` | yes |
-| 5 | Slash command | `text.startsWith("/")` | yes |
-
-Entry 5 is a *dispatch attempt*, not a separate fate: `handleCommand` is a chain
-of exact-match branches, and text that matches none of them falls through to the
-ordinary Operator turn. Since package 1.3 that is what `/stop`, `/cancel` and
-`/focus` do — they are deleted commands, so they reach the agent as plain text
-(and preempt the running turn like any other message). A semantic stop
-(«останови сборку») is the Operator's own job via `t3.interrupt_thread`; the
-deterministic hatch is the bare cancel word of §4.
+| 5 | Slash command | `dispatchableCommandName(part.text)` | yes |
 | 6 | Approval callback | `/^a:([A-Za-z0-9_-]+):(1\|s\|0)$/` | **no** — inline |
 | 7 | User-input callback | `/^ui:([^:]+):(\d+):(o\d+\|s\|c)$/` | **no** |
 | 8 | `ask_choices` callback | `/^route:([\w-]+):(\d+)$/` | **no**, but replays as a synthetic durable message |
@@ -52,6 +44,38 @@ deterministic hatch is the bare cancel word of §4.
 
 Entries 6–8, 9, 17 and 18 bypass the durable job table entirely — they are
 handled inline and are lost if the process dies mid-handling.
+
+### Entry 5 in detail
+
+A *dispatch attempt*, not a separate fate. Since package 4.3 the command
+surface has one source of truth — the table in `apps/daemon/src/commands.ts` —
+from which `setMyCommands`, `/help` and the viewer wall are all generated.
+
+```
+splitCommandBatch(update)
+├─ merged batch → the FIRST own (non-forwarded) part whose text is command-shaped
+│                 becomes its own update; every other part is re-queued through
+│                 enqueueBatchRemainder as the next turn
+├─ single message → itself, if command-shaped
+└─ nothing command-shaped → undefined; ordinary Operator turn
+```
+
+A *command-shaped* text is `/name`, optionally `@bot`, ending at a space or the
+end of the message, with an ASCII name — so `/tmp/report.log`, a bare `/` and
+«/статус» are ordinary text and reach the agent unchanged. A command that is
+shaped but unknown (`/statis`) is answered locally with a Levenshtein
+suggestion within distance 2 plus a pointer to `/help`; it never costs a turn.
+
+`/stop`, `/cancel` and `/focus` are the one exception: package 1.3 deleted them
+*into ordinary text* deliberately, so `dispatchableCommandName` refuses to claim
+them and they still reach the agent (and preempt the running turn like any other
+message). A semantic stop («останови сборку») is the Operator's own job via
+`t3.interrupt_thread`; the deterministic hatch is the bare cancel word of §4.
+
+The remainder of a split batch carries `batchWatermarkId` — the newest message
+id of the batch it came from — so the package 1.1 staleness rule judges it by
+its batch and not by its own ids. Without it, a burst whose command arrived
+*last* would have its prose discarded the instant it was re-queued.
 
 ---
 
@@ -94,8 +118,14 @@ if roleForUser === "viewer" && !isViewerSafeMessage(text)
    → return
 ```
 
-`isViewerSafeMessage` admits `/status`, `/projects`, `/work`, `/help` and
-`/start` (with args) only.
+Since package 4.3 both the predicate and the sentence are generated from the
+command table: `isViewerSafeMessage` admits exactly the rows whose `minRole` is
+`viewer` — `/status`, `/projects`, `/work`, `/help`, `/start` (with args) — and
+`viewerWallText()` lists the same set, so the wall can no longer promise
+something it refuses. The same table decides what `/help` prints for each role
+and what `setMyCommands` publishes: viewer-safe commands in the DEFAULT scope
+(strangers, groups), the role's full list in each configured user's private
+chat scope, republished when `/team set` changes a role.
 
 Consequence: a viewer never reaches `answerDirect`, therefore never receives an
 MCP tool lease. The in-command refusal `…не может управлять automations` is
