@@ -567,6 +567,33 @@ describe("a night the background channel is down (memory-design §5)", () => {
     expect(store.getRuntimeState(SCRIBE_MISS_COUNT_KEY)).toBe("0");
   });
 
+  it("tells a missing branch apart from a daemon that has no branches at all", async () => {
+    const store = tempStore();
+    const turns: Array<{ dedupeKey: string; prompt: string }> = [];
+    store.rememberOperatorNote({ content: "легаси-заметка" });
+    const { backgroundOneShot: _absent, ...withoutChannel } = baseDeps(store, []);
+    const scribe = new NightScribe({
+      ...withoutChannel,
+      requestOwnerTurn: (input) => turns.push(input),
+      now: () => NIGHT,
+    });
+    const outcome = await scribe.run({ force: true });
+    // A runtime with no background channel is a CONFIGURATION, not an outage:
+    // `SwitchableOperatorRuntime` always defines the method and rejects from
+    // inside it when Claude is missing, which is the case §5 wants recorded.
+    // Filing a skip here would invent a nightly outage nobody can fix, and
+    // page the owner about it on the third night.
+    expect(outcome.status).toBe("no-channel");
+    expect(store.listJournalEntries({})).toHaveLength(0);
+    expect(store.getRuntimeState(SCRIBE_MISS_COUNT_KEY)).toBeUndefined();
+    expect(store.getRuntimeState(SCRIBE_LAST_DAY_KEY)).toBeUndefined();
+    expect(turns).toHaveLength(0);
+    // It also leaves nothing behind in the event log — which is what keeps the
+    // daemon's own test suite from silently exercising this path for the two
+    // hours a day the wall clock happens to sit inside the window.
+    expect(store.listDaemonEvents({ typePrefixes: ["memory.scribe."] })).toHaveLength(0);
+  });
+
   it("keeps the deterministic half of a skipped night", async () => {
     const store = tempStore();
     const item = store.createNowItem({

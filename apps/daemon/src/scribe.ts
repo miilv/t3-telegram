@@ -111,6 +111,7 @@ export interface NightScribeDeps {
 export type ScribeRunStatus =
   | "outside-window"
   | "already-ran"
+  | "no-channel"
   | "no-work"
   | "completed"
   | "skipped";
@@ -157,6 +158,20 @@ export class NightScribe {
     const timeZone = this.deps.timeZone();
     if (!options.force && !isWithinLocalWindow(at, timeZone, SCRIBE_WINDOW_FROM_HOUR, SCRIBE_WINDOW_TO_HOUR)) {
       return this.idleOutcome("outside-window", ownerLogicalDay(at, timeZone));
+    }
+    // No background channel AT ALL is a different thing from the Claude branch
+    // being down, and only the second one is §5's skip.
+    //
+    // `SwitchableOperatorRuntime` always DEFINES `backgroundOneShot` and rejects
+    // from inside it when the Claude branch is missing — that is the outage §5
+    // describes, and it takes the recorded-skip road below. A missing METHOD
+    // means the daemon is not running the switchable runtime at all (an
+    // embedded runtime, a test double): there is no branch to be unavailable,
+    // nobody can fix it at runtime, and filing a skip every night forever —
+    // then paging the owner about it on the third — would be inventing an
+    // outage out of a configuration.
+    if (!this.deps.backgroundOneShot) {
+      return this.idleOutcome("no-channel", ownerLogicalDay(at, timeZone));
     }
     const day = scribeTargetDay({
       logicalDay: ownerLogicalDay(at, timeZone),
@@ -514,6 +529,7 @@ export class NightScribe {
    * that all end in the same place.
    */
   private async oneShot(prompt: string): Promise<string> {
+    // `run` refuses to start without one, so this is only the type narrowing.
     const call = this.deps.backgroundOneShot;
     if (!call) throw new ScribeChannelUnavailable("no background one-shot channel is configured");
     const timeoutMs = this.deps.timeoutMs ?? SCRIBE_ONESHOT_TIMEOUT_MS;
