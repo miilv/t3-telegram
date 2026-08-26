@@ -10,6 +10,8 @@ import type {
   Automation,
   InteractionMediation,
   MediatedQuestion,
+  NowItem,
+  NowSection,
   OperatorEvent,
   OperatorNote,
   OperatorPolicySettings,
@@ -43,9 +45,11 @@ import {
   knownFenceNonces,
   LaneQueue,
   ThreadEventDigest,
+  NOW_AGENT_WRITE_KEY,
   newId,
   nowIso,
   openFence,
+  ownerLogicalDay,
   claimOwnDispatchMarker,
   forgetOwnDispatchMarker,
   ownDispatchPendingCount,
@@ -97,21 +101,30 @@ import {
   buildOperatorSystemPrompt,
   classifyPause,
   decidePushMode,
+  MAINTENANCE_INDEX_BUDGET_CHARS,
+  NOW_ITEM_CONTENT_CHARS,
+  deriveFocusThreadRef,
   diffNowItems,
+  journalSlugBase,
   mayAutoApprove,
   parsePushBaseline,
   readOperatorPolicy,
+  reconcileDaemonSection,
+  renderClosedItemJournalBody,
   renderGapLine,
   renderMemoryIndex,
   renderNowDiff,
   renderPersonaDigest,
   renderStateLayers,
+  selectNowItemsForRender,
   serializePushBaseline,
   updateOperatorPolicy,
 } from "../../../packages/policy/src/index.js";
 import type {
   MemoryIndexNote,
   NowStateItem,
+  PauseAssessment,
+  PushMode,
   RenderedStateLayers,
 } from "../../../packages/policy/src/index.js";
 import {
@@ -384,7 +397,33 @@ interface OperatorTurnOptions {
 const OWNER_LAST_MESSAGE_KEY = "owner_last_message_at";
 /** Package 2.1: the persistent diff baseline of §1 (session, epoch, hashes). */
 const PUSH_BASELINE_KEY = "memory_push_baseline";
-/** Statuses that make a work thread a live now-state item (temporary source, §8.1). */
+/**
+ * The in-the-moment check (memory-design §2.4.2), in `runtime_state` so it
+ * survives a restart: the turn that mutated without recording anything, and how
+ * many reminders have gone out back-to-back.
+ */
+const NOW_CHECK_PENDING_KEY = "now_check_pending_turn";
+const NOW_CHECK_STREAK_KEY = "now_check_streak";
+/**
+ * Two in a row, then it becomes the secretary's problem (§2.4.2's `anti-loop`,
+ * modelled on `stop_hook_active`). A third reminder has never once been the
+ * thing that changed a model's behaviour; it is just the envelope nagging.
+ */
+const NOW_CHECK_MAX_STREAK = 2;
+/**
+ * Fixed text, like every linter hint (§5). It names WHAT the daemon observed
+ * rather than accusing, and it explicitly sanctions doing nothing — a nudge the
+ * agent cannot decline is a loop, and the state being already correct is the
+ * single most likely reason it wrote nothing.
+ */
+const NOW_CHECK_REMINDER =
+  "[state check: your previous turn changed things — dispatched work, sent messages, or wrote data — but recorded nothing in the state above. " +
+  "If something you started, finished, handed off or are now waiting on is missing there, put it in with now.update. If the state above is already right, ignore this line.]";
+/**
+ * Statuses in which a work thread is LIVE, and therefore carries an open daemon
+ * item in the now-state ledger (memory-design §2.2). `idle` is deliberately
+ * absent: a thread created but never dispatched is not work in progress.
+ */
 const NOW_STATE_THREAD_STATUSES = [
   "queued",
   "running",
@@ -878,15 +917,28 @@ export class OperatorDaemon {
       currentState: "Delegated to T3 and awaiting a worker result.",
       ...(input.intentText ? { nextAction: input.intentText } : {}),
     });
-    this.store.setFocus(
-      input.context.ownerId,
-      updateFocus(
-        this.store.getFocus(input.context.ownerId),
-        { projectId: thread.projectId, threadId: thread.id },
-        input.intentText || thread.title,
-        0.9,
-      ),
-    );
+    // Package 2.2 (memory-design §2.2): the owner's focus stopped being SET
+    // here and became a reading of the ledger. Opening the thread's daemon item
+    // first and deriving second keeps the outcome identical for the ordinary
+    // case — a brand-new thread is the newest active item — while making the
+    // agent's later "перенеси в blocked" actually take the work out of focus,
+    // which a direct write at dispatch time could never have honoured.
+    //
+    // Another user's focus is not derived: the ledger is the owner's, and a
+    // team member's binding has no items to be read from.
+    if (input.context.ownerId === this.ownerLedgerId()) {
+      this.reconcileDaemonNowItems();
+    } else {
+      this.store.setFocus(
+        input.context.ownerId,
+        updateFocus(
+          this.store.getFocus(input.context.ownerId),
+          { projectId: thread.projectId, threadId: thread.id },
+          input.intentText || thread.title,
+          0.9,
+        ),
+      );
+    }
     const messageIds = input.context.allowedMessageIds?.length
       ? input.context.allowedMessageIds
       : [input.context.originMessageId];
@@ -2460,6 +2512,11 @@ export class OperatorDaemon {
       }
       return;
     }
+
+    // memory-design §2.4.2 — the turn survived preemption (that branch returns
+    // above), so it is now fair to ask whether it changed the world without
+    // saying so in the state.
+    this.recordNowWriteCheck(operatorTurnId);
 
     // Package 1.2: a thread-event turn is allowed to end without a word. An
     // empty final is a decision ("routine progress, nothing to tell"), not a
@@ -4419,47 +4476,230 @@ export class OperatorDaemon {
   }
 
   /**
-   * Package 2.1 — the TEMPORARY now-state source (memory-design §8.1).
+   * Package 2.2 — the now layer, rendered from the `now_items` table.
    *
-   * The real `now_items` table arrives in package 2.2, with the agent's own
-   * entries, sections beyond active/waiting and the daemon's per-thread
-   * bookkeeping. Until then the daemon renders what it already knows for
-   * certain: the work threads that are live right now. Shipping the push
-   * skeleton against a placeholder source is the point of splitting 2.1 from
-   * 2.2 — the envelope, the budgets and the snapshot/diff machine get proven
-   * before the schema lands.
+   * The placeholder source of 2.1 (live threads, mapped on the fly) is gone:
+   * the ledger is now the single source, and the daemon's own thread items are
+   * rows in it like any other. Reconciling before reading is what makes them
+   * true — see `reconcileDaemonNowItems`.
    *
-   * Thread titles are model- and worker-written, so every one of them is
-   * defanged: the now layer is rendered UNFENCED (a fence per line would eat
-   * the budget and read as noise), and defanging is what keeps a title from
-   * forging a marker in the trusted part of the envelope.
+   * Content is model- and worker-written (thread titles, and now the agent's
+   * own lines), so every item is defanged on the way out: the now layer sits in
+   * the trusted head of the envelope, and defanging is what keeps a line from
+   * forging a fence marker there.
    */
   private currentNowItems(): NowStateItem[] {
-    return this.store
-      .listThreads({ statuses: [...NOW_STATE_THREAD_STATUSES] })
-      .slice(0, 50)
-      .map((thread) => {
-        const project = this.store.getProject(thread.projectId);
-        const waiting = thread.status === "waiting_approval" || thread.status === "waiting_user";
-        const suffix =
-          thread.status === "waiting_approval"
-            ? " — waiting for an approval decision"
-            : thread.status === "waiting_user"
-              ? " — waiting for an answer from the owner"
-              : "";
-        const label = project?.name ? `[${project.name}] ${thread.title}` : thread.title;
-        return {
-          id: thread.id,
-          section: waiting ? ("waiting" as const) : ("active" as const),
-          content: defangMarkers(`${label}${suffix}`),
-          updatedAt: thread.lastActivityAt,
-          source: "daemon" as const,
+    this.reconcileDaemonNowItems();
+    const items = this.store.listNowItems({ ownerId: this.ownerLedgerId() });
+    return selectNowItemsForRender(items, new Date())
+      .slice(0, 100)
+      .map((item) => ({ ...item, content: defangMarkers(item.content) }));
+  }
+
+  /** The ledger is per-owner, and the owner is the configured Telegram user. */
+  private ownerLedgerId(): string {
+    return String(this.config.telegram.allowedUserId);
+  }
+
+  /**
+   * The daemon's half of the double bookkeeping (§2.2).
+   *
+   * A projection, not a set of hooks. Every live thread must have exactly one
+   * open daemon item, every terminal thread's item must be closed and archived,
+   * and both facts are derived from the thread table on demand. The alternative
+   * — writing an item at each of the dozen sites that move a thread's status —
+   * would be a dozen chances to miss one, and a daemon that crashed between the
+   * terminal event and its bookkeeping would leave a finished work sitting in
+   * the state forever. A projection cannot drift: whatever happened while the
+   * process was down is reconciled the next time the state is read.
+   *
+   * The agent's items are never touched here. Neither is a daemon item's
+   * `section` when the agent has moved it somewhere the daemon does not derive
+   * (see `reconcileDaemonSection`), nor its `status` when the agent marked it
+   * `half` — regenerating content is the daemon's job, judging the work is not.
+   */
+  private reconcileDaemonNowItems(): void {
+    const ownerId = this.ownerLedgerId();
+    const live = this.store.listThreads({ statuses: [...NOW_STATE_THREAD_STATUSES] }).slice(0, 50);
+    const liveIds = new Set(live.map((thread) => thread.id));
+    for (const thread of live) {
+      const derived = this.daemonNowItemFields(thread);
+      const existing = this.store.getDaemonNowItemForThread(thread.id);
+      if (!existing) {
+        this.store.createNowItem({
+          ownerId,
+          section: derived.section,
+          content: derived.content,
+          source: "daemon",
           threadRef: thread.id,
-          // §2.2: the daemon's own active items are never the ones dropped when
-          // the render overflows.
-          pinned: !waiting,
-        };
-      });
+          // The item is as old as the work: focus ranks by creation instant
+          // (§2.2), and a row born at reconciliation time would make a daemon
+          // restart silently re-order which work is "current".
+          createdAt: thread.createdAt,
+        });
+        continue;
+      }
+      if (existing.status === "closed") continue;
+      const section = reconcileDaemonSection(existing.section, derived.section);
+      if (existing.content === derived.content && existing.section === section) continue;
+      this.store.updateNowItem(existing.id, { section, content: derived.content });
+    }
+    // Anything the daemon still holds open for a thread that has REACHED a
+    // terminal state (or vanished with its row) is closed and archived here —
+    // the same path the agent's own close takes.
+    //
+    // Terminal is tested explicitly rather than as "not in the live list": the
+    // live list is the set of statuses the now layer renders, and treating
+    // every status outside it as finished would archive a work the day someone
+    // adds a sixth status the layer does not happen to show.
+    for (const item of this.store.listNowItems({ ownerId })) {
+      if (item.source !== "daemon" || !item.threadRef) continue;
+      if (liveIds.has(item.threadRef)) continue;
+      const thread = this.store.getThread(item.threadRef);
+      if (thread && !TERMINAL_THREAD_STATUSES.includes(thread.status)) continue;
+      this.closeNowItem(item, item.content, "daemon");
+    }
+    this.syncDerivedFocus();
+  }
+
+  /** What a daemon item SAYS about a thread — regenerated, never agent-edited. */
+  private daemonNowItemFields(thread: WorkThread): { section: NowSection; content: string } {
+    const project = this.store.getProject(thread.projectId);
+    const waiting = thread.status === "waiting_approval" || thread.status === "waiting_user";
+    const suffix =
+      thread.status === "waiting_approval"
+        ? " — waiting for an approval decision"
+        : thread.status === "waiting_user"
+          ? " — waiting for an answer from the owner"
+          : "";
+    const label = project?.name ? `[${project.name}] ${thread.title}` : thread.title;
+    return {
+      section: waiting ? "waiting" : "active",
+      content: `${label}${suffix}`.slice(0, NOW_ITEM_CONTENT_CHARS),
+    };
+  }
+
+  /**
+   * The in-the-moment check, write half (memory-design §2.4.2).
+   *
+   * Called once the turn is known to have SURVIVED — every caller sits past the
+   * preemption branch, which returns on its own. That placement is the "не
+   * после вытеснения" clause: a turn the owner's next message replaced was
+   * never given the chance to record anything, and reminding the next turn
+   * about it would be blaming the agent for the daemon's own interruption.
+   */
+  private recordNowWriteCheck(operatorTurnId: string): void {
+    if (this.store.getRuntimeState(NOW_AGENT_WRITE_KEY) === operatorTurnId) {
+      // The agent recorded something: the pending nudge is answered and the
+      // streak resets — the counter measures reminders IN A ROW, and one
+      // successful turn breaks the row.
+      this.store.deleteRuntimeState(NOW_CHECK_PENDING_KEY);
+      this.store.setRuntimeState(NOW_CHECK_STREAK_KEY, "0");
+      return;
+    }
+    // A turn that changed nothing has nothing to have recorded. Note that this
+    // leaves an EARLIER pending flag standing: the question it asks is still
+    // unanswered, and a purely conversational turn in between is not an answer.
+    if (!this.store.turnHadMutations(operatorTurnId)) return;
+    this.store.setRuntimeState(NOW_CHECK_PENDING_KEY, operatorTurnId);
+  }
+
+  /**
+   * The in-the-moment check, read half (§2.4.2).
+   *
+   * Returns the line to put in the envelope plus the bookkeeping that may only
+   * run once the provider ACCEPTED the prompt — the same discipline as the push
+   * baseline. A reminder that was never delivered must not burn a slot of the
+   * two the anti-loop allows.
+   *
+   * The stale drops below happen immediately and unconditionally, because they
+   * are not deliveries: a reminder that has aged out is dead whether or not
+   * this particular prompt is accepted.
+   */
+  private consumeNowWriteReminder(
+    pause: PauseAssessment,
+  ): { line: string; commit: () => void } | undefined {
+    const pending = this.store.getRuntimeState(NOW_CHECK_PENDING_KEY);
+    if (!pending) return undefined;
+    // §2.4.2(a): inside the episode only. Past a `significant` pause the turn
+    // it refers to is no longer what either of them is doing, and a stale
+    // reminder is worse than none — it spends the agent's attention on
+    // bookkeeping for work the owner has already moved past. The secretary
+    // reconciles that window from the event log, which is why losing it here
+    // costs consistency nothing.
+    if (pause.pauseClass !== "same-episode" && pause.pauseClass !== "light") {
+      this.store.deleteRuntimeState(NOW_CHECK_PENDING_KEY);
+      this.store.setRuntimeState(NOW_CHECK_STREAK_KEY, "0");
+      return undefined;
+    }
+    const streak = Number(this.store.getRuntimeState(NOW_CHECK_STREAK_KEY) ?? "0");
+    if (!Number.isFinite(streak) || streak >= NOW_CHECK_MAX_STREAK) {
+      // §2.4.2(b): hand it over rather than repeat a third time.
+      this.store.deleteRuntimeState(NOW_CHECK_PENDING_KEY);
+      this.store.setRuntimeState(NOW_CHECK_STREAK_KEY, "0");
+      this.store.appendEvent("memory.now_check.exhausted", { payload: { turn: pending } });
+      return undefined;
+    }
+    return {
+      line: NOW_CHECK_REMINDER,
+      commit: () => {
+        this.store.setRuntimeState(NOW_CHECK_STREAK_KEY, String(streak + 1));
+        // The flag is cleared on DELIVERY, not on compliance: whether the agent
+        // acts on it is decided by the next turn's own check, and leaving it
+        // set would make one silent turn produce the same reminder forever.
+        this.store.deleteRuntimeState(NOW_CHECK_PENDING_KEY);
+      },
+    };
+  }
+
+  /** Close one item and archive it (§2.2); the journal entry is the item's afterlife. */
+  private closeNowItem(item: NowItem, content: string, source: "agent" | "daemon"): void {
+    const at = new Date();
+    const day = ownerLogicalDay(at, this.config.owner.timezone);
+    this.store.closeNowItem(item.id, {
+      slugBase: journalSlugBase(day, content),
+      day,
+      body: renderClosedItemJournalBody({ ...item, content }, at.toISOString()),
+      source,
+    });
+  }
+
+  /**
+   * `focus_state`, derived (§2.2 after package 1.3).
+   *
+   * Focus stopped being something anyone SETS. It is a reading of the ledger:
+   * the most recently started daemon `active` item, blocked ones excluded. The
+   * machine binding it feeds — `relatedThreadIds` on outgoing messages, path B
+   * of dialogue-flow §4 — is unchanged; only its source is.
+   *
+   * The projected primary is written back into `focus_state` rather than
+   * computed at every read, because the existing consumers take a `FocusState`
+   * and one of them (the cancellation hatch) has to work when no turn is
+   * running at all.
+   *
+   * It PROMOTES but never CLEARS. With no active candidate — everything blocked,
+   * waiting or finished — the previous binding stands: the deterministic cancel
+   * hatch of dialogue-flow §4 must keep working when nothing is running, and
+   * package 1.3 already made a stale binding refuse to resurrect finished work
+   * on its own.
+   */
+  private syncDerivedFocus(): void {
+    const ownerId = this.ownerLedgerId();
+    const threadRef = deriveFocusThreadRef(this.store.listNowItems({ ownerId }));
+    const focus = this.store.getFocus(ownerId);
+    if (!threadRef) return;
+    if (focus.primary?.threadId === threadRef) return;
+    const thread = this.store.getThread(threadRef);
+    if (!thread) return;
+    this.store.setFocus(
+      ownerId,
+      updateFocus(
+        focus,
+        { projectId: thread.projectId, threadId: thread.id },
+        this.store.getRuntimeState(`thread_user_intent:${thread.id}`) || thread.title,
+        0.9,
+      ),
+    );
   }
 
   /**
@@ -4494,11 +4734,10 @@ export class OperatorDaemon {
       now: nowItems,
       notes: notes.index,
       antiRediscovery: notes.antiRediscovery,
-      // `now.get` ships with the now_items table in package 2.2. Until then the
-      // honest pull for the thread-backed placeholder source is the thread
-      // search — pointing the agent at a tool that does not exist would be a
-      // worse overflow tail than none.
-      nowOverflowTool: "t3.search_threads",
+      // Package 2.2: the tail finally names the tool the design always meant.
+      // The 2.1 placeholder pointed at `t3.search_threads` only because
+      // `now.get` did not exist and the ledger it reads was the thread table.
+      nowOverflowTool: "now.get",
     });
   }
 
@@ -4521,10 +4760,19 @@ export class OperatorDaemon {
     layers: RenderedStateLayers,
     reason: string,
     ownerTurn: boolean,
+    mode: PushMode,
   ): void {
     // Only the owner's own turn advances what the OWNER has seen. A background
     // stretch of thread-event digests keeps the diff baseline honest about the
     // session's history while leaving their re-orientation intact (review №3).
+    //
+    // And only a FULL push does, even on their own turn (package 2.1 backlog).
+    // `ownerSnapshotHash` answers "has anything changed since the owner last
+    // SAW the state", and a diff turn shows them only the now layer: a durable
+    // note that changed in the same window is invisible in it. Moving the hash
+    // anyway would let an ordinary in-episode reply swallow that change, and
+    // the next significant pause — the exact moment the question is asked —
+    // would answer "nothing moved" about state the owner never saw.
     const previous = parsePushBaseline(this.store.getRuntimeState(PUSH_BASELINE_KEY));
     this.store.setRuntimeState(
       PUSH_BASELINE_KEY,
@@ -4533,15 +4781,16 @@ export class OperatorDaemon {
         epoch: this.pushEpoch(),
         nowHash: layers.nowHash,
         snapshotHash: layers.snapshotHash,
-        ownerSnapshotHash: ownerTurn
-          ? layers.snapshotHash
-          : (previous?.ownerSnapshotHash ?? layers.snapshotHash),
+        ownerSnapshotHash:
+          ownerTurn && mode === "full"
+            ? layers.snapshotHash
+            : (previous?.ownerSnapshotHash ?? layers.snapshotHash),
         items: layers.items,
         sentAt: nowIso(),
       }),
     );
     this.store.appendEvent("memory.pushed", {
-      payload: { reason, ownerTurn, chars: layers.snapshot.length },
+      payload: { reason, ownerTurn, mode, chars: layers.snapshot.length },
     });
   }
 
@@ -4590,7 +4839,7 @@ export class OperatorDaemon {
     if (decision.mode === "full") {
       const rendered = stateLayers();
       sections.push(rendered.snapshot);
-      commit = () => this.commitPushBaseline(rendered, decision.reason, options.ownerTurn);
+      commit = () => this.commitPushBaseline(rendered, decision.reason, options.ownerTurn, "full");
     } else {
       const diff = renderNowDiff(diffNowItems(baseline?.items ?? {}, nowItems));
       if (diff) {
@@ -4600,16 +4849,32 @@ export class OperatorDaemon {
         // an omission — it keeps the last FULL push as the reference a later
         // significant pause compares against.
         const rendered = stateLayers();
-        commit = () => this.commitPushBaseline(rendered, decision.reason, options.ownerTurn);
+        commit = () => this.commitPushBaseline(rendered, decision.reason, options.ownerTurn, "diff");
       }
     }
     // The gap line belongs to the owner's own turn (§2.7 measures THEIR
     // silence), and its wording depends on whether any state precedes it.
+    let reminder: { line: string; commit: () => void } | undefined;
     if (options.ownerTurn) {
       const gapLine = renderGapLine(pause, { stateAbove: sections.length > 0 });
       if (gapLine) sections.push(gapLine);
+      // The in-the-moment check goes LAST in the head: it is about the previous
+      // turn, so it has to read after the state it is asking to be reconciled
+      // with. Owner turns only, like the gap line — a digest turn is the daemon
+      // talking to itself, and the reminder is about the agent's habit with the
+      // owner's work.
+      reminder = this.consumeNowWriteReminder(pause);
+      if (reminder) sections.push(reminder.line);
     }
-    return { sections, commit, reason: decision.reason };
+    const pushCommit = commit;
+    return {
+      sections,
+      commit: () => {
+        pushCommit();
+        reminder?.commit();
+      },
+      reason: decision.reason,
+    };
   }
 
   /**
@@ -4628,7 +4893,7 @@ export class OperatorDaemon {
       // A compaction recovery or a provider handoff re-seeds the epoch for
       // everyone, the owner included: it IS the state they will next reason
       // from, so it advances their baseline too.
-      commit = () => this.commitPushBaseline(layers, "forced", true);
+      commit = () => this.commitPushBaseline(layers, "forced", true, "full");
       return compose(layers.snapshot);
     };
     const prompt = build();
@@ -6527,11 +6792,12 @@ export class OperatorDaemon {
     // notes are folded back IN (they are excluded from the pushed index because
     // they have their own block — excluding them here would make them the one
     // category this mechanism could never retire), and the budget is the
-    // one-shot's own 20 000, not the envelope's 3 000. A maintenance pass that
-    // sees a third of the notes would obsolete from a third of the picture.
+    // one-shot's own, not the envelope's 3 000 — see
+    // MAINTENANCE_INDEX_BUDGET_CHARS. A maintenance pass that sees a third of
+    // the notes would obsolete from a third of the picture.
     const notes = this.currentMemoryNotes();
     const maintenanceIndex = renderMemoryIndex([...notes.index, ...notes.antiRediscovery], {
-      budget: 20_000,
+      budget: MAINTENANCE_INDEX_BUDGET_CHARS,
     });
     const response = await this.askOperator(
       [

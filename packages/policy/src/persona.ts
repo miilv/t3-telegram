@@ -70,8 +70,8 @@ export const PERSONA_RULES: readonly PersonaRule[] = [
   {
     n: 6,
     id: "state-doubt",
-    text: "On any doubt about the CURRENT state of work — what is running, what is blocked, what you already started — re-read the state instead of trusting your memory of the episode. The daemon pushes it at the head of the envelope; when it is not there or looks stale, call t3.search_threads (or t3.get_thread_status for one work) before acting on a recollection. Use memory.search for what you once WROTE DOWN, which is a different question.",
-    digest: "doubt about current state → re-read it (envelope head / t3.search_threads), never recall.",
+    text: "On any doubt about the CURRENT state of work — what is running, what is blocked, what you already started, what you are waiting on — re-read the state instead of trusting your memory of the episode. The daemon pushes the top of it at the head of the envelope; call now.get for the full list, and t3.get_thread_status when you need the runtime detail of one specific work. Use memory.search for what you once WROTE DOWN, which is a different question. Keep that state true as you go: when you start, finish, hand off or get blocked on something, say so with now.update in the same turn — nothing else will.",
+    digest: "doubt about current state → re-read it (envelope head / now.get), never recall; keep it current with now.update.",
   },
   {
     n: 7,
