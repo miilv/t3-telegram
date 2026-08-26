@@ -89,11 +89,11 @@ describe("logical conversation ledger storage", () => {
     }
   });
 
-  it("migrates a legacy global cursor into bounded owner partitions idempotently", () => {
+  it("migrates an ambiguous legacy global cursor to replay-safe owner partitions", () => {
     const path = join(tempDirectory("conversation-ledger-cursor-migration-"), "operator.db");
     let store = new OperatorStore(path);
     store.migrate();
-    const ownerA = store.conversation.appendOwnerIngress({
+    store.conversation.appendOwnerIngress({
       ownerId: "owner-a",
       conversationKey: "7:owner-a:0:0",
       text: "owner A first",
@@ -101,13 +101,21 @@ describe("logical conversation ledger storage", () => {
       sourceKey: "migration-owner-a",
       ingressJobId: "migration-owner-a",
     });
-    const ownerB = store.conversation.appendOwnerIngress({
+    store.conversation.appendOwnerIngress({
       ownerId: "owner-b",
       conversationKey: "7:owner-b:0:0",
       text: "owner B first",
       evidenceText: "owner B first",
       sourceKey: "migration-owner-b",
       ingressJobId: "migration-owner-b",
+    });
+    const ownerANext = store.conversation.appendOwnerIngress({
+      ownerId: "owner-a",
+      conversationKey: "7:owner-a:0:0",
+      text: "owner A second",
+      evidenceText: "owner A second",
+      sourceKey: "migration-owner-a-2",
+      ingressJobId: "migration-owner-a-2",
     });
     store.db.exec(`
       DROP TABLE conversation_ledger_cursors;
@@ -120,22 +128,56 @@ describe("logical conversation ledger storage", () => {
     store.db.prepare(`
       INSERT INTO conversation_ledger_cursors(consumer,last_seq,updated_at)
       VALUES ('distiller',?,'2026-08-26T00:00:00.000Z')
-    `).run(ownerB.seq!);
+    `).run(ownerANext.seq!);
     store.close();
 
     store = new OperatorStore(path);
     store.migrate();
-    expect(store.conversation.cursor("distiller", "owner-a")).toBe(ownerA.seq);
-    expect(store.conversation.cursor("distiller", "owner-b")).toBe(ownerB.seq);
+    // The old global cursor could have followed A through seq 3 without ever
+    // consuming interleaved B at seq 2. No per-owner history can prove more.
+    expect(store.conversation.cursor("distiller", "owner-a")).toBe(0);
+    expect(store.conversation.cursor("distiller", "owner-b")).toBe(0);
     expect((store.db.prepare("PRAGMA table_info(conversation_ledger_cursors)").all() as Array<{
       name: string;
     }>).map((column) => column.name)).toContain("owner_id");
+
+    const ownerAPage = store.conversation.selectBatch({ ownerId: "owner-a", afterSeq: 0 });
+    const ownerBPage = store.conversation.selectBatch({ ownerId: "owner-b", afterSeq: 0 });
+    expect(ownerAPage.entries.map((entry) => entry.text))
+      .toEqual(["owner A first", "owner A second"]);
+    expect(ownerBPage.entries.map((entry) => entry.text)).toEqual(["owner B first"]);
+    expect(store.conversation.advanceCursor(
+      "distiller",
+      "owner-a",
+      0,
+      ownerAPage.throughSeq,
+    )).toBe(true);
+    expect(store.conversation.advanceCursor(
+      "distiller",
+      "owner-b",
+      0,
+      ownerBPage.throughSeq,
+    )).toBe(true);
+    expect(store.conversation.advanceCursor(
+      "distiller",
+      "owner-b",
+      0,
+      ownerBPage.throughSeq,
+    )).toBe(false);
     store.close();
 
     store = new OperatorStore(path);
     store.migrate();
-    expect(store.conversation.cursor("distiller", "owner-a")).toBe(ownerA.seq);
-    expect(store.conversation.cursor("distiller", "owner-b")).toBe(ownerB.seq);
+    expect(store.conversation.cursor("distiller", "owner-a")).toBe(ownerAPage.throughSeq);
+    expect(store.conversation.cursor("distiller", "owner-b")).toBe(ownerBPage.throughSeq);
+    expect(store.conversation.selectBatch({
+      ownerId: "owner-a",
+      afterSeq: store.conversation.cursor("distiller", "owner-a"),
+    }).entries).toEqual([]);
+    expect(store.conversation.selectBatch({
+      ownerId: "owner-b",
+      afterSeq: store.conversation.cursor("distiller", "owner-b"),
+    }).entries).toEqual([]);
     store.close();
   });
 

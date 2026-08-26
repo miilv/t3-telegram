@@ -68,6 +68,9 @@ export class ConversationLedgerRepository {
     const columns = this.db.prepare("PRAGMA table_info(conversation_ledger_cursors)").all() as Row[];
     if (!columns.length || columns.some((column) => column.name === "owner_id")) return;
     this.transaction(() => {
+      // A legacy global position proves nothing about which owner's filtered
+      // rows were consumed. Replaying from zero may repeat work; copying the
+      // position could permanently lose another owner's interleaved rows.
       this.db.exec(`
         ALTER TABLE conversation_ledger_cursors
           RENAME TO conversation_ledger_cursors_legacy_v1;
@@ -79,15 +82,11 @@ export class ConversationLedgerRepository {
           PRIMARY KEY (consumer, owner_id)
         );
         INSERT INTO conversation_ledger_cursors(consumer,owner_id,last_seq,updated_at)
-        SELECT legacy.consumer, ready.owner_id,
-          MIN(legacy.last_seq,ready.high_water_seq), legacy.updated_at
+        SELECT legacy.consumer,owners.owner_id,0,legacy.updated_at
         FROM conversation_ledger_cursors_legacy_v1 legacy
         CROSS JOIN (
-          SELECT ledger.owner_id,MAX(stream.seq) AS high_water_seq
-          FROM conversation_ledger_stream stream
-          JOIN conversation_ledger ledger ON ledger.id=stream.ledger_id
-          GROUP BY ledger.owner_id
-        ) ready;
+          SELECT DISTINCT owner_id FROM conversation_ledger
+        ) owners;
         DROP TABLE conversation_ledger_cursors_legacy_v1;
       `);
     });
