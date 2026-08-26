@@ -349,7 +349,15 @@ interface ActiveOperatorTurn {
    * not discard it (package 1.2), but the watchdog may still write it off.
    */
   preemptable?: boolean;
+  /**
+   * Package 1.5: WHY this turn was told to stop. A turn replaced by the owner's
+   * own newer message is finished with; a turn the watchdog stopped while the
+   * owner was still waiting for THIS answer owes them a retry.
+   */
+  supersedeReason?: string;
   interruptedAt?: number;
+  /** Package 1.5: the watchdog's clock when this turn was written off. */
+  abandonedAt?: number;
   zombie?: boolean;
   abandon?: () => void;
   /**
@@ -1608,6 +1616,7 @@ export class OperatorDaemon {
     // and the observer may have flagged it already.
     if (turn.superseded) return;
     turn.superseded = true;
+    turn.supersedeReason = reason;
     // Package 1.5: from this moment the turn is supposed to be going away. The
     // zombie grace is measured from here for EVERY reason it was told to stop,
     // so a turn that ignores an ordinary preemption is freed the same way as
@@ -1642,16 +1651,49 @@ export class OperatorDaemon {
   }
 
   /**
+   * Package 1.5: who is actually waiting for the single turn slot, read from
+   * the durable ingress queue. `pending` and due — a job in retry backoff is
+   * not queued behind this turn, it is waiting on a clock of its own.
+   */
+  private waitingIngress(now: number): { any: boolean; user: boolean } {
+    let any = false;
+    let user = false;
+    for (const job of this.store.listBackgroundJobs<DurableTelegramIngress>(
+      "telegram_ingress",
+      "pending",
+    )) {
+      const runAfter = job.runAfter ? Date.parse(job.runAfter) : Number.NaN;
+      if (Number.isFinite(runAfter) && runAfter > now) continue;
+      any = true;
+      if (ingressLane(job.payload) === "user") {
+        user = true;
+        break;
+      }
+    }
+    return { any, user };
+  }
+
+  /**
    * Package 1.5 — the wedged-turn watchdog, in two steps.
    *
-   * The precondition for both is that SOMEONE IS WAITING — on ANY lane, not
-   * just the owner's. A long turn nobody is queued behind is not a problem to
-   * solve; but a queue of digest interpretations is a waiting party too, and a
-   * wedge in front of them is worse than it looks: their terminal events sit
-   * under the `voice_relaying` marker, which keeps the degraded fallback
-   * rolling for as long as an interpretation claims to be running, so nobody —
-   * not even the flat template — ever tells the owner how the work ended.
-   * Non-user lanes simply get a longer budget (`NON_USER_STALL_FACTOR`).
+   * The precondition for both is that SOMEONE IS WAITING — and "waiting" is
+   * read from the DURABLE QUEUE, not from the lane queue's depth. The lane
+   * depth cannot express it: the reliability pump re-queues a thread-event and
+   * a background drain every second, and their "one in flight" flags clear when
+   * the task STARTS, so while a turn holds the slot both lanes are non-empty
+   * within a second — `depth() > 0` is tautologically true. On that gate a
+   * silent turn (a pure reasoning turn is dead air for minutes by design, bug
+   * №18) would be killed on the budget with nobody waiting at all, and the
+   * owner would be told "продолжаю с вашим новым сообщением" about a message
+   * they never sent.
+   *
+   * A real waiter is an unanswered `telegram_ingress` job: the running turn's
+   * own job is `running`, retry backoff is respected, and the lane comes from
+   * the job payload. Non-user lanes (digest interpretations) are waiters too —
+   * while one is wedged its terminals sit under the `voice_relaying` marker,
+   * which keeps the degraded fallback rolling, so nobody, not even the flat
+   * template, ever tells the owner how the work ended — but they get a longer
+   * budget (`NON_USER_STALL_FACTOR`).
    *
    *  1. a turn that has produced no stream event for `watchdogStallMs` is
    *     interrupted — the same token-scoped interrupt preemption uses;
@@ -1666,10 +1708,10 @@ export class OperatorDaemon {
    * never freeze the system, even at the cost of leaving a process running.
    */
   private sweepWedgedOperatorTurns(now: number): void {
-    if (!this.operatorInputQueue.depth()) return;
-    const ownerWaiting = this.operatorInputQueue.depth("user") > 0;
+    const waiting = this.waitingIngress(now);
+    if (!waiting.any) return;
     const stallMs =
-      this.config.operator.watchdogStallMs * (ownerWaiting ? 1 : NON_USER_STALL_FACTOR);
+      this.config.operator.watchdogStallMs * (waiting.user ? 1 : NON_USER_STALL_FACTOR);
     const graceMs = this.config.operator.watchdogGraceMs;
     for (const turn of this.activeOperatorTurns) {
       // A turn that has already delivered (or decided to say nothing) is done
@@ -1707,6 +1749,9 @@ export class OperatorDaemon {
     // its own, so the watchdog keeps waiting rather than faking an event.
     if (!turn.abandon) return;
     turn.zombie = true;
+    // The watchdog's clock, not the wall's: everything downstream (the notice
+    // throttle) must measure time the same way the sweep does.
+    turn.abandonedAt = now;
     metrics.increment("operator_turns_zombie_total");
     this.store.appendEvent("operator.turn.zombie", {
       correlationId: turn.operatorTurnId ?? `chat:${turn.chatId}`,
@@ -2235,9 +2280,27 @@ export class OperatorDaemon {
       this.markTurnSuperseded(turn, "newer_owner_message");
     }
     if (turn?.superseded) {
-      // Package 1.5: the owner is owed exactly one line when their answer was
-      // not merely replaced but LOST — the turn hung and had to be abandoned.
-      if (abandoned) await this.reportZombieTurn(update, operatorTurnId, correlationId);
+      // Package 1.5 — what the owner is owed depends on WHY the turn died.
+      //
+      // Replaced by their own newer message: one line, and the next turn takes
+      // over. Wedged with nobody replacing it (a silent turn the watchdog
+      // stopped): the question is still theirs and still unanswered, so the
+      // durable ingress job is REPLAYED and the line says so. Dropping it here
+      // would lose the message outright — the failure mode this whole package
+      // exists to prevent.
+      const replacedByOwner =
+        turn.supersedeReason !== "watchdog_stall" || this.inboundSupersedes(update);
+      const retryAfterZombie = Boolean(abandoned) && !replacedByOwner && !isThreadEventTurn;
+      if (abandoned) {
+        await this.reportZombieTurn(
+          update,
+          operatorTurnId,
+          correlationId,
+          retryAfterZombie,
+          attempt,
+          turn.abandonedAt ?? Date.now(),
+        );
+      }
       this.recordSupersededTurn(update, operatorTurnId, correlationId, attempt, turn);
       // Package 1.5: this interpretation never happened, and its job is
       // completed — nothing will retry it. `reportLostDigest` covers both
@@ -2247,6 +2310,15 @@ export class OperatorDaemon {
       // digest as "N messages of this work were lost".
       if (isThreadEventTurn) this.voice.reportLostDigest(threadEvents);
       await this.discardDraft(writer);
+      if (retryAfterZombie) {
+        // Thrown, not swallowed: the ingress drain's catch is the ONE place
+        // that owns retry bookkeeping (attempts, backoff, the give-up notice).
+        this.store.appendEvent("operator.turn.zombie_retry", {
+          correlationId,
+          payload: { operatorTurnId, attempt },
+        });
+        throw new Error("Operator turn wedged and was abandoned; replaying the message");
+      }
       return;
     }
 
@@ -2349,25 +2421,35 @@ export class OperatorDaemon {
     update: Extract<TelegramInbound, { type: "message" }>,
     operatorTurnId: string,
     correlationId: string,
+    /** The question is unanswered and the durable job will replay it. */
+    willRetry: boolean,
+    attempt: number,
+    /** The watchdog's clock, so a test's injected hour really is an hour. */
+    now: number,
   ): Promise<void> {
     if (update.synthetic || update.threadEvents?.length) return;
     // A cascade (a provider that wedges on every turn) is a stream of identical
     // sentences; one per chat per minute says the same thing without the flood.
     const lastNoticeAt = this.zombieNoticeSentAt.get(update.chatId) ?? 0;
-    if (Date.now() - lastNoticeAt < ZOMBIE_NOTICE_THROTTLE_MS) {
+    if (now - lastNoticeAt < ZOMBIE_NOTICE_THROTTLE_MS) {
       this.logger.warn(
         { chatId: update.chatId, operatorTurnId },
         "Zombie notice throttled; the owner was told about a wedged turn moments ago",
       );
       return;
     }
-    this.zombieNoticeSentAt.set(update.chatId, Date.now());
+    this.zombieNoticeSentAt.set(update.chatId, now);
     this.enqueueTelegramOutbox(
-      `telegram:operator:${operatorTurnId}:zombie`,
+      // A replay of the same message must not be able to re-send the line it
+      // already sent; a fresh attempt that wedges again gets its own key, and
+      // the throttle above decides whether it is worth saying at all.
+      `telegram:operator:${operatorTurnId}:zombie${attempt ? `:retry${attempt}` : ""}`,
       update.chatId,
       "rich",
       {
-        text: "Предыдущий ответ завис — продолжаю с вашим новым сообщением.",
+        text: willRetry
+          ? "Ответ завис — попробую ещё раз."
+          : "Предыдущий ответ завис — продолжаю с вашим новым сообщением.",
         options: replyOptions(update),
         operatorTurnId,
         correlationId,
@@ -2530,7 +2612,10 @@ export class OperatorDaemon {
     this.monitors.set(threadId, controller);
     this.store.setRuntimeState(`thread_monitor_started_at:${threadId}`, nowIso());
     // Package 1.5: silence is measured from the moment we started listening.
-    this.store.setRuntimeState(`thread_last_event_at:${threadId}`, nowIso());
+    this.store.setRuntimeState(
+      `thread_last_event_at:${threadId}`,
+      new Date(Date.now()).toISOString(),
+    );
     this.store.setRuntimeState(`thread_stall_reported_at:${threadId}`, "");
     metrics.set("active_workers", this.monitors.size);
     const currentRoute = (): MonitorRoute =>
@@ -2550,7 +2635,11 @@ export class OperatorDaemon {
           // Package 1.5: any event at all is a sign of life — including the
           // ones this daemon deliberately keeps silent about. Durable, so the
           // measurement survives the restart that resubscribes this monitor.
-          this.store.setRuntimeState(`thread_last_event_at:${threadId}`, nowIso());
+          // `Date.now()` is the same source the watchdog compares against.
+          this.store.setRuntimeState(
+            `thread_last_event_at:${threadId}`,
+            new Date(Date.now()).toISOString(),
+          );
           const route = currentRoute();
           // Bug №41: terminal events go to their own accumulator queue so a
           // burst of completions never occupies the interactive slots. This
@@ -5251,6 +5340,32 @@ export class OperatorDaemon {
   }
 
   /**
+   * Package 1.5: one delayed drain of the user lane, for a job that will be
+   * retried. Unref'd, capped, and harmless if it races another drain — the
+   * claim is atomic, so an extra pass simply finds nothing.
+   */
+  private scheduleUserIngressRedrain(runAfter?: string): void {
+    if (this.shutdown.signal.aborted) return;
+    const dueAt = runAfter ? Date.parse(runAfter) : Date.now();
+    const waitMs = Math.min(
+      60_000,
+      Math.max(0, (Number.isFinite(dueAt) ? dueAt : Date.now()) - Date.now()) + 50,
+    );
+    const timer = setTimeout(() => {
+      if (this.shutdown.signal.aborted) return;
+      void this.operatorInputQueue
+        .run("user", () => this.drainTelegramIngress(ingressClaims("user")))
+        .catch((error: unknown) => {
+          this.logger.warn(
+            { errorCode: classifyOperationalError(error).code },
+            "Deferred ingress redrain failed; the job stays pending",
+          );
+        });
+    }, waitMs);
+    timer.unref();
+  }
+
+  /**
    * Package 1.2: the filter is how the lanes stay honest. A drain running on
    * the `user` lane claims the owner's messages only, and the `thread-events`
    * lane claims digests only — otherwise a user-lane drain would happily take
@@ -5289,6 +5404,15 @@ export class OperatorDaemon {
       } catch (error) {
         const classified = classifyOperationalError(error);
         const gaveUp = this.store.retryBackgroundJob(job.id, classified.code);
+        // Package 1.5: wake the lane up when the retry becomes due. The user
+        // lane has no pump of its own — its drains are queued by ARRIVING
+        // messages — so a deferred message used to sit until the owner wrote
+        // again (or until it aged into the background escalation window). That
+        // is the difference between "the answer is late" and "the question was
+        // lost", and it is exactly the path a wedged turn now takes.
+        if (!gaveUp && ingressLane(job.payload) === "user") {
+          this.scheduleUserIngressRedrain(this.store.getBackgroundJob(job.id)?.runAfter);
+        }
         this.store.appendEvent("telegram.ingress.deferred", {
           correlationId: correlationForUpdate(job.payload.update),
           payload: { jobId: job.id, errorCode: classified.code, gaveUp },
@@ -5873,7 +5997,11 @@ export class OperatorDaemon {
    * is released and the child killed) rather than the next victim punished.
    */
   private async withRuntimeDeadline<T>(label: string, run: () => Promise<T>): Promise<T> {
-    const budgetMs = this.config.operator.turnTimeoutMs;
+    // A FRACTION of the turn timeout, not the whole of it: the CLI's own
+    // watchdog kills the child at `turnTimeoutMs`, so an equal budget would
+    // never fire first and a wedged compaction would hold the single voice for
+    // the full ten minutes before anything noticed.
+    const budgetMs = Math.max(1_000, Math.round(this.config.operator.turnTimeoutMs * 0.5));
     let budget: NodeJS.Timeout | undefined;
     try {
       return await Promise.race([

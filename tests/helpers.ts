@@ -41,11 +41,15 @@ function registerCleanup(cleanup: () => void): void {
     onTestFinished(() => {
       try {
         cleanup();
-      } catch {
-        // Best effort: a leftover temp file must never fail a green test.
+      } catch (error) {
+        // Best effort: a leftover temp file must never fail a green test — but
+        // it must not be invisible either, or /tmp fills up in silence again.
+        console.warn("[tests] temp cleanup failed:", error);
       }
     });
-  } catch {
-    // Called outside a test body (module scope in a fixture): nothing to hook.
+  } catch (error) {
+    // Called outside a test body (module scope, a beforeAll fixture): there is
+    // no test to hook, and the caller is responsible for its own cleanup.
+    console.warn("[tests] temp cleanup not registered (outside a test body):", error);
   }
 }

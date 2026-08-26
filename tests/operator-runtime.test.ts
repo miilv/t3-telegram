@@ -10,6 +10,14 @@ import {
 import type { OperatorEvent, OperatorRuntime, OperatorSession } from "../packages/shared/src/index.js";
 import { tempDirectory } from "./helpers.js";
 
+async function waitForCondition(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) throw new Error("Timed out waiting for runtime state");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe("ClaudeCliOperatorRuntime", () => {
   it("streams text, preserves the session id, and strips daemon secrets", async () => {
     const directory = tempDirectory("fake-claude-");
@@ -477,16 +485,24 @@ process.stdin.on("end", () => {
       binary,
       `#!/usr/bin/env node
 // A CLI that ignores SIGINT entirely: the exact process the watchdog has to
-// write off. The second turn ("next") answers normally, which is the point —
-// the runtime must be usable again the moment the first one is abandoned.
-process.on("SIGINT", () => {});
+// write off. "next" answers slowly but normally — the runtime must be usable
+// again the moment the wedged turn is abandoned — and the wedged one records
+// every signal it can catch, so "killed outright" is an assertion, not a hope
+// (SIGKILL is uncatchable, so an empty log means it really was SIGKILL).
+const fs = require("fs");
+const log = (signal) => { try { fs.appendFileSync(process.env.KILL_LOG, signal + "\\n"); } catch {} };
+process.on("SIGINT", () => log("SIGINT"));
+process.on("SIGTERM", () => log("SIGTERM"));
 let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   console.log(JSON.stringify({ type: "system", session_id: "abandon-session" }));
   if (input.includes("next")) {
-    console.log(JSON.stringify({ type: "result", result: "ответ", session_id: "abandon-session" }));
+    console.log(JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "работаю" } } }));
+    setTimeout(() => {
+      console.log(JSON.stringify({ type: "result", result: "ответ", session_id: "abandon-session" }));
+    }, 1500);
     return;
   }
   console.log(JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "думаю" } } }));
@@ -496,12 +512,15 @@ process.stdin.on("end", () => {
       { mode: 0o700 },
     );
     chmodSync(binary, 0o700);
+    const killLog = join(directory, "kills.log");
+    process.env.KILL_LOG = killLog;
     const runtime = new ClaudeCliOperatorRuntime({
       binary,
       cwd: directory,
       model: "opus",
       effort: "high",
       interruptGraceMs: 500,
+      envPassthrough: ["KILL_LOG"],
     });
     const session = await runtime.start({ systemPrompt: "system" });
 
@@ -538,16 +557,36 @@ process.stdin.on("end", () => {
     runtime.abandon("turn-1");
     // The slot is free immediately, and the wedged child is killed outright
     // rather than left to hold a CPU and its session.
+    // Turn 2 takes the freed slot and runs for a while.
     let answer = "";
-    for await (const event of runtime.sendTurn({
-      sessionId: session.id,
-      prompt: "next",
-      turnToken: "turn-2",
-    })) {
-      if (event.type === "result") answer = event.text;
-    }
+    let secondStarted = false;
+    const second = (async () => {
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "next",
+        turnToken: "turn-2",
+      })) {
+        if (event.type === "text_delta") secondStarted = true;
+        if (event.type === "result") answer = event.text;
+      }
+    })();
+    await waitForCondition(() => secondStarted);
+    // The abandoned turn's own generator settles here — AFTER turn 2 owns the
+    // slot. Its `finally` may not free a slot that is no longer its own: a
+    // third turn overlapping turn 2 must still be refused.
     await wedged;
+    await expect(
+      runtime.sendTurn({ sessionId: session.id, prompt: "third", turnToken: "turn-3" })[
+        Symbol.asyncIterator
+      ]().next(),
+    ).rejects.toThrow(/already has an active turn/u);
+
+    await second;
     expect(answer).toBe("ответ");
+    // The wedged child was killed outright: no SIGINT grace, and nothing it
+    // could catch — an empty log is the signature of SIGKILL.
+    expect(existsSync(killLog) ? readFileSync(killLog, "utf8") : "").toBe("");
+    delete process.env.KILL_LOG;
   }, 20_000);
 });
 

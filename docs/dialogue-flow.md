@@ -336,6 +336,13 @@ threads in. Without that, the third message of a chain would be told "no durable
 work was dispatched" while the thread was still running, and would dispatch it
 twice.
 
+A deferred user-lane job now wakes its own lane when the retry falls due
+(`scheduleUserIngressRedrain`). The user lane has no pump — its drains are
+queued by ARRIVING messages — so a deferred message used to sit until the owner
+wrote again or aged into the background escalation window; that is the
+difference between "the answer is late" and "the question was lost", and the
+zombie replay above takes exactly this path.
+
 The message itself takes the ordinary path: batching, durable ingress job, and a
 new turn on the `user` lane. The first message of a burst frees the turn slot
 while the rest of the burst is still being glued into the one job that replaces
@@ -382,14 +389,19 @@ Operator turn at a time is a session invariant, not a queue detail):
 
 Preemption covers "a new message against a LIVE turn". The watchdog covers the
 case preemption cannot: a turn that does not react to its interrupt at all. It
-ticks every 5 s and fires only when **someone is waiting** — `depth() > 0` on
-the lane queue, any lane. A long turn nobody is queued behind is not a problem
-to solve; the single voice is allowed to think for ten minutes. Non-user lanes
-get a longer budget (×3), not an infinite one: a queue of digest
-interpretations is a waiting party too, and while one is wedged its terminals
-sit under the `voice_relaying` marker, which keeps the degraded fallback
-rolling — so nobody, not even the flat template, ever tells the owner how the
-work ended.
+ticks every 5 s and fires only when **someone is waiting**. "Waiting" is read
+from the DURABLE QUEUE — pending, due `telegram_ingress` jobs — never from the
+lane queue's depth: the reliability pump re-queues a thread-event and a
+background drain every second and clears their "one in flight" flags when the
+task *starts*, so while a turn holds the slot `depth() > 0` is tautologically
+true. On that gate a silent turn would die on the budget with nobody waiting at
+all — and a pure reasoning turn is dead air for minutes by design (bug №18).
+
+A long turn nobody is queued behind is not a problem to solve; the single voice
+is allowed to think. Non-user lanes are waiters too (a wedged digest keeps its
+terminals under the `voice_relaying` marker, which rolls the degraded fallback
+forward, so nobody — not even the flat template — ever tells the owner how the
+work ended), and they get a longer budget: ×3.
 
 ```
 step 1 — STALL          no stream event (token or tool step) for
@@ -422,10 +434,17 @@ step 2 — ZOMBIE         the turn was told to stop (BY ANYONE: the watchdog abo
                             the late final is never enqueued — the superseded
                             machinery already guarantees that;
                           · the owner gets ONE line, the only one the daemon
-                            authors here: «Предыдущий ответ завис — продолжаю с
-                            вашим новым сообщением.» (`operator_zombie_notice`,
-                            never for a synthetic or thread-event turn — nobody
-                            was waiting on those);
+                            authors here, and WHICH line depends on why the turn
+                            died. Replaced by their own newer message:
+                            «Предыдущий ответ завис — продолжаю с вашим новым
+                            сообщением.» Wedged with nobody replacing it: the
+                            question is still unanswered, so the durable ingress
+                            job is REPLAYED and the line says «Ответ завис —
+                            попробую ещё раз.» Dropping it there would lose the
+                            message outright. One line per chat per minute
+                            (`operator_zombie_notice`), and none at all for a
+                            synthetic or thread-event turn — nobody was waiting
+                            on those;
                           · `operator.turn.zombie` is recorded, and the work the
                             turn had dispatched travels to the next turn in
                             `chat_pending` exactly like any supersession.
@@ -556,6 +575,12 @@ resource is the runtime's own slot — `abandon(turnToken)` on both CLI runtimes
 clears `active`/`activeTurnToken` and SIGKILLs the child immediately (no SIGINT
 grace: it already had its interrupt), and the generator's `finally` only clears
 the slot if it still owns it, so a late settle cannot free a live turn's slot.
+
+`compact()` and the provider-switch handoff are not turns — same serial runtime,
+no turn token, invisible to the watchdog — so they carry their own deadline of
+**half** `OPERATOR_TURN_TIMEOUT_MS` (an equal budget would never fire before the
+CLI's internal SIGKILL), and on expiry they repair the RESOURCE:
+`runtime.abandon()` frees the slot instead of leaving the next turn to pay.
 See §4 for the full stall→grace→zombie sequence and its config
 (`WATCHDOG_STALL_SECONDS`, `WATCHDOG_GRACE_SECONDS`).
 

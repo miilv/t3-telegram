@@ -254,6 +254,47 @@ describe("HttpT3Broker", () => {
     ]);
   });
 
+  it("falls back to the envelope correlation id when a turn start carries no command id (package 1.5)", async () => {
+    const liveClient = new FakeLiveClient();
+    const broker = new HttpT3Broker(
+      {
+        baseUrl: fixture.url,
+        providerInstanceId: "claude",
+        model: "claude-opus-4-1",
+        runtimeMode: "approval-required",
+        pollIntervalMs: 5,
+        liveClient,
+      },
+      store,
+      pino({ enabled: false }),
+    );
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: "/tmp/acme" });
+    const thread = await broker.createThread({ projectId: project.id, title: "Auth" });
+    await broker.sendTurn({ threadId: thread.id, text: "Fix auth", commandId: "cmd_ours" });
+    liveClient.threadItems = [
+      // `commandId` is nullable in the contract; `correlationId` carries the id
+      // of the command that CAUSED the event, which is the same identity for a
+      // turn start we asked for.
+      t3Event(
+        4,
+        "thread.turn-start-requested",
+        { threadId: thread.id, messageId: "cmd_ours:message" },
+        { commandId: null, correlationId: "cmd_ours" },
+      ),
+      t3Event(5, "thread.session-set", {
+        session: { status: "ready", activeTurnId: null, lastError: null },
+      }),
+    ];
+
+    const events = [];
+    for await (const event of broker.subscribeThread(thread.id)) events.push(event);
+
+    expect(events.filter((event) => event.type === "started")).toEqual([
+      { type: "started", threadId: thread.id, turnId: "turn_1" },
+      { type: "started", threadId: thread.id, commandId: "cmd_ours" },
+    ]);
+  });
+
   it("forwards intermediate agent narration but never the final answer twice", async () => {
     const liveClient = new FakeLiveClient();
     const broker = new HttpT3Broker(
