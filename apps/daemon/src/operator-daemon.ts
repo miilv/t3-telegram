@@ -1194,16 +1194,23 @@ export class OperatorDaemon {
       this.store.appendEvent("journals.pruned", { payload: pruned });
     }
 
+    if (reason !== "startup") await this.recoverWorkers();
+
     // Package 3.1 — the night secretary (memory-design §5). Its own gates are
     // inside: a 02:00–04:00 owner-local window, one attempt per logical day,
     // and a deterministic `has_work()` before any token is spent. From here it
-    // costs three indexed counts on every other tick.
+    // costs one Intl call on most ticks and three indexed counts on the first
+    // tick of a night.
     //
-    // It runs OUTSIDE the runtime queue on purpose, exactly like mediation:
-    // the pass belongs to the Claude branch's one-shot channel and must never
+    // It runs OUTSIDE the runtime queue on purpose, exactly like mediation: the
+    // pass belongs to the Claude branch's one-shot channel and must never
     // occupy, or wait behind, the main session (§5).
+    //
+    // LAST in the tick, because it is the only step here that can take minutes.
+    // Delivery is unaffected either way — the reliability pump owns the outbox
+    // and the T3 drains on its own one-second loop — but worker recovery runs
+    // only from this tick, and it has no business waiting behind hygiene.
     const scribeRun = await this.runNightScribe();
-    if (reason !== "startup") await this.recoverWorkers();
     const completedAt = nowIso();
     this.store.setRuntimeState("last_maintenance_at", completedAt);
     this.store.appendEvent("maintenance.completed", {
