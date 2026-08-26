@@ -311,6 +311,20 @@ export const AUTOMATION_STATUS_RU: Record<Automation["status"], string> = {
   deleted: "удалена",
 };
 
+/**
+ * «лимит 1 параллельных работ» is the kind of seam that makes an assistant
+ * read like a form letter. Returns the count together with the right form.
+ */
+export function pluralRu(count: number, one: string, few: string, many: string): string {
+  const abs = Math.abs(Math.trunc(count));
+  const lastTwo = abs % 100;
+  const last = abs % 10;
+  if (lastTwo >= 11 && lastTwo <= 14) return `${count} ${many}`;
+  if (last === 1) return `${count} ${one}`;
+  if (last >= 2 && last <= 4) return `${count} ${few}`;
+  return `${count} ${many}`;
+}
+
 export function threadStatusRu(status: string): string {
   return THREAD_STATUS_RU[status as ThreadStatus] ?? status;
 }

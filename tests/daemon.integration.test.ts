@@ -442,7 +442,7 @@ describe("OperatorDaemon product flow", () => {
     // cannot reach anything beyond the safe list survives in this form.
     telegram.push(messageAs(3, "/focus clear", 11));
     await waitFor(() =>
-      telegram.sent.some((entry) => entry.text.includes("Ваша роль viewer разрешает только")),
+      telegram.sent.some((entry) => entry.text.includes("Ваша роль `viewer` разрешает только")),
     );
     expect(telegram.sent.at(-1)?.text).not.toContain("/focus");
 
@@ -6653,10 +6653,10 @@ describe("OperatorDaemon product flow", () => {
     expect(runtime.resumedProviders).toEqual(["claude"]);
     expect(store.getRuntimeState("operator_provider")).toBe("claude");
     await waitFor(() =>
-      telegram.sent.some((entry) => entry.text.includes("Провайдер «codex» недоступен")),
+      telegram.sent.some((entry) => entry.text.includes("Движок «codex» недоступен")),
     );
     expect(
-      telegram.sent.filter((entry) => entry.text.includes("Провайдер «codex» недоступен")),
+      telegram.sent.filter((entry) => entry.text.includes("Движок «codex» недоступен")),
     ).toHaveLength(1);
 
     const run = daemon.run();
@@ -8012,6 +8012,24 @@ describe("OperatorDaemon product flow", () => {
     const help = telegram.sent.findLast((entry) => entry.text.startsWith("## Operator"))!.text;
     for (const english of ["persistent", "durable", "work threads", "proactive", "controls"]) {
       expect(help).not.toContain(english);
+    }
+
+    // The owner-only surfaces used to be the last English holdouts: they had
+    // no tests, which is exactly why they survived two sweeps (review).
+    telegram.push(message(6, "/policy"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Текущие настройки")));
+    telegram.push(message(7, "/operator"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Движок")));
+    telegram.push(message(8, "/operator switch nope"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Такой движок недоступен")));
+    telegram.push(message(9, "/team"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Команда")));
+    telegram.push(message(10, "/policy set nonsense 1"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Использование: `/policy set")));
+    telegram.push(message(11, "/automation add every 3 nonsense"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Разделите")));
+    for (const english of ["Live policy", "Operator runtime", "Provider недоступен", "Alias", "owner/admin", "invalid"]) {
+      expect(telegram.sent.some((entry) => entry.text.includes(english))).toBe(false);
     }
 
     telegram.push(message(5, "/memory compact"));

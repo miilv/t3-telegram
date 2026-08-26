@@ -169,7 +169,7 @@ export function classifyOperationalError(
     return classified("ARTIFACT_REJECTED", false, false, "Файл не прошёл проверку безопасности или ограничений размера.");
   }
   if (subsystem === "operator") {
-    return classified("OPERATOR_UNAVAILABLE", true, false, "Operator runtime временно недоступен.");
+    return classified("OPERATOR_UNAVAILABLE", true, false, "Движок временно недоступен.");
   }
   return classified("UNKNOWN", false, false, "Произошла внутренняя ошибка; подробности сохранены в диагностике.");
 }

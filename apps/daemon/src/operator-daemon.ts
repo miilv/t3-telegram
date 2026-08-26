@@ -35,6 +35,7 @@ import type {
 } from "../../../packages/shared/src/index.js";
 import {
   approvalRiskRu,
+  pluralRu,
   threadStatusRu,
   AUTOMATION_STATUS_RU,
   fenceUntrusted,
@@ -738,7 +739,7 @@ export class OperatorDaemon {
         ownerChatId,
         "rich",
         {
-          text: `Провайдер «${storedProvider}» недоступен, продолжаю работу на «${resolved}».`,
+          text: `Движок «${storedProvider}» недоступен, продолжаю работу на «${resolved}».`,
           options: {},
           messageType: "provider_fallback_notice",
         },
@@ -1119,7 +1120,7 @@ export class OperatorDaemon {
     }
 
     if (this.roleForUser(update.userId) === "viewer" && !isViewerSafeMessage(update.text)) {
-      await this.commandReply(update, "Ваша роль viewer разрешает только `/status`, `/projects`, `/work` и `/help`.");
+      await this.commandReply(update, "Ваша роль `viewer` разрешает только `/status`, `/projects`, `/work` и `/help`.");
       return;
     }
 
@@ -4420,13 +4421,13 @@ export class OperatorDaemon {
     }
     if (command === "/dashboard") {
       if (!this.isAdministrator(update.userId)) {
-        await this.commandReply(update, "Dashboard доступен только owner/admin.");
+        await this.commandReply(update, "Панель доступна только владельцу и админам.");
         return true;
       }
       const link = this.dashboard?.link();
       await this.commandReply(update, link
-          ? `Локальный dashboard: ${link}\n\nСсылка работает только на машине daemon и содержит временную process capability.`
-          : "Dashboard отключён в конфигурации.");
+          ? `Локальная панель: ${link}\n\nСсылка работает только на машине демона и содержит временный ключ доступа.`
+          : "Панель отключена в конфигурации.");
       return true;
     }
     if (command === "/policy") {
@@ -4471,7 +4472,7 @@ export class OperatorDaemon {
     }
     if (command === "/debug") {
       if (!this.isAdministrator(update.userId)) {
-        await this.commandReply(update, "Диагностика доступна только owner/admin.");
+        await this.commandReply(update, "Диагностика доступна только владельцу и админам.");
         return true;
       }
       const [t3, operator, telegram] = await Promise.all([
@@ -4488,7 +4489,7 @@ export class OperatorDaemon {
         "utf8",
       );
       const capabilities = telegram.capabilities
-        ? `rich-final=${telegram.capabilities.richFinal}, rich-draft=${telegram.capabilities.richDraft}, plain-draft=${telegram.capabilities.plainDraft}`
+        ? `rich-final=${telegram.capabilities.richFinal}, rich-draft=${telegram.capabilities.richDraft}, plain-draft=${telegram.capabilities.plainDraft}, expandable-quote=${telegram.capabilities.expandableQuote}`
         : "unknown";
       const metricSnapshot = safeExcerpt(JSON.stringify(metrics.snapshot()), 3_500);
       await this.commandReply(update, [
@@ -4535,14 +4536,14 @@ export class OperatorDaemon {
       projectId: project.id,
       payload: { alias, actorUserId: String(update.userId) },
     });
-    await this.commandReply(update, `Alias **${escapeMarkdownText(alias)}** привязан к **${escapeMarkdownText(project.name)}**.`);
+    await this.commandReply(update, `Алиас **${escapeMarkdownText(alias)}** привязан к проекту **${escapeMarkdownText(project.name)}**.`);
   }
 
   private async handleAutomationCommand(
     update: Extract<TelegramInbound, { type: "message" }>,
   ): Promise<void> {
     if (this.roleForUser(update.userId) === "viewer") {
-      await this.commandReply(update, "Роль viewer не может управлять automations.");
+      await this.commandReply(update, "Роль `viewer` не может управлять автоматизациями.");
       return;
     }
     const input = update.text.replace(/^\/automations?(?:@\w+)?\s*/iu, "").trim();
@@ -4622,9 +4623,9 @@ export class OperatorDaemon {
         ...(automation.projectId ? { projectId: automation.projectId } : {}),
         payload: { automationId: automation.id, ownerId: automation.ownerId, schedule: automation.schedule },
       });
-      await this.commandReply(update, `Создано **${escapeMarkdownText(automation.name)}** · \`${automation.id}\`\n\n${automationScheduleLabel(automation.schedule)} · next ${automation.nextRunAt}`);
+      await this.commandReply(update, `Создано **${escapeMarkdownText(automation.name)}** · \`${automation.id}\`\n\n${automationScheduleLabel(automation.schedule)} · следующий запуск ${automation.nextRunAt}`);
     } catch (error) {
-      await this.commandReply(update, `Automation отклонена: ${escapeMarkdownText(error instanceof Error ? error.message : "invalid schedule")}`);
+      await this.commandReply(update, `Автоматизация отклонена: ${escapeMarkdownText(error instanceof Error ? error.message : "некорректное расписание")}`);
     }
   }
 
@@ -4632,18 +4633,18 @@ export class OperatorDaemon {
     update: Extract<TelegramInbound, { type: "message" }>,
   ): Promise<void> {
     if (!this.isAdministrator(update.userId)) {
-      await this.commandReply(update, "Policy доступна только owner/admin.");
+      await this.commandReply(update, "Настройки доступны только владельцу и админам.");
       return;
     }
     const input = update.text.replace(/^\/policy(?:@\w+)?\s*/iu, "").trim();
     if (!input) {
       const policy = this.getPolicy();
-      await this.commandReply(update, `## Live policy\n\n${Object.entries(policy).map(([key, value]) => `- **${escapeMarkdownText(key)}**: \`${Array.isArray(value) ? value.join(",") : value}\``).join("\n")}\n\nИзменить: \`/policy set <key> <value>\`.`);
+      await this.commandReply(update, `## Текущие настройки\n\n${Object.entries(policy).map(([key, value]) => `- **${escapeMarkdownText(key)}**: \`${Array.isArray(value) ? value.join(",") : value}\``).join("\n")}\n\nИзменить: \`/policy set <ключ> <значение>\`.`);
       return;
     }
     const match = /^set\s+(\w+)\s+(.+)$/iu.exec(input);
     if (!match || !(match[1]! in this.getPolicy())) {
-      await this.commandReply(update, "Использование: `/policy set <known-key> <value>`.");
+      await this.commandReply(update, "Использование: `/policy set <известный-ключ> <значение>`.");
       return;
     }
     const key = match[1]! as keyof OperatorPolicySettings;
@@ -4658,7 +4659,7 @@ export class OperatorDaemon {
       this.store.appendEvent("policy.updated", { payload: { source: "telegram", key } });
       await this.commandReply(update, `Настройка **${escapeMarkdownText(key)}** сохранена: \`${Array.isArray(policy[key]) ? policy[key].join(",") : policy[key]}\`.`);
     } catch (error) {
-      await this.commandReply(update, `Policy отклонена: ${escapeMarkdownText(error instanceof Error ? error.message : "invalid value")}`);
+      await this.commandReply(update, `Настройка отклонена: ${escapeMarkdownText(error instanceof Error ? error.message : "некорректное значение")}`);
     }
   }
 
@@ -4666,28 +4667,28 @@ export class OperatorDaemon {
     update: Extract<TelegramInbound, { type: "message" }>,
   ): Promise<void> {
     if (!this.isAdministrator(update.userId)) {
-      await this.commandReply(update, "Operator runtime доступен только owner/admin.");
+      await this.commandReply(update, "Управление движком доступно только владельцу и админам.");
       return;
     }
     const current = this.runtime.currentProvider?.() ?? this.config.operator.provider;
     const available = this.runtime.availableProviders?.() ?? [current];
     const input = update.text.replace(/^\/operator(?:@\w+)?\s*/iu, "").trim();
     if (!input || input.toLocaleLowerCase() === "status") {
-      await this.commandReply(update, `## Operator runtime\n\nТекущий provider: **${escapeMarkdownText(current)}**\nДоступны: ${available.map((provider) => `\`${escapeMarkdownText(provider)}\``).join(", ")}\n\nПереключить: \`/operator switch <provider>\`.`);
+      await this.commandReply(update, `## Движок\n\nСейчас работает: **${escapeMarkdownText(current)}**\nДоступны: ${available.map((provider) => `\`${escapeMarkdownText(provider)}\``).join(", ")}\n\nПереключить: \`/operator switch <движок>\`.`);
       return;
     }
     const match = /^switch\s+([a-z0-9_-]+)$/iu.exec(input);
     const providerId = match?.[1]?.toLocaleLowerCase();
     if (!providerId || !available.includes(providerId)) {
-      await this.commandReply(update, `Provider недоступен. Выберите: ${available.map((provider) => `\`${escapeMarkdownText(provider)}\``).join(", ")}.`);
+      await this.commandReply(update, `Такой движок недоступен. Выберите: ${available.map((provider) => `\`${escapeMarkdownText(provider)}\``).join(", ")}.`);
       return;
     }
     if (providerId === current) {
-      await this.commandReply(update, `Operator уже использует **${escapeMarkdownText(current)}**.`);
+      await this.commandReply(update, `Уже работает на **${escapeMarkdownText(current)}**.`);
       return;
     }
     if (!this.runtime.switchProvider) {
-      await this.commandReply(update, "Этот runtime не поддерживает переключение provider.");
+      await this.commandReply(update, "Этот движок не поддерживает переключение.");
       return;
     }
     try {
@@ -4727,9 +4728,9 @@ export class OperatorDaemon {
           restored: restored.trim() === "PROVIDER_CONTEXT_RESTORED",
         },
       });
-      await this.commandReply(update, `Operator переключён: **${escapeMarkdownText(current)}** → **${escapeMarkdownText(providerId)}**. Контекст восстановлен.`);
+      await this.commandReply(update, `Движок переключён: **${escapeMarkdownText(current)}** → **${escapeMarkdownText(providerId)}**. Контекст восстановлен.`);
     } catch (error) {
-      await this.commandReply(update, `Переключение не выполнено: ${escapeMarkdownText(error instanceof Error ? error.message : "runtime error")}`);
+      await this.commandReply(update, `Переключение не выполнено: ${escapeMarkdownText(error instanceof Error ? error.message : "ошибка движка")}`);
     }
   }
 
@@ -4737,14 +4738,14 @@ export class OperatorDaemon {
     update: Extract<TelegramInbound, { type: "message" }>,
   ): Promise<void> {
     if (!this.isAdministrator(update.userId)) {
-      await this.commandReply(update, "Команда доступна только owner/admin.");
+      await this.commandReply(update, "Команда доступна только владельцу и админам.");
       return;
     }
     const args = update.text.trim().split(/\s+/).slice(1);
     if (!args.length || args[0]?.toLocaleLowerCase() === "list") {
       const members = this.store.listTeamMembers();
       await this.commandReply(update, members.length
-          ? `## Команда\n\n${members.map((member) => `- \`${member.userId}\` — **${member.role}**${member.displayName ? ` · ${escapeMarkdownText(member.displayName)}` : ""}`).join("\n")}`
+          ? `## Команда\n\n${members.map((member) => `- \`${member.userId}\` — \`${member.role}\`${member.displayName ? ` · ${escapeMarkdownText(member.displayName)}` : ""}`).join("\n")}`
           : "Команда пока пуста.");
       return;
     }
@@ -4772,7 +4773,7 @@ export class OperatorDaemon {
     this.store.appendEvent("team.role.updated", {
       payload: { actorUserId: String(update.userId), targetUserId: rawUserId, role: rawRole },
     });
-    await this.commandReply(update, `Роль \`${rawUserId}\` обновлена: **${escapeMarkdownText(rawRole)}**.`);
+    await this.commandReply(update, `Роль \`${rawUserId}\` обновлена: \`${escapeMarkdownText(rawRole)}\`.`);
   }
 
   private async handleShareCommand(
@@ -4796,7 +4797,7 @@ export class OperatorDaemon {
     }
     const actorAccess = this.store.getProjectAccess(project.id, String(update.userId));
     if (!this.isAdministrator(update.userId) && actorAccess !== "owner") {
-      await this.commandReply(update, "Делиться проектом может owner проекта или team admin.");
+      await this.commandReply(update, "Делиться проектом может владелец проекта или админ команды.");
       return;
     }
     const target = this.store.getTeamMember(rawUserId);
@@ -4805,7 +4806,7 @@ export class OperatorDaemon {
       return;
     }
     if (target.role === "viewer" && rawAccess !== "viewer") {
-      await this.commandReply(update, "Team viewer можно выдать только viewer-доступ.");
+      await this.commandReply(update, "Участнику с ролью `viewer` можно выдать только доступ `viewer`.");
       return;
     }
     this.store.upsertProject(project);
@@ -4814,7 +4815,7 @@ export class OperatorDaemon {
       projectId: project.id,
       payload: { actorUserId: String(update.userId), targetUserId: rawUserId, access: rawAccess },
     });
-    await this.commandReply(update, `Доступ к **${escapeMarkdownText(project.name)}** для \`${rawUserId}\`: **${escapeMarkdownText(rawAccess)}**.`);
+    await this.commandReply(update, `Доступ к **${escapeMarkdownText(project.name)}** для \`${rawUserId}\`: \`${escapeMarkdownText(rawAccess)}\`.`);
   }
 
   private async handleMemoryCommand(
@@ -5792,7 +5793,7 @@ export class OperatorDaemon {
       const limit = this.getPolicy().maxParallelWorkers;
       this.store.retryBackgroundJob(job.id, "PARALLEL_WORKER_LIMIT", Number.MAX_SAFE_INTEGER);
       this.enqueueTelegramOutbox(`telegram:${payload.commandId}:worker-limit`, payload.chatId, "rich", {
-        text: `Достигнут лимит ${limit} параллельных работ — запуск отложен до освобождения слота.`,
+        text: `Достигнут лимит ${pluralRu(limit, "параллельной работы", "параллельных работ", "параллельных работ")} — запуск отложен до освобождения слота.`,
         options: { ...payload.destination, replyToMessageId: payload.originMessageId },
         messageType: "t3_dispatch_deferred",
         projectId: payload.projectId,

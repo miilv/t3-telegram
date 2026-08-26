@@ -1,5 +1,5 @@
 import type { Automation, AutomationSchedule } from "../../shared/src/index.js";
-import { newId, ownerLocalParts, resolveTimeZone } from "../../shared/src/index.js";
+import { newId, ownerLocalParts, pluralRu, resolveTimeZone } from "../../shared/src/index.js";
 
 export function createAutomation(input: {
   ownerId: string;
@@ -156,6 +156,10 @@ function timeZoneOffsetMs(date: Date, timeZone: string): number {
 
 export function automationScheduleLabel(schedule: AutomationSchedule): string {
   if (schedule.type === "once") return `однократно ${schedule.runAt}`;
-  if (schedule.type === "interval") return `каждые ${schedule.intervalMinutes} мин`;
+  if (schedule.type === "interval") {
+    return schedule.intervalMinutes === 1
+      ? "каждую минуту"
+      : `каждые ${pluralRu(schedule.intervalMinutes, "минуту", "минуты", "минут")}`;
+  }
   return `ежедневно ${schedule.timeOfDay} ${schedule.timeZone}`;
 }
