@@ -417,6 +417,11 @@ CREATE TABLE IF NOT EXISTS now_items (
 --   entry stays. Matching on prose instead would make the answer depend on how
 --   an LLM happened to word a sentence, and a false negative there duplicates
 --   an entry every single night.
+--
+--   `origin_job` + `create_seq` — durable identity of each agent-authored
+--   `journal.note`. Ingress can replay a whole turn after a crash; the ordinal
+--   distinguishes several notes in that turn while the partial unique index
+--   makes replay return the original row instead of a `slug-2` duplicate.
 CREATE TABLE IF NOT EXISTS journal_entries (
   slug       TEXT PRIMARY KEY,
   day        TEXT NOT NULL,
@@ -424,6 +429,8 @@ CREATE TABLE IF NOT EXISTS journal_entries (
   source     TEXT NOT NULL,
   kind       TEXT NOT NULL DEFAULT 'entry',
   thread_ref TEXT,
+  origin_job TEXT,
+  create_seq INTEGER,
   created_at TEXT NOT NULL
 );
 
@@ -465,6 +472,9 @@ CREATE INDEX IF NOT EXISTS idx_journal_entries_day
 -- PARTIAL, because only archives carry a thread.
 CREATE INDEX IF NOT EXISTS idx_journal_entries_thread
   ON journal_entries(thread_ref, day DESC) WHERE thread_ref IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_entries_replay
+  ON journal_entries(origin_job, create_seq)
+  WHERE origin_job IS NOT NULL AND create_seq IS NOT NULL;
 
 DELETE FROM operator_note_search;
 -- The description is indexed WITH the content (package 3.1, memory-design

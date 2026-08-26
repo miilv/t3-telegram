@@ -1,31 +1,4 @@
-/**
- * Package 3.1 — the night secretary (memory-design §2.4, §5, §8.3).
- *
- * A separate file for the same reason `voice.ts` is one: the boundary is real.
- * This module owns one pass, end to end —
- *
- *   window + day gate → has_work() → deterministic reconciliation
- *                     → one-shot passes on the CLAUDE branch
- *                     → journal writes
- *                     → (on failure) a recorded skip, a catch-up, and after
- *                       three, ONE orchestrator turn
- *
- * — and it owns nothing else. The daemon supplies storage, the background
- * channel, the projection and a way to ask the orchestrator to speak.
- *
- * Two properties are load-bearing and easy to lose in a refactor:
- *
- *   - **Nothing here writes to the chat.** The two owner-facing outputs are
- *     PROMPTS handed to `requestOwnerTurn`, which turns them into a synthetic
- *     turn. Single-voice: the daemon has no mouth, and a background job that
- *     grew one would be a new direct path in a codebase that spent package 1.2
- *     removing them.
- *
- *   - **The deterministic half runs before, and independently of, the model.**
- *     TTL transfers and the event-log reconciliation are database work. They
- *     survive an unavailable provider, they are idempotent under the catch-up,
- *     and they are what makes a skipped night cost only its narrative.
- */
+/** Package 3.1 night-scribe orchestration. */
 import type { Logger } from "pino";
 import {
   type JournalEntry,
@@ -36,335 +9,171 @@ import {
   ownerLogicalDay,
 } from "../../../packages/shared/src/index.js";
 import {
-  type ScribeEvent,
   type ScribeWorkVerdict,
   type UnfiledWork,
-  SCRIBE_CATCHUP_WINDOW_MS,
   SCRIBE_LAST_DAY_KEY,
   SCRIBE_LAST_ROLLUP_KEY,
-  SCRIBE_LAST_RUN_KEY,
-  SCRIBE_MISS_ALERT_KEY,
-  SCRIBE_MISS_ALERT_THRESHOLD,
-  SCRIBE_MISS_COUNT_KEY,
   SCRIBE_ONESHOT_TIMEOUT_MS,
-  SCRIBE_SIGNIFICANT_EVENT_TYPES,
+  SCRIBE_RECOVERY_RUN_KEY,
   SCRIBE_WINDOW_FROM_HOUR,
   SCRIBE_WINDOW_TO_HOUR,
   SCRIBE_WORK_EVENT_PREFIXES,
   buildDailySummaryPrompt,
   buildDescriptionPrompt,
-  buildMissAlertPrompt,
   buildMonthlyProposalPrompt,
   buildRollupPrompt,
   firstDayOfMonth,
   hasScribeWork,
   lastDayOfMonth,
+  normalizeDailySummary,
   parseDescriptions,
   parseRollup,
   previousMonth,
   reconcileArchivesAgainstLedger,
-  renderExpiredItemJournalBody,
-  renderRecoveredEntryBody,
-  renderScribeSkipBody,
   rollupSlug,
   scribeTargetDay,
-  selectUnfiledWork,
-  skipSlug,
   summarySlug,
 } from "../../../packages/policy/src/index.js";
 import type { OperatorStore } from "../../../packages/storage/src/index.js";
+import { ScribeFinalizer, type ScribeProgress } from "./scribe-finalization.js";
+import type { ScribeRunOutcome } from "./scribe-finalization.js";
+import { ScribeReconciler } from "./scribe-reconciler.js";
 
-/** How many finished threads one night may recover; the rest wait a night. */
-const RECOVERY_BATCH = 20;
-/** How many expired items one night files. */
+export type { ScribeRunOutcome, ScribeRunStatus } from "./scribe-finalization.js";
+
 const TTL_BATCH = 50;
-/** How many legacy notes one night describes — "лениво" is the whole point. */
 const DESCRIPTION_BATCH = 10;
-/** Journal rows one rollup reads; a busy month is summarised, not transcribed. */
 const ROLLUP_ENTRY_LIMIT = 300;
-/** Expired facts carried into the monthly turn. */
 const EXPIRED_FACT_LIMIT = 10;
-/**
- * Days one night may write summaries for (§5's 48-hour catch-up).
- *
- * Three: the day that just ended plus the two a 48-hour window can reach. Past
- * that the event log has usually been pruned out from under the gap, and a
- * narrative written from what is left would read complete without being it.
- */
 const CATCHUP_DAY_LIMIT = 3;
 
 export interface NightScribeDeps {
   store: OperatorStore;
   logger: Logger;
-  /** The ledger owner — the same id `now_items` is keyed by. */
   ownerId: () => string;
   timeZone: () => string | undefined;
   language: () => string;
-  /**
-   * §5: the Claude branch of the switchable runtime, whatever the main session
-   * is running. Absent or rejecting means "skip the night", never "fall back".
-   */
   backgroundOneShot?: (input: { prompt: string; timeoutMs?: number }) => Promise<string>;
-  /** Package 2.2's projection; converged before the ledger is read. */
   reconcileNowItems: () => void;
-  /**
-   * Single-voice. The scribe hands over a PROMPT and the orchestrator says
-   * whatever it decides to say — this is not a delivery callback.
-   */
-  requestOwnerTurn: (input: { dedupeKey: string; prompt: string }) => void;
+  /** True only after the owner turn has been durably enqueued. */
+  requestOwnerTurn: (input: { dedupeKey: string; prompt: string }) => boolean;
   now?: () => Date;
   timeoutMs?: number;
 }
 
-export type ScribeRunStatus =
-  | "outside-window"
-  | "already-ran"
-  | "no-channel"
-  | "no-work"
-  | "completed"
-  | "skipped";
-
-export interface ScribeRunOutcome {
-  status: ScribeRunStatus;
-  /** The logical day the run files under — the one that has ended. */
-  day: string;
-  /** Which has_work signals fired. */
-  reasons: string[];
-  /** Background LLM calls actually made. Zero on a quiet night, by contract. */
-  llmCalls: number;
-  recovered: number;
-  expired: number;
-  described: number;
-  rollupMonth?: string;
-  /** Consecutive skips after this run, on the skip path. */
-  misses?: number;
-  detail?: string;
-  /** True when the catch-up could not reach back to the last completed run. */
-  truncated?: boolean;
-}
-
-/** Raised when the background channel is unusable; the caller turns it into a skip. */
 class ScribeChannelUnavailable extends Error {}
 
 export class NightScribe {
-  constructor(private readonly deps: NightScribeDeps) {}
+  private readonly finalizer: ScribeFinalizer;
+  private readonly reconciler: ScribeReconciler;
+
+  constructor(private readonly deps: NightScribeDeps) {
+    this.finalizer = new ScribeFinalizer(deps);
+    this.reconciler = new ScribeReconciler(deps);
+  }
 
   private now(): Date {
     return this.deps.now?.() ?? new Date();
   }
 
-  /**
-   * One night's pass.
-   *
-   * `force` exists for the operator's own hand and for tests; it skips the
-   * clock window and the once-a-day gate, and nothing else — a forced run is
-   * still gated by `has_work`, still runs on the Claude branch, and still
-   * records a skip when the branch is down.
-   */
   async run(options: { force?: boolean } = {}): Promise<ScribeRunOutcome> {
     const at = this.now();
     const timeZone = this.deps.timeZone();
     if (!options.force && !isWithinLocalWindow(at, timeZone, SCRIBE_WINDOW_FROM_HOUR, SCRIBE_WINDOW_TO_HOUR)) {
-      return this.idleOutcome("outside-window", ownerLogicalDay(at, timeZone));
+      return this.finalizer.idle("outside-window", ownerLogicalDay(at, timeZone));
     }
-    // No background channel AT ALL is a different thing from the Claude branch
-    // being down, and only the second one is §5's skip.
-    //
-    // `SwitchableOperatorRuntime` always DEFINES `backgroundOneShot` and rejects
-    // from inside it when the Claude branch is missing — that is the outage §5
-    // describes, and it takes the recorded-skip road below. A missing METHOD
-    // means the daemon is not running the switchable runtime at all (an
-    // embedded runtime, a test double): there is no branch to be unavailable,
-    // nobody can fix it at runtime, and filing a skip every night forever —
-    // then paging the owner about it on the third — would be inventing an
-    // outage out of a configuration.
+    this.finalizer.flushPendingOwnerTurns();
     if (!this.deps.backgroundOneShot) {
-      return this.idleOutcome("no-channel", ownerLogicalDay(at, timeZone));
+      return this.finalizer.idle("no-channel", ownerLogicalDay(at, timeZone));
     }
     const day = scribeTargetDay({
       logicalDay: ownerLogicalDay(at, timeZone),
       localHour: ownerLocalParts(at, timeZone).hour,
     });
-    // One ATTEMPT per night, success or skip. Without this the per-minute
-    // maintenance tick would re-enter a failing run every sixty seconds for two
-    // hours — a hundred and twenty one-shot attempts against a provider that is
-    // already known to be down. The catch-up is the NEXT night's job (§5), and
-    // it works because the cursor below only moves when the run completed.
     if (!options.force && this.deps.store.getRuntimeState(SCRIBE_LAST_DAY_KEY) === day) {
-      return this.idleOutcome("already-ran", day);
+      return this.finalizer.idle("already-ran", day);
     }
 
-    const cursor = this.reconciliationCursor(at);
-    const ownerId = this.deps.ownerId();
     const store = this.deps.store;
-
-    // ---- the gate, before anything is spent (§5) --------------------------
-    const expiredItems = store.listExpiredNowItems({
-      ownerId,
-      at: at.toISOString(),
-      limit: TTL_BATCH,
-    });
-    const notesToDescribe = store.listNotesMissingDescription(DESCRIPTION_BATCH);
-    const rollupMonth = this.dueRollupMonth(day);
-    const summaryDays = this.daysOwedASummary({ day, since: cursor.since, timeZone });
-    const verdict: ScribeWorkVerdict = hasScribeWork({
-      events: store.countDaemonEventsSince(cursor.since, SCRIBE_WORK_EVENT_PREFIXES),
-      messages: store.countTelegramMessagesSince(cursor.since),
-      expiredItems: expiredItems.length,
-      changedItems: store.countNowItemsUpdatedSince(ownerId, cursor.since),
-      notesMissingDescription: notesToDescribe.length,
-      rollupDue: Boolean(rollupMonth),
-      summariesDue: summaryDays.length,
-    });
-    if (!verdict.work) {
-      // A quiet night still counts as a night that ran: the cursor moves, so
-      // the window does not grow without bound, and the day gate stops the
-      // remaining ticks. What it deliberately does NOT touch is the miss
-      // counter — a night with nothing to do proves nothing about whether the
-      // background channel is alive.
-      store.setRuntimeState(SCRIBE_LAST_DAY_KEY, day);
-      store.setRuntimeState(SCRIBE_LAST_RUN_KEY, at.toISOString());
-      store.appendEvent("memory.scribe.idle", { payload: { day, since: cursor.since } });
-      return { ...this.idleOutcome("no-work", day), reasons: verdict.reasons };
-    }
-
-    // ---- deterministic half: no model, no network -------------------------
-    this.deps.reconcileNowItems();
-    const expired = this.fileExpiredItems(expiredItems, at);
-    const events = this.readEvents(cursor.since);
-    const recovered = this.recoverUnfiledWork(events, timeZone);
-
-    // ---- the model half ---------------------------------------------------
-    let llmCalls = 0;
-    let described = 0;
+    const progress: ScribeProgress = { reasons: [], llmCalls: 0, recovered: 0, expired: 0, described: 0 };
     try {
-      llmCalls += await this.writeDailySummaries({ day, summaryDays, timeZone, expired, recovered });
-      if (rollupMonth) llmCalls += await this.writeRollup(rollupMonth, day);
+      const cursor = this.reconciler.cursor(at);
+      const recoverySince = this.reconciler.recoveryCursor(cursor.since);
+      const ownerId = this.deps.ownerId();
+      const expiredItems = store.listExpiredNowItems({ ownerId, at: at.toISOString(), limit: TTL_BATCH });
+      const notesToDescribe = store.listNotesMissingDescription(DESCRIPTION_BATCH);
+      const rollupMonth = this.dueRollupMonth(day);
+      const summaryDays = this.daysOwedASummary({ day, since: cursor.since, timeZone });
+      const pendingRecovery = this.reconciler.pendingRecovery(recoverySince);
+      const verdict: ScribeWorkVerdict = hasScribeWork({
+        events: store.countDaemonEventsSince(cursor.since, SCRIBE_WORK_EVENT_PREFIXES),
+        messages: store.countTelegramMessagesSince(cursor.since),
+        expiredItems: expiredItems.length,
+        changedItems: store.countNowItemsUpdatedSince(ownerId, cursor.since),
+        notesMissingDescription: notesToDescribe.length,
+        rollupDue: Boolean(rollupMonth),
+        summariesDue: summaryDays.length,
+        recoveryDue: pendingRecovery.work.length,
+      });
+      progress.reasons = verdict.reasons;
+      if (!verdict.work) {
+        return this.finalizer.noWork({ day, at, since: cursor.since, reasons: verdict.reasons });
+      }
+
+      this.deps.reconcileNowItems();
+      const expired = this.reconciler.fileExpired(expiredItems, at);
+      progress.expired = expired.length;
+      const recovered = this.reconciler.recover(pendingRecovery.work, timeZone);
+      progress.recovered = recovered.length;
+      store.setRuntimeState(SCRIBE_RECOVERY_RUN_KEY, pendingRecovery.hasMore ? recoverySince : at.toISOString());
+
+      for (const summary of this.dailySummaryInputs({ day, summaryDays, timeZone, expired, recovered })) {
+        progress.llmCalls += await this.writeDailySummary(summary);
+      }
+      if (rollupMonth) {
+        progress.llmCalls += await this.writeRollup(rollupMonth, day);
+        progress.rollupMonth = rollupMonth;
+      }
       const descriptionResult = await this.describeLegacyNotes(notesToDescribe);
-      llmCalls += descriptionResult.calls;
-      described = descriptionResult.described;
+      progress.llmCalls += descriptionResult.calls;
+      progress.described = descriptionResult.described;
+      if (cursor.truncated) progress.truncated = true;
+      return this.finalizer.complete(day, at, progress);
     } catch (error) {
-      return this.recordSkip({
+      return this.finalizer.failure({
         day,
         error,
-        // Only a night that produced NOTHING is §5's skip.
-        //
-        // Both halves matter. A storage error is a defect, not an outage — but
-        // so is a channel that died after the summary already landed: that
-        // night the secretary DID run, and counting it toward the alert makes
-        // the orchestrator tell the owner "не отработал 3 ночи подряд" about
-        // three nights that each wrote a summary, with both the summary and the
-        // skip mark sitting in the journal under the same day. The counter
-        // exists to detect hygiene being dead, and hygiene that produced a
-        // day's narrative is not dead — it is degraded, which the journal mark
-        // records without waking anyone.
-        channelDown: error instanceof ScribeChannelUnavailable && llmCalls === 0,
-        llmCalls,
-        recovered: recovered.length,
-        expired: expired.length,
-        at,
+        channelDown: error instanceof ScribeChannelUnavailable && progress.llmCalls === 0,
+        progress,
       });
     }
-
-    store.setRuntimeState(SCRIBE_LAST_DAY_KEY, day);
-    store.setRuntimeState(SCRIBE_LAST_RUN_KEY, at.toISOString());
-    store.setRuntimeState(SCRIBE_MISS_COUNT_KEY, "0");
-    store.deleteRuntimeState(SCRIBE_MISS_ALERT_KEY);
-    store.appendEvent("memory.scribe.completed", {
-      payload: {
-        day,
-        reasons: verdict.reasons,
-        llmCalls,
-        recovered: recovered.length,
-        expired: expired.length,
-        described,
-        ...(rollupMonth ? { rollupMonth } : {}),
-        ...(cursor.truncated ? { truncated: true } : {}),
-      },
-    });
-    return {
-      status: "completed",
-      day,
-      reasons: verdict.reasons,
-      llmCalls,
-      recovered: recovered.length,
-      expired: expired.length,
-      described,
-      ...(rollupMonth ? { rollupMonth } : {}),
-      ...(cursor.truncated ? { truncated: true } : {}),
-    };
   }
 
-  private idleOutcome(status: ScribeRunStatus, day: string): ScribeRunOutcome {
-    return { status, day, reasons: [], llmCalls: 0, recovered: 0, expired: 0, described: 0 };
-  }
-
-  /**
-   * Where this run starts reading, and whether it reaches the last completed
-   * one (§5: "догон следующей ночью, окно 48 ч").
-   *
-   * `truncated` is not cosmetic. It is the run admitting that the gap is wider
-   * than what it looked at — and since `daemon_events` is pruned at 30 days, a
-   * gap wide enough to truncate is usually a gap with nothing left in it to
-   * read. Saying so beats a summary that reads complete and is not.
-   */
-  private reconciliationCursor(at: Date): { since: string; truncated: boolean } {
-    const floorMs = at.getTime() - SCRIBE_CATCHUP_WINDOW_MS;
-    const last = this.deps.store.getRuntimeState(SCRIBE_LAST_RUN_KEY);
-    const lastMs = last ? Date.parse(last) : Number.NaN;
-    if (!Number.isFinite(lastMs)) return { since: new Date(floorMs).toISOString(), truncated: true };
-    if (lastMs < floorMs) return { since: new Date(floorMs).toISOString(), truncated: true };
-    return { since: new Date(lastMs).toISOString(), truncated: false };
-  }
-
-  /** Which month still owes a rollup, or undefined when none does (§2.4). */
   private dueRollupMonth(day: string): string | undefined {
     const month = previousMonth(day);
     const settled = this.deps.store.getRuntimeState(SCRIBE_LAST_ROLLUP_KEY);
-    // String compare on `YYYY-MM` is chronological, so a daemon that was down
-    // for a quarter settles the most recent month and does not walk backwards
-    // through the ones whose journal rows it can still read but whose story
-    // nobody is waiting for.
     if (settled && settled >= month) return undefined;
     if (this.deps.store.getJournalEntry(rollupSlug(month))) {
       this.deps.store.setRuntimeState(SCRIBE_LAST_ROLLUP_KEY, month);
       return undefined;
     }
-    const entries = this.rollupInputEntries(month, 1);
-    if (!entries.length) {
-      // An empty month is settled, not retried: without this the gate would
-      // report "rollup due" every night forever on a fresh install.
+    if (!this.rollupInputEntries(month, 1).length) {
       this.deps.store.setRuntimeState(SCRIBE_LAST_ROLLUP_KEY, month);
       return undefined;
     }
     return month;
   }
 
-  /**
-   * What a month's rollup reads.
-   *
-   * Never `kind: 'rollup'`: a rollup reading a rollup compresses a compression,
-   * and by the third month the record would be a rumour.
-   *
-   * The day summaries are fetched SEPARATELY and first. A single capped query
-   * ordered newest-first loses the beginning of any month past the cap — and
-   * the beginning is the part a monthly narrative most needs, since that is
-   * where a month's decisions get made. There is at most one summary a day, so
-   * pulling them on their own guarantees the whole month has a spine no matter
-   * how many archives a busy fortnight piled on top of it.
-   */
   private rollupInputEntries(month: string, limit = ROLLUP_ENTRY_LIMIT): JournalEntry[] {
     const from = firstDayOfMonth(month);
     const to = lastDayOfMonth(month);
-    const store = this.deps.store;
-    const summaries = store.listJournalEntries({ from, to, kinds: ["summary"], limit: 62 });
-    const rest = store.listJournalEntries({
+    const summaries = this.deps.store.listJournalEntries({ from, to, kinds: ["summary"], limit: 62 });
+    const rest = this.deps.store.listJournalEntries({
       from,
       to,
       kinds: ["entry", "archive"],
       limit: Math.max(1, limit - summaries.length),
     });
-    // Oldest first: the prompt should read the month in the order it happened.
     return [...summaries, ...rest].sort((left, right) =>
       left.day === right.day
         ? left.createdAt.localeCompare(right.createdAt)
@@ -372,178 +181,34 @@ export class NightScribe {
     );
   }
 
-  /**
-   * TTL transfers (§2.2/§5): an open item past its deadline is closed and
-   * archived with the "истёк без закрытия" mark.
-   *
-   * Daemon items are skipped. Their life is their thread's life (package 2.2,
-   * review B2) — closing one here would delete live work from the state and
-   * the reconciliation would only have to reopen it. They also never carry a
-   * TTL, so the branch is a guard against a future writer, not a live case.
-   */
-  private fileExpiredItems(items: readonly NowItem[], at: Date): NowItem[] {
-    const filed: NowItem[] = [];
-    const stamp = at.toISOString();
-    for (const item of items) {
-      if (item.source === "daemon") continue;
-      // Filed under the day the DEADLINE fell, not the day the sweep noticed —
-      // the rule package 2.2 settled for archives (review S3). A secretary that
-      // was down over a weekend would otherwise file Friday's expiry under
-      // Monday, and both the daily summary and the monthly rollup read `day`.
-      const deadline = item.validUntil ? new Date(item.validUntil) : at;
-      const day = ownerLogicalDay(
-        Number.isFinite(deadline.getTime()) ? deadline : at,
-        this.deps.timeZone(),
-      );
-      const closed = this.deps.store.closeNowItem(item.id, {
-        slugBase: `${day}-expired-${item.id}`,
-        day,
-        body: renderExpiredItemJournalBody(item, stamp),
-        source: "scribe",
-      });
-      if (closed) filed.push(closed.item);
-    }
-    return filed;
-  }
-
-  /**
-   * The terminal events the recovery pass reads.
-   *
-   * Filtered to `SCRIBE_SIGNIFICANT_EVENT_TYPES`, NOT to the gate's allow-list,
-   * and the difference is work being lost rather than tidiness. The store
-   * clamps any read to 200 rows ordered newest-first; the allow-list matches
-   * every tool call and every turn, so one working day overruns 200 easily and
-   * the rows that fall off the end are the OLDEST — exactly the finished work
-   * this pass exists to notice. The cursor advances regardless, so a
-   * `thread.completed` dropped that way is never recovered at all.
-   *
-   * Three event types per finished thread, a handful of threads a day: this
-   * query cannot overrun the clamp for any plausible amount of real work.
-   */
-  private readEvents(since: string): ScribeEvent[] {
-    return this.deps.store.listDaemonEvents({
-      since,
-      typePrefixes: [...SCRIBE_SIGNIFICANT_EVENT_TYPES],
-      limit: 200,
-    });
-  }
-
-  /**
-   * Work the event log shows finishing that nobody filed (§5: "значимая работа
-   * без журнальной записи → дописать с пометкой").
-   *
-   * The entry is filed under the day the WORK ended, not the day the secretary
-   * noticed — the same rule package 2.2 settled for archives (review S3). A
-   * night run that catches up two days would otherwise pile Monday's and
-   * Tuesday's work onto Wednesday, and both the daily summary and the monthly
-   * rollup read `day`.
-   */
-  private recoverUnfiledWork(events: readonly ScribeEvent[], timeZone: string | undefined): UnfiledWork[] {
-    const store = this.deps.store;
-    const candidates = selectUnfiledWork({
-      events,
-      isFiled: (threadRef) => store.listJournalEntries({ threadRef, limit: 1 }).length > 0,
-    }).slice(0, RECOVERY_BATCH);
-    const written: UnfiledWork[] = [];
-    for (const work of candidates) {
-      const thread = store.getThread(work.threadRef);
-      const endedAt = new Date(work.endedAt);
-      const day = ownerLogicalDay(
-        Number.isFinite(endedAt.getTime()) ? endedAt : new Date(),
-        timeZone,
-      );
-      const entry = store.appendUniqueJournalEntry({
-        slug: `${day}-recovered-${work.threadRef}`,
-        day,
-        body: renderRecoveredEntryBody({
-          work,
-          ...(thread?.title ? { title: thread.title } : {}),
-          ...(thread?.status ? { status: thread.status } : {}),
-        }),
-        source: "scribe",
-        kind: "entry",
-        threadRef: work.threadRef,
-      });
-      if (entry) written.push(work);
-    }
-    return written;
-  }
-
-  /**
-   * The daily summary — the one pass that must not be built by retelling the
-   * journal (the package 2.2 review finding).
-   *
-   * The archives of the day are checked against the ledger first, and anything
-   * the ledger contradicts reaches the prompt labelled as reopened. That the
-   * model is also TOLD not to call reopened work finished is a second line of
-   * defence, not the first: the first is that it never receives it as finished.
-   */
-  /**
-   * Every day the catch-up window still owes a summary (§5: "догон следующей
-   * ночью, окно 48 ч").
-   *
-   * A missed night used to lose its day's narrative FOREVER: the run summarised
-   * exactly one day — the one that had just ended — so a night the provider was
-   * down took yesterday's story with it, while the skip mark it left behind
-   * promised in writing that the next night would catch up. The reconciliation
-   * cursor did catch up; the narrative never did.
-   *
-   * Bounded by the same 48-hour window and by `CATCHUP_DAY_LIMIT`, because the
-   * bound is honesty rather than cost: past it `daemon_events` has usually been
-   * pruned out from under the gap, and a summary written from what is left
-   * would read complete without being it. Days with nothing filed under them
-   * are skipped by `writeDailySummary` itself, so a genuinely quiet outage
-   * costs nothing to catch up on.
-   */
-  private daysOwedASummary(input: {
-    day: string;
-    since: string;
-    timeZone: string | undefined;
-  }): string[] {
+  private daysOwedASummary(input: { day: string; since: string; timeZone: string | undefined }): string[] {
     const store = this.deps.store;
     const from = ownerLogicalDay(new Date(input.since), input.timeZone);
-    // `listJournalDays` asks exactly this question — and until this pass
-    // existed it had no caller at all, which is what a promise of a catch-up
-    // with no catch-up behind it looks like in the code.
-    const days = new Set<string>(store.listJournalDays({ from, to: input.day }));
-    // Oldest first, so a catch-up reads the way the days happened; the newest
-    // are kept when the limit bites, because the most recent day is the one the
-    // owner is about to ask about.
-    return [...days]
+    return store.listJournalDays({ from, to: input.day })
       .sort()
       .slice(-CATCHUP_DAY_LIMIT)
       .filter((day) => !store.getJournalEntry(summarySlug(day)));
   }
 
-  private async writeDailySummaries(input: {
+  private dailySummaryInputs(input: {
     day: string;
     summaryDays: readonly string[];
     timeZone: string | undefined;
     expired: readonly NowItem[];
     recovered: readonly UnfiledWork[];
-  }): Promise<number> {
+  }): Array<{ day: string; expired: NowItem[]; recovered: UnfiledWork[] }> {
     const dayOf = (iso: string | undefined): string => {
       const at = iso ? new Date(iso) : undefined;
-      return at && Number.isFinite(at.getTime())
-        ? ownerLogicalDay(at, input.timeZone)
-        : input.day;
+      return at && Number.isFinite(at.getTime()) ? ownerLogicalDay(at, input.timeZone) : input.day;
     };
     const days = new Set<string>([input.day, ...input.summaryDays]);
-    // The days THIS run filed something under, which are not necessarily today:
-    // a TTL archive is filed under its deadline, a recovered entry under the
-    // day the work ended.
     for (const item of input.expired) days.add(dayOf(item.validUntil));
     for (const work of input.recovered) days.add(dayOf(work.endedAt));
-
-    let calls = 0;
-    for (const day of [...days].sort().slice(-CATCHUP_DAY_LIMIT)) {
-      calls += await this.writeDailySummary({
-        day,
-        expired: input.expired.filter((item) => dayOf(item.validUntil) === day),
-        recovered: input.recovered.filter((work) => dayOf(work.endedAt) === day),
-      });
-    }
-    return calls;
+    return [...days].sort().slice(-CATCHUP_DAY_LIMIT).map((day) => ({
+      day,
+      expired: input.expired.filter((item) => dayOf(item.validUntil) === day),
+      recovered: input.recovered.filter((work) => dayOf(work.endedAt) === day),
+    }));
   }
 
   private async writeDailySummary(input: {
@@ -553,49 +218,36 @@ export class NightScribe {
   }): Promise<number> {
     const store = this.deps.store;
     if (store.getJournalEntry(summarySlug(input.day))) return 0;
-    const entries = store.listJournalEntries({ day: input.day, limit: 200 });
-    // A gate that fired is not a day that happened. `has_work` also passes on
-    // an undescribed note, a due rollup, or the ledger rows this very run just
-    // touched — and a summary of a day with nothing in it is an LLM call that
-    // buys a permanent "Сделано: —" row, which the monthly rollup then has to
-    // read. The day's own facts decide whether there is a day to summarise.
+    const journal = store.selectJournalEntries({ day: input.day, limit: 200 });
+    const entries = journal.entries;
     if (!entries.length && !input.expired.length && !input.recovered.length) return 0;
     const verdict = reconcileArchivesAgainstLedger({
       entries,
       lookup: (slug) => store.getNowItemByJournalRef(slug),
       lookupByThread: (threadRef) => store.getDaemonNowItemForThread(threadRef),
     });
-    // `listNowItems` already excludes closed rows unless asked otherwise.
     const openItems = store.listNowItems({ ownerId: this.deps.ownerId(), limit: 200 });
-    const body = await this.oneShot(
-      buildDailySummaryPrompt({
-        day: input.day,
-        language: this.deps.language(),
-        entries,
-        confirmed: verdict.confirmed,
-        contradicted: verdict.contradicted,
-        openItems,
-        expired: input.expired,
-        recovered: input.recovered,
-      }),
-    );
+    const body = await this.oneShot(buildDailySummaryPrompt({
+      day: input.day,
+      language: this.deps.language(),
+      entries,
+      confirmed: verdict.confirmed,
+      contradicted: verdict.contradicted,
+      openItems,
+      expired: input.expired,
+      recovered: input.recovered,
+      entriesOmitted: journal.omitted,
+    }));
     store.appendUniqueJournalEntry({
       slug: summarySlug(input.day),
       day: input.day,
-      body,
+      body: normalizeDailySummary(body, journal.omitted),
       source: "scribe",
       kind: "summary",
     });
     return 1;
   }
 
-  /**
-   * The monthly rollup (§2.4), built from `journal_entries` and nothing else.
-   *
-   * Its settled proposals are exactly that — proposals. `anti-rediscovery` is
-   * a curated category (§2.3), so the batch goes to the owner through an
-   * orchestrator turn and a note is written only if the owner agrees.
-   */
   private async writeRollup(month: string, day: string): Promise<number> {
     const store = this.deps.store;
     const entries = this.rollupInputEntries(month);
@@ -604,27 +256,33 @@ export class NightScribe {
         buildRollupPrompt({ month, language: this.deps.language(), entries }),
       ),
     );
-    store.appendUniqueJournalEntry({
-      slug: rollupSlug(month),
-      day: firstDayOfMonth(month),
-      body: parsed.body,
-      source: "scribe",
-      kind: "rollup",
-    });
-    store.setRuntimeState(SCRIBE_LAST_ROLLUP_KEY, month);
     const expiredFacts = store
       .listNotesExpiredBetween(firstDayOfMonth(month), `${lastDayOfMonth(month)}T23:59:59.999Z`, EXPIRED_FACT_LIMIT)
       .map((note) => note.content);
-    if (parsed.proposals.length || expiredFacts.length) {
-      // The one monthly thing the owner hears, and it goes through a turn.
-      this.deps.requestOwnerTurn({
-        dedupeKey: `scribe-monthly:${month}`,
-        prompt: buildMonthlyProposalPrompt({ month, proposals: parsed.proposals, expiredFacts }),
+    const turn = parsed.proposals.length || expiredFacts.length
+      ? {
+          dedupeKey: `scribe-monthly:${month}`,
+          prompt: buildMonthlyProposalPrompt({ month, proposals: parsed.proposals, expiredFacts }),
+        }
+      : undefined;
+    // The rollup, its settlement marker, the event and the retryable owner-turn
+    // intent become visible together. A restart may flush any pending intent
+    // immediately because the narrative it refers to is guaranteed to exist.
+    store.transaction(() => {
+      store.journal.insertUnique({
+        slug: rollupSlug(month),
+        day: firstDayOfMonth(month),
+        body: parsed.body,
+        source: "scribe",
+        kind: "rollup",
       });
-    }
-    this.deps.store.appendEvent("memory.scribe.rollup", {
-      payload: { month, day, entries: entries.length, proposals: parsed.proposals.length },
+      if (turn) this.finalizer.persistOwnerTurn(turn);
+      store.setRuntimeState(SCRIBE_LAST_ROLLUP_KEY, month);
+      store.appendEvent("memory.scribe.rollup", {
+        payload: { month, day, entries: entries.length, proposals: parsed.proposals.length },
+      });
     });
+    if (turn) this.finalizer.flushPendingOwnerTurns();
     return 1;
   }
 
@@ -705,78 +363,4 @@ export class NightScribe {
    * need a retry tonight, because the cursor did not move and the next night's
    * 48-hour window still contains everything this one did not read.
    */
-  private recordSkip(input: {
-    day: string;
-    error: unknown;
-    /** True only for an unusable background channel — §5's own failure mode. */
-    channelDown: boolean;
-    llmCalls: number;
-    recovered: number;
-    expired: number;
-    at: Date;
-  }): ScribeRunOutcome {
-    const store = this.deps.store;
-    const detail = input.error instanceof Error ? input.error.message : String(input.error);
-    // Only a channel outage moves the counter that pages the owner. A defect
-    // still stops the night and still leaves a mark — it just does not claim
-    // the provider did it, and it does not accumulate toward a message whose
-    // whole content would be wrong.
-    const previous = Math.max(0, Number(store.getRuntimeState(SCRIBE_MISS_COUNT_KEY) ?? "0") || 0);
-    const misses = input.channelDown ? previous + 1 : previous;
-    if (input.channelDown) store.setRuntimeState(SCRIBE_MISS_COUNT_KEY, String(misses));
-    store.setRuntimeState(SCRIBE_LAST_DAY_KEY, input.day);
-    store.appendUniqueJournalEntry({
-      slug: skipSlug(input.day),
-      day: input.day,
-      body: renderScribeSkipBody({
-        day: input.day,
-        reason: input.channelDown
-          ? "the background one-shot channel was unavailable"
-          : "the pass failed before it finished",
-        misses,
-        detail,
-      }),
-      // `daemon`, not `scribe`: the secretary did not write this — it is the
-      // daemon's record that the secretary never got to run.
-      source: "daemon",
-      kind: "entry",
-    });
-    store.appendEvent("memory.scribe.skipped", {
-      payload: { day: input.day, misses, channelDown: input.channelDown, detail: detail.slice(0, 300) },
-    });
-    this.deps.logger.warn(
-      { day: input.day, misses, channelDown: input.channelDown, err: input.error },
-      input.channelDown
-        ? "Night secretary skipped: the background one-shot channel is unavailable"
-        : "Night secretary stopped on an error of its own",
-    );
-    // Once per outage, not once per night. The counter resets on the first run
-    // that completes, so a NEW outage alerts again; a provider that stays down
-    // for a month does not restate the same sentence thirty times.
-    const alertedAt = Number(store.getRuntimeState(SCRIBE_MISS_ALERT_KEY) ?? "0") || 0;
-    if (misses >= SCRIBE_MISS_ALERT_THRESHOLD && alertedAt < SCRIBE_MISS_ALERT_THRESHOLD) {
-      store.setRuntimeState(SCRIBE_MISS_ALERT_KEY, String(misses));
-      const lastRunAt = store.getRuntimeState(SCRIBE_LAST_RUN_KEY);
-      this.deps.requestOwnerTurn({
-        dedupeKey: `scribe-miss-alert:${input.day}`,
-        prompt: buildMissAlertPrompt({
-          misses,
-          ...(lastRunAt ? { lastRunAt } : {}),
-          reason: detail,
-        }),
-      });
-    }
-    return {
-      status: "skipped",
-      day: input.day,
-      reasons: [],
-      llmCalls: input.llmCalls,
-      recovered: input.recovered,
-      expired: input.expired,
-      described: 0,
-      misses,
-      detail,
-    };
-  }
 }
-

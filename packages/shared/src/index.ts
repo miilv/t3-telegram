@@ -230,6 +230,10 @@ export interface JournalEntry {
   kind: JournalKind;
   /** T3 thread the entry is about, when it is about one (§2.4 reconciliation). */
   threadRef?: string;
+  /** Ingress job of an agent-authored replayable journal write. */
+  originJob?: string;
+  /** Ordinal of that journal write inside its turn. */
+  createSeq?: number;
   createdAt: string;
 }
 
@@ -829,6 +833,12 @@ export function newId(prefix: string): string {
 
 export function unique<T>(values: readonly T[]): T[] {
   return [...new Set(values)];
+}
+
+/** Slice by Unicode code points, never through a surrogate pair. */
+export function truncateCodePoints(value: string, limit: number): string {
+  if (limit <= 0) return "";
+  return [...value].slice(0, limit).join("");
 }
 
 /**

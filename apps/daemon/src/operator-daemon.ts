@@ -49,7 +49,6 @@ import {
   newId,
   nowIso,
   openFence,
-  ownerLocalParts,
   ownerLogicalDay,
   claimOwnDispatchMarker,
   forgetOwnDispatchMarker,
@@ -83,7 +82,6 @@ import {
 } from "./commands.js";
 import { ThreadVoice } from "./voice.js";
 import { NightScribe, type ScribeRunOutcome } from "./scribe.js";
-import { SCRIBE_LAST_DAY_KEY, scribeTargetDay } from "../../../packages/policy/src/index.js";
 import {
   SHUTDOWN_DEADLINE_MS,
   awaitShutdownSteps,
@@ -4668,39 +4666,13 @@ export class OperatorDaemon {
    * once-a-day gate; the `has_work()` gate, the Claude branch and the skip
    * bookkeeping are not optional.
    *
-   * A throw here must never take the maintenance tick down with it: hygiene is
-   * the least urgent thing in the pass, and the outbox flush and the worker
-   * recovery that follow it are not. Its own failures are already handled
-   * inside — what this catches is a genuine defect, which belongs in the log
-   * rather than in a dropped tick.
+   * NightScribe owns finalization for every failure after its day gate. Keeping
+   * that responsibility at the boundary means a query/projection defect gets
+   * the same durable skip row and event as a later failure; this wrapper does
+   * not silently burn the day with only a runtime-state stamp.
    */
   async runNightScribe(options: { force?: boolean } = {}): Promise<ScribeRunOutcome> {
-    try {
-      return await this.scribe.run(options);
-    } catch (error) {
-      this.logger.error({ err: error }, "Night secretary pass failed unexpectedly");
-      // Burn the night. `run` stamps the day gate on each of its own terminal
-      // paths, but a throw from BEFORE that — the gate queries, the projection,
-      // the TTL sweep — escapes past all of them, and without a stamp the
-      // per-minute tick re-enters the same failing pass every sixty seconds
-      // until 04:00, re-running its database writes each time. One broken night
-      // is the designed cost; a hundred and twenty retries of it is not.
-      const day = scribeTargetDay({
-        logicalDay: ownerLogicalDay(new Date(), this.config.owner.timezone),
-        localHour: ownerLocalParts(new Date(), this.config.owner.timezone).hour,
-      });
-      this.store.setRuntimeState(SCRIBE_LAST_DAY_KEY, day);
-      return {
-        status: "skipped",
-        day,
-        reasons: [],
-        llmCalls: 0,
-        recovered: 0,
-        expired: 0,
-        described: 0,
-        detail: error instanceof Error ? error.message : String(error),
-      };
-    }
+    return this.scribe.run(options);
   }
 
   /**
@@ -4716,13 +4688,13 @@ export class OperatorDaemon {
    * their own chat, and the age escalation of package 1.2 keeps it from
    * starving behind a busy one.
    */
-  private requestScribeOwnerTurn(input: { dedupeKey: string; prompt: string }): void {
+  private requestScribeOwnerTurn(input: { dedupeKey: string; prompt: string }): boolean {
     const chatId = this.ownerChatId();
     if (chatId === undefined) {
       // No chat has ever been seen, so there is nobody to tell. The journal
       // mark and the event stay, which is the whole record either way.
       this.logger.warn({ dedupeKey: input.dedupeKey }, "Scribe turn requested before any owner chat is known");
-      return;
+      return false;
     }
     const syntheticId = syntheticNegativeMessageId(input.dedupeKey);
     const update: Extract<TelegramInbound, { type: "message" }> = {
@@ -4744,6 +4716,7 @@ export class OperatorDaemon {
       payload: { dedupeKey: input.dedupeKey },
     });
     this.queueBackgroundIngressDrain();
+    return true;
   }
 
   /**

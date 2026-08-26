@@ -39,7 +39,17 @@ import {
   nowIso,
   redactSecrets,
   redactSecretsDeep,
+  truncateCodePoints,
 } from "../../shared/src/index.js";
+import {
+  JournalRepository,
+  type JournalEntryInput,
+  type JournalFilter,
+  type JournalSelection,
+} from "./journal.js";
+
+export { JournalRepository } from "./journal.js";
+export type { JournalEntryInput, JournalFilter, JournalSelection } from "./journal.js";
 
 type Row = Record<string, unknown>;
 
@@ -53,20 +63,6 @@ type Row = Record<string, unknown>;
  * nothing to say, and §6.4's temporary index format still covers the note.
  */
 const NOTE_DESCRIPTION_MAX_ATTEMPTS = 3;
-
-/** One row of the narrative journal (memory-design §2.4). */
-export interface JournalEntryInput {
-  /** Readable name; uniqueness is resolved here, the only layer that sees a clash. */
-  slugBase: string;
-  /** Owner-local logical day, 03:00 boundary. */
-  day: string;
-  body: string;
-  source: JournalEntry["source"];
-  /** Defaults to `entry`: an unlabelled row is narrative, never an archive. */
-  kind?: JournalKind;
-  threadRef?: string;
-  createdAt?: string;
-}
 
 export interface UserInputDraftAnswer {
   selectedOptionLabels?: string[];
@@ -137,11 +133,13 @@ function resolveMigrationPath(): string {
 
 export class OperatorStore {
   readonly db: DatabaseSync;
+  readonly journal: JournalRepository;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+    this.journal = new JournalRepository(this.db, (fn) => this.transaction(fn));
   }
 
   migrate(): void {
@@ -212,6 +210,12 @@ export class OperatorStore {
       }
       if (!journalColumns.some((column) => column.name === "thread_ref")) {
         this.db.exec("ALTER TABLE journal_entries ADD COLUMN thread_ref TEXT");
+      }
+      if (!journalColumns.some((column) => column.name === "origin_job")) {
+        this.db.exec("ALTER TABLE journal_entries ADD COLUMN origin_job TEXT");
+      }
+      if (!journalColumns.some((column) => column.name === "create_seq")) {
+        this.db.exec("ALTER TABLE journal_entries ADD COLUMN create_seq INTEGER");
       }
     }
     const sql = readFileSync(resolveMigrationPath(), "utf8");
@@ -1382,7 +1386,7 @@ export class OperatorStore {
       // The un-wrapped insert, not `appendJournalEntry`: `transaction()` issues
       // a bare BEGIN IMMEDIATE and SQLite has no nested transactions, so a
       // helper that opens its own would abort this one.
-      const entry = this.insertJournalEntry({
+      const entry = this.journal.insert({
         slugBase: journal.slugBase,
         day: journal.day,
         body: journal.body,
@@ -1413,23 +1417,7 @@ export class OperatorStore {
    * because an archive that loses an entry to a name clash is not an archive.
    */
   appendJournalEntry(input: JournalEntryInput): JournalEntry {
-    return this.transaction(() => this.insertJournalEntry(input));
-  }
-
-  private insertJournalEntry(input: JournalEntryInput): JournalEntry {
-    const base = (input.slugBase.trim() || input.day).slice(0, 120);
-    const body = redactSecrets(input.body).trim().slice(0, 8_000);
-    const createdAt = input.createdAt ?? nowIso();
-    let slug = base;
-    for (let suffix = 2; this.getJournalEntry(slug) && suffix < 1_000; suffix += 1) {
-      slug = `${base}-${suffix}`;
-    }
-    this.db
-      .prepare(
-        "INSERT INTO journal_entries(slug,day,body,source,kind,thread_ref,created_at) VALUES (?,?,?,?,?,?,?)",
-      )
-      .run(slug, input.day, body, input.source, input.kind ?? "entry", input.threadRef ?? null, createdAt);
-    return this.getJournalEntry(slug)!;
+    return this.journal.append(input);
   }
 
   /**
@@ -1446,31 +1434,11 @@ export class OperatorStore {
   appendUniqueJournalEntry(
     input: Omit<JournalEntryInput, "slugBase"> & { slug: string },
   ): JournalEntry | undefined {
-    return this.transaction(() => {
-      if (this.getJournalEntry(input.slug)) return undefined;
-      const body = redactSecrets(input.body).trim().slice(0, 8_000);
-      this.db
-        .prepare(
-          "INSERT INTO journal_entries(slug,day,body,source,kind,thread_ref,created_at) VALUES (?,?,?,?,?,?,?)",
-        )
-        .run(
-          input.slug,
-          input.day,
-          body,
-          input.source,
-          input.kind ?? "entry",
-          input.threadRef ?? null,
-          input.createdAt ?? nowIso(),
-        );
-      return this.getJournalEntry(input.slug)!;
-    });
+    return this.journal.appendUnique(input);
   }
 
   getJournalEntry(slug: string): JournalEntry | undefined {
-    const row = this.db.prepare("SELECT * FROM journal_entries WHERE slug=?").get(slug) as
-      | Row
-      | undefined;
-    return row ? rowToJournalEntry(row) : undefined;
+    return this.journal.get(slug);
   }
 
   /**
@@ -1490,56 +1458,16 @@ export class OperatorStore {
       limit?: number;
     } = {},
   ): JournalEntry[] {
-    const limit = Math.max(1, Math.min(input.limit ?? 50, 500));
-    const clauses: string[] = [];
-    const parameters: SQLInputValue[] = [];
-    if (input.day) {
-      clauses.push("day=?");
-      parameters.push(input.day);
-    }
-    if (input.from) {
-      clauses.push("day>=?");
-      parameters.push(input.from);
-    }
-    if (input.to) {
-      clauses.push("day<=?");
-      parameters.push(input.to);
-    }
-    if (input.kinds?.length) {
-      clauses.push(`kind IN (${input.kinds.map(() => "?").join(",")})`);
-      parameters.push(...input.kinds);
-    }
-    if (input.threadRef) {
-      clauses.push("thread_ref=?");
-      parameters.push(input.threadRef);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM journal_entries ${where} ORDER BY day DESC, created_at DESC LIMIT ?`,
-      )
-      .all(...parameters, limit) as Row[];
-    return rows.map(rowToJournalEntry);
+    return this.journal.select(input).entries;
+  }
+
+  selectJournalEntries(input: JournalFilter = {}): JournalSelection {
+    return this.journal.select(input);
   }
 
   /** Distinct logical days that carry at least one entry, newest first. */
   listJournalDays(input: { from?: string; to?: string; limit?: number } = {}): string[] {
-    const limit = Math.max(1, Math.min(input.limit ?? 62, 400));
-    const clauses: string[] = [];
-    const parameters: SQLInputValue[] = [];
-    if (input.from) {
-      clauses.push("day>=?");
-      parameters.push(input.from);
-    }
-    if (input.to) {
-      clauses.push("day<=?");
-      parameters.push(input.to);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
-      .prepare(`SELECT DISTINCT day FROM journal_entries ${where} ORDER BY day DESC LIMIT ?`)
-      .all(...parameters, limit) as Row[];
-    return rows.map((row) => String(row.day));
+    return this.journal.days(input);
   }
 
   /**
@@ -1696,7 +1624,7 @@ export class OperatorStore {
     // trigger, not a summary). A storage cap of its own would accept what the
     // linter is required to refuse, and the two numbers would drift apart in
     // exactly the direction that makes the render budget wrong.
-    const trimmed = redactSecrets(description).trim().slice(0, NOTE_DESCRIPTION_CHARS);
+    const trimmed = truncateCodePoints(redactSecrets(description).trim(), NOTE_DESCRIPTION_CHARS);
     if (!trimmed) return false;
     return this.transaction(() => {
       const row = this.db
@@ -2854,20 +2782,6 @@ function rowToNowItem(row: Row): NowItem {
     ...(row.valid_until ? { validUntil: String(row.valid_until) } : {}),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
-  };
-}
-
-function rowToJournalEntry(row: Row): JournalEntry {
-  const source = String(row.source);
-  const kind = String(row.kind ?? "entry");
-  return {
-    slug: String(row.slug),
-    day: String(row.day),
-    body: String(row.body),
-    source: source === "scribe" || source === "daemon" ? source : "agent",
-    kind: (JOURNAL_KINDS as readonly string[]).includes(kind) ? (kind as JournalKind) : "entry",
-    ...(row.thread_ref ? { threadRef: String(row.thread_ref) } : {}),
-    createdAt: String(row.created_at),
   };
 }
 

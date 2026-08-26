@@ -1639,12 +1639,21 @@ stays, so an archive the ledger no longer confirms reaches the prompt labelled a
 reopened, never as done — otherwise the daily summary announces "закрыто" about
 work that is running right now.
 
-A skipped night leaves a journal mark, the cursor stays put so the next night's
-48-hour window still covers it, and after **three** consecutive skips the owner
-hears about it once. Both owner-facing outputs — that alert and the monthly
-proposal batch — are enqueued as synthetic background-lane turns, so the words
-are the Operator's. The daemon gains no new path to the chat, and the untrusted
-lists inside those prompts are fenced like any worker output.
+A skipped night leaves a journal mark, the narrative cursor stays put so the
+next night's 48-hour window still covers it, and after **three** consecutive
+total skips the owner hears about it once. Terminal-event recovery has its own
+cursor: a capped batch advances only after every older candidate is filed, so
+the 21st terminal survives both the next night and a daemon restart. A catch-up
+that writes one summary and then loses the channel is `degraded`; completed
+calls survive and it does not pretend the provider missed the whole night.
+
+Both owner-facing outputs — that alert and the monthly proposal batch — are
+persisted as pending synthetic background-lane turns before their once-only
+markers settle, then removed only after durable enqueue is confirmed. No known
+owner chat or an enqueue exception therefore retries later rather than losing
+the notification. The words are still the Operator's: the daemon gains no new
+path to the chat. Query, projection, TTL, or recovery defects after the day gate
+take one finalization path: skip row + event + day stamp, without an outage miss.
 
 ---
 
