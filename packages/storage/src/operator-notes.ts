@@ -110,6 +110,17 @@ export class OperatorNoteRepository {
     });
   }
 
+  operationReplay(operationKey: string): OperatorNote | undefined {
+    const row = this.db
+      .prepare(`
+        SELECT n.* FROM operator_note_operations o
+        JOIN operator_notes n ON n.id=o.note_id
+        WHERE o.operation_key=?
+      `)
+      .get(operationKey) as Row | undefined;
+    return row ? rowToOperatorNote(row) : undefined;
+  }
+
   getActive(reference: string): OperatorNote | undefined {
     const row = this.db
       .prepare("SELECT * FROM operator_notes WHERE status='active' AND (id=? OR key=?) LIMIT 1")

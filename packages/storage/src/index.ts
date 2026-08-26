@@ -64,8 +64,12 @@ import {
   rowToOperatorNote as rowToOperatorNoteV2,
 } from "./operator-notes.js";
 import { migrateOperatorNotesV2 } from "./migrations.js";
-import { LocalNoteEmbeddingService } from "./note-embeddings.js";
-import { OperatorNoteWriter, type KeyedOperatorNoteDraft } from "./operator-note-writer.js";
+import { LocalNoteEmbeddingService, type NoteQueryVector } from "./note-embeddings.js";
+import {
+  automaticOperatorNoteOperationKey,
+  OperatorNoteWriter,
+  type KeyedOperatorNoteDraft,
+} from "./operator-note-writer.js";
 
 export { JournalRepository } from "./journal.js";
 export type { JournalEntryInput, JournalFilter, JournalSelection } from "./journal.js";
@@ -79,6 +83,7 @@ export {
 export {
   MINILM_CROSS_LINK_THRESHOLD,
   MINILM_MERGE_PROPOSAL_THRESHOLD,
+  automaticOperatorNoteOperationKey,
   OperatorNoteWriter,
 } from "./operator-note-writer.js";
 export type {
@@ -1174,15 +1179,9 @@ export class OperatorStore {
   async rememberKeyedOperatorNote(
     input: Omit<KeyedOperatorNoteDraft, "operationKey"> & { operationKey?: string },
   ) {
-    const normalized = {
-      key: input.key,
-      description: input.description,
-      category: input.category ?? "general",
-      content: input.content,
-    };
     return this.noteWriter.write({
       ...input,
-      operationKey: input.operationKey ?? `manual:${operatorNoteInputHash(normalized)}`,
+      operationKey: input.operationKey ?? automaticOperatorNoteOperationKey(input),
     });
   }
 
@@ -1261,6 +1260,59 @@ export class OperatorStore {
       .sort((left, right) => right.score - left.score || String(right.row.updated_at).localeCompare(String(left.row.updated_at)))
       .slice(0, boundedLimit);
     return ranked.map((entry) => rowToOperatorNote(entry.row));
+  }
+
+  /**
+   * Public semantic retrieval: query and stored vectors must share one exact
+   * model/algorithm/dimension tuple. The older synchronous hash path above is
+   * retained only for compatibility callers that cannot await embedding.
+   */
+  async searchOperatorNotesEmbedded(
+    query: string,
+    embedQuery: (query: string) => Promise<NoteQueryVector> = (value) => this.noteEmbeddings.embedQuery(value),
+    limit = 8,
+  ): Promise<OperatorNote[]> {
+    const terms = query
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .match(/[\p{L}\p{N}_-]{2,}/gu)
+      ?.slice(0, 10);
+    if (!terms?.length) return [];
+    const queryVector = await embedQuery(query);
+    if (!validQueryVector(queryVector)) return [];
+    const match = terms.map((term) => `"${term.replaceAll('"', '""')}"*`).join(" OR ");
+    const boundedLimit = Math.max(1, Math.min(limit, 50));
+    const lexical = this.db
+      .prepare(`
+        SELECT n.* FROM operator_note_search s
+        JOIN operator_notes n ON n.id=s.id
+        WHERE operator_note_search MATCH ? AND n.status='active'
+        ORDER BY bm25(operator_note_search),n.updated_at DESC LIMIT ?
+      `)
+      .all(match, Math.max(boundedLimit, 20)) as Row[];
+    const lexicalRank = new Map(lexical.map((row, index) => [String(row.id), 1 / (index + 1)]));
+    const vectorRows = this.db
+      .prepare(`
+        SELECT n.*,v.vector_json FROM operator_note_vectors v
+        JOIN operator_notes n ON n.id=v.note_id
+        WHERE n.status='active' AND v.model=? AND v.dimensions=?
+          AND v.input_hash=n.input_hash
+        ORDER BY n.updated_at DESC LIMIT 500
+      `)
+      .all(queryVector.model, queryVector.dimensions) as Row[];
+    const vectorById = new Map(vectorRows.map((row) => [String(row.id), row]));
+    const candidates = [...vectorRows, ...lexical.filter((row) => !vectorById.has(String(row.id)))];
+    return candidates
+      .map((row) => {
+        const vector = parseMemoryVector(row.vector_json, queryVector.dimensions);
+        const similarity = vector ? cosineSimilarity(queryVector.values, vector) : 0;
+        const lexicalScore = lexicalRank.get(String(row.id)) ?? 0;
+        return { row, similarity, score: lexicalScore * 0.62 + Math.max(0, similarity) * 0.38 };
+      })
+      .filter((entry) => lexicalRank.has(String(entry.row.id)) || entry.similarity >= 0.18)
+      .sort((left, right) => right.score - left.score || String(right.row.updated_at).localeCompare(String(left.row.updated_at)))
+      .slice(0, boundedLimit)
+      .map((entry) => rowToOperatorNote(entry.row));
   }
 
   markOperatorNoteObsolete(id: string): boolean {
@@ -3283,4 +3335,9 @@ function parseMemoryVector(value: unknown, dimensions: number): number[] | undef
   } catch {
     return undefined;
   }
+}
+
+function validQueryVector(vector: NoteQueryVector): boolean {
+  return Boolean(vector.model) && Number.isInteger(vector.dimensions) && vector.dimensions > 0 &&
+    vector.values.length === vector.dimensions && vector.values.every((value) => Number.isFinite(value));
 }

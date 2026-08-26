@@ -139,4 +139,73 @@ describe("OperatorNoteWriter", () => {
       .resolves.toMatchObject({ ok: true, kind: "written", crossLinks: [] });
     store.close();
   });
+
+  it("replays a completed write before semantic matching can propose the note itself", async () => {
+    const store = tempStore();
+    const input = {
+      key: "warehouse-contact",
+      category: "people",
+      description: "when warehouse contact matters → use Dan",
+      content: "Dan is the warehouse contact",
+    };
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => true,
+      embed: async (draft) => vector(draft, unit(1, 0)),
+    });
+
+    await expect(writer.write({ ...input, source: "manual", operationKey: "manual:1" }))
+      .resolves.toMatchObject({ ok: true, kind: "written", write: { applied: true } });
+    await expect(writer.write({ ...input, source: "manual", operationKey: "manual:1" }))
+      .resolves.toMatchObject({ ok: true, kind: "written", write: { applied: false } });
+    store.close();
+  });
+
+  it("allows an authorized exact-key update instead of treating its current version as a semantic duplicate", async () => {
+    const store = tempStore();
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => true,
+      embed: async (draft) => vector(draft, unit(1, 0)),
+    });
+    const base = {
+      key: "warehouse-contact",
+      category: "people",
+      description: "when warehouse contact matters → use Dan",
+      source: "manual" as const,
+    };
+    await writer.write({ ...base, content: "Dan is the warehouse contact", operationKey: "manual:1" });
+
+    await expect(writer.write({ ...base, content: "Dan is now the warehouse contact", operationKey: "manual:2" }))
+      .resolves.toMatchObject({ ok: true, kind: "written", write: { applied: true } });
+    expect(store.notes.getActive("warehouse-contact")?.content).toBe("Dan is now the warehouse contact");
+    store.close();
+  });
+
+  it("always proposes a distilled collision with an existing curated key even when semantic embeddings are unavailable", async () => {
+    const store = tempStore();
+    const curated = {
+      key: "warehouse-contact",
+      category: "people",
+      description: "when warehouse contact matters → use Dan",
+      content: "Dan is the warehouse contact",
+    };
+    store.notes.writeVersion({ ...curated, source: "manual", operationKey: "manual:1" });
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => false,
+      embed: async (draft) => ({
+        model: "local-hash-v3",
+        dimensions: NOTE_EMBEDDING_DIMENSIONS,
+        inputHash: operatorNoteInputHash(draft),
+        values: unit(1, 0),
+      }),
+    });
+
+    await expect(writer.write({
+      ...curated,
+      content: "The distiller says another warehouse contact exists",
+      source: "distilled",
+      operationKey: "distilled:1",
+    })).resolves.toMatchObject({ ok: true, kind: "merge-proposal", mergeProposal: { note: { key: curated.key } } });
+    expect(store.notes.getActive(curated.key)?.content).toBe(curated.content);
+    store.close();
+  });
 });

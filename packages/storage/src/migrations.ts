@@ -71,6 +71,12 @@ export function migrateOperatorNotesV2(
       `);
     }
     db.exec(`
+      CREATE TABLE IF NOT EXISTS operator_note_operations (
+        operation_key TEXT PRIMARY KEY,
+        note_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
+      );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_notes_active_key
         ON operator_notes(key) WHERE status='active' AND key IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_operator_note_vectors_backfill

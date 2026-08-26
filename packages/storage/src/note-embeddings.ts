@@ -4,7 +4,8 @@ import { operatorNoteInputHash, type OperatorNoteRepository } from "./operator-n
 
 /** Operator-supplied local ONNX model; weights are deliberately not in git. */
 export const MINILM_NOTE_EMBEDDING_MODEL = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
-export const HASH_NOTE_EMBEDDING_MODEL = "local-hash-v2";
+/** Current 384d fallback. `local-hash-v2` remains the distinct legacy 128d model. */
+export const HASH_NOTE_EMBEDDING_MODEL = "local-hash-v3";
 export const NOTE_EMBEDDING_DIMENSIONS = 384;
 
 type RuntimeEnvironment = {
@@ -35,6 +36,12 @@ export interface NoteEmbeddingBackfillResult {
   semantic: boolean;
 }
 
+export interface NoteQueryVector {
+  model: string;
+  dimensions: number;
+  values: number[];
+}
+
 /**
  * A small offline-only boundary. It never fetches model weights: missing or
  * corrupt local weights return deterministic retrieval vectors instead.
@@ -56,23 +63,32 @@ export class LocalNoteEmbeddingService {
     category: string;
     content: string;
   }): Promise<PreparedNoteVector> {
-    await this.initialize();
     const inputHash = operatorNoteInputHash(input);
     const text = [input.key ?? "", input.description ?? "", input.category, input.content]
       .filter(Boolean)
       .join("\n");
+    const query = await this.embedText(text);
+    return { ...query, inputHash };
+  }
+
+  /** Embed a retrieval query with the same selected model and dimensions. */
+  async embedQuery(query: string): Promise<NoteQueryVector> {
+    return this.embedText(query);
+  }
+
+  private async embedText(text: string): Promise<NoteQueryVector> {
+    await this.initialize();
     if (!this.extractor) {
       return {
         model: HASH_NOTE_EMBEDDING_MODEL,
         dimensions: NOTE_EMBEDDING_DIMENSIONS,
-        inputHash,
         values: hashVector(text),
       };
     }
     try {
       const values = vectorFromRuntimeResult(await this.extractor(text, { pooling: "mean", normalize: true }));
       if (values.length !== NOTE_EMBEDDING_DIMENSIONS) throw new Error("MiniLM returned an unexpected vector dimension");
-      return { model: MINILM_NOTE_EMBEDDING_MODEL, dimensions: NOTE_EMBEDDING_DIMENSIONS, inputHash, values };
+      return { model: MINILM_NOTE_EMBEDDING_MODEL, dimensions: NOTE_EMBEDDING_DIMENSIONS, values };
     } catch {
       // A runtime becoming unusable after initialization must not block a note write.
       this.extractor = undefined;
@@ -80,7 +96,6 @@ export class LocalNoteEmbeddingService {
       return {
         model: HASH_NOTE_EMBEDDING_MODEL,
         dimensions: NOTE_EMBEDDING_DIMENSIONS,
-        inputHash,
         values: hashVector(text),
       };
     }

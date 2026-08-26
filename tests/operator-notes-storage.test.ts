@@ -126,4 +126,28 @@ describe("OperatorNoteRepository version transactions", () => {
     expect(store.getOperatorNoteVersion(written.note.id)?.status).toBe("obsolete");
     store.close();
   });
+
+  it("creates a distinct automatic replay key when only valid-until changes", async () => {
+    const store = tempStore();
+    const input = {
+      key: "warehouse-owner",
+      category: "people",
+      description: "when warehouse ownership matters → Dan owns it",
+      content: "Dan owns the warehouse",
+      source: "manual" as const,
+    };
+    const first = await store.rememberKeyedOperatorNote({
+      ...input,
+      validUntil: "2026-09-01T00:00:00.000Z",
+    });
+    const second = await store.rememberKeyedOperatorNote({
+      ...input,
+      validUntil: "2026-10-01T00:00:00.000Z",
+    });
+
+    expect(first).toMatchObject({ ok: true, kind: "written", write: { applied: true } });
+    expect(second).toMatchObject({ ok: true, kind: "written", write: { applied: true } });
+    expect(store.notes.getActive("warehouse-owner")?.validUntil).toBe("2026-10-01T00:00:00.000Z");
+    store.close();
+  });
 });

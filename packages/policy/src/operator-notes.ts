@@ -40,7 +40,9 @@ export function validateOperatorNoteDraft(input: {
   const description = normalizeNoteDescription(input.description);
   const descriptionLint = lintNoteDescription(description);
   if (!descriptionLint.ok) return descriptionLint;
-  const content = input.content.normalize("NFKC").trim();
+  // Content is evidence, not an identifier: preserve compatibility characters
+  // (for example, ① and ﬁ) after accepting only permitted edge whitespace.
+  const content = input.content.trim();
   if (
     !content ||
     [...content].length > OPERATOR_NOTE_CONTENT_CHARS ||

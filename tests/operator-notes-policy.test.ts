@@ -56,6 +56,12 @@ describe("operator-note v2 policy", () => {
     ).toEqual({ ok: false, hint: OPERATOR_NOTE_CONTENT_HINT });
   });
 
+  it("preserves accepted compatibility characters in keyed source content", () => {
+    const content = "Keep the unit as ① and the ligature as ﬁ.";
+    expect(validateOperatorNoteDraft({ key: "compat", description: "when copying source → preserve it", content }))
+      .toMatchObject({ ok: true, content });
+  });
+
   it("projects stale facts as hypotheses and ranks them lower without hiding them", () => {
     const at = new Date("2026-08-26T12:00:00.000Z");
     const stale = note("stale", { validUntil: "2026-08-01T00:00:00.000Z", accessCount: 20 });

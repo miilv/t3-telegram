@@ -833,12 +833,12 @@ export class OperatorToolServer {
       description: "Search durable Operator notes and compact thread summaries.",
       schema: z.object({ query: z.string().trim().min(2).max(1_000), limit: z.number().int().min(1).max(20).optional() }),
       readOnly: true,
-      handler: ({ query, limit }, capability) => {
+      handler: async ({ query, limit }, capability) => {
         this.requireAdministrativeRole(capability, "search global Operator memory");
         const bounded = limit ?? 8;
         const fence = openFence("worker");
         return {
-          notes: this.options.store.searchOperatorNotes(query, bounded).map(noteForMemoryRead),
+          notes: (await this.options.store.searchOperatorNotesEmbedded(query, undefined, bounded)).map(noteForMemoryRead),
           threads: this.options.store.searchThreads(query, undefined, bounded).map((candidate) => ({
             ...compactThread(candidate.thread, fence),
             score: candidate.score,
