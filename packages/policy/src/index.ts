@@ -132,7 +132,6 @@ export {
   renderJournalSkeleton,
   renderRecoveredEntryBody,
   renderScribeSkipBody,
-  reopenedItemIds,
   rollupSlug,
   selectUnfiledWork,
   skipSlug,

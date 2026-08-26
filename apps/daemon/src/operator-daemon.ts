@@ -49,6 +49,7 @@ import {
   newId,
   nowIso,
   openFence,
+  ownerLocalParts,
   ownerLogicalDay,
   claimOwnDispatchMarker,
   forgetOwnDispatchMarker,
@@ -82,6 +83,7 @@ import {
 } from "./commands.js";
 import { ThreadVoice } from "./voice.js";
 import { NightScribe, type ScribeRunOutcome } from "./scribe.js";
+import { SCRIBE_LAST_DAY_KEY, scribeTargetDay } from "../../../packages/policy/src/index.js";
 import {
   SHUTDOWN_DEADLINE_MS,
   awaitShutdownSteps,
@@ -4677,9 +4679,20 @@ export class OperatorDaemon {
       return await this.scribe.run(options);
     } catch (error) {
       this.logger.error({ err: error }, "Night secretary pass failed unexpectedly");
+      // Burn the night. `run` stamps the day gate on each of its own terminal
+      // paths, but a throw from BEFORE that — the gate queries, the projection,
+      // the TTL sweep — escapes past all of them, and without a stamp the
+      // per-minute tick re-enters the same failing pass every sixty seconds
+      // until 04:00, re-running its database writes each time. One broken night
+      // is the designed cost; a hundred and twenty retries of it is not.
+      const day = scribeTargetDay({
+        logicalDay: ownerLogicalDay(new Date(), this.config.owner.timezone),
+        localHour: ownerLocalParts(new Date(), this.config.owner.timezone).hour,
+      });
+      this.store.setRuntimeState(SCRIBE_LAST_DAY_KEY, day);
       return {
         status: "skipped",
-        day: ownerLogicalDay(new Date(), this.config.owner.timezone),
+        day,
         reasons: [],
         llmCalls: 0,
         recovered: 0,

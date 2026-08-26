@@ -42,6 +42,17 @@ import {
 
 type Row = Record<string, unknown>;
 
+/**
+ * Nights one legacy note may be offered to the describing pass before it is
+ * left alone (memory-design §6.4).
+ *
+ * Three, not one: a single failure is usually the pass dying halfway, and a
+ * single failure permanently retiring a note would make the backlog quietly
+ * undrainable. Three consecutive nights of silence is the model saying it has
+ * nothing to say, and §6.4's temporary index format still covers the note.
+ */
+const NOTE_DESCRIPTION_MAX_ATTEMPTS = 3;
+
 /** One row of the narrative journal (memory-design §2.4). */
 export interface JournalEntryInput {
   /** Readable name; uniqueness is resolved here, the only layer that sees a clash. */
@@ -158,6 +169,49 @@ export class OperatorStore {
       if (!noteColumns.some((column) => column.name === "description")) {
         this.db.exec("ALTER TABLE operator_notes ADD COLUMN description TEXT");
       }
+      // How many nights the secretary has offered this note to the model and
+      // got nothing back. Without it one note the model declines to describe
+      // stays at the head of an `updated_at ASC` queue forever, and §5's "тихая
+      // ночь не стоит ни токена" quietly stops being true on that install.
+      if (!noteColumns.some((column) => column.name === "description_attempts")) {
+        this.db.exec(
+          "ALTER TABLE operator_notes ADD COLUMN description_attempts INTEGER NOT NULL DEFAULT 0",
+        );
+      }
+    }
+    // Package 3.1 (§2.4): `kind` separates a rollup and an automatic archive
+    // from a narrative entry; `thread_ref` is how the reconciliation asks
+    // whether finished work is already filed.
+    //
+    // BEFORE `exec(sql)`, like the `operator_notes` block above and unlike the
+    // ALTERs below it — and that ordering is not a style choice. The schema file
+    // creates an INDEX on `thread_ref`, and `CREATE TABLE IF NOT EXISTS` is a
+    // no-op on a database that already has the table, so on every existing
+    // install the index statement would reach a column that does not exist yet
+    // and `migrate()` would throw. `initialize()` migrates before anything else,
+    // so that is not a degraded start: it is a daemon that never boots again.
+    // Columns whose schema-file lines are only column definitions can be added
+    // after; anything the .sql then INDEXES has to exist by the time it runs.
+    //
+    // On a database written by package 2.2 every existing row is an archive of a
+    // closed now item — that was the only writer — but they are backfilled as
+    // 'entry' rather than 'archive': `kind='archive'` is what lets the daily
+    // summary CONTRADICT a close from the registry, and claiming that power over
+    // rows whose `journal_ref` links predate the check would report old,
+    // correctly closed work as reopened on the first night after the upgrade.
+    const journalTableExists = Boolean(
+      this.db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_entries'")
+        .get(),
+    );
+    if (journalTableExists) {
+      const journalColumns = this.db.prepare("PRAGMA table_info(journal_entries)").all() as Row[];
+      if (!journalColumns.some((column) => column.name === "kind")) {
+        this.db.exec("ALTER TABLE journal_entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'entry'");
+      }
+      if (!journalColumns.some((column) => column.name === "thread_ref")) {
+        this.db.exec("ALTER TABLE journal_entries ADD COLUMN thread_ref TEXT");
+      }
     }
     const sql = readFileSync(resolveMigrationPath(), "utf8");
     this.db.exec(sql);
@@ -181,25 +235,6 @@ export class OperatorStore {
     const pendingUserInputColumns = this.db.prepare("PRAGMA table_info(pending_user_inputs)").all() as Row[];
     if (pendingUserInputColumns.length && !pendingUserInputColumns.some((column) => column.name === "mediation_json")) {
       this.db.exec("ALTER TABLE pending_user_inputs ADD COLUMN mediation_json TEXT");
-    }
-    // Package 3.1 (§2.4): `kind` separates a rollup and an automatic archive
-    // from a narrative entry; `thread_ref` is how the reconciliation asks
-    // whether finished work is already filed. On a database written by package
-    // 2.2 every existing row is an archive of a closed now item — that is the
-    // only writer there was — but they are backfilled as 'entry' rather than
-    // 'archive': `kind='archive'` is what lets the daily summary CONTRADICT a
-    // close using the registry, and claiming that power over rows whose
-    // `journal_ref` links may predate the check would report old, correctly
-    // closed work as reopened on the first night after the upgrade.
-    const journalColumns = this.db.prepare("PRAGMA table_info(journal_entries)").all() as Row[];
-    if (journalColumns.length && !journalColumns.some((column) => column.name === "kind")) {
-      this.db.exec("ALTER TABLE journal_entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'entry'");
-    }
-    if (journalColumns.length && !journalColumns.some((column) => column.name === "thread_ref")) {
-      this.db.exec("ALTER TABLE journal_entries ADD COLUMN thread_ref TEXT");
-      this.db.exec(
-        "CREATE INDEX IF NOT EXISTS idx_journal_entries_thread ON journal_entries(thread_ref, day DESC) WHERE thread_ref IS NOT NULL",
-      );
     }
     const processedEventColumns = this.db.prepare("PRAGMA table_info(processed_events)").all() as Row[];
     if (processedEventColumns.length && !processedEventColumns.some((column) => column.name === "status")) {
@@ -1402,7 +1437,9 @@ export class OperatorStore {
    * twice. `undefined` means "already written" — the caller decides whether
    * that is a skip or a no-op.
    */
-  appendUniqueJournalEntry(input: JournalEntryInput & { slug: string }): JournalEntry | undefined {
+  appendUniqueJournalEntry(
+    input: Omit<JournalEntryInput, "slugBase"> & { slug: string },
+  ): JournalEntry | undefined {
     return this.transaction(() => {
       if (this.getJournalEntry(input.slug)) return undefined;
       const body = redactSecrets(input.body).trim().slice(0, 8_000);
@@ -1560,15 +1597,23 @@ export class OperatorStore {
   }
 
   /**
-   * Open items whose `valid_until` has passed (§2.2: hidden from the render at
-   * once, filed by the secretary later). Ordered oldest deadline first, so a
-   * capped sweep always drains the longest-overdue work.
+   * Open AGENT items whose `valid_until` has passed (§2.2: hidden from the
+   * render at once, filed by the secretary later). Ordered oldest deadline
+   * first, so a capped sweep always drains the longest-overdue work.
+   *
+   * Daemon items are excluded here rather than skipped by the caller, and the
+   * difference is the `has_work()` gate. A daemon item's life is its thread's
+   * life (package 2.2, review B2) so the sweep may not close one — but if the
+   * QUERY still returned it, the gate would see `expired:1` every night for as
+   * long as the thread lived, and every one of those nights would spend a call.
+   * Nothing gives a daemon item a TTL today; this makes sure nothing can.
    */
   listExpiredNowItems(input: { ownerId: string; at?: string; limit?: number }): NowItem[] {
     const rows = this.db
       .prepare(`
         SELECT * FROM now_items
-        WHERE owner_id=? AND status!='closed' AND valid_until IS NOT NULL AND valid_until<=?
+        WHERE owner_id=? AND source!='daemon' AND status!='closed'
+          AND valid_until IS NOT NULL AND valid_until<=?
         ORDER BY valid_until ASC LIMIT ?
       `)
       .all(
@@ -1591,10 +1636,29 @@ export class OperatorStore {
       .prepare(`
         SELECT * FROM operator_notes
         WHERE status='active' AND (description IS NULL OR TRIM(description)='')
+          AND COALESCE(description_attempts,0) < ?
         ORDER BY updated_at ASC LIMIT ?
       `)
-      .all(Math.max(1, Math.min(limit, 100))) as Row[];
+      .all(NOTE_DESCRIPTION_MAX_ATTEMPTS, Math.max(1, Math.min(limit, 100))) as Row[];
     return rows.map(rowToOperatorNote);
+  }
+
+  /**
+   * Record that the secretary offered these notes to the model.
+   *
+   * Counted for every note in the batch, described or not, and that is the
+   * point: a note the model keeps declining has to leave the queue eventually.
+   * The alternative — retrying it nightly — turns one unhelpful note into a
+   * permanent LLM call on an otherwise silent installation.
+   */
+  markDescriptionAttempt(ids: readonly string[]): void {
+    if (!ids.length) return;
+    const statement = this.db.prepare(
+      "UPDATE operator_notes SET description_attempts=COALESCE(description_attempts,0)+1 WHERE id=?",
+    );
+    this.transaction(() => {
+      for (const id of ids) statement.run(id);
+    });
   }
 
   /**

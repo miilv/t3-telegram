@@ -114,6 +114,11 @@ CREATE TABLE IF NOT EXISTS operator_notes (
   -- one comes early because its writer is the night secretary of package 3.1,
   -- and a pass whose output has nowhere to land is not a pass.
   description TEXT,
+  -- Nights the secretary offered this note to the model and got nothing back.
+  -- The backlog is drained oldest-first, so without a bound one note the model
+  -- has nothing to say about sits at the head of the queue forever and every
+  -- "quiet" night costs a call.
+  description_attempts INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

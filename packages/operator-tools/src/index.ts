@@ -870,11 +870,10 @@ export class OperatorToolServer {
           // about the window's period.
           from: firstDayOfMonth(monthOfDay(fromDay)),
           to: toDay,
-          // Rollups first in intent, but read together: a window that spans the
-          // cutoff wants the month summaries for its old half AND the day
-          // entries for its recent one, and deciding which is "old" per row
-          // here would duplicate a boundary the days already express.
-          kinds: ["rollup", "summary", "entry", "archive"],
+          // Every kind, so no `kinds` filter: a window that spans the cutoff
+          // wants the month rollups for its old half AND the day entries for
+          // its recent one, and deciding which is "old" per row here would
+          // duplicate a boundary the days already express.
           limit: 60,
         });
         return {
@@ -940,17 +939,20 @@ export class OperatorToolServer {
         };
         const verdict = lintJournalNote(sections);
         if (!verdict.ok) return verdict;
-        // A hand-written entry may not take a name the secretary owns: a row
-        // called `2026-08-25-summary` would be read back as the day's summary
-        // by the rollup and by `journal.read`.
-        if (input.title && isReservedJournalSlug(input.title)) {
+        const day = input.day ?? ownerLogicalDay(this.now(), this.options.ownerTimeZone?.());
+        // Checked on the DERIVED slug, not on the raw title. `journalSlugBase`
+        // prefixes the day, so a title of "summary" passes a check on the title
+        // and produces `2026-08-25-summary` — the exact name the night
+        // secretary writes its day under. That is not cosmetic: the summary
+        // pass skips a day whose slug already exists, so an innocent title
+        // silently costs the owner that night's summary. `title: "scribe
+        // skipped"` collides with the skip mark the same way.
+        const slugBase = journalSlugBase(day, input.title?.trim() ? input.title : input.done);
+        if (isReservedJournalSlug(slugBase)) {
           return { ok: false, hint: JOURNAL_HINT_RESERVED_SLUG };
         }
-        const day = input.day ?? ownerLogicalDay(this.now(), this.options.ownerTimeZone?.());
         const entry = this.options.store.appendJournalEntry({
-          slugBase: input.title?.trim()
-            ? journalSlugBase(day, input.title)
-            : journalSlugBase(day, input.done),
+          slugBase,
           day,
           body: renderJournalSkeleton(sections),
           source: "agent",

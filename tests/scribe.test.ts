@@ -1,4 +1,6 @@
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
@@ -50,7 +52,7 @@ import type {
   WorkThread,
 } from "../packages/shared/src/index.js";
 import { NOW_AGENT_WRITE_KEY, nowIso } from "../packages/shared/src/index.js";
-import type { OperatorStore } from "../packages/storage/src/index.js";
+import { OperatorStore } from "../packages/storage/src/index.js";
 import type { TelegramTransport } from "../packages/telegram/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
 
@@ -69,6 +71,82 @@ const ZONE = "Europe/Moscow";
 const NIGHT = new Date("2026-08-26T00:00:00.000Z");
 /** The day that has ended by then, which is what a run files under. */
 const NIGHT_DAY = "2026-08-25";
+
+// ---------------------------------------------------------------------------
+// Migrating a database that already exists
+// ---------------------------------------------------------------------------
+
+describe("upgrading a package 2.2 database in place", () => {
+  it("adds the journal columns without tripping over the index that uses them", () => {
+    // The one test shape this suite did not have, and the reason a boot-killing
+    // bug shipped green: every other `migrate()` runs on a database the current
+    // schema file just created, where `CREATE TABLE` did all the work.
+    //
+    // On an EXISTING database `CREATE TABLE IF NOT EXISTS` is a no-op, so any
+    // column the schema file then INDEXES has to have been added before the file
+    // runs. `idx_journal_entries_thread` indexes `thread_ref`; with the ALTER
+    // placed after `exec(sql)` — where every other guarded ALTER lives —
+    // `migrate()` threw `no such column: thread_ref`, and `initialize()`
+    // migrates before anything else, so the daemon never started again.
+    const directory = tempDirectory("scribe-upgrade-");
+    const path = join(directory, "operator.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE journal_entries (
+        slug       TEXT PRIMARY KEY,
+        day        TEXT NOT NULL,
+        body       TEXT NOT NULL,
+        source     TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE operator_notes (
+        id TEXT PRIMARY KEY,
+        category TEXT NOT NULL DEFAULT 'general',
+        content TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        source TEXT NOT NULL DEFAULT 'manual',
+        expires_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO journal_entries VALUES
+        ('2026-08-24-deploy', '2026-08-24', 'Closed (daemon bookkeeping): деплой', 'daemon', '2026-08-24T20:00:00.000Z');
+      INSERT INTO operator_notes VALUES
+        ('note_old', 'ops', 'старая заметка', 'active', 'manual', NULL, '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z');
+    `);
+    legacy.close();
+
+    const store = new OperatorStore(path);
+    expect(() => store.migrate()).not.toThrow();
+    try {
+      // The row survives, and is backfilled as a narrative `entry` rather than
+      // an `archive` — `archive` is what lets the daily summary contradict a
+      // close from the registry, and claiming that power over links written
+      // before the check existed would report old, correctly closed work as
+      // reopened on the first night after the upgrade.
+      const entry = store.getJournalEntry("2026-08-24-deploy")!;
+      expect(entry.kind).toBe("entry");
+      expect(entry.threadRef).toBeUndefined();
+      expect(entry.body).toContain("деплой");
+      // The new columns and the index they exist for are both live.
+      expect(store.listJournalEntries({ threadRef: "th_any" })).toEqual([]);
+      expect(store.appendJournalEntry({
+        slugBase: "2026-08-25-x",
+        day: "2026-08-25",
+        body: "новая",
+        source: "scribe",
+        kind: "archive",
+        threadRef: "th_new",
+      }).threadRef).toBe("th_new");
+      // And the notes side upgraded too, so the description pass has a column.
+      expect(store.listNotesMissingDescription(10).map((note) => note.id)).toEqual(["note_old"]);
+      store.markDescriptionAttempt(["note_old"]);
+      expect(store.listNotesMissingDescription(10)).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------
 // The gate (memory-design §5)
@@ -143,6 +221,20 @@ describe("the night window and the logical day (memory-design §5, §2.7)", () =
     expect(lastDayOfMonth("2028-02")).toBe("2028-02-29");
     expect(lastDayOfMonth("2026-02")).toBe("2026-02-28");
     expect(lastDayOfMonth("2026-12")).toBe("2026-12-31");
+  });
+
+  it("opens at 02:00 and closes at 04:00, un-forced", async () => {
+    // Every other behavioural test here uses `force`, so the boundaries
+    // themselves need one test that does not: an off-by-one at either edge is
+    // a secretary that never runs, or one that runs at breakfast.
+    const store = tempStore();
+    const at = async (iso: string) =>
+      (await new NightScribe({ ...baseDeps(store, []), now: () => new Date(iso) }).run()).status;
+    // Moscow is UTC+3, so 23:00Z is 02:00 local the next day.
+    expect(await at("2026-08-25T22:59:00.000Z")).toBe("outside-window"); // 01:59
+    expect(await at("2026-08-25T23:00:00.000Z")).not.toBe("outside-window"); // 02:00
+    expect(await at("2026-08-26T00:59:00.000Z")).not.toBe("outside-window"); // 03:59
+    expect(await at("2026-08-26T01:00:00.000Z")).toBe("outside-window"); // 04:00
   });
 
   it("does not run outside 02:00–04:00, and runs once inside it", async () => {
@@ -251,6 +343,26 @@ describe("reconciliation of the event log against the journal (memory-design §2
     expect(store.listJournalEntries({ threadRef: "th_again" })).toHaveLength(1);
   });
 
+  it("still finds the finished thread under a day's worth of tool calls", async () => {
+    const store = tempStore();
+    seedProject(store);
+    store.upsertThread(threadFixture("th_buried", "Работа под завалом"));
+    store.appendEvent("thread.completed", { threadId: "th_buried", payload: { status: "completed" } });
+    // A working day. The store clamps any event read to 200 rows ordered
+    // NEWEST first, so a recovery pass that read the gate's whole allow-list
+    // would drop the oldest rows — which is precisely the terminal event it
+    // exists to notice — and the cursor would advance anyway, losing the work
+    // for good. The recovery reads only the terminal types for that reason.
+    for (let call = 0; call < 250; call += 1) {
+      store.appendEvent("operator.tool.completed", { payload: { tool: "t3.get_thread" } });
+    }
+    const scribe = new NightScribe({ ...baseDeps(store, []), now: () => NIGHT });
+    const outcome = await scribe.run({ force: true });
+    expect(outcome.reasons.some((reason) => reason.startsWith("events:"))).toBe(true);
+    expect(outcome.recovered).toBe(1);
+    expect(store.listJournalEntries({ threadRef: "th_buried" })).toHaveLength(1);
+  });
+
   it("asks the journal once per thread, not once per terminal event", () => {
     const asked: string[] = [];
     const work = selectUnfiledWork({
@@ -291,9 +403,60 @@ describe("the daily summary believes the registry, not the journal (package 2.2 
     });
     expect(verdict.confirmed.map((entry) => entry.slug)).toEqual(["a-confirmed"]);
     expect(verdict.contradicted.map(({ entry }) => entry.slug)).toEqual(["a-reopened"]);
-    // A narrative entry is not an archive and is never judged as one: nothing
-    // in the ledger is supposed to point at it.
-    expect(verdict.confirmed).not.toContainEqual(narrative);
+    expect(verdict.superseded).toEqual([]);
+    // A narrative entry is not an archive and is judged in NEITHER direction —
+    // nothing in the ledger is supposed to point at one, so a rule that read it
+    // as an unconfirmed close would report every `journal.note` as reopened.
+    const slugs = [
+      ...verdict.confirmed,
+      ...verdict.superseded,
+      ...verdict.contradicted.map(({ entry }) => entry),
+    ].map((entry) => entry.slug);
+    expect(slugs).not.toContain(narrative.slug);
+  });
+
+  it("does not call finished work reopened just because it ran twice", async () => {
+    const store = tempStore();
+    const prompts: string[] = [];
+    // close → re-run → close. Package 1.3 lets a finished thread run again, and
+    // the second close writes a SECOND archive while repointing the item at it.
+    // The first archive is then an orphan that looks exactly like a reopen — so
+    // the mechanism built to stop one false "закрыто" would manufacture the
+    // mirror-image false "снова открыта" about work that is genuinely done.
+    const item = store.createNowItem({
+      ownerId: OWNER,
+      section: "active",
+      content: "Ночная сборка",
+      source: "daemon",
+      threadRef: "th_nightly",
+    });
+    const first = store.closeNowItem(item.id, {
+      slugBase: `${NIGHT_DAY}-nightly-1`,
+      day: NIGHT_DAY,
+      body: "Closed (daemon bookkeeping): Ночная сборка — прогон 1",
+    })!;
+    store.reopenNowItem(item.id, { section: "active", content: "Ночная сборка" });
+    const second = store.closeNowItem(item.id, {
+      slugBase: `${NIGHT_DAY}-nightly-2`,
+      day: NIGHT_DAY,
+      body: "Closed (daemon bookkeeping): Ночная сборка — прогон 2",
+    })!;
+    expect(store.getNowItem(item.id)!.status).toBe("closed");
+
+    const scribe = new NightScribe({
+      ...baseDeps(store, prompts, () => "Сделано: —"),
+      now: () => NIGHT,
+    });
+    await scribe.run({ force: true });
+    const prompt = prompts.find((entry) => entry.includes("CLOSED"))!;
+    // The newer archive is the day's fact; the older one is superseded and says
+    // nothing the day needs. Neither of them may appear as running.
+    expect(blockOf(prompt, "CLOSED")).toContain("прогон 2");
+    expect(blockOf(prompt, "REOPENED")).toBe("- нет");
+    expect(prompt).not.toContain("прогон 1");
+    // Both archives stay in the journal — the earlier run did happen.
+    expect(store.getJournalEntry(first.entry.slug)).toBeDefined();
+    expect(store.getJournalEntry(second.entry.slug)).toBeDefined();
   });
 
   it("never hands reopened work to the summary as finished", async () => {
@@ -411,6 +574,31 @@ describe("TTL transfers (memory-design §2.2, §5)", () => {
     const outcome = await scribe.run({ force: true });
     expect(outcome.expired).toBe(0);
     expect(store.getNowItem(item.id)!.status).toBe("open");
+    // …and it is excluded by the QUERY, not skipped by the sweep. Were it still
+    // returned, the gate would read `expired:1` every night for as long as the
+    // thread lived and spend a call on each of them.
+    expect(store.listExpiredNowItems({ ownerId: OWNER })).toHaveLength(0);
+    expect(outcome.reasons).not.toContain("expired:1");
+  });
+
+  it("does not summarise a day that did not happen", async () => {
+    const store = tempStore();
+    const prompts: string[] = [];
+    // The gate fires on the description backlog and nothing else — no entries
+    // for the day, nothing expired, nothing recovered. A gate that fired is not
+    // a day that happened, and a summary here buys a permanent "Сделано: —" row
+    // that next month's rollup then has to read.
+    store.rememberOperatorNote({ content: "легаси-заметка без описания" });
+    const scribe = new NightScribe({
+      ...baseDeps(store, prompts, () => "модели нечего сказать"),
+      now: () => NIGHT,
+    });
+    const outcome = await scribe.run({ force: true });
+    expect(outcome.status).toBe("completed");
+    expect(outcome.reasons).toEqual(["descriptions:1"]);
+    expect(outcome.llmCalls).toBe(1);
+    expect(prompts.some((prompt) => prompt.includes("CLOSED"))).toBe(false);
+    expect(store.getJournalEntry(summarySlug(NIGHT_DAY))).toBeUndefined();
   });
 });
 
@@ -440,8 +628,10 @@ describe("the monthly rollup (memory-design §2.4)", () => {
     expect(pruned.daemonEvents).toBeGreaterThan(0);
     expect(store.listJournalEntries({}).length).toBe(3);
 
+    const turns: Array<{ dedupeKey: string; prompt: string }> = [];
     const scribe = new NightScribe({
       ...baseDeps(store, prompts, () => "Июль: закрыли биллинг.\nПРЕДЛОЖЕНИЯ:\n- деплой staging → миграции идут первыми\n- нет"),
+      requestOwnerTurn: (input) => turns.push(input),
       now: () => NIGHT,
     });
     const outcome = await scribe.run({ force: true });
@@ -455,14 +645,22 @@ describe("the monthly rollup (memory-design §2.4)", () => {
     expect(rollup.day).toBe("2026-07-01");
     expect(rollup.body).toContain("Июль: закрыли биллинг.");
     // The proposals are stripped out of the narrative and go to the owner as a
-    // PROPOSAL — anti-rediscovery is curated, so nothing was written to memory.
+    // PROPOSAL: anti-rediscovery is curated (§2.3), so the turn is requested and
+    // the note is NOT written. Both halves asserted — "no note" alone would
+    // hold if the whole proposal path were deleted.
     expect(rollup.body).not.toContain("ПРЕДЛОЖЕНИЯ");
+    expect(turns.map((turn) => turn.dedupeKey)).toEqual(["scribe-monthly:2026-07"]);
+    expect(turns[0]!.prompt).toContain("деплой staging → миграции идут первыми");
     expect(store.listOperatorNotes({ status: "active" })).toHaveLength(0);
   });
 
-  it("never feeds a rollup its own kind, and settles an empty month once", async () => {
+  it("never reads a rollup as rollup input", () => {
+    // Asserted on the query the rollup actually issues, because the run-level
+    // path cannot reach it: a month that already HAS a rollup is never rebuilt,
+    // so a test driving a whole pass would pass with the filter deleted. The
+    // filter is what stops a rollup from compressing a compression the day
+    // anything else does rebuild one.
     const store = tempStore();
-    const prompts: string[] = [];
     store.appendJournalEntry({
       slugBase: rollupSlug("2026-07"),
       day: "2026-07-01",
@@ -477,13 +675,51 @@ describe("the monthly rollup (memory-design §2.4)", () => {
       source: "agent",
       kind: "entry",
     });
-    // A rollup already exists for July, so nothing is due at all…
-    const settled = new NightScribe({ ...baseDeps(store, prompts), now: () => NIGHT });
-    expect((await settled.run({ force: true })).rollupMonth).toBeUndefined();
-    expect(prompts).toHaveLength(0);
+    const input = store.listJournalEntries({
+      from: "2026-07-01",
+      to: "2026-07-31",
+      kinds: ["entry", "archive", "summary"],
+    });
+    expect(input.map((entry) => entry.slug)).toEqual(["2026-07-09-note"]);
+    // …and the month is not rebuilt while its rollup stands.
+    expect(store.getJournalEntry(rollupSlug("2026-07"))).toBeDefined();
+  });
 
-    // …and on a month with no rows the gate settles it instead of reporting
-    // "rollup due" every night for the rest of the installation's life.
+  it("reads a busy month from its beginning, not its last three hundred rows", async () => {
+    const store = tempStore();
+    const prompts: string[] = [];
+    store.appendJournalEntry({
+      slugBase: "2026-07-01-summary",
+      day: "2026-07-01",
+      body: "Решения: выбрали новый биллинг",
+      source: "scribe",
+      kind: "summary",
+    });
+    // A fortnight of archives piled on top of it, past the read cap. Ordered
+    // newest-first, a single capped query would drop the 1 July decision — the
+    // part a monthly narrative most needs, since that is where a month's
+    // decisions get made.
+    for (let index = 0; index < 320; index += 1) {
+      store.appendJournalEntry({
+        slugBase: `2026-07-2${index % 10}-archive-${index}`,
+        day: `2026-07-2${index % 10}`,
+        body: `Closed (daemon bookkeeping): рутина ${index}`,
+        source: "daemon",
+        kind: "archive",
+      });
+    }
+    const scribe = new NightScribe({
+      ...baseDeps(store, prompts, () => "Июль."),
+      now: () => NIGHT,
+    });
+    expect((await scribe.run({ force: true })).rollupMonth).toBe("2026-07");
+    const rollupPrompt = prompts.find((prompt) => prompt.includes("месячную сводку"))!;
+    expect(rollupPrompt).toContain("выбрали новый биллинг");
+    // And it reads the month in the order it happened.
+    expect(rollupPrompt.indexOf("2026-07-01")).toBeLessThan(rollupPrompt.indexOf("2026-07-29"));
+  });
+
+  it("settles an empty month once instead of reporting it due every night", async () => {
     const empty = tempStore();
     const emptyScribe = new NightScribe({ ...baseDeps(empty, []), now: () => NIGHT });
     expect((await emptyScribe.run({ force: true })).status).toBe("no-work");
@@ -605,6 +841,44 @@ describe("a night the background channel is down (memory-design §5)", () => {
     expect(store.listDaemonEvents({ typePrefixes: ["memory.scribe."] })).toHaveLength(0);
   });
 
+  it("does not blame the provider for a failure of its own", async () => {
+    const store = tempStore();
+    const turns: Array<{ dedupeKey: string; prompt: string }> = [];
+    store.rememberOperatorNote({ content: "легаси-заметка" });
+    // A failure AFTER the model answered — here a storage error while recording
+    // the attempt. An error thrown by the call itself is a channel failure and
+    // is meant to count; this one never touched the provider at all.
+    const brokenStore = new Proxy(store, {
+      get(target, property, receiver) {
+        if (property === "markDescriptionAttempt") {
+          return () => {
+            throw new Error("database is locked");
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const scribe = new NightScribe({
+      ...baseDeps(store, [], () => "n1 :: триггер → суть"),
+      store: brokenStore,
+      requestOwnerTurn: (input) => turns.push(input),
+      now: () => NIGHT,
+    });
+    const outcome = await scribe.run({ force: true });
+    expect(outcome.status).toBe("skipped");
+    expect(outcome.detail).toContain("database is locked");
+    // A defect still stops the night and still leaves a mark. What it must not
+    // do is claim the channel was down and accumulate toward a message to the
+    // owner whose entire content would be wrong.
+    expect(outcome.misses).toBe(0);
+    expect(store.getRuntimeState(SCRIBE_MISS_COUNT_KEY)).toBeUndefined();
+    expect(store.getJournalEntry(`${NIGHT_DAY}-scribe-skipped`)!.body).toContain(
+      "the pass failed before it finished",
+    );
+    expect(turns).toHaveLength(0);
+  });
+
   it("keeps the deterministic half of a skipped night", async () => {
     const store = tempStore();
     const item = store.createNowItem({
@@ -660,6 +934,30 @@ describe("lazy descriptions for legacy notes (memory-design §6.4)", () => {
     );
     expect(store.getOperatorNote("note_forged")).toBeUndefined();
     // And the note is out of the backlog, so the next night does not redo it.
+    expect(store.listNotesMissingDescription(10)).toHaveLength(0);
+  });
+
+  it("stops offering a note the model keeps declining", async () => {
+    const store = tempStore();
+    const prompts: string[] = [];
+    store.rememberOperatorNote({ content: "заметка, про которую нечего сказать" });
+    // The prompt invites the model to skip a note it has nothing to say about,
+    // and a skipped note keeps BOTH its empty description and its old
+    // updated_at — so on an oldest-first queue it returns every single night.
+    // Without a bound, one such note makes every "quiet" night cost two calls,
+    // forever, on an installation where nothing else is happening.
+    const nights = ["2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28"];
+    const statuses: string[] = [];
+    for (const day of nights) {
+      const scribe = new NightScribe({
+        ...baseDeps(store, prompts, () => "модели нечего сказать"),
+        now: () => new Date(`${day}T00:00:00.000Z`),
+      });
+      statuses.push((await scribe.run({ force: true })).status);
+    }
+    // Three attempts, then the note leaves the queue and the nights go quiet.
+    expect(statuses).toEqual(["completed", "completed", "completed", "no-work", "no-work"]);
+    expect(prompts).toHaveLength(3);
     expect(store.listNotesMissingDescription(10)).toHaveLength(0);
   });
 
@@ -784,6 +1082,19 @@ describe("journal.* tools (memory-design §2.4)", () => {
       expect(
         await callJson(client, "journal.note", { done: "сводка", title: "2026-08-20-summary" }),
       ).toEqual({ ok: false, hint: JOURNAL_HINT_RESERVED_SLUG });
+      // Checked on the DERIVED slug, not the raw title. `journalSlugBase`
+      // prefixes the day, so a title of "summary" alone becomes
+      // `2026-08-21-summary` — the exact name the night secretary writes its
+      // day under, and the summary pass skips a day whose slug already exists.
+      // An innocent-looking title would quietly cost the owner that summary.
+      expect(await callJson(client, "journal.note", { done: "итоги", title: "summary" })).toEqual({
+        ok: false,
+        hint: JOURNAL_HINT_RESERVED_SLUG,
+      });
+      expect(
+        await callJson(client, "journal.note", { done: "итоги", title: "scribe skipped" }),
+      ).toEqual({ ok: false, hint: JOURNAL_HINT_RESERVED_SLUG });
+      expect(store.getJournalEntry(summarySlug("2026-08-21"))).toBeUndefined();
 
       // Reads: one day, a range, and the month sugar for a rollup.
       store.appendJournalEntry({

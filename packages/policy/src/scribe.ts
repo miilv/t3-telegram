@@ -462,6 +462,18 @@ export interface ArchiveVerdict {
    * what is happening now, not what the entry said then.
    */
   contradicted: Array<{ entry: JournalEntry; item?: NowItem }>;
+  /**
+   * Archives of an EARLIER close of work that has since closed again.
+   *
+   * Neither finished-now nor running-now, and reporting them as either is a
+   * false claim. Package 1.3 lets a finished thread be re-run: close → reopen
+   * (which clears `journal_ref`) → close writes a SECOND archive and points the
+   * item at that one. The first archive is then an orphan that looks exactly
+   * like a reopen — so the mechanism built to stop one wrong "закрыто" would
+   * manufacture the mirror-image wrong "снова открыта" about work that is done.
+   * The newer archive is in `confirmed` and says everything the day needs.
+   */
+  superseded: JournalEntry[];
 }
 
 /**
@@ -480,12 +492,14 @@ export interface ArchiveVerdict {
  */
 export function reconcileArchivesAgainstLedger(input: {
   entries: readonly JournalEntry[];
+  /** The item that currently points at this archive, if any. */
   lookup: (slug: string) => NowItem | undefined;
-  /** Item ids the event log saw reopen; only used to name them accurately. */
-  reopenedItemIds?: ReadonlySet<string>;
+  /** The item currently tracking a thread — how a supersede is told from a reopen. */
+  lookupByThread?: (threadRef: string) => NowItem | undefined;
 }): ArchiveVerdict {
   const confirmed: JournalEntry[] = [];
   const contradicted: Array<{ entry: JournalEntry; item?: NowItem }> = [];
+  const superseded: JournalEntry[] = [];
   for (const entry of input.entries) {
     if (entry.kind !== "archive") continue;
     const item = input.lookup(entry.slug);
@@ -493,26 +507,17 @@ export function reconcileArchivesAgainstLedger(input: {
       confirmed.push(entry);
       continue;
     }
-    contradicted.push({ entry, ...(item ? { item } : {}) });
+    // An orphan archive: nothing claims it. Two very different stories produce
+    // that, and only the thread can tell them apart — which is the second
+    // reason `thread_ref` is on the table.
+    const tracked = entry.threadRef ? input.lookupByThread?.(entry.threadRef) : undefined;
+    if (tracked && tracked.status === "closed") {
+      superseded.push(entry);
+      continue;
+    }
+    contradicted.push({ entry, ...(item ?? tracked ? { item: (item ?? tracked)! } : {}) });
   }
-  return { confirmed, contradicted };
-}
-
-/**
- * Item ids the event log saw come back to life in the window.
- *
- * The registry is the authority (an item that is open is open, whatever the
- * log says), but the log is what makes the summary able to SAY it — "эта
- * работа снова идёт" needs to know it was ever closed.
- */
-export function reopenedItemIds(events: readonly ScribeEvent[]): Set<string> {
-  const ids = new Set<string>();
-  for (const event of events) {
-    if (event.eventType !== "memory.now_item.reopened") continue;
-    const itemId = event.payload.itemId;
-    if (typeof itemId === "string" && itemId) ids.add(itemId);
-  }
-  return ids;
+  return { confirmed, contradicted, superseded };
 }
 
 // ---------------------------------------------------------------------------

@@ -47,6 +47,7 @@ import {
   SCRIBE_MISS_ALERT_THRESHOLD,
   SCRIBE_MISS_COUNT_KEY,
   SCRIBE_ONESHOT_TIMEOUT_MS,
+  SCRIBE_SIGNIFICANT_EVENT_TYPES,
   SCRIBE_WINDOW_FROM_HOUR,
   SCRIBE_WINDOW_TO_HOUR,
   SCRIBE_WORK_EVENT_PREFIXES,
@@ -65,7 +66,6 @@ import {
   renderExpiredItemJournalBody,
   renderRecoveredEntryBody,
   renderScribeSkipBody,
-  reopenedItemIds,
   rollupSlug,
   scribeTargetDay,
   selectUnfiledWork,
@@ -234,7 +234,20 @@ export class NightScribe {
       llmCalls += descriptionResult.calls;
       described = descriptionResult.described;
     } catch (error) {
-      return this.recordSkip({ day, error, llmCalls, recovered: recovered.length, expired: expired.length, at });
+      return this.recordSkip({
+        day,
+        error,
+        // Only an unusable CHANNEL is §5's skip. A storage error inside the
+        // rollup, or a description pass that failed after the summary already
+        // committed, is a defect — recording it as "the provider was down"
+        // writes a false cause into the journal and, three nights running,
+        // pages the owner about an outage that never happened.
+        channelDown: error instanceof ScribeChannelUnavailable,
+        llmCalls,
+        recovered: recovered.length,
+        expired: expired.length,
+        at,
+      });
     }
 
     store.setRuntimeState(SCRIBE_LAST_DAY_KEY, day);
@@ -311,15 +324,36 @@ export class NightScribe {
     return month;
   }
 
+  /**
+   * What a month's rollup reads.
+   *
+   * Never `kind: 'rollup'`: a rollup reading a rollup compresses a compression,
+   * and by the third month the record would be a rumour.
+   *
+   * The day summaries are fetched SEPARATELY and first. A single capped query
+   * ordered newest-first loses the beginning of any month past the cap — and
+   * the beginning is the part a monthly narrative most needs, since that is
+   * where a month's decisions get made. There is at most one summary a day, so
+   * pulling them on their own guarantees the whole month has a spine no matter
+   * how many archives a busy fortnight piled on top of it.
+   */
   private rollupInputEntries(month: string, limit = ROLLUP_ENTRY_LIMIT): JournalEntry[] {
-    return this.deps.store.listJournalEntries({
-      from: firstDayOfMonth(month),
-      to: lastDayOfMonth(month),
-      // Everything except `rollup`: a rollup reading a rollup compresses a
-      // compression, and by the third month the record would be a rumour.
-      kinds: ["entry", "archive", "summary"],
-      limit,
+    const from = firstDayOfMonth(month);
+    const to = lastDayOfMonth(month);
+    const store = this.deps.store;
+    const summaries = store.listJournalEntries({ from, to, kinds: ["summary"], limit: 62 });
+    const rest = store.listJournalEntries({
+      from,
+      to,
+      kinds: ["entry", "archive"],
+      limit: Math.max(1, limit - summaries.length),
     });
+    // Oldest first: the prompt should read the month in the order it happened.
+    return [...summaries, ...rest].sort((left, right) =>
+      left.day === right.day
+        ? left.createdAt.localeCompare(right.createdAt)
+        : left.day.localeCompare(right.day),
+    );
   }
 
   /**
@@ -356,10 +390,24 @@ export class NightScribe {
     return filed;
   }
 
+  /**
+   * The terminal events the recovery pass reads.
+   *
+   * Filtered to `SCRIBE_SIGNIFICANT_EVENT_TYPES`, NOT to the gate's allow-list,
+   * and the difference is work being lost rather than tidiness. The store
+   * clamps any read to 200 rows ordered newest-first; the allow-list matches
+   * every tool call and every turn, so one working day overruns 200 easily and
+   * the rows that fall off the end are the OLDEST — exactly the finished work
+   * this pass exists to notice. The cursor advances regardless, so a
+   * `thread.completed` dropped that way is never recovered at all.
+   *
+   * Three event types per finished thread, a handful of threads a day: this
+   * query cannot overrun the clamp for any plausible amount of real work.
+   */
   private readEvents(since: string): ScribeEvent[] {
     return this.deps.store.listDaemonEvents({
       since,
-      typePrefixes: [...SCRIBE_WORK_EVENT_PREFIXES],
+      typePrefixes: [...SCRIBE_SIGNIFICANT_EVENT_TYPES],
       limit: 200,
     });
   }
@@ -390,7 +438,6 @@ export class NightScribe {
       );
       const entry = store.appendUniqueJournalEntry({
         slug: `${day}-recovered-${work.threadRef}`,
-        slugBase: `${day}-recovered-${work.threadRef}`,
         day,
         body: renderRecoveredEntryBody({
           work,
@@ -424,14 +471,19 @@ export class NightScribe {
     const store = this.deps.store;
     if (store.getJournalEntry(summarySlug(input.day))) return 0;
     const entries = store.listJournalEntries({ day: input.day, limit: 200 });
+    // A gate that fired is not a day that happened. `has_work` also passes on
+    // an undescribed note, a due rollup, or the ledger rows this very run just
+    // touched — and a summary of a day with nothing in it is an LLM call that
+    // buys a permanent "Сделано: —" row, which the monthly rollup then has to
+    // read. The day's own facts decide whether there is a day to summarise.
+    if (!entries.length && !input.expired.length && !input.recovered.length) return 0;
     const verdict = reconcileArchivesAgainstLedger({
       entries,
       lookup: (slug) => store.getNowItemByJournalRef(slug),
-      reopenedItemIds: reopenedItemIds(input.events),
+      lookupByThread: (threadRef) => store.getDaemonNowItemForThread(threadRef),
     });
-    const openItems = store
-      .listNowItems({ ownerId: this.deps.ownerId(), limit: 200 })
-      .filter((item) => item.status !== "closed");
+    // `listNowItems` already excludes closed rows unless asked otherwise.
+    const openItems = store.listNowItems({ ownerId: this.deps.ownerId(), limit: 200 });
     const body = await this.oneShot(
       buildDailySummaryPrompt({
         day: input.day,
@@ -446,7 +498,6 @@ export class NightScribe {
     );
     store.appendUniqueJournalEntry({
       slug: summarySlug(input.day),
-      slugBase: summarySlug(input.day),
       day: input.day,
       body,
       source: "scribe",
@@ -472,7 +523,6 @@ export class NightScribe {
     );
     store.appendUniqueJournalEntry({
       slug: rollupSlug(month),
-      slugBase: rollupSlug(month),
       day: firstDayOfMonth(month),
       body: parsed.body,
       source: "scribe",
@@ -515,6 +565,12 @@ export class NightScribe {
     for (const { id, description } of parseDescriptions(response, allowed)) {
       if (this.deps.store.setNoteDescription(id, description)) described += 1;
     }
+    // Every note in the batch, not only the ones that came back. The prompt
+    // invites the model to skip a note it has nothing to say about, and a
+    // skipped note keeps both its empty description and its old `updated_at` —
+    // so without this it sits at the head of an oldest-first queue forever and
+    // every "quiet" night on that installation costs a call.
+    this.deps.store.markDescriptionAttempt(notes.map((note) => note.id));
     return { calls: 1, described };
   }
 
@@ -569,6 +625,8 @@ export class NightScribe {
   private recordSkip(input: {
     day: string;
     error: unknown;
+    /** True only for an unusable background channel — §5's own failure mode. */
+    channelDown: boolean;
     llmCalls: number;
     recovered: number;
     expired: number;
@@ -576,16 +634,22 @@ export class NightScribe {
   }): ScribeRunOutcome {
     const store = this.deps.store;
     const detail = input.error instanceof Error ? input.error.message : String(input.error);
-    const misses = Math.max(0, Number(store.getRuntimeState(SCRIBE_MISS_COUNT_KEY) ?? "0") || 0) + 1;
-    store.setRuntimeState(SCRIBE_MISS_COUNT_KEY, String(misses));
+    // Only a channel outage moves the counter that pages the owner. A defect
+    // still stops the night and still leaves a mark — it just does not claim
+    // the provider did it, and it does not accumulate toward a message whose
+    // whole content would be wrong.
+    const previous = Math.max(0, Number(store.getRuntimeState(SCRIBE_MISS_COUNT_KEY) ?? "0") || 0);
+    const misses = input.channelDown ? previous + 1 : previous;
+    if (input.channelDown) store.setRuntimeState(SCRIBE_MISS_COUNT_KEY, String(misses));
     store.setRuntimeState(SCRIBE_LAST_DAY_KEY, input.day);
     store.appendUniqueJournalEntry({
       slug: skipSlug(input.day),
-      slugBase: skipSlug(input.day),
       day: input.day,
       body: renderScribeSkipBody({
         day: input.day,
-        reason: "the background one-shot channel was unavailable",
+        reason: input.channelDown
+          ? "the background one-shot channel was unavailable"
+          : "the pass failed before it finished",
         misses,
         detail,
       }),
@@ -595,11 +659,13 @@ export class NightScribe {
       kind: "entry",
     });
     store.appendEvent("memory.scribe.skipped", {
-      payload: { day: input.day, misses, detail: detail.slice(0, 300) },
+      payload: { day: input.day, misses, channelDown: input.channelDown, detail: detail.slice(0, 300) },
     });
     this.deps.logger.warn(
-      { day: input.day, misses },
-      "Night secretary skipped: the background one-shot channel is unavailable",
+      { day: input.day, misses, channelDown: input.channelDown, err: input.error },
+      input.channelDown
+        ? "Night secretary skipped: the background one-shot channel is unavailable"
+        : "Night secretary stopped on an error of its own",
     );
     // Once per outage, not once per night. The counter resets on the first run
     // that completes, so a NEW outage alerts again; a provider that stays down
