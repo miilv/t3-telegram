@@ -1885,7 +1885,7 @@ describe("OperatorDaemon product flow", () => {
     const normalizationGate = new Promise<void>((resolvePromise) => (releaseNormalization = resolvePromise));
     class BlockedNormalizationRuntime extends FakeRuntime {
       normalizations = 0;
-      override async *sendTurn(input: {
+      override async *stream(input: {
         sessionId: string;
         prompt: string;
         toolAccess?: OperatorToolAccess;
@@ -1894,7 +1894,7 @@ describe("OperatorDaemon product flow", () => {
           this.normalizations += 1;
           await normalizationGate;
         }
-        yield* super.sendTurn(input);
+        yield* super.stream(input);
       }
     }
     class PerThreadBroker extends FakeBroker {
@@ -3468,6 +3468,19 @@ describe("OperatorDaemon product flow", () => {
       { type: "completed", threadId: "th_1", result: "Collaborative turn finished in the UI." },
     ];
     broker.holdTerminal();
+    // Package 1.5: the collaborator's turn starts long after ours, so the
+    // own-dispatch race window is over before their narration arrives — which
+    // is what makes the suppression below safe. Inside that window the events
+    // would reach the OPERATOR (never the chat) rather than be lost, because
+    // after 1.2 a mis-labelled turn costs the narrative of our own work.
+    broker.beforeEvent = (event) => {
+      if (event.type === "started" && event.turnId === "turn_external") {
+        store.setRuntimeState(
+          "thread_own_dispatch_at:th_1",
+          new Date(Date.now() - 10 * 60 * 1_000).toISOString(),
+        );
+      }
+    };
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
@@ -4472,6 +4485,799 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   });
+
+  it("frees the queue slot of a turn that ignores its interrupt, and never delivers its late answer (package 1.5)", async () => {
+    const home = tempDirectory("daemon-zombie-");
+    const store = tempStore();
+    // The provider counts interrupts and does nothing about them — the exact
+    // failure the SIGKILL timeout used to cover ten minutes later.
+    const runtime = new WedgedRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 30_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      telegram.push(message(1, "зависший вопрос про миграцию"));
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("зависший вопрос")));
+
+      // The owner writes again: ordinary preemption, and the provider ignores
+      // the interrupt it is sent.
+      telegram.push(message(2, "новый вопрос вместо предыдущего"));
+      await waitFor(() => runtime.interrupts >= 1);
+
+      // The watchdog clock is the test's, not the wall's: no sleeps, no
+      // dependence on how fast this machine's disk is.
+      const interruptedAt = Date.now();
+      daemon.watchdogTick(interruptedAt + 10_000);
+      expect(zombieCount(store)).toBe(0);
+      expect(telegram.sent.some((sent) => sent.text.includes("Предыдущий ответ завис"))).toBe(false);
+
+      // Grace expired: the turn is written off. Ticking inside `waitFor`
+      // because the durable ingress row of message 2 — the real waiter the
+      // watchdog reads — is written asynchronously, after the preemption.
+      await waitFor(() => {
+        daemon.watchdogTick(interruptedAt + 40_000);
+        return zombieCount(store) === 1;
+      }, 5_000);
+
+      // (а) the queue does not stop: the newer message is answered while the
+      // wedged turn is still sitting inside the provider call. This is also
+      // where the fakes now behave like the real CLI runtimes — one active turn
+      // at a time — so it only passes because the runtime slot was released too.
+      await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."), 10_000);
+      // (б) the owner hears exactly one line about the answer they lost.
+      expect(
+        telegram.sent.filter((sent) => sent.text.includes("Предыдущий ответ завис")),
+      ).toHaveLength(1);
+      // (в) the zombie is recorded, and its durable job is completed — as a
+      // superseded turn, so a restart replays nothing.
+      expect(zombieCount(store)).toBe(1);
+      expect(store.listBackgroundJobs("telegram_ingress", "pending")).toHaveLength(0);
+      expect(store.listBackgroundJobs("telegram_ingress", "running")).toHaveLength(0);
+      expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(2);
+
+      // (г) the zombie finally comes back to life — and reaches nobody, not
+      // even the session state: it may not adopt a session id behind the back
+      // of the turn that replaced it.
+      runtime.release();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(telegram.sent.some((sent) => sent.text.includes("поздний ответ зомби"))).toBe(false);
+      expect(store.getRuntimeState("operator_session_id")).not.toBe("zombie-session");
+    } finally {
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("tells the owner once when turns wedge back to back (package 1.5)", async () => {
+    const home = tempDirectory("daemon-zombie-cascade-");
+    const store = tempStore();
+    const runtime = new WedgedRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 30_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      telegram.push(message(1, "зависший вопрос первый"));
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("зависший вопрос первый")));
+      telegram.push(message(2, "зависший вопрос второй"));
+      await waitFor(() => runtime.interrupts >= 1);
+      const firstWedge = Date.now();
+      await waitFor(() => {
+        daemon.watchdogTick(firstWedge + 40_000);
+        return zombieCount(store) === 1;
+      }, 5_000);
+
+      // The second turn wedges the same way, and a third message preempts it.
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("зависший вопрос второй")), 10_000);
+      telegram.push(message(3, "третий вопрос, уже без зависаний"));
+      await waitFor(() => runtime.interrupts >= 2, 10_000);
+      const secondWedge = Date.now();
+      await waitFor(() => {
+        // The same minute on the watchdog's clock as the first zombie, which is
+        // what the notice throttle is measured against.
+        daemon.watchdogTick(secondWedge + 40_000);
+        return zombieCount(store) === 2;
+      }, 5_000);
+      await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."), 10_000);
+
+      // Two turns were abandoned; the owner was told once. A cascade is a
+      // stream of identical sentences, and the second one explains nothing.
+      expect(zombieCount(store)).toBe(2);
+      expect(
+        telegram.sent.filter((sent) => sent.text.includes("Предыдущий ответ завис")),
+      ).toHaveLength(1);
+    } finally {
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("says nothing to the owner when the wedged turn was a digest, and carries its loss forward (package 1.5)", async () => {
+    const home = tempDirectory("daemon-zombie-digest-");
+    const store = tempStore();
+    // The digest interpretation is the turn that wedges here; the owner never
+    // asked for it, so they must not be told their answer was lost.
+    const runtime = new WedgedRuntime();
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "agent_message", threadId: "th_1", text: "зависший ход: заметка воркера" },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 30_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      const project = await broker.createProject({ name: "Acme", workspaceRoot: `${home}/acme` });
+      store.upsertProject(project);
+      const thread = await broker.createThread({ projectId: project.id, title: "Тихая работа" });
+      store.upsertThread(thread);
+      await daemon.trackOperatorToolThread({
+        threadId: thread.id,
+        context: { chatId: 7, ownerId: "42", teamRole: "owner", originMessageId: 1, operatorTurnId: "opturn_1" },
+      });
+
+      // The digest turn starts and wedges inside the provider.
+      await waitFor(
+        () => runtime.prompts.some((prompt) => prompt.includes("зависший ход: заметка воркера")),
+        10_000,
+      );
+      // An owner message queues behind it, which is what puts the watchdog on
+      // the clock at all.
+      telegram.push(message(1, "что там по работе?"));
+      const wedgedAt = Date.now();
+      // Step one (the interrupt) and step two (the abandonment), both on the
+      // test's clock. A digest turn gets the longer non-user budget: ×3.
+      await waitFor(() => {
+        daemon.watchdogTick(wedgedAt + 400_000);
+        return runtime.interrupts >= 1;
+      }, 5_000);
+      daemon.watchdogTick(wedgedAt + 800_000);
+      await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."), 10_000);
+
+      expect(zombieCount(store)).toBe(1);
+      // Nobody was waiting on the digest, so nobody is told it was lost…
+      expect(telegram.sent.some((sent) => sent.text.includes("Предыдущий ответ завис"))).toBe(false);
+      const messageTypes = (
+        store.db.prepare("SELECT payload_json FROM telegram_outbox").all() as Array<{ payload_json: string }>
+      ).map((row) => (JSON.parse(row.payload_json) as { messageType?: string }).messageType);
+      expect(messageTypes).not.toContain("operator_zombie_notice");
+      // …but the notes it swallowed are not lost in silence: the next digest
+      // carries the fact that they existed, for the Operator to speak to.
+      await waitFor(
+        () => runtime.prompts.some((prompt) => prompt.includes("потеряно сообщений этой работы")),
+        10_000,
+      );
+    } finally {
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("never calls a turn that already answered a zombie (package 1.5)", async () => {
+    const home = tempDirectory("daemon-zombie-settled-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new InterruptCountingBroker();
+    // Delivery blocks AFTER the final is enqueued: the turn is done with the
+    // provider but still holds its queue slot. That window used to look exactly
+    // like a wedge.
+    const telegram = new BlockingDeliveryTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 30_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      telegram.push(message(1, "первый вопрос"));
+      await waitFor(() => telegram.blockedSends >= 1, 10_000);
+      // A second message preempts the (already answered) turn, so the grace
+      // clock is running and the queue has a waiter — the whole zombie
+      // precondition, minus the freeze.
+      telegram.push(message(2, "второй вопрос"));
+      // Deterministic: wait until the preemption is on the record, not for an
+      // arbitrary 50 ms. Without it this test could pass by never reaching the
+      // state it is about.
+      await waitFor(
+        () =>
+          (
+            store.db
+              .prepare(
+                "SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.superseded'",
+              )
+              .get() as { count: number }
+          ).count >= 1,
+        5_000,
+      );
+      daemon.watchdogTick(Date.now() + 10 * 60_000);
+      expect(zombieCount(store)).toBe(0);
+      expect(telegram.sent.some((sent) => sent.text.includes("Предыдущий ответ завис"))).toBe(false);
+    } finally {
+      telegram.releaseSends();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("interrupts a turn that fell silent while the owner waits, and gives other lanes a longer budget (package 1.5)", async () => {
+    const home = tempDirectory("daemon-watchdog-stall-");
+    const store = tempStore();
+    const runtime = new WedgedRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      // A long grace: this test is about step one only — the interrupt.
+      watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 300_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      telegram.push({ ...message(1, "зависший вопрос про миграцию"), messageThreadId: 11 });
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("зависший вопрос")));
+      const startedAt = Date.now();
+
+      // Six minutes of total silence with NOBODY waiting — no pending ingress
+      // job of any kind. A pure reasoning turn is exactly this shape (dead air
+      // for minutes, bug №18), and the reliability pump keeps both housekeeping
+      // lanes non-empty the whole time, so a lane-depth gate would have killed
+      // it here and told the owner about a message they never sent.
+      for (const minute of [1, 2, 3, 4, 5, 6]) {
+        daemon.watchdogTick(startedAt + minute * 60_000);
+      }
+      expect(runtime.interrupts).toBe(0);
+      expect(zombieCount(store)).toBe(0);
+      expect(store.listBackgroundJobs("telegram_ingress", "pending")).toHaveLength(0);
+
+      // Another topic — so nothing is preempted — puts the OWNER in the queue,
+      // and the same silence is now over budget.
+      telegram.push({ ...message(2, "вопрос в другом топике"), messageThreadId: 22 });
+      await waitFor(() => {
+        daemon.watchdogTick(startedAt + 200_000);
+        return runtime.interrupts >= 1;
+      }, 5_000);
+      expect(
+        store.db
+          .prepare(
+            "SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.superseded' AND payload_json LIKE '%watchdog_stall%'",
+          )
+          .get(),
+      ).toMatchObject({ count: 1 });
+      // The grace has not expired, so nothing has been abandoned and the owner
+      // has been told nothing.
+      expect(zombieCount(store)).toBe(0);
+      expect(telegram.sent.some((sent) => sent.text.includes("Предыдущий ответ завис"))).toBe(false);
+
+      // The turn finally reacts: interrupted means undeliverable, and the
+      // waiting message is served as usual.
+      runtime.release();
+      await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."), 10_000);
+      expect(telegram.sent.some((sent) => sent.text.includes("поздний ответ зомби"))).toBe(false);
+    } finally {
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("replays the owner's question when the turn wedged with nobody replacing it (package 1.5)", async () => {
+    const home = tempDirectory("daemon-zombie-retry-");
+    const store = tempStore();
+    // Wedges on the first attempt, answers on the replay.
+    const runtime = new WedgedOnceRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 30_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      // ONE message from the owner, and a second one in another topic so the
+      // watchdog has a real waiter without replacing the first question.
+      telegram.push({ ...message(1, "зависший вопрос про миграцию"), messageThreadId: 11 });
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("зависший вопрос")));
+      telegram.push({ ...message(2, "вопрос в другом топике"), messageThreadId: 22 });
+      const startedAt = Date.now();
+
+      // Stall, then grace: the turn is written off — but the question behind it
+      // was never replaced, so it must not be dropped.
+      await waitFor(() => {
+        daemon.watchdogTick(startedAt + 200_000);
+        return runtime.interrupts >= 1;
+      }, 5_000);
+      daemon.watchdogTick(startedAt + 400_000);
+
+      // The line is honest about what happens next…
+      await waitFor(
+        () => telegram.sent.some((sent) => sent.text.includes("Ответ завис — попробую ещё раз")),
+        10_000,
+      );
+      expect(
+        telegram.sent.some((sent) => sent.text.includes("продолжаю с вашим новым сообщением")),
+      ).toBe(false);
+      // …and the durable job really is replayed, so the question gets answered.
+      await waitFor(
+        () => telegram.sent.some((sent) => sent.text.includes("Ответ со второй попытки")),
+        15_000,
+      );
+      expect(zombieCount(store)).toBe(1);
+      expect(
+        store.db
+          .prepare(
+            "SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.zombie_retry'",
+          )
+          .get(),
+      ).toMatchObject({ count: 1 });
+      expect(store.listBackgroundJobs("telegram_ingress", "failed")).toHaveLength(0);
+    } finally {
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  it("leaves a long turn alone while it keeps producing events (package 1.5)", async () => {
+    const home = tempDirectory("daemon-watchdog-healthy-");
+    const store = tempStore();
+    const runtime = new SteadyRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 300_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      telegram.push({ ...message(1, "долгий вопрос про архитектуру"), messageThreadId: 11 });
+      await waitFor(() => runtime.started);
+      // Another topic is another conversation: it waits in the user lane (the
+      // watchdog's precondition) without preempting anything.
+      telegram.push({ ...message(2, "вопрос в другом топике"), messageThreadId: 22 });
+
+      // Twenty ticks on the real clock while the turn streams. The budget is
+      // 100 s and this whole test takes under a second, so the only way the
+      // watchdog could fire is by ignoring the events — which is the bug.
+      for (let index = 0; index < 20; index += 1) {
+        daemon.watchdogTick();
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+      expect(runtime.interrupts).toBe(0);
+      expect(zombieCount(store)).toBe(0);
+
+      runtime.release();
+      await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Долгий ответ дописан")), 10_000);
+    } finally {
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("never starts the provider for a turn abandoned while it waited in the queue (package 1.5)", async () => {
+    const home = tempDirectory("daemon-zombie-queued-");
+    const store = tempStore();
+    // The first turn wedges and holds the runtime; the second owner message
+    // queues behind it and is written off BEFORE it ever reaches the provider.
+    const runtime = new WedgedRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 30_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      telegram.push(message(1, "зависший вопрос про миграцию"));
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("зависший вопрос")));
+      const promptsBefore = runtime.prompts.length;
+
+      // The owner writes again. Their new turn is queued behind the wedge — and
+      // the watchdog abandons the wedged one, which is what lets the queued
+      // turn run at all.
+      telegram.push(message(2, "новый вопрос вместо предыдущего"));
+      await waitFor(() => runtime.interrupts >= 1);
+      const wedgedAt = Date.now();
+      await waitFor(() => {
+        daemon.watchdogTick(wedgedAt + 40_000);
+        return zombieCount(store) === 1;
+      }, 5_000);
+      await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."), 10_000);
+
+      // Exactly one new provider call happened: the answered one. The wedged
+      // turn's own call was never re-entered.
+      expect(runtime.prompts.length).toBe(promptsBefore + 1);
+      // (The branch that guarantees a queued-and-abandoned turn never reaches
+      // the provider is asserted directly in the next test, at the seam.)
+    } finally {
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("returns an already-abandoned turn without touching the provider (package 1.5)", async () => {
+    const home = tempDirectory("daemon-abandon-before-start-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const scheduler = new DailyScheduler(async () => undefined, logger);
+    const daemon = new OperatorDaemon(
+      config(home),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+    );
+    const promptsBefore = runtime.prompts.length;
+    // Straight at the seam: a handle that is already settled must short-circuit
+    // the call, not merely lose the race with it.
+    const answer = await (
+      daemon as unknown as {
+        askOperator: (
+          prompt: string,
+          onDelta?: (delta: string) => void,
+          toolAccess?: unknown,
+          onToolStarted?: (tool: string) => void,
+          turnToken?: string,
+          abandon?: { settled: () => boolean; promise: Promise<unknown> },
+        ) => Promise<string>;
+      }
+    ).askOperator("вопрос", undefined, undefined, undefined, "opturn_x", {
+      settled: () => true,
+      promise: new Promise(() => undefined),
+    });
+
+    expect(answer).toBe("");
+    expect(runtime.prompts.length).toBe(promptsBefore);
+    expect(
+      store.db
+        .prepare(
+          "SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.abandoned_before_start'",
+        )
+        .get(),
+    ).toMatchObject({ count: 1 });
+  });
+
+  it("bounds a wedged compaction and repairs the runtime instead of the next turn (package 1.5)", async () => {
+    const home = tempDirectory("daemon-compact-deadline-");
+    const store = tempStore();
+    const runtime = new WedgedCompactionRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const scheduler = new DailyScheduler(async () => undefined, logger);
+    // A compaction is not a turn: it holds the same serial runtime with no turn
+    // token, so the watchdog cannot name it. Its own deadline is the only bound
+    // — half the turn timeout, so it fires before the CLI's internal SIGKILL.
+    const daemon = new OperatorDaemon(
+      { ...config(home), operator: { ...config(home).operator, turnTimeoutMs: 200 } },
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+    );
+
+    await expect(daemon.compact("test")).rejects.toThrow(/deadline/u);
+    // The RESOURCE was repaired, not the next victim punished.
+    expect(runtime.abandons).toBe(1);
+  }, 20_000);
+
+  it("reports a silent running work to the Operator once per window, and never interrupts it (package 1.5)", async () => {
+    const home = tempDirectory("daemon-thread-stall-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new InterruptCountingBroker();
+    // The work starts and then says nothing at all — forever, as far as this
+    // test is concerned.
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      watchdogConfig(home, { threadStallMs: 60_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      telegram.push(message(1, "исправь race condition в auth"));
+      await waitFor(() => store.getThread("th_1")?.status === "running", 10_000);
+      const startedAt = Date.now();
+
+      // Inside the window: the work is merely busy.
+      daemon.watchdogTick(startedAt + 30_000);
+      expect(stalledFactCount(store)).toBe(0);
+
+      // Past it: one fact, however often the watchdog looks.
+      daemon.watchdogTick(startedAt + 120_000);
+      daemon.watchdogTick(startedAt + 130_000);
+      daemon.watchdogTick(startedAt + 140_000);
+      expect(stalledFactCount(store)).toBe(1);
+
+      // The fact reaches the OPERATOR, fenced as data — and nothing about the
+      // silence is said in the chat by the daemon.
+      await waitFor(
+        () => runtime.prompts.some((prompt) => prompt.includes("не подаёт признаков жизни")),
+        10_000,
+      );
+      expect(telegram.sent.some((sent) => sent.text.includes("не подаёт признаков жизни"))).toBe(false);
+      expect(telegram.sent.some((sent) => sent.text.includes("молч"))).toBe(false);
+      // Judgement stays with the Operator: the daemon never stops the thread.
+      expect(broker.interrupts).toBe(0);
+      expect(store.getThread("th_1")?.status).toBe("running");
+
+      // A new window opens and the still-silent work is worth saying again.
+      daemon.watchdogTick(startedAt + 200_000);
+      expect(stalledFactCount(store)).toBe(2);
+    } finally {
+      broker.releaseTerminal();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+
+  it("keeps the worker's narrative when a foreign turn starts first (package 1.5, deferred 1.2 issue)", async () => {
+    const home = tempDirectory("daemon-turn-identity-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    // The broker announces a collaborator's turn BEFORE our own dispatch is
+    // acknowledged. By the counter alone our own turn would then be labelled
+    // external and its whole narrative would be dropped in silence; the
+    // commandId we chose at dispatch is what settles the ownership.
+    const broker = new TurnIdentityBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь race condition в auth"));
+    await waitFor(
+      () => runtime.prompts.some((prompt) => prompt.includes("нарратив нашей работы")),
+      10_000,
+    );
+    // The thread is ours again once our own turn is recognised…
+    await waitFor(() => store.getRuntimeState("thread_turn_external:th_1") === "");
+    // …the collaborator's turn was still announced once, and neither narrative
+    // was shown to the owner verbatim.
+    expect(
+      telegram.sent.filter((sent) => sent.text.includes("тред продолжили напрямую в T3")),
+    ).toHaveLength(1);
+    expect(telegram.sent.some((sent) => sent.text.includes("нарратив нашей работы"))).toBe(false);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
 
   it("supersedes a turn that is still transcribing when the next message lands (package 1.1)", async () => {
     const home = tempDirectory("daemon-preempt-media-");
@@ -6014,6 +6820,10 @@ describe("OperatorDaemon product flow", () => {
       "automation_paused",
       "user_input_submitted",
       "approval_decision_failed",
+      // Package 1.5: not about a work either — the one line that explains why
+      // the answer the owner was waiting for will never arrive (zombie turn).
+      // No Operator turn can author it: the turn IS the thing that hung.
+      "operator_zombie_notice",
       // About a work, still direct — each one tracked in roadmap 1.2 debt.
       "artifact_sent",
       "worker_external_turn",
@@ -6108,7 +6918,7 @@ describe("OperatorDaemon product flow", () => {
     const home = tempDirectory("voice-fallback-");
     const store = tempStore();
     class DeadProviderRuntime extends FakeRuntime {
-      override async *sendTurn(input: {
+      override async *stream(input: {
         sessionId: string;
         prompt: string;
         toolAccess?: OperatorToolAccess;
@@ -6225,7 +7035,7 @@ describe("OperatorDaemon product flow", () => {
     let relayStarted = false;
     class GatedRelayRuntime extends FakeRuntime {
       interrupts = 0;
-      override async *sendTurn(input: {
+      override async *stream(input: {
         sessionId: string;
         prompt: string;
         toolAccess?: OperatorToolAccess;
@@ -6239,7 +7049,7 @@ describe("OperatorDaemon product flow", () => {
           yield { type: "result", text, sessionId: input.sessionId };
           return;
         }
-        yield* super.sendTurn(input);
+        yield* super.stream(input);
       }
       override async interrupt(): Promise<void> {
         this.interrupts += 1;
@@ -6301,7 +7111,7 @@ describe("OperatorDaemon product flow", () => {
     const store = tempStore();
     let hangStarted = false;
     class HangingRelayRuntime extends FakeRuntime {
-      override async *sendTurn(input: {
+      override async *stream(input: {
         sessionId: string;
         prompt: string;
         toolAccess?: OperatorToolAccess;
@@ -6311,7 +7121,7 @@ describe("OperatorDaemon product flow", () => {
           hangStarted = true;
           await new Promise(() => undefined);
         }
-        yield* super.sendTurn(input);
+        yield* super.stream(input);
       }
     }
     const broker = new FakeBroker();
@@ -6397,7 +7207,7 @@ describe("OperatorDaemon product flow", () => {
     const relayGates: Array<() => void> = [];
     class SlowRelayRuntime extends FakeRuntime {
       relayStarts = 0;
-      override async *sendTurn(input: {
+      override async *stream(input: {
         sessionId: string;
         prompt: string;
         toolAccess?: OperatorToolAccess;
@@ -6411,7 +7221,7 @@ describe("OperatorDaemon product flow", () => {
           yield { type: "result", text, sessionId: input.sessionId };
           return;
         }
-        yield* super.sendTurn(input);
+        yield* super.stream(input);
       }
     }
     const runtime = new SlowRelayRuntime();
@@ -6506,7 +7316,7 @@ describe("OperatorDaemon product flow", () => {
     const relayGate = new Promise<void>((resolve) => (releaseRelay = resolve));
     let relayStarted = false;
     class SlowRelayRuntime extends FakeRuntime {
-      override async *sendTurn(input: {
+      override async *stream(input: {
         sessionId: string;
         prompt: string;
         toolAccess?: OperatorToolAccess;
@@ -6520,7 +7330,7 @@ describe("OperatorDaemon product flow", () => {
           yield { type: "result", text, sessionId: input.sessionId };
           return;
         }
-        yield* super.sendTurn(input);
+        yield* super.stream(input);
       }
     }
     const runtime = new SlowRelayRuntime();
@@ -6654,7 +7464,7 @@ describe("OperatorDaemon product flow", () => {
     const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
     let firstTurnStarted = false;
     class LaneOrderRuntime extends FakeRuntime {
-      override async *sendTurn(input: {
+      override async *stream(input: {
         sessionId: string;
         prompt: string;
         toolAccess?: OperatorToolAccess;
@@ -7051,7 +7861,7 @@ describe("OperatorDaemon product flow", () => {
     const store = tempStore();
     class RefusingRuntime extends FakeRuntime {
       refuse = true;
-      override async *sendTurn(input: {
+      override async *stream(input: {
         sessionId: string;
         prompt: string;
         toolAccess?: OperatorToolAccess;
@@ -7061,7 +7871,7 @@ describe("OperatorDaemon product flow", () => {
           await Promise.resolve();
           throw new Error("provider CLI is not running");
         }
-        yield* super.sendTurn(input);
+        yield* super.stream(input);
       }
     }
     const runtime = new RefusingRuntime();
@@ -7177,6 +7987,15 @@ function fenceNonces(prompt: string): Set<string> {
   return new Set([...prompt.matchAll(/<<<worker:([0-9a-f]{8})>>>/g)].map((match) => match[1]!));
 }
 
+/** Package 1.5: the same config with the watchdog deadlines a test needs. */
+function watchdogConfig(
+  home: string,
+  overrides: Partial<Pick<Config["operator"], "watchdogStallMs" | "watchdogGraceMs" | "threadStallMs">>,
+): Config {
+  const base = config(home);
+  return { ...base, operator: { ...base.operator, ...overrides } };
+}
+
 function config(home: string): Config {
   return {
     owner: { name: "Ilia Mikhalchuk", language: "ru", timezone: "Europe/Moscow" },
@@ -7214,6 +8033,12 @@ function config(home: string): Config {
       // A short digest window keeps the suite off the global timeouts; the
       // coalescing behaviour under test does not depend on its length.
       threadDigestWindowMs: 50,
+      // Package 1.5: the watchdog is driven explicitly by the tests that care
+      // (daemon.watchdogTick()), so the production defaults would only add
+      // real-time waits here. Kept non-zero and realistic in shape.
+      watchdogStallMs: 120_000,
+      watchdogGraceMs: 30_000,
+      threadStallMs: 30 * 60_000,
       fullAccess: false,
       home,
       runtimeDir: `${home}/runtime`,
@@ -7369,6 +8194,33 @@ class FakeRuntime implements OperatorRuntime {
   readonly compactReasons: string[] = [];
   readonly toolAccesses: OperatorToolAccess[] = [];
   readonly startPrompts: string[] = [];
+  /**
+   * Package 1.5: the fakes now enforce what BOTH CLI runtimes enforce — one
+   * active turn at a time (`if (this.active) throw`). Without it a fake happily
+   * runs a second turn beside an abandoned one, and the whole class of bugs
+   * around detaching a wedged call ("the next turn gets an apology instead of
+   * an answer") is invisible in tests.
+   */
+  private active: { generation: number; token?: string } | undefined;
+  private generation = 0;
+
+  protected beginTurn(turnToken?: string): { release: () => void } {
+    if (this.active) throw new Error("Operator runtime already has an active turn");
+    const generation = (this.generation += 1);
+    this.active = { generation, ...(turnToken ? { token: turnToken } : {}) };
+    return {
+      // A late release may not clear a slot that a newer turn already owns.
+      release: () => {
+        if (this.active?.generation === generation) this.active = undefined;
+      },
+    };
+  }
+
+  /** The daemon's escape hatch: drop the slot and let the next turn start. */
+  abandon(turnToken?: string): void {
+    if (turnToken !== undefined && this.active?.token !== turnToken) return;
+    this.active = undefined;
+  }
 
   async start(input?: { systemPrompt: string }): Promise<{ id: string }> {
     if (input?.systemPrompt) this.startPrompts.push(input.systemPrompt);
@@ -7376,6 +8228,20 @@ class FakeRuntime implements OperatorRuntime {
   }
 
   async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+    turnToken?: string;
+  }): AsyncIterable<OperatorEvent> {
+    const slot = this.beginTurn(input.turnToken);
+    try {
+      yield* this.stream(input);
+    } finally {
+      slot.release();
+    }
+  }
+
+  protected async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
@@ -7424,7 +8290,7 @@ class FlakyProviderRuntime extends FakeRuntime {
     super();
   }
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
@@ -7434,7 +8300,7 @@ class FlakyProviderRuntime extends FakeRuntime {
       this.prompts.push(input.prompt);
       throw this.error;
     }
-    yield* super.sendTurn(input);
+    yield* super.stream(input);
   }
 }
 
@@ -7464,13 +8330,13 @@ class FailingCompactRuntime extends FakeRuntime {
 class MemoryPlanRuntime extends FakeRuntime {
   obsoleteNoteIds: string[] = [];
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
   }): AsyncIterable<OperatorEvent> {
     if (!input.prompt.includes("Prepare durable memory maintenance")) {
-      yield* super.sendTurn(input);
+      yield* super.stream(input);
       return;
     }
     this.prompts.push(input.prompt);
@@ -7493,13 +8359,13 @@ class DelegatingRuntime extends FakeRuntime {
     super();
   }
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
   }): AsyncIterable<OperatorEvent> {
     if (!input.prompt.includes("User message:") || !input.toolAccess) {
-      yield* super.sendTurn(input);
+      yield* super.stream(input);
       return;
     }
     this.prompts.push(input.prompt);
@@ -7660,7 +8526,7 @@ class RecoveryDecidingRuntime extends DelegatingRuntime {
     super(script);
   }
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
@@ -7672,7 +8538,7 @@ class RecoveryDecidingRuntime extends DelegatingRuntime {
       yield { type: "result", text, sessionId: input.sessionId };
       return;
     }
-    yield* super.sendTurn(input);
+    yield* super.stream(input);
   }
 }
 
@@ -7689,7 +8555,7 @@ class BlockingRuntime extends FakeRuntime {
     this.release?.();
   }
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
@@ -7754,7 +8620,7 @@ class ProviderSwitchRuntime extends FakeRuntime {
     return { id: `${providerId}-session` };
   }
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
@@ -7765,7 +8631,7 @@ class ProviderSwitchRuntime extends FakeRuntime {
       yield { type: "result", text: "PROVIDER_CONTEXT_RESTORED", sessionId: input.sessionId };
       return;
     }
-    yield* super.sendTurn(input);
+    yield* super.stream(input);
   }
 }
 
@@ -7782,6 +8648,8 @@ class FakeBroker implements T3Broker {
   workerEvents: WorkerEvent[] | undefined;
   outputArtifacts: ArtifactRef[] = [];
   dispatchFailures = 0;
+  /** Package 1.5: a hook fired just before each scripted event is yielded. */
+  beforeEvent: ((event: WorkerEvent) => Promise<void> | void) | undefined;
   private terminalGate: Promise<void> | undefined;
   private releaseTerminalGate: (() => void) | undefined;
 
@@ -7914,6 +8782,7 @@ class FakeBroker implements T3Broker {
     this.subscriptions.push(threadId);
     if (this.workerEvents) {
       for (const event of this.workerEvents) {
+        await this.beforeEvent?.(event);
         if (
           this.terminalGate &&
           (event.type === "completed" || event.type === "failed" || event.type === "cancelled")
@@ -8201,13 +9070,13 @@ class ScriptedEventsRuntime extends FakeRuntime {
     super();
   }
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
   }): AsyncIterable<OperatorEvent> {
     if (!input.prompt.includes("User message:")) {
-      yield* super.sendTurn(input);
+      yield* super.stream(input);
       return;
     }
     this.prompts.push(input.prompt);
@@ -8269,7 +9138,7 @@ class PreemptibleRuntime extends FakeRuntime {
     this.release?.();
   }
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
@@ -8289,7 +9158,7 @@ class PreemptibleRuntime extends FakeRuntime {
       yield { type: "result", text, sessionId: input.sessionId };
       return;
     }
-    yield* super.sendTurn(input);
+    yield* super.stream(input);
   }
 }
 
@@ -8311,19 +9180,213 @@ class ChainPreemptibleRuntime extends FakeRuntime {
     while (this.gates.length) this.gates.shift()?.();
   }
 
-  override async *sendTurn(input: {
+  override async *stream(input: {
     sessionId: string;
     prompt: string;
     toolAccess?: OperatorToolAccess;
   }): AsyncIterable<OperatorEvent> {
     if (!input.prompt.includes("жди")) {
-      yield* super.sendTurn(input);
+      yield* super.stream(input);
       return;
     }
     this.prompts.push(input.prompt);
     yield { type: "text_delta", text: "начал" };
     await new Promise<void>((resolve) => this.gates.push(resolve));
     yield { type: "result", text: "недописанное", sessionId: input.sessionId };
+  }
+}
+
+/**
+ * Package 1.5: a provider that ACCEPTS an interrupt and ignores it. It answers
+ * the wedged question only when the test releases it — long after the watchdog
+ * has written it off — and that answer must reach nobody.
+ */
+class WedgedRuntime extends FakeRuntime {
+  interrupts = 0;
+  private releaseGate: (() => void) | undefined;
+
+  override async interrupt(): Promise<void> {
+    this.interrupts += 1;
+  }
+
+  release(): void {
+    this.releaseGate?.();
+    this.releaseGate = undefined;
+  }
+
+  override async *stream(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (!input.prompt.includes("зависший")) {
+      yield* super.stream(input);
+      return;
+    }
+    this.prompts.push(input.prompt);
+    yield { type: "text_delta", text: "начал думать" };
+    await new Promise<void>((resolve) => {
+      this.releaseGate = resolve;
+    });
+    const text = "поздний ответ зомби";
+    yield { type: "text_delta", text };
+    // A session id nobody may adopt: the turn that replaced this one owns the
+    // session now (package 1.5 — an abandoned turn is inert, not just unheard).
+    yield { type: "result", text, sessionId: "zombie-session" };
+  }
+}
+
+/** Package 1.5: a compaction that never returns — the queue-holder nobody names. */
+class WedgedCompactionRuntime extends FakeRuntime {
+  abandons = 0;
+
+  override abandon(turnToken?: string): void {
+    this.abandons += 1;
+    super.abandon(turnToken);
+  }
+
+  override async compact(): Promise<{ sessionId: string; summary?: string }> {
+    await new Promise(() => undefined);
+    throw new Error("unreachable");
+  }
+}
+
+/**
+ * Package 1.5: wedges the FIRST time it sees the question and answers the
+ * replay — the shape of a stuck turn whose message the owner never replaced.
+ */
+class WedgedOnceRuntime extends FakeRuntime {
+  interrupts = 0;
+  private wedged = false;
+  private releaseGate: (() => void) | undefined;
+
+  override async interrupt(): Promise<void> {
+    this.interrupts += 1;
+  }
+
+  release(): void {
+    this.releaseGate?.();
+    this.releaseGate = undefined;
+  }
+
+  override async *stream(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (!input.prompt.includes("зависший")) {
+      yield* super.stream(input);
+      return;
+    }
+    this.prompts.push(input.prompt);
+    if (!this.wedged) {
+      this.wedged = true;
+      yield { type: "text_delta", text: "начал думать" };
+      await new Promise<void>((resolve) => {
+        this.releaseGate = resolve;
+      });
+      yield { type: "result", text: "поздний ответ зомби", sessionId: "zombie-session" };
+      return;
+    }
+    const text = "Ответ со второй попытки.";
+    yield { type: "text_delta", text };
+    yield { type: "result", text, sessionId: input.sessionId };
+  }
+}
+
+/**
+ * Package 1.5: a turn that takes a long time and says so all the way through —
+ * the shape the watchdog must never touch.
+ */
+class SteadyRuntime extends FakeRuntime {
+  interrupts = 0;
+  started = false;
+  private done = false;
+
+  override async interrupt(): Promise<void> {
+    this.interrupts += 1;
+  }
+
+  release(): void {
+    this.done = true;
+  }
+
+  override async *stream(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (!input.prompt.includes("долгий вопрос")) {
+      yield* super.stream(input);
+      return;
+    }
+    this.prompts.push(input.prompt);
+    this.started = true;
+    while (!this.done) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      yield { type: "text_delta", text: "." };
+    }
+    const text = "Долгий ответ дописан.";
+    yield { type: "text_delta", text };
+    yield { type: "result", text, sessionId: input.sessionId };
+  }
+}
+
+/**
+ * Package 1.5: a collaborator's turn is announced before ours, carrying a
+ * command id that is not one of ours; our own turn follows with the id we chose
+ * at dispatch. Ownership by identity is the only thing that can tell them apart.
+ */
+class TurnIdentityBroker extends FakeBroker {
+  private ownCommandId: string | undefined;
+
+  override async sendTurn(input: SendThreadTurnInput): Promise<TurnHandle> {
+    this.ownCommandId = input.commandId;
+    return super.sendTurn(input);
+  }
+
+  override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+    this.subscriptions.push(threadId);
+    yield {
+      type: "started",
+      threadId,
+      turnId: "turn_collaborator",
+      commandId: "cmd_someone_else",
+    };
+    await Promise.resolve();
+    yield {
+      type: "started",
+      threadId,
+      turnId: "turn_ours",
+      ...(this.ownCommandId ? { commandId: this.ownCommandId } : {}),
+    };
+    await Promise.resolve();
+    yield { type: "agent_message", threadId, text: "нарратив нашей работы" };
+    await Promise.resolve();
+    yield { type: "completed", threadId, result: "Fixed auth race. Tests pass." };
+  }
+}
+
+/**
+ * Package 1.5: delivery that blocks after the turn is done with the provider.
+ * The turn is settled and still holds its queue slot — the window where a naive
+ * watchdog would announce a freeze to an owner who already had their answer.
+ */
+class BlockingDeliveryTelegram extends FakeTelegram {
+  blockedSends = 0;
+  private release: (() => void) | undefined;
+  private readonly gate = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+
+  releaseSends(): void {
+    this.release?.();
+  }
+
+  override async sendRich(chatId: number, text: string): Promise<SentMessage[]> {
+    this.blockedSends += 1;
+    await this.gate;
+    return super.sendRich(chatId, text);
   }
 }
 
@@ -8448,6 +9511,24 @@ async function waitForPumpPasses(store: OperatorStore, passes: number): Promise<
   } finally {
     spied.listBlockedTelegramOutboxHeads = original;
   }
+}
+
+/** Package 1.5: turns the watchdog wrote off. */
+function zombieCount(store: OperatorStore): number {
+  return (
+    store.db
+      .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.zombie'")
+      .get() as { count: number }
+  ).count;
+}
+
+/** Package 1.5: daemon facts about a work that stopped saying anything. */
+function stalledFactCount(store: OperatorStore): number {
+  return (
+    store.db
+      .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='worker.stalled'")
+      .get() as { count: number }
+  ).count;
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {

@@ -30,6 +30,44 @@ describe("media configuration", () => {
     expect(config.approval).toMatchObject({ autoAllow: ["safe-read"], ttlHours: 6 });
   });
 
+  it("carries the watchdog deadlines in milliseconds, defaults included (package 1.5)", () => {
+    const base = {
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+    };
+    expect(loadConfig(base).operator).toMatchObject({
+      watchdogStallMs: 120_000,
+      watchdogGraceMs: 30_000,
+      threadStallMs: 30 * 60_000,
+    });
+    expect(
+      loadConfig({
+        ...base,
+        WATCHDOG_STALL_SECONDS: "45",
+        WATCHDOG_GRACE_SECONDS: "10",
+        THREAD_STALL_MINUTES: "5",
+      }).operator,
+    ).toMatchObject({
+      watchdogStallMs: 45_000,
+      watchdogGraceMs: 10_000,
+      threadStallMs: 5 * 60_000,
+    });
+    // Out-of-range values are a boot error, not a silently clamped watchdog.
+    expect(() => loadConfig({ ...base, WATCHDOG_GRACE_SECONDS: "0" })).toThrow();
+    expect(() => loadConfig({ ...base, THREAD_STALL_MINUTES: "0" })).toThrow();
+    // A grace shorter than the runtime's own SIGINT→SIGKILL escalation would
+    // declare a turn a zombie while it is still being killed politely, so every
+    // ordinary preemption would end in a "предыдущий ответ завис" line.
+    expect(() =>
+      loadConfig({ ...base, WATCHDOG_GRACE_SECONDS: "5", OPERATOR_INTERRUPT_GRACE_MS: "8000" }),
+    ).toThrow(/WATCHDOG_GRACE_SECONDS/u);
+    expect(
+      loadConfig({ ...base, WATCHDOG_GRACE_SECONDS: "5", OPERATOR_INTERRUPT_GRACE_MS: "3000" })
+        .operator.watchdogGraceMs,
+    ).toBe(5_000);
+  });
+
   it("accepts an explicit approval TTL in hours", () => {
     const config = loadConfig({
       TELEGRAM_BOT_TOKEN: "test-token",

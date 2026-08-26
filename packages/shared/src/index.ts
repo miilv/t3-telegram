@@ -317,7 +317,12 @@ export interface ProviderDescriptor {
 }
 
 export type WorkerEvent =
-  | { type: "started"; threadId: string; turnId?: string }
+  /**
+   * `commandId` is our own dispatch identity echoed back by the server
+   * (package 1.5); when present it settles own/external classification without
+   * a race. Absent on servers that do not echo it.
+   */
+  | { type: "started"; threadId: string; turnId?: string; commandId?: string }
   | { type: "progress"; threadId: string; summary: string }
   | { type: "agent_message"; threadId: string; text: string }
   | {
@@ -397,6 +402,16 @@ export interface OperatorRuntime {
    * hatch (the cancel word), unchanged.
    */
   interrupt(turnToken?: string): Promise<void>;
+  /**
+   * Package 1.5 — write this turn off and release the single turn slot NOW.
+   *
+   * `sendTurn` refuses to start while a turn is active, so a watchdog that only
+   * stops awaiting a wedged call would hand the next turn an error instead of
+   * an answer. Implementations must drop their active-turn bookkeeping and kill
+   * the process outright (the interrupt was already tried and ignored).
+   * Optional: an in-memory runtime has no slot to release.
+   */
+  abandon?(turnToken?: string): void;
   compact(reason?: string): Promise<{
     sessionId: string;
     summary?: string;
@@ -522,12 +537,82 @@ export interface RuntimeStateStore {
  * short window of our dispatch are never suppressed even when the started
  * events arrived in a confusing order.
  */
-export function raiseOwnDispatchPending(store: RuntimeStateStore, threadId: string): void {
+export function raiseOwnDispatchPending(
+  store: RuntimeStateStore,
+  threadId: string,
+  /**
+   * Package 1.5: the identity of the turn we are about to start — the
+   * `commandId` we hand T3. When the broker echoes it back on the `started`
+   * event the classification stops being first-come-first-served: THIS turn is
+   * ours because it carries OUR marker, whatever else started meanwhile.
+   */
+  marker?: string,
+): void {
   store.setRuntimeState(
     `thread_own_dispatch_pending:${threadId}`,
     String(ownDispatchPendingCount(store, threadId) + 1),
   );
   store.setRuntimeState(`thread_own_dispatch_at:${threadId}`, nowIso());
+  if (marker) {
+    const expected = [...readOwnDispatchMarkers(store, threadId), marker];
+    // Bounded: a broker that never echoes markers back must not grow the row
+    // without limit. The oldest are dropped — they can only mislead by then.
+    writeOwnDispatchMarkers(store, threadId, expected.slice(-OWN_DISPATCH_MARKER_LIMIT));
+  }
+}
+
+const OWN_DISPATCH_MARKER_LIMIT = 8;
+
+function markersKey(threadId: string): string {
+  return `thread_expected_turns:${threadId}`;
+}
+
+function readOwnDispatchMarkers(store: RuntimeStateStore, threadId: string): string[] {
+  return (store.getRuntimeState(markersKey(threadId)) ?? "").split(",").filter(Boolean);
+}
+
+function writeOwnDispatchMarkers(
+  store: RuntimeStateStore,
+  threadId: string,
+  markers: string[],
+): void {
+  store.setRuntimeState(markersKey(threadId), markers.join(","));
+}
+
+/**
+ * Package 1.5: is this the turn we dispatched? Consumes the marker, so the same
+ * id can never claim ownership twice. `undefined` means "no identity travelled
+ * with the event" — the caller falls back to the counter and the grace window.
+ */
+export function claimOwnDispatchMarker(
+  store: RuntimeStateStore,
+  threadId: string,
+  marker: string | undefined,
+): boolean | undefined {
+  if (!marker) return undefined;
+  const expected = readOwnDispatchMarkers(store, threadId);
+  if (!expected.length) return undefined;
+  if (!expected.includes(marker)) return false;
+  writeOwnDispatchMarkers(
+    store,
+    threadId,
+    expected.filter((candidate) => candidate !== marker),
+  );
+  return true;
+}
+
+/** A dispatch that never reached T3 leaves no turn to recognise. */
+export function forgetOwnDispatchMarker(
+  store: RuntimeStateStore,
+  threadId: string,
+  marker: string | undefined,
+): void {
+  if (!marker) return;
+  writeOwnDispatchMarkers(
+    store,
+    threadId,
+    readOwnDispatchMarkers(store, threadId).filter((candidate) => candidate !== marker),
+  );
 }
 
 /** Consume one pending own dispatch (dispatch failed, or its turn started). */

@@ -26,7 +26,9 @@ import type {
   WorkThread,
 } from "../../shared/src/index.js";
 import {
+  forgetOwnDispatchMarker,
   knownFenceNonces,
+  newId,
   nowIso,
   openFence,
   raiseOwnDispatchPending,
@@ -509,18 +511,24 @@ export class OperatorToolServer {
         }
         // Mark the dispatch as our own so the daemon's monitor can tell it
         // apart from turns started directly in the T3 UI (counter, bug №27).
-        raiseOwnDispatchPending(this.options.store, input.threadId);
+        // Package 1.5: the commandId is chosen HERE instead of inside the
+        // broker, so the dispatch has an identity we can recognise when the
+        // turn starts — the counter alone loses that race to a collaborator.
+        const commandId = newId("cmd");
+        raiseOwnDispatchPending(this.options.store, input.threadId, commandId);
         let handle;
         try {
           handle = await this.options.broker.sendTurn({
             threadId: input.threadId,
             text: input.text,
+            commandId,
             ...(artifacts.length ? { artifacts } : {}),
             ...(input.providerInstanceId ? { providerInstanceId: input.providerInstanceId } : {}),
             ...(input.model ? { model: input.model } : {}),
           });
         } catch (error) {
           releaseOwnDispatchPending(this.options.store, input.threadId);
+          forgetOwnDispatchMarker(this.options.store, input.threadId, commandId);
           throw error;
         }
         await this.options.onThreadStarted?.(started);

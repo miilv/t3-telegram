@@ -336,6 +336,13 @@ threads in. Without that, the third message of a chain would be told "no durable
 work was dispatched" while the thread was still running, and would dispatch it
 twice.
 
+A deferred user-lane job now wakes its own lane when the retry falls due
+(`scheduleUserIngressRedrain`). The user lane has no pump — its drains are
+queued by ARRIVING messages — so a deferred message used to sit until the owner
+wrote again or aged into the background escalation window; that is the
+difference between "the answer is late" and "the question was lost", and the
+zombie replay above takes exactly this path.
+
 The message itself takes the ordinary path: batching, durable ingress job, and a
 new turn on the `user` lane. The first message of a burst frees the turn slot
 while the rest of the burst is still being glued into the one job that replaces
@@ -377,6 +384,87 @@ Operator turn at a time is a session invariant, not a queue detail):
 | `user` | live message updates, `ask_choices` button answers |
 | `thread-events` | digested worker events (package 1.2 connects the feed) |
 | `background` | startup ingress replay, the 1 s reliability pump |
+
+### The watchdog: a hung turn may never freeze the system (package 1.5)
+
+Preemption covers "a new message against a LIVE turn". The watchdog covers the
+case preemption cannot: a turn that does not react to its interrupt at all. It
+ticks every 5 s and fires only when **someone is waiting**. "Waiting" is read
+from the DURABLE QUEUE — pending, due `telegram_ingress` jobs — never from the
+lane queue's depth: the reliability pump re-queues a thread-event and a
+background drain every second and clears their "one in flight" flags when the
+task *starts*, so while a turn holds the slot `depth() > 0` is tautologically
+true. On that gate a silent turn would die on the budget with nobody waiting at
+all — and a pure reasoning turn is dead air for minutes by design (bug №18).
+
+A long turn nobody is queued behind is not a problem to solve; the single voice
+is allowed to think. Non-user lanes are waiters too (a wedged digest keeps its
+terminals under the `voice_relaying` marker, which rolls the degraded fallback
+forward, so nobody — not even the flat template — ever tells the owner how the
+work ended), and they get a longer budget: ×3.
+
+```
+step 1 — STALL          no stream event (token or tool step) for
+                        WATCHDOG_STALL_SECONDS (120) while the user lane waits
+                        → mark superseded (reason `watchdog_stall`) +
+                          runtime.interrupt(turnToken). Same interrupt as
+                          preemption; the answer is undeliverable from here on.
+step 2 — ZOMBIE         the turn was told to stop (BY ANYONE: the watchdog above
+                        or an ordinary preemption) and is still running
+                        WATCHDOG_GRACE_SECONDS (30) later
+                        → `turn.abandon()`:
+                          · the lane-queue slot is released — the awaited call
+                            in answerDirect resolves, the drain completes the
+                            ingress job (completed-as-superseded) and claims the
+                            next one, so the QUEUE CONTINUES;
+                          · the runtime-queue slot is released too — freeing
+                            only the lane would leave the next turn waiting on
+                            the same wedged provider call. `askOperator` races
+                            the same signal inside its serial task, and a turn
+                            abandoned WHILE QUEUED never starts its call at all;
+                          · `runtime.abandon(turnToken)` drops the runtime's own
+                            active-turn slot and SIGKILLs the child outright.
+                            Without it the release above would be a trap: both
+                            CLI runtimes refuse a `sendTurn` while a turn is
+                            active, so the next message would get an apology
+                            instead of an answer until the zombie died;
+                          · the provider call carries on DETACHED and unheard:
+                            deltas and tool steps are dropped (`turn.zombie`),
+                            the tool lease is revoked, the draft discarded, and
+                            the late final is never enqueued — the superseded
+                            machinery already guarantees that;
+                          · the owner gets ONE line, the only one the daemon
+                            authors here, and WHICH line depends on why the turn
+                            died. Replaced by their own newer message:
+                            «Предыдущий ответ завис — продолжаю с вашим новым
+                            сообщением.» Wedged with nobody replacing it: the
+                            question is still unanswered, so the durable ingress
+                            job is REPLAYED and the line says «Ответ завис —
+                            попробую ещё раз.» Dropping it there would lose the
+                            message outright. One line per chat per minute
+                            (`operator_zombie_notice`), and none at all for a
+                            synthetic or thread-event turn — nobody was waiting
+                            on those;
+                          · `operator.turn.zombie` is recorded, and the work the
+                            turn had dispatched travels to the next turn in
+                            `chat_pending` exactly like any supersession.
+```
+
+The concession is deliberate: the abandoned turn's own generator may still be
+draining when its replacement starts, so an abandoned turn is INERT, not merely
+unheard — its late result may not adopt a session id, book usage or create a
+session behind the back of the turn that replaced it. `WATCHDOG_GRACE_SECONDS`
+must exceed `OPERATOR_INTERRUPT_GRACE_MS` (enforced in `loadConfig`): a turn
+still being killed politely is not yet a zombie.
+
+**Which turns the watchdog sees.** All of them, including a digest
+interpretation. Package 1.2 kept digest turns out of `activeOperatorTurns`
+entirely so that an owner message could not discard them — which also put them
+beyond the watchdog. They are tracked now and marked `preemptable: false`: an
+owner message still may not discard one, the watchdog still may write one off.
+A zombie digest says nothing to the owner (they never asked for it) and its
+notes travel into the next digest as a loss report (`reportLostDigest`), so the
+terminal it was interpreting stops holding the degraded fallback back.
 
 Starvation of the background lane is deliberate: every background producer is a
 repeating pump, so a skipped round retries. **The pump never awaits the lane** —
@@ -477,6 +565,24 @@ switched to codex and `OPERATOR_CODEX_ENABLED` later returns to `false`,
 `resolveUnavailableProvider` falls back to the configured default (else any
 available provider), persists the correction, logs a warning and sends the
 owner one line — boot continues.
+
+**A hung turn no longer holds the three serial resources** (package 1.5).
+`OPERATOR_TURN_TIMEOUT_MS` (600 s) remains the outer SIGKILL bound, but it is no
+longer the only one. `askOperator` takes an abandonment handle: a queued turn
+that is abandoned never starts its provider call, and a running one has its
+runtime-queue task returned while the call streams into nothing. The third
+resource is the runtime's own slot — `abandon(turnToken)` on both CLI runtimes
+clears `active`/`activeTurnToken` and SIGKILLs the child immediately (no SIGINT
+grace: it already had its interrupt), and the generator's `finally` only clears
+the slot if it still owns it, so a late settle cannot free a live turn's slot.
+
+`compact()` and the provider-switch handoff are not turns — same serial runtime,
+no turn token, invisible to the watchdog — so they carry their own deadline of
+**half** `OPERATOR_TURN_TIMEOUT_MS` (an equal budget would never fire before the
+CLI's internal SIGKILL), and on expiry they repair the RESOURCE:
+`runtime.abandon()` frees the slot instead of leaving the next turn to pay.
+See §4 for the full stall→grace→zombie sequence and its config
+(`WATCHDOG_STALL_SECONDS`, `WATCHDOG_GRACE_SECONDS`).
 
 **A hung CLI hangs boot.** Runtime health is `spawn(binary, ["--version"])` with
 no watchdog. A non-zero exit aborts boot with one unattributed line; a binary
@@ -636,6 +742,37 @@ keep their own mediation path (unchanged, they are questions to the owner);
 `progress`, `agent_message` and the three terminal types go to the
 `ThreadEventDigest` and reach the owner only through an Operator turn (§14).
 Nothing in this path writes to the chat directly any more.
+
+**Turn ownership — by identity first** (package 1.5). Every own dispatch chooses
+its own `commandId` (`t3.send_turn`, the durable `t3_dispatch` job, a queued
+follow-up) and remembers it in `thread_expected_turns:<threadId>` (cleared when
+the monitor ends). A `started` event that echoes one of those ids is OURS, full
+stop; one carrying a foreign command id is external, full stop, and it no longer
+consumes the pending slot our own dispatch is still waiting for. The id is read
+off the EVENT ENVELOPE (`EventBaseFields.commandId` in the orchestration
+contract) — `thread.turn-start-requested` carries `threadId` and `messageId` in
+its payload and no turn id at all, which is also why a changed command id is
+what makes the projection emit a second `started` inside one subscription. The old counter
+(`thread_own_dispatch_pending`) survives as the fallback for servers that do not
+echo the command id — and under that fallback the `OWN_DISPATCH_GRACE_MS`
+(120 s) window now also covers `progress` and `agent_message`, not just
+terminals: after 1.2 a mis-labelled turn no longer costs a duplicated message,
+it costs the whole narrative of our own work, told to nobody.
+
+**Silent-thread watchdog** (package 1.5). Silence is measured from
+`thread_last_event_at:<threadId>`, written on every event (durable, so it
+survives the restart that resubscribes the monitor). A thread that is `running`
+with a live subscription and has produced no event at all for `THREAD_STALL_MINUTES`
+(default 30) becomes a daemon FACT in the digest — «работа числится
+выполняющейся, но не подаёт признаков жизни: ни одного события за N мин.» — at
+most once per stall window (`thread_stall_reported_at:<threadId>`, cleared when
+the monitor ends). Two deliberate non-actions: the daemon does **not** interrupt
+the thread (whether a long silence means "thinking" or "wedged" is judgement,
+and the Operator holds `t3.interrupt_thread`), and it does **not** speak to the
+owner (single voice — the Operator decides whether it is worth a word). This
+fact is also the only chance the Operator gets to notice such a thread at all:
+`dispatchNextFollowup` only runs on a terminal event, so a forever-`running`
+thread would otherwise never surface.
 
 Monitor resubscribe: 10 attempts, 1 s base, 60 s cap. Exhaustion →
 `Потерял связь с тредом **<title>** после нескольких попыток переподключения.

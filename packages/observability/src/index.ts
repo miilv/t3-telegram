@@ -19,7 +19,13 @@ export type MetricName =
   | "telegram_outbox_pending"
   | "telegram_outbox_uncertain"
   /** Package 1.1: Operator turns preempted by a newer owner message. */
-  | "operator_turns_superseded_total";
+  | "operator_turns_superseded_total"
+  /** Package 1.5: turns the watchdog interrupted for producing no events. */
+  | "operator_turns_stalled_total"
+  /** Package 1.5: turns that ignored the interrupt and lost their queue slot. */
+  | "operator_turns_zombie_total"
+  /** Package 1.5: running threads reported to the Operator as silent. */
+  | "worker_threads_stalled_total";
 
 export interface MetricSummary {
   count: number;
