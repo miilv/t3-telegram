@@ -29,7 +29,7 @@
  */
 
 import type { JournalEntry, NowItem } from "../../shared/src/index.js";
-import { fenceUntrusted, openFence } from "../../shared/src/index.js";
+import { NOTE_DESCRIPTION_CHARS, fenceUntrusted, openFence } from "../../shared/src/index.js";
 import { LOGICAL_DAY_BOUNDARY_HOUR } from "./pauses.js";
 
 // ---------------------------------------------------------------------------
@@ -123,6 +123,18 @@ export interface ScribeWorkSignals {
   notesMissingDescription: number;
   /** A month with entries and no rollup yet (§2.4). */
   rollupDue: boolean;
+  /**
+   * Days inside the catch-up window that have journal rows and no summary
+   * (§5's "догон следующей ночью, окно 48 ч").
+   *
+   * A signal of its own rather than a thing inferred from the event delta. The
+   * catch-up would MOSTLY work without it — a skipped night leaves the cursor
+   * where it was, so the missed day's events are usually still in the window —
+   * but "usually" is doing load-bearing work in that sentence, and the debt
+   * this expresses is a fact about the journal, not about the event log. The
+   * night that owes a summary should say so.
+   */
+  summariesDue: number;
 }
 
 export interface ScribeWorkVerdict {
@@ -148,6 +160,7 @@ export function hasScribeWork(signals: ScribeWorkSignals): ScribeWorkVerdict {
     reasons.push(`descriptions:${signals.notesMissingDescription}`);
   }
   if (signals.rollupDue) reasons.push("rollup");
+  if (signals.summariesDue > 0) reasons.push(`summaries:${signals.summariesDue}`);
   return { work: reasons.length > 0, reasons };
 }
 
@@ -510,6 +523,16 @@ export function reconcileArchivesAgainstLedger(input: {
     // An orphan archive: nothing claims it. Two very different stories produce
     // that, and only the thread can tell them apart — which is the second
     // reason `thread_ref` is on the table.
+    //
+    // SAFETY NOTE for whoever wires the next writer: `lookupByThread` must
+    // answer about whatever item currently TRACKS the thread, not specifically
+    // about a daemon-authored one. `createNowItem` already accepts a
+    // `thread_ref` from any source, so the day package 3.3 gives an agent item
+    // a thread (an escalation waiting on one, say), a lookup that still asked
+    // only for `source='daemon'` would return nothing, the archive would fall
+    // through to `contradicted`, and finished work would be announced as
+    // running again — the exact bug this branch exists to prevent, returning
+    // silently and only for the new case.
     const tracked = entry.threadRef ? input.lookupByThread?.(entry.threadRef) : undefined;
     if (tracked && tracked.status === "closed") {
       superseded.push(entry);
@@ -753,7 +776,7 @@ export function buildDescriptionPrompt(input: {
   return lines.join("\n");
 }
 
-export const NOTE_DESCRIPTION_CHARS = 120;
+export { NOTE_DESCRIPTION_CHARS };
 
 /**
  * Parse `id :: description` lines, keeping only ids that were actually asked

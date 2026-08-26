@@ -84,6 +84,14 @@ const DESCRIPTION_BATCH = 10;
 const ROLLUP_ENTRY_LIMIT = 300;
 /** Expired facts carried into the monthly turn. */
 const EXPIRED_FACT_LIMIT = 10;
+/**
+ * Days one night may write summaries for (§5's 48-hour catch-up).
+ *
+ * Three: the day that just ended plus the two a 48-hour window can reach. Past
+ * that the event log has usually been pruned out from under the gap, and a
+ * narrative written from what is left would read complete without being it.
+ */
+const CATCHUP_DAY_LIMIT = 3;
 
 export interface NightScribeDeps {
   store: OperatorStore;
@@ -198,6 +206,7 @@ export class NightScribe {
     });
     const notesToDescribe = store.listNotesMissingDescription(DESCRIPTION_BATCH);
     const rollupMonth = this.dueRollupMonth(day);
+    const summaryDays = this.daysOwedASummary({ day, since: cursor.since, timeZone });
     const verdict: ScribeWorkVerdict = hasScribeWork({
       events: store.countDaemonEventsSince(cursor.since, SCRIBE_WORK_EVENT_PREFIXES),
       messages: store.countTelegramMessagesSince(cursor.since),
@@ -205,6 +214,7 @@ export class NightScribe {
       changedItems: store.countNowItemsUpdatedSince(ownerId, cursor.since),
       notesMissingDescription: notesToDescribe.length,
       rollupDue: Boolean(rollupMonth),
+      summariesDue: summaryDays.length,
     });
     if (!verdict.work) {
       // A quiet night still counts as a night that ran: the cursor moves, so
@@ -228,7 +238,7 @@ export class NightScribe {
     let llmCalls = 0;
     let described = 0;
     try {
-      llmCalls += await this.writeDailySummary({ day, events, expired, recovered });
+      llmCalls += await this.writeDailySummaries({ day, summaryDays, timeZone, expired, recovered });
       if (rollupMonth) llmCalls += await this.writeRollup(rollupMonth, day);
       const descriptionResult = await this.describeLegacyNotes(notesToDescribe);
       llmCalls += descriptionResult.calls;
@@ -237,12 +247,18 @@ export class NightScribe {
       return this.recordSkip({
         day,
         error,
-        // Only an unusable CHANNEL is §5's skip. A storage error inside the
-        // rollup, or a description pass that failed after the summary already
-        // committed, is a defect — recording it as "the provider was down"
-        // writes a false cause into the journal and, three nights running,
-        // pages the owner about an outage that never happened.
-        channelDown: error instanceof ScribeChannelUnavailable,
+        // Only a night that produced NOTHING is §5's skip.
+        //
+        // Both halves matter. A storage error is a defect, not an outage — but
+        // so is a channel that died after the summary already landed: that
+        // night the secretary DID run, and counting it toward the alert makes
+        // the orchestrator tell the owner "не отработал 3 ночи подряд" about
+        // three nights that each wrote a summary, with both the summary and the
+        // skip mark sitting in the journal under the same day. The counter
+        // exists to detect hygiene being dead, and hygiene that produced a
+        // day's narrative is not dead — it is degraded, which the journal mark
+        // records without waking anyone.
+        channelDown: error instanceof ScribeChannelUnavailable && llmCalls === 0,
         llmCalls,
         recovered: recovered.length,
         expired: expired.length,
@@ -462,9 +478,76 @@ export class NightScribe {
    * model is also TOLD not to call reopened work finished is a second line of
    * defence, not the first: the first is that it never receives it as finished.
    */
+  /**
+   * Every day the catch-up window still owes a summary (§5: "догон следующей
+   * ночью, окно 48 ч").
+   *
+   * A missed night used to lose its day's narrative FOREVER: the run summarised
+   * exactly one day — the one that had just ended — so a night the provider was
+   * down took yesterday's story with it, while the skip mark it left behind
+   * promised in writing that the next night would catch up. The reconciliation
+   * cursor did catch up; the narrative never did.
+   *
+   * Bounded by the same 48-hour window and by `CATCHUP_DAY_LIMIT`, because the
+   * bound is honesty rather than cost: past it `daemon_events` has usually been
+   * pruned out from under the gap, and a summary written from what is left
+   * would read complete without being it. Days with nothing filed under them
+   * are skipped by `writeDailySummary` itself, so a genuinely quiet outage
+   * costs nothing to catch up on.
+   */
+  private daysOwedASummary(input: {
+    day: string;
+    since: string;
+    timeZone: string | undefined;
+  }): string[] {
+    const store = this.deps.store;
+    const from = ownerLogicalDay(new Date(input.since), input.timeZone);
+    // `listJournalDays` asks exactly this question — and until this pass
+    // existed it had no caller at all, which is what a promise of a catch-up
+    // with no catch-up behind it looks like in the code.
+    const days = new Set<string>(store.listJournalDays({ from, to: input.day }));
+    // Oldest first, so a catch-up reads the way the days happened; the newest
+    // are kept when the limit bites, because the most recent day is the one the
+    // owner is about to ask about.
+    return [...days]
+      .sort()
+      .slice(-CATCHUP_DAY_LIMIT)
+      .filter((day) => !store.getJournalEntry(summarySlug(day)));
+  }
+
+  private async writeDailySummaries(input: {
+    day: string;
+    summaryDays: readonly string[];
+    timeZone: string | undefined;
+    expired: readonly NowItem[];
+    recovered: readonly UnfiledWork[];
+  }): Promise<number> {
+    const dayOf = (iso: string | undefined): string => {
+      const at = iso ? new Date(iso) : undefined;
+      return at && Number.isFinite(at.getTime())
+        ? ownerLogicalDay(at, input.timeZone)
+        : input.day;
+    };
+    const days = new Set<string>([input.day, ...input.summaryDays]);
+    // The days THIS run filed something under, which are not necessarily today:
+    // a TTL archive is filed under its deadline, a recovered entry under the
+    // day the work ended.
+    for (const item of input.expired) days.add(dayOf(item.validUntil));
+    for (const work of input.recovered) days.add(dayOf(work.endedAt));
+
+    let calls = 0;
+    for (const day of [...days].sort().slice(-CATCHUP_DAY_LIMIT)) {
+      calls += await this.writeDailySummary({
+        day,
+        expired: input.expired.filter((item) => dayOf(item.validUntil) === day),
+        recovered: input.recovered.filter((work) => dayOf(work.endedAt) === day),
+      });
+    }
+    return calls;
+  }
+
   private async writeDailySummary(input: {
     day: string;
-    events: readonly ScribeEvent[];
     expired: readonly NowItem[];
     recovered: readonly UnfiledWork[];
   }): Promise<number> {

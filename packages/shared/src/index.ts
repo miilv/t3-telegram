@@ -206,6 +206,18 @@ export const NOW_AGENT_WRITE_KEY = "now_agent_write_turn";
  *                  next month cannot read it as input and compress a
  *                  compression.
  */
+/**
+ * Cap on a note's index line (memory-design §2.3: "description <=120 и
+ * триггер-форма").
+ *
+ * In SHARED because two layers enforce it and they must not drift: the policy
+ * linter refuses a longer one, and the store cuts what it is given. A store
+ * with a larger cap of its own would silently accept exactly what the linter is
+ * required to reject, and the render budget would be computed from a number
+ * nobody enforces.
+ */
+export const NOTE_DESCRIPTION_CHARS = 120;
+
 export const JOURNAL_KINDS = ["entry", "archive", "summary", "rollup"] as const;
 export type JournalKind = (typeof JOURNAL_KINDS)[number];
 

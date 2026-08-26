@@ -467,5 +467,15 @@ CREATE INDEX IF NOT EXISTS idx_journal_entries_thread
   ON journal_entries(thread_ref, day DESC) WHERE thread_ref IS NOT NULL;
 
 DELETE FROM operator_note_search;
+-- The description is indexed WITH the content (package 3.1, memory-design
+-- §2.3/§6.4): a trigger line's job is "when will I need this", which is a
+-- retrieval question, and one that cannot be found by its own words answers
+-- nobody. This rebuild runs on EVERY boot, so leaving it on content alone
+-- would quietly undo every description the night secretary indexed the moment
+-- the daemon restarted.
 INSERT INTO operator_note_search(id,category,content)
-  SELECT id,category,content FROM operator_notes WHERE status='active';
+  SELECT id, category,
+         CASE WHEN description IS NOT NULL AND TRIM(description) <> ''
+              THEN content || char(10) || description
+              ELSE content END
+  FROM operator_notes WHERE status='active';

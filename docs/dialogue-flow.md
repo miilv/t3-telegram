@@ -1301,8 +1301,8 @@ advertise `max(4_096)`. `send_voice` advertises `1_024` and matches;
 
 ## 13. Tools and the per-turn lease
 
-The tool list is constant (50 names — `now.get` and `now.update` joined in
-package 2.2). Narrowing is entirely in the capability
+The tool list is constant (52 names — `now.get` and `now.update` joined in
+package 2.2, `journal.note` and `journal.read` in package 3.1). Narrowing is entirely in the capability
 context: fixed destination, `originMessageId` as the only reply target,
 `allowedMessageIds` for reactions, `allowedArtifactIds` bypassing project ACLs,
 `teamRole`, `ingressJobId`, and the per-turn `now.update` create counter that

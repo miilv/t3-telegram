@@ -809,7 +809,9 @@ export class OperatorToolServer {
     this.addTool(server, token, {
       name: "memory.journal",
       description:
-        "Read the daemon's durable event journal (what the Operator, workers and automations actually did), newest first. Answers 'what did you do yesterday' from the record, not from memory.",
+        "Read the daemon's durable event journal (what the Operator, workers and automations actually did), newest first. Answers 'what did you do yesterday' from the record, not from memory. " +
+        "Returns {events}; when the window reaches past the 30-day event retention it also returns {journal, coverage} — the narrative entries and monthly rollups that cover the part the event log no longer has. " +
+        "For the narrative itself (what was decided, what is next) read journal.read instead: no event carries a decision.",
       schema: z.object({
         since: z
           .string()

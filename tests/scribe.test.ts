@@ -51,7 +51,7 @@ import type {
   T3Broker,
   WorkThread,
 } from "../packages/shared/src/index.js";
-import { NOW_AGENT_WRITE_KEY, nowIso } from "../packages/shared/src/index.js";
+import { NOTE_DESCRIPTION_CHARS, NOW_AGENT_WRITE_KEY, nowIso } from "../packages/shared/src/index.js";
 import { OperatorStore } from "../packages/storage/src/index.js";
 import type { TelegramTransport } from "../packages/telegram/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
@@ -128,6 +128,38 @@ describe("upgrading a package 2.2 database in place", () => {
       expect(entry.kind).toBe("entry");
       expect(entry.threadRef).toBeUndefined();
       expect(entry.body).toContain("деплой");
+      // The once-only guard, pinned: `appendJournalEntry` resolves a name
+      // clash with `-2` (two closes of similar work are two facts), which is
+      // exactly wrong for the secretary's once-a-period rows — a re-entered
+      // tick or a catch-up would leave `2026-08-25-summary-2` beside the real
+      // one and the monthly rollup would read the day twice.
+      const first = store.appendUniqueJournalEntry({
+        slug: "2026-08-25-summary",
+        day: "2026-08-25",
+        body: "первая",
+        source: "scribe",
+        kind: "summary",
+      });
+      expect(first?.body).toBe("первая");
+      expect(
+        store.appendUniqueJournalEntry({
+          slug: "2026-08-25-summary",
+          day: "2026-08-25",
+          body: "вторая",
+          source: "scribe",
+          kind: "summary",
+        }),
+      ).toBeUndefined();
+      expect(store.getJournalEntry("2026-08-25-summary")!.body).toBe("первая");
+      expect(store.getJournalEntry("2026-08-25-summary-2")).toBeUndefined();
+      // …while the appending path still disambiguates, which is its job.
+      expect(
+        store.appendJournalEntry({ slugBase: "dup", day: "2026-08-25", body: "a", source: "agent" }).slug,
+      ).toBe("dup");
+      expect(
+        store.appendJournalEntry({ slugBase: "dup", day: "2026-08-25", body: "b", source: "agent" }).slug,
+      ).toBe("dup-2");
+
       // The new columns and the index they exist for are both live.
       expect(store.listJournalEntries({ threadRef: "th_any" })).toEqual([]);
       expect(store.appendJournalEntry({
@@ -160,6 +192,7 @@ describe("has_work() gate (memory-design §5)", () => {
     changedItems: 0,
     notesMissingDescription: 0,
     rollupDue: false,
+    summariesDue: 0,
   };
 
   it("finds nothing to do on a night where nothing moved", () => {
@@ -176,6 +209,10 @@ describe("has_work() gate (memory-design §5)", () => {
       reasons: ["descriptions:4"],
     });
     expect(hasScribeWork({ ...quiet, rollupDue: true })).toEqual({ work: true, reasons: ["rollup"] });
+    expect(hasScribeWork({ ...quiet, summariesDue: 2 })).toEqual({
+      work: true,
+      reasons: ["summaries:2"],
+    });
   });
 
   it("keeps the daemon's own housekeeping out of the event delta", () => {
@@ -879,6 +916,106 @@ describe("a night the background channel is down (memory-design §5)", () => {
     expect(turns).toHaveLength(0);
   });
 
+  it("catches up the day a skipped night lost", async () => {
+    const store = tempStore();
+    const prompts: string[] = [];
+    store.appendJournalEntry({
+      slugBase: "2026-08-24-billing",
+      day: "2026-08-24",
+      body: "Сделано: перевели биллинг",
+      source: "agent",
+      kind: "entry",
+    });
+    const down = new NightScribe({
+      ...baseDeps(store, prompts),
+      backgroundOneShot: async () => {
+        throw new Error("claude binary is missing");
+      },
+      now: () => new Date("2026-08-25T00:00:00.000Z"),
+    });
+    expect((await down.run({ force: true })).status).toBe("skipped");
+    expect(store.getJournalEntry(summarySlug("2026-08-24"))).toBeUndefined();
+    // The skip mark promises a catch-up in writing.
+    expect(store.getJournalEntry("2026-08-24-scribe-skipped")!.body).toContain("catches up");
+
+    // The next night the channel is back. Before this fix the run summarised
+    // exactly one day — the one that had just ended — so the lost day's
+    // narrative was gone forever while the journal claimed otherwise: the
+    // reconciliation cursor caught up, the story never did.
+    store.appendJournalEntry({
+      slugBase: "2026-08-25-deploy",
+      day: "2026-08-25",
+      body: "Сделано: выкатили staging",
+      source: "agent",
+      kind: "entry",
+    });
+    const up = new NightScribe({
+      ...baseDeps(store, prompts, (prompt) =>
+        prompt.includes("2026-08-24") ? "Сделано: понедельник" : "Сделано: вторник",
+      ),
+      now: () => new Date("2026-08-26T00:00:00.000Z"),
+    });
+    expect((await up.run({ force: true })).status).toBe("completed");
+    expect(store.getJournalEntry(summarySlug("2026-08-24"))!.body).toContain("понедельник");
+    expect(store.getJournalEntry(summarySlug("2026-08-25"))!.body).toContain("вторник");
+  });
+
+  it("does not re-summarise a day it already wrote", async () => {
+    const store = tempStore();
+    const prompts: string[] = [];
+    store.appendJournalEntry({
+      slugBase: "2026-08-25-deploy",
+      day: "2026-08-25",
+      body: "Сделано: выкатили staging",
+      source: "agent",
+      kind: "entry",
+    });
+    const run = () =>
+      new NightScribe({
+        ...baseDeps(store, prompts, () => "Сделано: вторник"),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+      }).run({ force: true });
+    expect((await run()).llmCalls).toBe(1);
+    // The catch-up walks the window every night; a day that already has its
+    // summary must not buy another one, or a quiet week costs three calls a
+    // night forever.
+    expect((await run()).llmCalls).toBe(0);
+    expect(store.listJournalEntries({ day: "2026-08-25", kinds: ["summary"] })).toHaveLength(1);
+  });
+
+  it("does not tell the owner the night failed when the night wrote its summary", async () => {
+    const store = tempStore();
+    const prompts: string[] = [];
+    const turns: Array<{ dedupeKey: string; prompt: string }> = [];
+    store.appendJournalEntry({
+      slugBase: `${NIGHT_DAY}-work`,
+      day: NIGHT_DAY,
+      body: "Сделано: работа",
+      source: "agent",
+      kind: "entry",
+    });
+    store.rememberOperatorNote({ content: "легаси-заметка" });
+    const scribe = new NightScribe({
+      ...baseDeps(store, prompts, (prompt) => {
+        // The summary lands; the channel dies before the descriptions.
+        if (prompt.includes("строку индекса")) throw new Error("provider went away");
+        return "Сделано: работа";
+      }),
+      requestOwnerTurn: (input) => turns.push(input),
+      now: () => NIGHT,
+    });
+    const outcome = await scribe.run({ force: true });
+    expect(outcome.llmCalls).toBe(1);
+    expect(store.getJournalEntry(summarySlug(NIGHT_DAY))).toBeDefined();
+    // The night DID run. Counting it toward the alert makes the orchestrator
+    // tell the owner "не отработал 3 ночи подряд" about three nights that each
+    // wrote a summary — with the summary and the skip mark filed under the same
+    // day, in the same journal, contradicting each other.
+    expect(outcome.misses).toBe(0);
+    expect(store.getRuntimeState(SCRIBE_MISS_COUNT_KEY)).toBeUndefined();
+    expect(turns).toHaveLength(0);
+  });
+
   it("keeps the deterministic half of a skipped night", async () => {
     const store = tempStore();
     const item = store.createNowItem({
@@ -959,6 +1096,63 @@ describe("lazy descriptions for legacy notes (memory-design §6.4)", () => {
     expect(statuses).toEqual(["completed", "completed", "completed", "no-work", "no-work"]);
     expect(prompts).toHaveLength(3);
     expect(store.listNotesMissingDescription(10)).toHaveLength(0);
+  });
+
+  it("does not reorder the owner's memory index while describing it", async () => {
+    const store = tempStore();
+    // Two old notes (the description backlog) and two the owner touched today.
+    const old2024a = store.rememberOperatorNote({ content: "заметка 2024 a" });
+    const old2024b = store.rememberOperatorNote({ content: "заметка 2024 b" });
+    store.setNoteDescription(old2024a.id, "seed");
+    store.setNoteDescription(old2024b.id, "seed");
+    // Re-open them as undescribed, keeping their old updated_at.
+    store.rememberOperatorNote({ id: old2024a.id, content: "заметка 2024 a" });
+    store.rememberOperatorNote({ id: old2024b.id, content: "заметка 2024 b" });
+    const before = store.listOperatorNotes({ status: "active" }).map((note) => note.id);
+    const stampBefore = store.getOperatorNote(old2024a.id)!.updatedAt;
+
+    const described = store.setNoteDescription(old2024a.id, "деплой → сначала миграции");
+    expect(described).toBe(true);
+    // `listOperatorNotes` is updated_at DESC and `renderMemoryIndex` cuts that
+    // list at a character budget, so a bump here marches the oldest backlog to
+    // the head of the index and pushes out what the owner actually touched —
+    // a background job silently rewriting what the agent is shown, every night,
+    // getting worse as the backlog drains.
+    expect(store.listOperatorNotes({ status: "active" }).map((note) => note.id)).toEqual(before);
+    expect(store.getOperatorNote(old2024a.id)!.updatedAt).toBe(stampBefore);
+    // And it still leaves the queue: a note is done when it HAS a description.
+    expect(store.listNotesMissingDescription(10).map((note) => note.id)).not.toContain(old2024a.id);
+  });
+
+  it("makes a description findable by its own words", () => {
+    const store = tempStore();
+    const note = store.rememberOperatorNote({
+      content: "Прод разворачивается только после зелёного прогона миграций",
+      category: "ops",
+    });
+    // The whole point of a trigger line (§2.3/§6.4) is "when will I need this",
+    // which is a retrieval question — a description nobody can find answers it
+    // for nobody.
+    expect(store.searchOperatorNotes("легаси")).toEqual([]);
+    store.setNoteDescription(note.id, "легаси-деплой → сначала прогнать миграции");
+    expect(store.searchOperatorNotes("легаси").map((hit) => hit.id)).toEqual([note.id]);
+    // And it survives the boot-time FTS rebuild, which runs on EVERY start and
+    // would otherwise quietly undo every description the secretary indexed.
+    store.migrate();
+    expect(store.searchOperatorNotes("легаси").map((hit) => hit.id)).toEqual([note.id]);
+    // Re-remembering the note must not drop it either.
+    store.rememberOperatorNote({ id: note.id, content: "Прод разворачивается после миграций" });
+    expect(store.searchOperatorNotes("легаси").map((hit) => hit.id)).toEqual([note.id]);
+  });
+
+  it("cuts a description at the limit the linter enforces", () => {
+    const store = tempStore();
+    const note = store.rememberOperatorNote({ content: "заметка" });
+    store.setNoteDescription(note.id, "я".repeat(NOTE_DESCRIPTION_CHARS + 60));
+    // One number, in shared, for both layers: a store that accepted more than
+    // the linter allows would silently keep exactly what §2.3 forbids, and the
+    // render budget would be computed from a cap nobody enforces.
+    expect([...store.getOperatorNote(note.id)!.description!]).toHaveLength(NOTE_DESCRIPTION_CHARS);
   });
 
   it("keeps an id the model invented out of the write path", () => {

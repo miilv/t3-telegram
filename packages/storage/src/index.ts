@@ -32,6 +32,7 @@ import type {
 } from "../../shared/src/index.js";
 import {
   JOURNAL_KINDS,
+  NOTE_DESCRIPTION_CHARS,
   NOW_SECTIONS,
   NOW_STATUSES,
   newId,
@@ -1020,10 +1021,18 @@ export class OperatorStore {
             source=excluded.source,expires_at=excluded.expires_at,updated_at=excluded.updated_at
         `)
         .run(id, category, content, "active", source, input.expiresAt ?? null, createdAt, now);
-      this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
-      this.db
-        .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
-        .run(id, category, content);
+      // The upsert above does not clear `description`, so the index must not
+      // either — re-remembering a described note would otherwise silently make
+      // its trigger line unsearchable again while the table still shows it.
+      //
+      // Read back by ID, not taken from the dedupe lookup above: that lookup
+      // matches on category+content, so a caller passing an explicit id with
+      // CHANGED content misses it entirely and would land here with `undefined`
+      // for a note that has a perfectly good description.
+      const described = this.db
+        .prepare("SELECT description FROM operator_notes WHERE id=?")
+        .get(id) as Row | undefined;
+      this.reindexNoteSearch(id, category, content, described?.description as string | undefined);
       this.upsertNoteVector(id, `${category} ${content}`, now);
     });
     return this.getOperatorNote(id)!;
@@ -1113,10 +1122,7 @@ export class OperatorStore {
         .run(now, id);
       const category = String(row.category);
       const content = String(row.content);
-      this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
-      this.db
-        .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
-        .run(id, category, content);
+      this.reindexNoteSearch(id, category, content, row.description as string | undefined);
       this.upsertNoteVector(id, `${category} ${content}`, now);
       return true;
     });
@@ -1686,12 +1692,58 @@ export class OperatorStore {
    * automatic pass capable of losing what the owner wrote (bug №42's lesson).
    */
   setNoteDescription(id: string, description: string): boolean {
-    const trimmed = redactSecrets(description).trim().slice(0, 240);
+    // Cut to the SAME limit the policy layer states (§2.3: an index line is a
+    // trigger, not a summary). A storage cap of its own would accept what the
+    // linter is required to refuse, and the two numbers would drift apart in
+    // exactly the direction that makes the render budget wrong.
+    const trimmed = redactSecrets(description).trim().slice(0, NOTE_DESCRIPTION_CHARS);
     if (!trimmed) return false;
-    const changes = this.db
-      .prepare("UPDATE operator_notes SET description=?,updated_at=? WHERE id=? AND status='active'")
-      .run(trimmed, nowIso(), id).changes;
-    return Number(changes) > 0;
+    return this.transaction(() => {
+      const row = this.db
+        .prepare("SELECT * FROM operator_notes WHERE id=? AND status='active'")
+        .get(id) as Row | undefined;
+      if (!row) return false;
+      // `updated_at` is deliberately NOT touched.
+      //
+      // It is the owner's own ordering: `listOperatorNotes` reads newest-first
+      // and `renderMemoryIndex` cuts that list at a character budget. The
+      // secretary describes the OLDEST undescribed notes, so bumping the
+      // timestamp would march the 2024 backlog to the head of the index every
+      // night and push what the owner actually touched out of the envelope —
+      // a background job quietly rewriting what the agent is shown. The queue
+      // does not need the bump either: a note leaves it by HAVING a
+      // description, not by being recent.
+      this.db.prepare("UPDATE operator_notes SET description=? WHERE id=?").run(trimmed, id);
+      this.reindexNoteSearch(id, String(row.category), String(row.content), trimmed);
+      return true;
+    });
+  }
+
+  /**
+   * Rewrite a note's FTS row.
+   *
+   * The description is indexed WITH the content (§2.3/§6.4): its whole job is
+   * "when will I need this", which is a retrieval question, and a trigger line
+   * that cannot be found by its own words answers nobody. Words that live only
+   * in the description — the category name, the trigger — used to return
+   * nothing from `memory.search`.
+   *
+   * Vectors deliberately stay on content alone until package 3.2: they are
+   * rebuilt from `${category} ${content}` on every boot, so adding the
+   * description on one path only would come apart at the next restart. MiniLM
+   * and that rebuild arrive together.
+   */
+  private reindexNoteSearch(
+    id: string,
+    category: string,
+    content: string,
+    description?: string | null,
+  ): void {
+    const trimmed = description?.trim();
+    this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
+    this.db
+      .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
+      .run(id, category, trimmed ? `${content}\n${trimmed}` : content);
   }
 
   saveArtifact(artifact: Artifact): void {
