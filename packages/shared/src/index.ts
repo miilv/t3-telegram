@@ -128,6 +128,13 @@ export interface OperatorNote {
   createdAt: string;
   updatedAt: string;
   expiresAt?: string;
+  /**
+   * The index line of §2.3: TRIGGER -> what is inside. Absent on every note
+   * written before package 3.1, which is exactly what the night secretary
+   * fills in lazily (§6.4) — the memory index falls back to the first ~100
+   * characters of the content until it does.
+   */
+  description?: string;
 }
 
 /** memory-design §2.2 — the five now-state sections, in render order. */
@@ -173,8 +180,34 @@ export interface NowItem {
  * It records a write that actually reached the table — a create the linter
  * refused is not a record of anything, and counting it would teach the agent
  * that a rejected call satisfies the check.
+ *
+ * Package 3.1 widened what satisfies it from "now" to "now OR journal", which
+ * is what §2.4.2 asked for all along; package 2.2 could only check the now half
+ * because `journal.note` did not exist yet. The key keeps its name: it answers
+ * one question — did this turn record anything at all — and a second key would
+ * only mean two reads for one answer.
  */
 export const NOW_AGENT_WRITE_KEY = "now_agent_write_turn";
+
+/**
+ * What a journal row IS (package 3.1, memory-design §2.4).
+ *
+ * `source` already says who wrote it; `kind` says what it is for, and the two
+ * are independent — the secretary writes both plain entries and rollups, and
+ * both the daemon and the agent write archives.
+ *
+ *   - `archive`  — written automatically when a now item closed (§2.2). The
+ *                  only kind the daily summary is allowed to CONTRADICT, by
+ *                  checking whether the registry still calls that item closed.
+ *   - `entry`    — narrative: `journal.note`, and the secretary's recovered
+ *                  entries for work the event log shows but nobody filed.
+ *   - `summary`  — one per logical day, the secretary's own.
+ *   - `rollup`   — one per month, built FROM the rows above. Its own kind so
+ *                  next month cannot read it as input and compress a
+ *                  compression.
+ */
+export const JOURNAL_KINDS = ["entry", "archive", "summary", "rollup"] as const;
+export type JournalKind = (typeof JOURNAL_KINDS)[number];
 
 export interface JournalEntry {
   slug: string;
@@ -182,6 +215,9 @@ export interface JournalEntry {
   day: string;
   body: string;
   source: "agent" | "scribe" | "daemon";
+  kind: JournalKind;
+  /** T3 thread the entry is about, when it is about one (§2.4 reconciliation). */
+  threadRef?: string;
   createdAt: string;
 }
 
@@ -547,6 +583,25 @@ export interface OperatorRuntime {
    * serialized main-session turn queue.
    */
   oneShot?(input: { prompt: string; timeoutMs?: number }): Promise<string>;
+  /**
+   * The BACKGROUND one-shot channel (memory-design §5), and deliberately not
+   * the same thing as `oneShot`.
+   *
+   * `oneShot` follows the active provider, which is right for mediation: it
+   * speaks in the middle of the owner's own conversation. Hygiene does not.
+   * §5 pins the nightly runs to the **Claude branch of
+   * `SwitchableOperatorRuntime` regardless of which provider the main session
+   * is on**, because Codex has no one-shot channel at all and an owner who
+   * left the session on Codex would otherwise silently lose the secretary —
+   * "основной механизм консистентности" (§2.4.2) dying without a sound.
+   *
+   * Optional, and a runtime that cannot reach a Claude branch must REJECT
+   * rather than fall back to the active provider: a caller that quietly ran
+   * hygiene on a branch with no one-shot support would be the exact failure
+   * this member exists to prevent. The skip is a first-class outcome — the
+   * secretary records it, catches up the next night and alerts after three.
+   */
+  backgroundOneShot?(input: { prompt: string; timeoutMs?: number }): Promise<string>;
   health(): Promise<{
     healthy: boolean;
     detail?: string;

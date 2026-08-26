@@ -12,6 +12,7 @@ import type {
   FocusState,
   InteractionMediation,
   JournalEntry,
+  JournalKind,
   NowItem,
   NowSection,
   NowSource,
@@ -30,6 +31,7 @@ import type {
   WorkThread,
 } from "../../shared/src/index.js";
 import {
+  JOURNAL_KINDS,
   NOW_SECTIONS,
   NOW_STATUSES,
   newId,
@@ -39,6 +41,20 @@ import {
 } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
+
+/** One row of the narrative journal (memory-design §2.4). */
+export interface JournalEntryInput {
+  /** Readable name; uniqueness is resolved here, the only layer that sees a clash. */
+  slugBase: string;
+  /** Owner-local logical day, 03:00 boundary. */
+  day: string;
+  body: string;
+  source: JournalEntry["source"];
+  /** Defaults to `entry`: an unlabelled row is narrative, never an archive. */
+  kind?: JournalKind;
+  threadRef?: string;
+  createdAt?: string;
+}
 
 export interface UserInputDraftAnswer {
   selectedOptionLabels?: string[];
@@ -133,6 +149,15 @@ export class OperatorStore {
       if (!noteColumns.some((column) => column.name === "expires_at")) {
         this.db.exec("ALTER TABLE operator_notes ADD COLUMN expires_at TEXT");
       }
+      // memory-design §2.3/§6.4. The column belongs to the notes rewrite of
+      // package 3.2, but its WRITER is the night secretary of 3.1 ("секретарь
+      // лениво дописывает description"), and a package whose output has
+      // nowhere to land is not a package. Only this one column moves early —
+      // `key`, `verified_at`, `valid_until` and `superseded_by` come with the
+      // supersede transaction that gives them meaning.
+      if (!noteColumns.some((column) => column.name === "description")) {
+        this.db.exec("ALTER TABLE operator_notes ADD COLUMN description TEXT");
+      }
     }
     const sql = readFileSync(resolveMigrationPath(), "utf8");
     this.db.exec(sql);
@@ -156,6 +181,25 @@ export class OperatorStore {
     const pendingUserInputColumns = this.db.prepare("PRAGMA table_info(pending_user_inputs)").all() as Row[];
     if (pendingUserInputColumns.length && !pendingUserInputColumns.some((column) => column.name === "mediation_json")) {
       this.db.exec("ALTER TABLE pending_user_inputs ADD COLUMN mediation_json TEXT");
+    }
+    // Package 3.1 (§2.4): `kind` separates a rollup and an automatic archive
+    // from a narrative entry; `thread_ref` is how the reconciliation asks
+    // whether finished work is already filed. On a database written by package
+    // 2.2 every existing row is an archive of a closed now item — that is the
+    // only writer there was — but they are backfilled as 'entry' rather than
+    // 'archive': `kind='archive'` is what lets the daily summary CONTRADICT a
+    // close using the registry, and claiming that power over rows whose
+    // `journal_ref` links may predate the check would report old, correctly
+    // closed work as reopened on the first night after the upgrade.
+    const journalColumns = this.db.prepare("PRAGMA table_info(journal_entries)").all() as Row[];
+    if (journalColumns.length && !journalColumns.some((column) => column.name === "kind")) {
+      this.db.exec("ALTER TABLE journal_entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'entry'");
+    }
+    if (journalColumns.length && !journalColumns.some((column) => column.name === "thread_ref")) {
+      this.db.exec("ALTER TABLE journal_entries ADD COLUMN thread_ref TEXT");
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_journal_entries_thread ON journal_entries(thread_ref, day DESC) WHERE thread_ref IS NOT NULL",
+      );
     }
     const processedEventColumns = this.db.prepare("PRAGMA table_info(processed_events)").all() as Row[];
     if (processedEventColumns.length && !processedEventColumns.some((column) => column.name === "status")) {
@@ -1302,6 +1346,10 @@ export class OperatorStore {
         day: journal.day,
         body: journal.body,
         source: journal.source ?? (existing.source === "daemon" ? "daemon" : "agent"),
+        // An automatic archive, and labelled as one: it is the single kind the
+        // secretary's daily summary may overrule from the registry (§2.4).
+        kind: "archive",
+        ...(existing.threadRef ? { threadRef: existing.threadRef } : {}),
       });
       this.db
         .prepare("UPDATE now_items SET status='closed',journal_ref=?,updated_at=? WHERE id=?")
@@ -1323,23 +1371,11 @@ export class OperatorStore {
    * worded work on one day get `-2`, `-3`; they do not overwrite each other,
    * because an archive that loses an entry to a name clash is not an archive.
    */
-  appendJournalEntry(input: {
-    slugBase: string;
-    day: string;
-    body: string;
-    source: JournalEntry["source"];
-    createdAt?: string;
-  }): JournalEntry {
+  appendJournalEntry(input: JournalEntryInput): JournalEntry {
     return this.transaction(() => this.insertJournalEntry(input));
   }
 
-  private insertJournalEntry(input: {
-    slugBase: string;
-    day: string;
-    body: string;
-    source: JournalEntry["source"];
-    createdAt?: string;
-  }): JournalEntry {
+  private insertJournalEntry(input: JournalEntryInput): JournalEntry {
     const base = (input.slugBase.trim() || input.day).slice(0, 120);
     const body = redactSecrets(input.body).trim().slice(0, 8_000);
     const createdAt = input.createdAt ?? nowIso();
@@ -1348,9 +1384,43 @@ export class OperatorStore {
       slug = `${base}-${suffix}`;
     }
     this.db
-      .prepare("INSERT INTO journal_entries(slug,day,body,source,created_at) VALUES (?,?,?,?,?)")
-      .run(slug, input.day, body, input.source, createdAt);
+      .prepare(
+        "INSERT INTO journal_entries(slug,day,body,source,kind,thread_ref,created_at) VALUES (?,?,?,?,?,?,?)",
+      )
+      .run(slug, input.day, body, input.source, input.kind ?? "entry", input.threadRef ?? null, createdAt);
     return this.getJournalEntry(slug)!;
+  }
+
+  /**
+   * Write an entry under an EXACT slug, or leave the existing one alone.
+   *
+   * The append path resolves a name clash with `-2`, which is right for
+   * archives (two closes of similar work are two facts). It is wrong for the
+   * secretary's own once-per-period rows: a maintenance tick that ran twice, or
+   * a catch-up that re-covered a day, would otherwise leave `2026-08-25-summary`
+   * next to `2026-08-25-summary-2` and the monthly rollup would read the day
+   * twice. `undefined` means "already written" — the caller decides whether
+   * that is a skip or a no-op.
+   */
+  appendUniqueJournalEntry(input: JournalEntryInput & { slug: string }): JournalEntry | undefined {
+    return this.transaction(() => {
+      if (this.getJournalEntry(input.slug)) return undefined;
+      const body = redactSecrets(input.body).trim().slice(0, 8_000);
+      this.db
+        .prepare(
+          "INSERT INTO journal_entries(slug,day,body,source,kind,thread_ref,created_at) VALUES (?,?,?,?,?,?,?)",
+        )
+        .run(
+          input.slug,
+          input.day,
+          body,
+          input.source,
+          input.kind ?? "entry",
+          input.threadRef ?? null,
+          input.createdAt ?? nowIso(),
+        );
+      return this.getJournalEntry(input.slug)!;
+    });
   }
 
   getJournalEntry(slug: string): JournalEntry | undefined {
@@ -1360,16 +1430,204 @@ export class OperatorStore {
     return row ? rowToJournalEntry(row) : undefined;
   }
 
-  listJournalEntries(input: { day?: string; limit?: number } = {}): JournalEntry[] {
-    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
-    const rows = input.day
-      ? this.db
-          .prepare("SELECT * FROM journal_entries WHERE day=? ORDER BY created_at DESC LIMIT ?")
-          .all(input.day, limit)
-      : this.db
-          .prepare("SELECT * FROM journal_entries ORDER BY day DESC, created_at DESC LIMIT ?")
-          .all(limit);
-    return (rows as Row[]).map(rowToJournalEntry);
+  /**
+   * Read the narrative journal by day, by interval, or by kind.
+   *
+   * `from`/`to` are LOGICAL DAYS (`YYYY-MM-DD`), not instants: `day` is what
+   * §2.4 files an entry under, and comparing it against a timestamp would put
+   * every entry of the boundary day on the wrong side of the range.
+   */
+  listJournalEntries(
+    input: {
+      day?: string;
+      from?: string;
+      to?: string;
+      kinds?: readonly JournalKind[];
+      threadRef?: string;
+      limit?: number;
+    } = {},
+  ): JournalEntry[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 500));
+    const clauses: string[] = [];
+    const parameters: SQLInputValue[] = [];
+    if (input.day) {
+      clauses.push("day=?");
+      parameters.push(input.day);
+    }
+    if (input.from) {
+      clauses.push("day>=?");
+      parameters.push(input.from);
+    }
+    if (input.to) {
+      clauses.push("day<=?");
+      parameters.push(input.to);
+    }
+    if (input.kinds?.length) {
+      clauses.push(`kind IN (${input.kinds.map(() => "?").join(",")})`);
+      parameters.push(...input.kinds);
+    }
+    if (input.threadRef) {
+      clauses.push("thread_ref=?");
+      parameters.push(input.threadRef);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM journal_entries ${where} ORDER BY day DESC, created_at DESC LIMIT ?`,
+      )
+      .all(...parameters, limit) as Row[];
+    return rows.map(rowToJournalEntry);
+  }
+
+  /** Distinct logical days that carry at least one entry, newest first. */
+  listJournalDays(input: { from?: string; to?: string; limit?: number } = {}): string[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 62, 400));
+    const clauses: string[] = [];
+    const parameters: SQLInputValue[] = [];
+    if (input.from) {
+      clauses.push("day>=?");
+      parameters.push(input.from);
+    }
+    if (input.to) {
+      clauses.push("day<=?");
+      parameters.push(input.to);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(`SELECT DISTINCT day FROM journal_entries ${where} ORDER BY day DESC LIMIT ?`)
+      .all(...parameters, limit) as Row[];
+    return rows.map((row) => String(row.day));
+  }
+
+  /**
+   * The now item an entry archived, if one still points at it (§2.2/§2.4).
+   *
+   * This is the whole "реестр важнее журнала" rule in one query: an archive
+   * whose item no longer claims it — reopened work clears `journal_ref` — is a
+   * close the REGISTRY no longer confirms, and the daily summary must not
+   * report it as finished.
+   */
+  getNowItemByJournalRef(slug: string): NowItem | undefined {
+    const row = this.db.prepare("SELECT * FROM now_items WHERE journal_ref=?").get(slug) as
+      | Row
+      | undefined;
+    return row ? rowToNowItem(row) : undefined;
+  }
+
+  // ---------------------------------------------------------------------
+  // The `has_work()` gate (memory-design §5) — counts, never rows.
+  //
+  // "Тихая ночь не стоит ни токена" only holds if ASKING is cheap too. Every
+  // question below is one indexed COUNT with a LIMIT, so the gate costs the
+  // same on a quiet night as the LLM run costs on a busy one: nothing.
+  // ---------------------------------------------------------------------
+
+  /** Events in `[since, …)`, optionally restricted to type prefixes. */
+  countDaemonEventsSince(since: string, typePrefixes: readonly string[] = []): number {
+    const clauses = ["created_at>=?"];
+    const parameters: SQLInputValue[] = [since];
+    const prefixes = typePrefixes.map((prefix) => prefix.trim()).filter(Boolean);
+    if (prefixes.length) {
+      clauses.push(`(${prefixes.map(() => "event_type LIKE ? ESCAPE '\\'").join(" OR ")})`);
+      parameters.push(...prefixes.map((prefix) => `${prefix.replace(/[\\%_]/g, "\\$&")}%`));
+    }
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM daemon_events WHERE ${clauses.join(" AND ")}`)
+      .get(...parameters) as Row;
+    return Number(row.count ?? 0);
+  }
+
+  /**
+   * Telegram messages recorded since an instant — the correspondence delta.
+   *
+   * Counts BOTH directions on purpose: §2.5 distils from "входящие+исходящие",
+   * and a night on which the operator spoke and the owner did not is still a
+   * night with something to reconcile.
+   */
+  countTelegramMessagesSince(since: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count FROM telegram_messages WHERE created_at>=?")
+      .get(since) as Row;
+    return Number(row.count ?? 0);
+  }
+
+  /** Ledger rows this owner touched since an instant, closed ones included. */
+  countNowItemsUpdatedSince(ownerId: string, since: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count FROM now_items WHERE owner_id=? AND updated_at>=?")
+      .get(ownerId, since) as Row;
+    return Number(row.count ?? 0);
+  }
+
+  /**
+   * Open items whose `valid_until` has passed (§2.2: hidden from the render at
+   * once, filed by the secretary later). Ordered oldest deadline first, so a
+   * capped sweep always drains the longest-overdue work.
+   */
+  listExpiredNowItems(input: { ownerId: string; at?: string; limit?: number }): NowItem[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM now_items
+        WHERE owner_id=? AND status!='closed' AND valid_until IS NOT NULL AND valid_until<=?
+        ORDER BY valid_until ASC LIMIT ?
+      `)
+      .all(
+        input.ownerId,
+        input.at ?? nowIso(),
+        Math.max(1, Math.min(input.limit ?? 50, 200)),
+      ) as Row[];
+    return rows.map(rowToNowItem);
+  }
+
+  /**
+   * Active notes still missing the §2.3 index line, oldest first.
+   *
+   * Oldest first, not newest: the legacy notes of §6.4 are precisely the old
+   * ones, and a newest-first sweep on a busy memory would keep re-describing
+   * fresh notes while the 2024 backlog never moved.
+   */
+  listNotesMissingDescription(limit = 20): OperatorNote[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM operator_notes
+        WHERE status='active' AND (description IS NULL OR TRIM(description)='')
+        ORDER BY updated_at ASC LIMIT ?
+      `)
+      .all(Math.max(1, Math.min(limit, 100))) as Row[];
+    return rows.map(rowToOperatorNote);
+  }
+
+  /**
+   * Facts whose `expires_at` fell inside a period (§5, "перепроверка фактов").
+   *
+   * Reads notes the per-minute sweep has already retired, and does not
+   * un-retire them: the monthly batch asks the owner what is still true, and
+   * an answer of "that one still holds" is a `memory.remember`, not a
+   * resurrection behind their back.
+   */
+  listNotesExpiredBetween(from: string, to: string, limit = 10): OperatorNote[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM operator_notes
+        WHERE status='obsolete' AND expires_at IS NOT NULL AND expires_at>=? AND expires_at<=?
+        ORDER BY expires_at DESC LIMIT ?
+      `)
+      .all(from, to, Math.max(1, Math.min(limit, 50))) as Row[];
+    return rows.map(rowToOperatorNote);
+  }
+
+  /**
+   * Fill in a note's index line. Content is never touched here: the secretary
+   * describes what a note is FOR, and rewriting what it says would make an
+   * automatic pass capable of losing what the owner wrote (bug №42's lesson).
+   */
+  setNoteDescription(id: string, description: string): boolean {
+    const trimmed = redactSecrets(description).trim().slice(0, 240);
+    if (!trimmed) return false;
+    const changes = this.db
+      .prepare("UPDATE operator_notes SET description=?,updated_at=? WHERE id=? AND status='active'")
+      .run(trimmed, nowIso(), id).changes;
+    return Number(changes) > 0;
   }
 
   saveArtifact(artifact: Artifact): void {
@@ -2448,6 +2706,7 @@ function rowToOperatorNote(row: Row): OperatorNote {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     ...(row.expires_at ? { expiresAt: String(row.expires_at) } : {}),
+    ...(row.description ? { description: String(row.description) } : {}),
   };
 }
 
@@ -2484,11 +2743,14 @@ function rowToNowItem(row: Row): NowItem {
 
 function rowToJournalEntry(row: Row): JournalEntry {
   const source = String(row.source);
+  const kind = String(row.kind ?? "entry");
   return {
     slug: String(row.slug),
     day: String(row.day),
     body: String(row.body),
     source: source === "scribe" || source === "daemon" ? source : "agent",
+    kind: (JOURNAL_KINDS as readonly string[]).includes(kind) ? (kind as JournalKind) : "entry",
+    ...(row.thread_ref ? { threadRef: String(row.thread_ref) } : {}),
     createdAt: String(row.created_at),
   };
 }

@@ -94,8 +94,8 @@ export const PERSONA_RULES: readonly PersonaRule[] = [
   {
     n: 10,
     id: "memory-write",
-    text: "When a work ends or a decision is settled, record what outlives the chat before you answer: call memory.remember for the decision and its price, the areas changed, and what is still unresolved. Nothing else extracts that for you — unwritten, it is gone at the next compaction.",
-    digest: "work ends → memory.remember the decisions, changes, unresolved; nothing else will.",
+    text: "When a work ends or a decision is settled, record what outlives the chat before you answer: journal.note for the narrative — what was done, what was decided, what turned up on the way, what is next — and memory.remember for a fact you will need to look up later. Nothing else extracts that for you: the event log keeps calls for thirty days and no decisions at all, and unwritten, the rest is gone at the next compaction.",
+    digest: "work ends → journal.note the narrative and memory.remember the durable facts; nothing else will.",
   },
   {
     n: 11,
