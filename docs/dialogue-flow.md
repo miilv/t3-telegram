@@ -1177,6 +1177,89 @@ chat differs. `"message is not modified"` counts as delivered. On a
 `TELEGRAM_BAD_REQUEST` that is not ambiguous, an edit falls back to a fresh
 send; anything else is rethrown so nothing duplicates.
 
+### Signs of life (package 4.1, audit «латентность №1–5»)
+
+Two indicators, and a rule about which one is owed:
+
+```
+draft preview  — durable-looking, carries content, one per Operator turn
+chat action    — ephemeral (~5 s), carries nothing, creates no message
+```
+
+`sendChatAction` **bypasses `outbound`** — no per-chat lock, one attempt, no
+inline flood wait, errors swallowed — for the same reason `sendAlert` does
+(package 0.7): a pulse that queues behind a rate-limited send lands after its
+own lifetime has expired, having delayed the answer it was queued in front of.
+An indicator that arrives late is a lie.
+
+Where each fires:
+
+```
+message accepted (transport)      → typing (never for an edit: it starts no turn)
+message queued behind another turn→ typing every 4 s, capped at 60 s
+ingress starts (daemon)           → typing
+attachment download / enrichment  → typing every 4 s for as long as the work runs
+Operator turn, no live preview    → typing every 4 s
+Operator turn, live preview       → preview only; heartbeat refresh every 15 s
+```
+
+Bypassing `outbound` also bypasses the only **global** pacer there is
+(`minimumGlobalIntervalMs`, ~28.5 req/s), so `sendChatAction` throttles itself:
+at most one action per 4 s **per destination** — per topic, not per chat, since
+in a forum each topic shows its own indicator. Without it a single `getUpdates`
+page, which `acceptUpdate` walks in one synchronous loop, fired up to 100
+actions at once, and the 429 they earn applies to the chat the real answer has
+to go to. Refusals count into `telegram_chat_actions_dropped_total`,
+deliberately not `telegram_errors_total` — a blocked bot produces a steady
+trickle of them and would drown the signal that real delivery is failing.
+
+The queued-message pulse exists because only the OWNER's message preempts the
+turn ahead of it (package 1.1); a group member's just waits. It is capped: past
+a minute the daemon stops claiming to be busy, because an indicator that never
+stops is a worse lie than a chat that admits it went quiet.
+
+Both cadences live in `OperatorDaemon.livenessTimings`, mutable so a test can
+drive them instead of spending eighteen seconds of wall clock per assertion.
+
+The turn's typing pulse stops only when the chat really has a preview to look
+at: a write must have been *issued through an existing writer* and Telegram
+must not have refused it (`DraftWriter.healthy`). A draft that never started —
+`startDraft` threw, the destination refuses drafts — or one Telegram later
+rejects keeps the pulse running for the whole turn. The old flag meant "a write
+was attempted", so such a chat went silent 15 s in and stayed silent.
+
+`DraftWriter` flushes on a 300 ms quiet timer **and** on an 800 ms max-wait
+deadline that later appends do not push back. Under a continuous token stream
+the quiet timer never expires, so before the deadline existed the preview only
+moved when the 15 s heartbeat pushed it — in jumps. `reset`, `finalize` and
+`closePreview` disarm both timers, so a dropped preamble cannot be resurrected
+by a deadline armed before it (package 1.1/bug №40).
+
+Writes are **collapsed, not queued**: at most one `updateDraft` in flight and
+one pending text, always the newest.
+
+```
+append/refresh/reset → write(text)
+   ├─ text === last written → dropped ("message is not modified" would follow)
+   ├─ an update in flight   → replaces the pending text
+   └─ otherwise             → starts a drain that loops until nothing is pending
+```
+
+The timers fire on wall clock and know nothing about how slow Telegram is, so a
+per-flush queue grew without bound — and `closePreview`/`finalize`, which the
+final answer waits on, paid for every edit the turn had ever queued while
+holding the per-chat lock that answer needs. Intermediate frames of a preview
+are worthless the moment a newer one exists, so dropping them costs nothing and
+bounds the close to a single round trip.
+
+`healthy` is the last **completed** write, and only a verdict Telegram will
+repeat (`TELEGRAM_BAD_REQUEST`, `TELEGRAM_FORBIDDEN`) clears it. A 5xx or a
+socket reset says nothing about what the chat currently shows, and latching on
+those would park a typing indicator next to a live preview for the whole turn.
+The `edit`-mode branch of `updateDraft` carries the same `isMessageNotModified`
+guard as every other edit site in the transport.
+
+
 ### Retry classification
 
 | input | code | retryable | ambiguous |
@@ -1261,6 +1344,48 @@ inbound size gate
 Local Bot API path checks throw
 `Local Bot API returned a file outside the configured root` and
 `Local Bot API file path escaped the configured root`.
+
+**One line before the first byte** (package 4.1, «латентность №3/№4»). Ingestion
+is the longest silence the system can produce — download, ffmpeg, then an STT
+call whose long deadline is 30 minutes — so the daemon says what it is doing
+*before* it starts, from the metadata Telegram already sent. Exactly one
+message, never two:
+
+```
+the trigger is the WORK, never the shape of the burst
+├─ slow transcription  → "Расшифровка: голосовое, 6 мин…"
+│    long per item: > 60 s video / video note, > 120 s voice / audio, or > 5 MiB
+│    long together:  > 180 s of declared audio in the batch
+├─ > 10 MiB to fetch, or ≥ 3 items that really get processed
+│    alone   → "Обработка вложений…"
+│    in bulk → "Принято 7 сообщ., вложений: 4. Расшифровка: 3 шт.…"
+└─ otherwise → nothing; the typing pulse is enough
+```
+
+"Really get processed" means what is actually configured: with no media
+processor nothing is transcribed, above `media.maxInputBytes` the artifact is
+never ingested, and with OCR off a photo costs only its download. The notice
+never promises work that will not happen.
+
+Everything else is deliberately silent. Three quickly typed lines carry no
+ingestion; three 400 KB JPEGs are a second of download; a short voice is
+transcribed faster than a line about it would be read. An album counts as one
+message however many updates Telegram split it into.
+
+The register is impersonal — «Принято», «Расшифровка», not «Принял»,
+«Расшифровываю» — because this is the daemon's machine indication and must not
+read as the Operator's voice. For the same reason the line is **passed into the
+envelope** (as a `mediaContext` entry), so the Operator knows it is already in
+the chat and does not open its answer with the same sentence; nothing else
+would prevent that.
+
+The outbox key is per `(chat, message)`, so a replayed ingress job never posts
+it twice, and a remainder of a split burst — which inherits the parent's
+attachments — is recognised by its inherited `mediaContext` and stays silent.
+The flush is **not** awaited: the row is durable once enqueued, and draining up
+to a hundred outbox items with flood waits before starting the download would
+delay the work in order to announce the work.
+
 
 ```
 voice / audio / video_note / video

@@ -1092,6 +1092,158 @@ describe("Telegram inbound normalization", () => {
     expect(observed).toHaveLength(2);
   });
 
+  it("pulses typing while the batch window holds a burst (package 4.1, finding «латентность №5»)", async () => {
+    vi.useFakeTimers();
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport(
+      "test-token",
+      { users: { 42: "owner" }, allowGroups: false },
+      1,
+      logger,
+    );
+    const internals = transport as unknown as {
+      acceptUpdate(update: unknown): void;
+      inbound: { push(item: unknown): void };
+    };
+    const delivered: TelegramMessageInbound[] = [];
+    internals.inbound.push = (item) => delivered.push(item as TelegramMessageInbound);
+
+    // Nothing downstream has seen the message yet — it leaves as one envelope
+    // when the window closes — so the batch window is dead air unless the
+    // transport itself signals. A chat action creates no message.
+    internals.acceptUpdate(rawTextUpdate(1, 1));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.map((call) => call.method)).toEqual(["sendChatAction"]);
+    expect(calls[0]!.body).toMatchObject({ chat_id: 7, action: "typing" });
+    expect(delivered).toHaveLength(0);
+
+    // A second message one second later re-arms the window, but the indicator
+    // it would renew is still live: `sendChatAction` throttles per destination,
+    // which is what keeps a 100-update page from firing 100 actions at once.
+    await vi.advanceTimersByTimeAsync(1_000);
+    internals.acceptUpdate(rawTextUpdate(2, 2));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.messageIds).toEqual([1, 2]);
+
+    // Past the throttle window, so an accepted message here WOULD pulse: what
+    // the next two assertions observe is the rule under test, not the throttle
+    // still being closed (review C).
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    // An unauthorized sender is filtered before the pulse: no stranger can make
+    // the bot look busy in a chat it does not serve.
+    internals.acceptUpdate({
+      ...rawTextUpdate(3, 3),
+      message: { ...rawTextUpdate(3, 3).message, from: { id: 99, first_name: "X" } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
+
+    // An EDIT starts no turn, so it gets no indicator either.
+    internals.acceptUpdate({
+      update_id: 4,
+      edited_message: { ...rawTextUpdate(4, 1).message, text: "msg 1 fixed" },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
+
+    // The positive control for both: an ordinary authorized message at this
+    // very moment DOES pulse, which is what makes the two silences above
+    // attributable to the access policy and the edit rule rather than to a
+    // throttle window that simply had not reopened.
+    internals.acceptUpdate(rawTextUpdate(5, 5));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(2);
+  });
+
+  it("collapses a whole getUpdates page into one indicator (review: 100 updates, 100 actions)", async () => {
+    vi.useFakeTimers();
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport(
+      "test-token",
+      { users: { 42: "owner" }, allowGroups: false },
+      1,
+      logger,
+    );
+    const internals = transport as unknown as {
+      acceptUpdate(update: unknown): void;
+      inbound: { push(item: unknown): void };
+    };
+    internals.inbound.push = () => undefined;
+
+    // `pollUpdates` walks a full page in one synchronous loop, and the pulse
+    // bypasses `outbound` — which is also the only GLOBAL pacer there is
+    // (~28.5 req/s). Unthrottled, a forwarded bundle of 100 fired 100 chat
+    // actions at once and the 429 they earn applies to the chat the real
+    // answer has to go to.
+    for (let updateId = 1; updateId <= 100; updateId += 1) {
+      internals.acceptUpdate(rawTextUpdate(updateId, updateId));
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
+  });
+
+  it("never parks a chat action behind the per-chat lock (package 4.1)", async () => {
+    const calls: ApiCall[] = [];
+    let releaseSend!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        // The lock holder is a send that Telegram is making wait — in
+        // production a flood wait parks it for up to 30 s inside `outbound`.
+        if (call.method === "sendRichMessage") await blocked;
+        return telegramResponse(messageResult(101));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    const send = transport.sendRich(7, "долгий ответ");
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    // Same chat, so `outbound` would serialize the pulse behind the stuck send
+    // and it would land after its own ~5 s lifetime had expired — an indicator
+    // that arrives late is a lie, and it would have delayed the answer too.
+    // This await returning at all, with the send still parked, is the assertion.
+    await transport.sendChatAction(7, "typing");
+    expect(calls.map((call) => call.method)).toEqual(["sendRichMessage", "sendChatAction"]);
+
+    releaseSend();
+    await send;
+  });
+
+  it("keeps a second topic's indicator when another topic just pulsed", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    // The indicator belongs to a topic, not to a chat: throttling per chat
+    // would leave a second active forum topic permanently silent.
+    await transport.sendChatAction(7, "typing", { messageThreadId: 11 });
+    await transport.sendChatAction(7, "typing", { messageThreadId: 22 });
+    await transport.sendChatAction(7, "typing", { messageThreadId: 11 });
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(2);
+  });
+
+  it("swallows a refused chat action instead of failing the turn behind it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => telegramResponse({ ok: false, error_code: 403, description: "Forbidden: bot was blocked" }, 403)),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    await expect(transport.sendChatAction(7, "typing")).resolves.toBeUndefined();
+  });
+
   it("holds an album open across getUpdates page boundaries instead of splitting it", async () => {
     vi.useFakeTimers();
     const transport = new TelegramBotTransport("test-token", 42, 1, logger);

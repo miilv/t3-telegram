@@ -25,7 +25,14 @@ export type MetricName =
   /** Package 1.5: turns that ignored the interrupt and lost their queue slot. */
   | "operator_turns_zombie_total"
   /** Package 1.5: running threads reported to the Operator as silent. */
-  | "worker_threads_stalled_total";
+  | "worker_threads_stalled_total"
+  /**
+   * Package 4.1: chat actions Telegram refused. Deliberately separate from
+   * `telegram_errors_total`: indicators are best-effort and a blocked bot
+   * produces a steady trickle of them, which would drown the signal that real
+   * delivery is failing.
+   */
+  | "telegram_chat_actions_dropped_total";
 
 export interface MetricSummary {
   count: number;
