@@ -16,8 +16,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { openFence } from "../../shared/src/index.js";
-import type { Fence } from "../../shared/src/index.js";
+import { NOW_SECTIONS, openFence } from "../../shared/src/index.js";
+import type { Fence, NowSection } from "../../shared/src/index.js";
 
 /** memory-design §2.2 — now-state render budget. */
 export const NOW_STATE_BUDGET_CHARS = 3_000;
@@ -25,6 +25,19 @@ export const NOW_STATE_BUDGET_CHARS = 3_000;
 export const MEMORY_INDEX_BUDGET_CHARS = 3_000;
 /** memory-design §2.3 — anti-rediscovery descriptions render budget. */
 export const ANTI_REDISCOVERY_BUDGET_CHARS = 1_000;
+/**
+ * The memory index rendered for the memory-maintenance one-shot — its own
+ * budget, not the envelope's, because that pass names the ids it wants to
+ * retire and can only retire what it was shown.
+ *
+ * 32 000, raised from 20 000 (package 2.1 backlog). The reference at the end of
+ * a legacy §6.4 index line is a 41-character note id, so at the 200-note
+ * ceiling the store returns, 20 000 characters silently cut roughly 65 of them
+ * — silently, because the render's answer to overflow is a tail, not an error.
+ * The number is a function of that temporary format and shrinks again when
+ * package 3.2 replaces ids with short keys.
+ */
+export const MAINTENANCE_INDEX_BUDGET_CHARS = 32_000;
 
 /** Per-item cap from §2.2; enforced at write time in package 2.2, defensively here. */
 export const NOW_ITEM_CONTENT_CHARS = 200;
@@ -46,10 +59,14 @@ export const NOW_DIFF_HEADER = "Current state changed since your last turn:";
 /** The category whose descriptions get their own push block (§2.3). */
 export const ANTI_REDISCOVERY_CATEGORY = "anti-rediscovery";
 
-export type NowSection = "active" | "blocked" | "waiting" | "next" | "debt";
+export type { NowSection };
 
-/** Render order of the sections; anything unknown sorts last. */
-const SECTION_ORDER: readonly NowSection[] = ["active", "blocked", "waiting", "next", "debt"];
+/**
+ * Render order of the sections; anything unknown sorts last. One list, shared
+ * with the schema's vocabulary and the tool's enum — a render order that could
+ * drift from the accepted sections would silently stop rendering a section.
+ */
+const SECTION_ORDER: readonly NowSection[] = NOW_SECTIONS;
 
 export interface NowStateItem {
   id: string;

@@ -16,6 +16,7 @@ export {
   ANTI_REDISCOVERY_EMPTY,
   ANTI_REDISCOVERY_HEADER,
   LEGACY_INDEX_EXCERPT_CHARS,
+  MAINTENANCE_INDEX_BUDGET_CHARS,
   MEMORY_INDEX_BUDGET_CHARS,
   MEMORY_INDEX_EMPTY,
   MEMORY_INDEX_HEADER,
@@ -44,6 +45,23 @@ export type {
   RenderOptions,
   StateLayerInput,
 } from "./memory-layers.js";
+export {
+  NOW_HINT_CLOSE_NEEDS_ID,
+  NOW_HINT_CODE_BLOCK,
+  NOW_HINT_CREATE_NEEDS_FIELDS,
+  NOW_HINT_DAEMON_CONTENT,
+  NOW_HINT_EMPTY,
+  NOW_HINT_TOO_LONG,
+  NOW_HINT_UNKNOWN_ITEM,
+  deriveFocusThreadRef,
+  journalSlugBase,
+  lintNowContent,
+  mayAgentEditContent,
+  reconcileDaemonSection,
+  renderClosedItemJournalBody,
+  selectNowItemsForRender,
+} from "./now-items.js";
+export type { NowLintResult } from "./now-items.js";
 export {
   LOGICAL_DAY_BOUNDARY_HOUR,
   PAUSE_COLD_AFTER_MS,

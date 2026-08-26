@@ -357,11 +357,54 @@ CREATE TABLE IF NOT EXISTS provider_performance (
   PRIMARY KEY (provider_instance_id, model)
 );
 
+-- memory-design §2.2 — the now-state ledger (package 2.2).
+--
+-- `created_at` is not in the design's column list, but §2.2 makes focus derive
+-- from "the LAST daemon active item by the item's CREATION time, not
+-- updated_at" — the daemon regenerating a thread's content must not move the
+-- focus. No listed column can express that, so the instant is stored.
+--
+-- `create_seq` is the second half of the replay-idempotency key: §2.2 keys a
+-- create on (origin_job, ordinal of the create WITHIN the turn), deliberately
+-- not on the section, because one turn may legitimately open two items in the
+-- same section and a partial replay must top up the missing one rather than
+-- merge the two into one.
+CREATE TABLE IF NOT EXISTS now_items (
+  id          TEXT PRIMARY KEY,
+  owner_id    TEXT NOT NULL,
+  section     TEXT NOT NULL,
+  content     TEXT NOT NULL,
+  source      TEXT NOT NULL,
+  thread_ref  TEXT,
+  origin_job  TEXT,
+  create_seq  INTEGER,
+  status      TEXT NOT NULL DEFAULT 'open',
+  journal_ref TEXT,
+  valid_until TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
+-- memory-design §2.4 — the narrative journal. Package 2.2 ships only the
+-- daemon's automatic close entries, so the package stands on its own; the
+-- secretary and the `journal.*` tools fill it out in package 3.1.
+CREATE TABLE IF NOT EXISTS journal_entries (
+  slug       TEXT PRIMARY KEY,
+  day        TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  source     TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id);
 CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
 CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity_at DESC);
 CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON daemon_events(created_at DESC);
+-- memory-design §2.4.2: "did this turn mutate anything" is answered by reading
+-- one turn's own tool events, so the correlation id needs to be an index and
+-- not a scan of a 30-day table.
+CREATE INDEX IF NOT EXISTS idx_events_correlation ON daemon_events(correlation_id);
 CREATE INDEX IF NOT EXISTS idx_operator_notes_status ON operator_notes(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_telegram_outbox_delivery
   ON telegram_outbox(status, next_attempt_at, created_at);
@@ -373,6 +416,15 @@ CREATE INDEX IF NOT EXISTS idx_automations_due
   ON automations(status, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_automation_runs_automation
   ON automation_runs(automation_id, scheduled_for DESC);
+CREATE INDEX IF NOT EXISTS idx_now_items_owner
+  ON now_items(owner_id, status, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_now_items_replay
+  ON now_items(owner_id, origin_job, create_seq)
+  WHERE origin_job IS NOT NULL AND create_seq IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_now_items_thread
+  ON now_items(thread_ref) WHERE source='daemon' AND thread_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_journal_entries_day
+  ON journal_entries(day DESC, created_at DESC);
 
 DELETE FROM operator_note_search;
 INSERT INTO operator_note_search(id,category,content)

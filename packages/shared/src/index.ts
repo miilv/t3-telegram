@@ -130,6 +130,61 @@ export interface OperatorNote {
   expiresAt?: string;
 }
 
+/** memory-design §2.2 — the five now-state sections, in render order. */
+export const NOW_SECTIONS = ["active", "blocked", "waiting", "next", "debt"] as const;
+export type NowSection = (typeof NOW_SECTIONS)[number];
+
+/** `half` is blick's `[~]`: done halfway, with the remainder named in `content`. */
+export const NOW_STATUSES = ["open", "half", "closed"] as const;
+export type NowStatus = (typeof NOW_STATUSES)[number];
+
+/** Double bookkeeping (§2.2): the daemon keeps thread items, the agent keeps the rest. */
+export type NowSource = "agent" | "daemon";
+
+export interface NowItem {
+  id: string;
+  ownerId: string;
+  section: NowSection;
+  content: string;
+  source: NowSource;
+  /** T3 thread this item is about; set for every daemon item. */
+  threadRef?: string;
+  /** Ingress job of the turn that created it — first half of the replay key. */
+  originJob?: string;
+  /** Ordinal of the create WITHIN that turn — second half of the replay key. */
+  createSeq?: number;
+  status: NowStatus;
+  /** Slug (a name, not an id) of the journal entry this item was archived into. */
+  journalRef?: string;
+  validUntil?: string;
+  /** Focus derives from this, never from updatedAt (§2.2). */
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * `runtime_state` key holding the operator turn whose `now.update` last LANDED
+ * (memory-design §2.4.2).
+ *
+ * Written by the tool, read by the daemon at the end of the turn, and one row
+ * rather than one per turn: the question is only ever asked about the turn that
+ * just finished, so history here would be garbage that never gets collected.
+ *
+ * It records a write that actually reached the table — a create the linter
+ * refused is not a record of anything, and counting it would teach the agent
+ * that a rejected call satisfies the check.
+ */
+export const NOW_AGENT_WRITE_KEY = "now_agent_write_turn";
+
+export interface JournalEntry {
+  slug: string;
+  /** Owner-local logical day (03:00 boundary), not a UTC date. */
+  day: string;
+  body: string;
+  source: "agent" | "scribe" | "daemon";
+  createdAt: string;
+}
+
 export interface ConversationCompaction {
   id: string;
   operatorSessionId?: string;

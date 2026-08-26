@@ -11,6 +11,11 @@ import type {
   ConversationCompaction,
   FocusState,
   InteractionMediation,
+  JournalEntry,
+  NowItem,
+  NowSection,
+  NowSource,
+  NowStatus,
   OperatorNote,
   Project,
   ProviderPerformance,
@@ -24,7 +29,14 @@ import type {
   WorkerResult,
   WorkThread,
 } from "../../shared/src/index.js";
-import { newId, nowIso, redactSecrets, redactSecretsDeep } from "../../shared/src/index.js";
+import {
+  NOW_SECTIONS,
+  NOW_STATUSES,
+  newId,
+  nowIso,
+  redactSecrets,
+  redactSecretsDeep,
+} from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
 
@@ -1046,6 +1058,286 @@ export class OperatorStore {
       }
       return ids.length;
     });
+  }
+
+  // ---------------------------------------------------------------------
+  // now_items — the now-state ledger (memory-design §2.2, package 2.2)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Create a now item, idempotently under a replay.
+   *
+   * The replay key is `(owner_id, origin_job, create_seq)` — the ingress job of
+   * the creating turn plus the ORDINAL of this create within that turn — and
+   * deliberately not the section (§2.2). One turn may legitimately open two
+   * items in the same section ("ответить Дане" and "ответить бухгалтеру" are
+   * both `next`), so keying on the section would merge them; and a turn that
+   * crashed after its first create must, on replay, top the second one up
+   * rather than find its slot already taken.
+   *
+   * `create_seq` is counted per TURN ATTEMPT, not per stored row: a replay
+   * starts the count from one again, which is exactly what makes the first
+   * create of the replay land on the row the first attempt already wrote.
+   */
+  createNowItem(input: {
+    ownerId: string;
+    section: NowSection;
+    content: string;
+    source: NowSource;
+    threadRef?: string;
+    originJob?: string;
+    createSeq?: number;
+    status?: NowStatus;
+    validUntil?: string;
+    createdAt?: string;
+  }): NowItem {
+    const content = redactSecrets(input.content).trim();
+    if (!content) throw new Error("Now item cannot be empty");
+    const now = nowIso();
+    return this.transaction(() => {
+      const replayable = Boolean(input.originJob) && input.createSeq !== undefined;
+      if (replayable) {
+        const existing = this.db
+          .prepare(
+            "SELECT * FROM now_items WHERE owner_id=? AND origin_job=? AND create_seq=?",
+          )
+          .get(input.ownerId, input.originJob!, input.createSeq!) as Row | undefined;
+        if (existing) {
+          // The same create, seen twice. Re-assert what the turn said rather
+          // than skipping: a replay may carry a corrected wording, and the
+          // alternative — insert — is the duplicate this key exists to prevent.
+          this.db
+            .prepare(
+              "UPDATE now_items SET section=?,content=?,valid_until=?,updated_at=? WHERE id=?",
+            )
+            .run(
+              input.section,
+              content,
+              input.validUntil ?? null,
+              now,
+              String(existing.id),
+            );
+          return rowToNowItem(
+            this.db.prepare("SELECT * FROM now_items WHERE id=?").get(String(existing.id)) as Row,
+          );
+        }
+      }
+      const id = newId("now");
+      this.db
+        .prepare(`
+          INSERT INTO now_items(
+            id,owner_id,section,content,source,thread_ref,origin_job,create_seq,
+            status,journal_ref,valid_until,created_at,updated_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `)
+        .run(
+          id,
+          input.ownerId,
+          input.section,
+          content,
+          input.source,
+          input.threadRef ?? null,
+          input.originJob ?? null,
+          input.createSeq ?? null,
+          input.status ?? "open",
+          null,
+          input.validUntil ?? null,
+          input.createdAt ?? now,
+          now,
+        );
+      return rowToNowItem(this.db.prepare("SELECT * FROM now_items WHERE id=?").get(id) as Row);
+    });
+  }
+
+  /**
+   * Did this operator turn change anything outside itself (§2.4.2)?
+   *
+   * Read from the event log rather than counted in memory, because the check
+   * runs at the END of a turn that may have been replayed, and the log is the
+   * only record that survived the crash. `args` is the marker: `addTool`
+   * journals truncated arguments for MUTATING tools only, so its presence is
+   * exactly "a call that could have changed the world" — including a call that
+   * failed, which is still a turn that tried to act and is worth a nudge.
+   */
+  turnHadMutations(operatorTurnId: string): boolean {
+    const rows = this.db
+      .prepare(
+        "SELECT payload_json FROM daemon_events WHERE correlation_id=? AND event_type LIKE 'operator.tool.%'",
+      )
+      .all(operatorTurnId) as Row[];
+    return rows.some((row) => {
+      try {
+        return (JSON.parse(String(row.payload_json)) as { args?: unknown }).args !== undefined;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  getNowItem(id: string): NowItem | undefined {
+    const row = this.db.prepare("SELECT * FROM now_items WHERE id=?").get(id) as Row | undefined;
+    return row ? rowToNowItem(row) : undefined;
+  }
+
+  /**
+   * The ledger for one owner. Closed items are excluded by default — they left
+   * the render the moment they closed (§2.2) and their archive is the journal.
+   */
+  listNowItems(input: {
+    ownerId: string;
+    includeClosed?: boolean;
+    limit?: number;
+  }): NowItem[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 200, 500));
+    const rows = input.includeClosed
+      ? this.db
+          .prepare("SELECT * FROM now_items WHERE owner_id=? ORDER BY updated_at DESC LIMIT ?")
+          .all(input.ownerId, limit)
+      : this.db
+          .prepare(
+            "SELECT * FROM now_items WHERE owner_id=? AND status!='closed' ORDER BY updated_at DESC LIMIT ?",
+          )
+          .all(input.ownerId, limit);
+    return (rows as Row[]).map(rowToNowItem);
+  }
+
+  /** §2.2 granularity: ONE item per thread, whatever produced the thread. */
+  getDaemonNowItemForThread(threadRef: string): NowItem | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM now_items WHERE source='daemon' AND thread_ref=?")
+      .get(threadRef) as Row | undefined;
+    return row ? rowToNowItem(row) : undefined;
+  }
+
+  /**
+   * Change an OPEN item. `status` here cannot be `closed`: closing writes a
+   * journal entry in the same transaction, so it has its own method and the
+   * type system makes the shortcut unreachable rather than merely discouraged.
+   */
+  updateNowItem(
+    id: string,
+    patch: {
+      section?: NowSection;
+      content?: string;
+      status?: Exclude<NowStatus, "closed">;
+      validUntil?: string | null;
+      journalRef?: string;
+    },
+  ): NowItem | undefined {
+    return this.transaction(() => {
+      const existing = this.getNowItem(id);
+      if (!existing) return undefined;
+      const content =
+        patch.content === undefined ? existing.content : redactSecrets(patch.content).trim();
+      if (!content) throw new Error("Now item cannot be empty");
+      this.db
+        .prepare(
+          "UPDATE now_items SET section=?,content=?,status=?,valid_until=?,journal_ref=?,updated_at=? WHERE id=?",
+        )
+        .run(
+          patch.section ?? existing.section,
+          content,
+          patch.status ?? existing.status,
+          patch.validUntil === undefined ? (existing.validUntil ?? null) : patch.validUntil,
+          patch.journalRef ?? existing.journalRef ?? null,
+          nowIso(),
+          id,
+        );
+      return this.getNowItem(id);
+    });
+  }
+
+  /**
+   * Close an item and archive it in the same transaction (§2.2: "при закрытии
+   * автоматически создаётся журнальная запись").
+   *
+   * One transaction is the whole point: a close whose journal entry failed to
+   * land would erase the item from the render with nothing left behind it, and
+   * the now-state exists precisely so that work does not vanish silently.
+   */
+  closeNowItem(
+    id: string,
+    journal: { slugBase: string; day: string; body: string; source?: JournalEntry["source"] },
+  ): { item: NowItem; entry: JournalEntry } | undefined {
+    return this.transaction(() => {
+      const existing = this.getNowItem(id);
+      if (!existing) return undefined;
+      // The un-wrapped insert, not `appendJournalEntry`: `transaction()` issues
+      // a bare BEGIN IMMEDIATE and SQLite has no nested transactions, so a
+      // helper that opens its own would abort this one.
+      const entry = this.insertJournalEntry({
+        slugBase: journal.slugBase,
+        day: journal.day,
+        body: journal.body,
+        source: journal.source ?? (existing.source === "daemon" ? "daemon" : "agent"),
+      });
+      this.db
+        .prepare("UPDATE now_items SET status='closed',journal_ref=?,updated_at=? WHERE id=?")
+        .run(entry.slug, nowIso(), id);
+      return { item: this.getNowItem(id)!, entry };
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // journal_entries — the narrative journal (memory-design §2.4)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Append an entry under a readable slug.
+   *
+   * `journal_ref` in §2.2 is a NAME, not an id, so the slug is derived from the
+   * day and the item's own words — and uniqueness therefore has to be resolved
+   * here, the only layer that can see the collision. Two closes of similarly
+   * worded work on one day get `-2`, `-3`; they do not overwrite each other,
+   * because an archive that loses an entry to a name clash is not an archive.
+   */
+  appendJournalEntry(input: {
+    slugBase: string;
+    day: string;
+    body: string;
+    source: JournalEntry["source"];
+    createdAt?: string;
+  }): JournalEntry {
+    return this.transaction(() => this.insertJournalEntry(input));
+  }
+
+  private insertJournalEntry(input: {
+    slugBase: string;
+    day: string;
+    body: string;
+    source: JournalEntry["source"];
+    createdAt?: string;
+  }): JournalEntry {
+    const base = (input.slugBase.trim() || input.day).slice(0, 120);
+    const body = redactSecrets(input.body).trim().slice(0, 8_000);
+    const createdAt = input.createdAt ?? nowIso();
+    let slug = base;
+    for (let suffix = 2; this.getJournalEntry(slug) && suffix < 1_000; suffix += 1) {
+      slug = `${base}-${suffix}`;
+    }
+    this.db
+      .prepare("INSERT INTO journal_entries(slug,day,body,source,created_at) VALUES (?,?,?,?,?)")
+      .run(slug, input.day, body, input.source, createdAt);
+    return this.getJournalEntry(slug)!;
+  }
+
+  getJournalEntry(slug: string): JournalEntry | undefined {
+    const row = this.db.prepare("SELECT * FROM journal_entries WHERE slug=?").get(slug) as
+      | Row
+      | undefined;
+    return row ? rowToJournalEntry(row) : undefined;
+  }
+
+  listJournalEntries(input: { day?: string; limit?: number } = {}): JournalEntry[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
+    const rows = input.day
+      ? this.db
+          .prepare("SELECT * FROM journal_entries WHERE day=? ORDER BY created_at DESC LIMIT ?")
+          .all(input.day, limit)
+      : this.db
+          .prepare("SELECT * FROM journal_entries ORDER BY day DESC, created_at DESC LIMIT ?")
+          .all(limit);
+    return (rows as Row[]).map(rowToJournalEntry);
   }
 
   saveArtifact(artifact: Artifact): void {
@@ -2124,6 +2416,48 @@ function rowToOperatorNote(row: Row): OperatorNote {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     ...(row.expires_at ? { expiresAt: String(row.expires_at) } : {}),
+  };
+}
+
+/**
+ * Rows are read back through a narrowing map, not cast.
+ *
+ * A `section` or `status` that is not in the vocabulary can only come from a
+ * hand-edited database or a future schema, and the render groups strictly by
+ * the known sections — an unknown one would silently disappear from the
+ * envelope. Falling back to `next`/`open` keeps it visible instead.
+ */
+function rowToNowItem(row: Row): NowItem {
+  const section = String(row.section);
+  const status = String(row.status ?? "open");
+  const createSeq = row.create_seq;
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    section: (NOW_SECTIONS as readonly string[]).includes(section)
+      ? (section as NowSection)
+      : "next",
+    content: String(row.content),
+    source: String(row.source) === "daemon" ? "daemon" : "agent",
+    ...(row.thread_ref ? { threadRef: String(row.thread_ref) } : {}),
+    ...(row.origin_job ? { originJob: String(row.origin_job) } : {}),
+    ...(createSeq === null || createSeq === undefined ? {} : { createSeq: Number(createSeq) }),
+    status: (NOW_STATUSES as readonly string[]).includes(status) ? (status as NowStatus) : "open",
+    ...(row.journal_ref ? { journalRef: String(row.journal_ref) } : {}),
+    ...(row.valid_until ? { validUntil: String(row.valid_until) } : {}),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function rowToJournalEntry(row: Row): JournalEntry {
+  const source = String(row.source);
+  return {
+    slug: String(row.slug),
+    day: String(row.day),
+    body: String(row.body),
+    source: source === "scribe" || source === "daemon" ? source : "agent",
+    createdAt: String(row.created_at),
   };
 }
 
