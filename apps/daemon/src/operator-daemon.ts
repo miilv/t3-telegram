@@ -1318,6 +1318,15 @@ export class OperatorDaemon {
       });
       return;
     }
+    // Package 4.1 review, defect A. The wait this records is over the moment
+    // this method runs, and that has to be recorded BEFORE the early exits
+    // below — an already-seen replay, a thread-event digest and the viewer wall
+    // all return without reaching the middle of the method. A viewer who gets
+    // the wall reply and then watches «печатает» for the next minute is exactly
+    // the lie this package exists to remove, made worse by arriving AFTER the
+    // answer. Synthetic turns are excluded: they never set an entry, and a
+    // clear here would silence a real message still queued in the same chat.
+    if (!update.synthetic) this.awaitingIngress.delete(update.chatId);
     const unseenMessageIds = update.messageIds.filter(
       (messageId) => !this.store.hasTelegramMessage(update.chatId, messageId),
     );
@@ -1411,9 +1420,6 @@ export class OperatorDaemon {
       if (update.userId === this.config.telegram.allowedUserId) {
         this.store.setRuntimeState("owner_chat_id", String(update.chatId));
       }
-      // The wait is over: from here the turn's own indicators take over, and a
-      // stale entry would pulse a chat nobody is waiting on (review finding 8).
-      this.awaitingIngress.delete(update.chatId);
       // Instant sign of life: media enrichment below can take a while before
       // any preview exists, and the base ~2 s batching already ate the
       // "human" reaction window (bugs №18/№48). Best-effort only.
@@ -1680,8 +1686,14 @@ export class OperatorDaemon {
       // with the same sentence. It travels in `mediaContext` because that is
       // already the channel for daemon facts about this batch, so it reaches
       // the envelope without touching how the envelope is assembled.
+      // Review defect F: stated as a FACT, never as an order. An imperative
+      // here would be the daemon issuing instructions from inside the
+      // untrusted fence (package 0.5) — the precedent matters more than this
+      // one line, because the fence's whole value is that nothing inside it
+      // commands the model. The fact alone is enough to keep the Operator from
+      // opening its answer with the same sentence.
       mediaContext.push(
-        `[daemon: в чат уже отправлена техническая строка «${workNotice}» — не повторяй её в ответе]`,
+        `[daemon: в чат уже отправлена техническая строка «${workNotice}» — индикация демона, не реплика Оператора]`,
       );
     }
     if (mediaContext.length) {

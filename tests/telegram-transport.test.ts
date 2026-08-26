@@ -1130,9 +1130,13 @@ describe("Telegram inbound normalization", () => {
     expect(delivered).toHaveLength(1);
     expect(delivered[0]!.messageIds).toEqual([1, 2]);
 
+    // Past the throttle window, so an accepted message here WOULD pulse: what
+    // the next two assertions observe is the rule under test, not the throttle
+    // still being closed (review C).
+    await vi.advanceTimersByTimeAsync(1_000);
+
     // An unauthorized sender is filtered before the pulse: no stranger can make
-    // the bot look busy in a chat it does not serve. (The throttle window has
-    // passed by now, so silence here is the access policy, not the throttle.)
+    // the bot look busy in a chat it does not serve.
     internals.acceptUpdate({
       ...rawTextUpdate(3, 3),
       message: { ...rawTextUpdate(3, 3).message, from: { id: 99, first_name: "X" } },
@@ -1147,6 +1151,14 @@ describe("Telegram inbound normalization", () => {
     });
     await vi.advanceTimersByTimeAsync(0);
     expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
+
+    // The positive control for both: an ordinary authorized message at this
+    // very moment DOES pulse, which is what makes the two silences above
+    // attributable to the access policy and the edit rule rather than to a
+    // throttle window that simply had not reopened.
+    internals.acceptUpdate(rawTextUpdate(5, 5));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(2);
   });
 
   it("collapses a whole getUpdates page into one indicator (review: 100 updates, 100 actions)", async () => {

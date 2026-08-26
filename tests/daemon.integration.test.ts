@@ -4526,13 +4526,61 @@ describe("OperatorDaemon product flow", () => {
     expect(runtime.prompts).toHaveLength(1);
 
     await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length === 2, 20_000);
+    // Checked BEFORE shutdown: `stop()` clears the map wholesale, so asserting
+    // after it would pass even with the cleanup deleted outright (review B).
+    expect((daemon as unknown as { awaitingIngress: Map<number, unknown> }).awaitingIngress.size).toBe(0);
 
     telegram.finish();
     await run;
     await daemon.stop();
-    // The bookkeeping does not outlive the wait it describes.
-    expect((daemon as unknown as { awaitingIngress: Map<number, unknown> }).awaitingIngress.size).toBe(0);
   }, 40_000);
+
+  it("stops claiming to be busy the moment an early exit answers (package 4.1 review, defect A)", async () => {
+    const home = tempDirectory("daemon-early-exit-pulse-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    store.upsertTeamMember("11", "viewer");
+    const baseConfig = config(home);
+    const teamConfig: Config = {
+      ...baseConfig,
+      telegram: { ...baseConfig.telegram, users: { 42: "owner", 11: "viewer" } },
+    };
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(teamConfig, store, runtime, broker, telegram, artifacts, scheduler, logger);
+    daemon.livenessTimings.typingMs = 120;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // The viewer wall answers and RETURNS, long before the middle of
+    // handleUpdate. With the queued-message bookkeeping cleared halfway down
+    // the method, this chat kept «печатает» for the next minute — after its
+    // answer had already arrived, which is worse than the silence the package
+    // set out to fix. The same three-line shape covers a replayed update, which
+    // answers nothing at all.
+    telegram.push(messageAs(1, "расскажи, что происходит", 11));
+    await waitFor(() =>
+      telegram.sent.some((entry) => entry.text.includes("Ваша роль `viewer` разрешает только")),
+    );
+    const answeredAt = Date.now();
+    expect(
+      (daemon as unknown as { awaitingIngress: Map<number, unknown> }).awaitingIngress.size,
+    ).toBe(0);
+
+    // …and nothing pulses after the answer, over several would-be intervals.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(
+      telegram.chatActions.filter((entry) => entry.action === "typing" && entry.at > answeredAt),
+    ).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
 
   it("resumes typing when Telegram refuses the preview it did start (package 4.1 review)", async () => {
     const home = tempDirectory("daemon-dead-draft-typing-");
