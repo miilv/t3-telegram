@@ -64,6 +64,14 @@ export {
 } from "./now-items.js";
 export type { NowLintResult } from "./now-items.js";
 export {
+  NOTE_DESCRIPTION_HINT_CODE,
+  NOTE_DESCRIPTION_HINT_EMPTY,
+  NOTE_DESCRIPTION_HINT_TOO_LONG,
+  NOTE_DESCRIPTION_HINT_TRIGGER,
+  lintNoteDescription,
+} from "./note-descriptions.js";
+export type { NoteDescriptionLintResult } from "./note-descriptions.js";
+export {
   LOGICAL_DAY_BOUNDARY_HOUR,
   PAUSE_COLD_AFTER_MS,
   PAUSE_LIGHT_AFTER_MS,
@@ -79,6 +87,86 @@ export {
   serializePushBaseline,
 } from "./push.js";
 export type { PushBaseline, PushDecision, PushDecisionInput, PushMode, PushReason } from "./push.js";
+export {
+  SCRIBE_CATCHUP_WINDOW_MS,
+  SCRIBE_LAST_DAY_KEY,
+  SCRIBE_LAST_ROLLUP_KEY,
+  SCRIBE_LAST_RUN_KEY,
+  SCRIBE_MISS_ALERT_KEY,
+  SCRIBE_PENDING_TURN_PREFIX,
+  SCRIBE_MISS_ALERT_THRESHOLD,
+  SCRIBE_MISS_COUNT_KEY,
+  SCRIBE_ONESHOT_TIMEOUT_MS,
+  SCRIBE_RECOVERY_RUN_KEY,
+  SCRIBE_WINDOW_FROM_HOUR,
+  SCRIBE_WINDOW_TO_HOUR,
+  SCRIBE_WORK_EVENT_PREFIXES,
+  firstDayOfMonth,
+  hasScribeWork,
+  lastDayOfMonth,
+  monthOfDay,
+  previousDay,
+  previousMonth,
+  scribeTargetDay,
+} from "./scribe-schedule.js";
+export type { ScribeWorkSignals, ScribeWorkVerdict } from "./scribe-schedule.js";
+export {
+  JOURNAL_HINT_CODE_BLOCK,
+  JOURNAL_HINT_EMPTY,
+  JOURNAL_HINT_RESERVED_SLUG,
+  JOURNAL_HINT_TOO_LONG,
+  JOURNAL_SECTION_CHARS,
+  JOURNAL_SECTION_DECISIONS,
+  JOURNAL_SECTION_DONE,
+  JOURNAL_SECTION_FOUND,
+  JOURNAL_SECTION_NEXT,
+  JOURNAL_SKELETON,
+  SCRIBE_EXPIRED_MARK,
+  SCRIBE_RECOVERED_MARK,
+  SCRIBE_ROLLUP_SLUG_PREFIX,
+  SCRIBE_SIGNIFICANT_EVENT_TYPES,
+  SCRIBE_SKIP_SLUG_SUFFIX,
+  SCRIBE_SUMMARY_SLUG_SUFFIX,
+  isReservedJournalSlug,
+  lintJournalNote,
+  reconcileArchivesAgainstLedger,
+  renderExpiredItemJournalBody,
+  renderJournalSkeleton,
+  renderRecoveredEntryBody,
+  rollupSlug,
+  selectUnfiledWork,
+  skipSlug,
+  summarySlug,
+} from "./journal-policy.js";
+export type {
+  ArchiveVerdict,
+  JournalLintResult,
+  JournalNoteSections,
+  ScribeEvent,
+  UnfiledWork,
+} from "./journal-policy.js";
+export {
+  DESCRIPTION_SEPARATOR,
+  NOTE_DESCRIPTION_CHARS,
+  ROLLUP_MAX_PROPOSALS,
+  ROLLUP_PROPOSAL_MARKER,
+  buildDailySummaryPrompt,
+  buildDescriptionPrompt,
+  buildMissAlertPrompt,
+  buildMonthlyProposalPrompt,
+  buildRollupPrompt,
+  normalizeDailySummary,
+  parseDescriptions,
+  parseRollup,
+  renderScribeSkipBody,
+} from "./scribe-prompts.js";
+export type {
+  DailySummaryInput,
+  NoteToDescribe,
+  ParsedRollup,
+  RollupInput,
+  RollupProposal,
+} from "./scribe-prompts.js";
 
 export interface OwnerProfile {
   /** Owner's human name; empty when not configured. */

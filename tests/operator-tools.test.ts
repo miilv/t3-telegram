@@ -304,22 +304,31 @@ describe("OperatorToolServer", () => {
 
       store.appendEvent("worker.completed", { threadId: thread.id, payload: { status: "completed" } });
       store.appendEvent("automation.dispatched", { payload: { automationId: "auto_brief" } });
+      // Package 3.1: the result is `{ events }` — and only `{ events }` while
+      // the window stays inside the 30-day event retention, so a caller that
+      // asked about yesterday is not handed a journal read it did not need.
       const journal = await callJson(client, "memory.journal", {
         since: "-24h",
         types: ["worker.", "automation."],
         limit: 10,
-      }) as Array<{ eventType: string; threadId?: string; payload: Record<string, unknown> }>;
-      expect(journal.map((event) => event.eventType).sort()).toEqual([
+      }) as {
+        events: Array<{ eventType: string; threadId?: string; payload: Record<string, unknown> }>;
+        journal?: unknown;
+      };
+      expect(journal.journal).toBeUndefined();
+      expect(journal.events.map((event) => event.eventType).sort()).toEqual([
         "automation.dispatched",
         "worker.completed",
       ]);
-      expect(journal.find((event) => event.eventType === "worker.completed")).toMatchObject({
+      expect(journal.events.find((event) => event.eventType === "worker.completed")).toMatchObject({
         threadId: thread.id,
         payload: { status: "completed" },
       });
       // The server clock is pinned to 2026-08-21: an until in its past hides
       // everything appended by this test run.
-      expect(await callJson(client, "memory.journal", { until: "-48h" })).toEqual([]);
+      expect(await callJson(client, "memory.journal", { until: "-48h" })).toMatchObject({
+        events: [],
+      });
       const badJournal = await client.callTool({
         name: "memory.journal",
         arguments: { since: "yesterday-ish" },

@@ -21,6 +21,7 @@ import type {
   FocusState,
   InteractionMediation,
   JournalEntry,
+  JournalKind,
   NowItem,
   NowItemOrigin,
   NowSection,
@@ -40,15 +41,38 @@ import type {
   WorkThread,
 } from "../../shared/src/index.js";
 import {
+  JOURNAL_KINDS,
+  NOTE_DESCRIPTION_CHARS,
   NOW_SECTIONS,
   NOW_STATUSES,
   newId,
   nowIso,
   redactSecrets,
   redactSecretsDeep,
+  truncateCodePoints,
 } from "../../shared/src/index.js";
+import {
+  JournalRepository,
+  type JournalEntryInput,
+  type JournalFilter,
+  type JournalSelection,
+} from "./journal.js";
+
+export { JournalRepository } from "./journal.js";
+export type { JournalEntryInput, JournalFilter, JournalSelection } from "./journal.js";
 
 type Row = Record<string, unknown>;
+
+/**
+ * Nights one legacy note may be offered to the describing pass before it is
+ * left alone (memory-design §6.4).
+ *
+ * Three, not one: a single failure is usually the pass dying halfway, and a
+ * single failure permanently retiring a note would make the backlog quietly
+ * undrainable. Three consecutive nights of silence is the model saying it has
+ * nothing to say, and §6.4's temporary index format still covers the note.
+ */
+const NOTE_DESCRIPTION_MAX_ATTEMPTS = 3;
 
 export interface UserInputDraftAnswer {
   selectedOptionLabels?: string[];
@@ -135,10 +159,12 @@ export class OperatorStore {
   readonly db: DatabaseSync;
   private readonly localApprovals: LocalApprovalRepository;
   private readonly automations: AutomationRepository;
+  readonly journal: JournalRepository;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
+    this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
     this.localApprovals = new LocalApprovalRepository(this.db, (work) => this.transaction(work));
     this.automations = new AutomationRepository(
       this.db,
@@ -149,7 +175,7 @@ export class OperatorStore {
         appendEvent: (eventType, input) => this.appendEvent(eventType, input),
       },
     );
-    this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+    this.journal = new JournalRepository(this.db, (fn) => this.transaction(fn));
   }
 
   migrate(): void {
@@ -168,6 +194,64 @@ export class OperatorStore {
       }
       if (!noteColumns.some((column) => column.name === "expires_at")) {
         this.db.exec("ALTER TABLE operator_notes ADD COLUMN expires_at TEXT");
+      }
+      // memory-design §2.3/§6.4. The column belongs to the notes rewrite of
+      // package 3.2, but its WRITER is the night secretary of 3.1 ("секретарь
+      // лениво дописывает description"), and a package whose output has
+      // nowhere to land is not a package. Only this one column moves early —
+      // `key`, `verified_at`, `valid_until` and `superseded_by` come with the
+      // supersede transaction that gives them meaning.
+      if (!noteColumns.some((column) => column.name === "description")) {
+        this.db.exec("ALTER TABLE operator_notes ADD COLUMN description TEXT");
+      }
+      // How many nights the secretary has offered this note to the model and
+      // got nothing back. Without it one note the model declines to describe
+      // stays at the head of an `updated_at ASC` queue forever, and §5's "тихая
+      // ночь не стоит ни токена" quietly stops being true on that install.
+      if (!noteColumns.some((column) => column.name === "description_attempts")) {
+        this.db.exec(
+          "ALTER TABLE operator_notes ADD COLUMN description_attempts INTEGER NOT NULL DEFAULT 0",
+        );
+      }
+    }
+    // Package 3.1 (§2.4): `kind` separates a rollup and an automatic archive
+    // from a narrative entry; `thread_ref` is how the reconciliation asks
+    // whether finished work is already filed.
+    //
+    // BEFORE `exec(sql)`, like the `operator_notes` block above and unlike the
+    // ALTERs below it — and that ordering is not a style choice. The schema file
+    // creates an INDEX on `thread_ref`, and `CREATE TABLE IF NOT EXISTS` is a
+    // no-op on a database that already has the table, so on every existing
+    // install the index statement would reach a column that does not exist yet
+    // and `migrate()` would throw. `initialize()` migrates before anything else,
+    // so that is not a degraded start: it is a daemon that never boots again.
+    // Columns whose schema-file lines are only column definitions can be added
+    // after; anything the .sql then INDEXES has to exist by the time it runs.
+    //
+    // On a database written by package 2.2 every existing row is an archive of a
+    // closed now item — that was the only writer — but they are backfilled as
+    // 'entry' rather than 'archive': `kind='archive'` is what lets the daily
+    // summary CONTRADICT a close from the registry, and claiming that power over
+    // rows whose `journal_ref` links predate the check would report old,
+    // correctly closed work as reopened on the first night after the upgrade.
+    const journalTableExists = Boolean(
+      this.db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_entries'")
+        .get(),
+    );
+    if (journalTableExists) {
+      const journalColumns = this.db.prepare("PRAGMA table_info(journal_entries)").all() as Row[];
+      if (!journalColumns.some((column) => column.name === "kind")) {
+        this.db.exec("ALTER TABLE journal_entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'entry'");
+      }
+      if (!journalColumns.some((column) => column.name === "thread_ref")) {
+        this.db.exec("ALTER TABLE journal_entries ADD COLUMN thread_ref TEXT");
+      }
+      if (!journalColumns.some((column) => column.name === "origin_job")) {
+        this.db.exec("ALTER TABLE journal_entries ADD COLUMN origin_job TEXT");
+      }
+      if (!journalColumns.some((column) => column.name === "create_seq")) {
+        this.db.exec("ALTER TABLE journal_entries ADD COLUMN create_seq INTEGER");
       }
     }
     // --- package 3.3 (memory-design §3): reminders, recurrence, escalation ---
@@ -987,10 +1071,18 @@ export class OperatorStore {
             source=excluded.source,expires_at=excluded.expires_at,updated_at=excluded.updated_at
         `)
         .run(id, category, content, "active", source, input.expiresAt ?? null, createdAt, now);
-      this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
-      this.db
-        .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
-        .run(id, category, content);
+      // The upsert above does not clear `description`, so the index must not
+      // either — re-remembering a described note would otherwise silently make
+      // its trigger line unsearchable again while the table still shows it.
+      //
+      // Read back by ID, not taken from the dedupe lookup above: that lookup
+      // matches on category+content, so a caller passing an explicit id with
+      // CHANGED content misses it entirely and would land here with `undefined`
+      // for a note that has a perfectly good description.
+      const described = this.db
+        .prepare("SELECT description FROM operator_notes WHERE id=?")
+        .get(id) as Row | undefined;
+      this.reindexNoteSearch(id, category, content, described?.description as string | undefined);
       this.upsertNoteVector(id, `${category} ${content}`, now);
     });
     return this.getOperatorNote(id)!;
@@ -1080,10 +1172,7 @@ export class OperatorStore {
         .run(now, id);
       const category = String(row.category);
       const content = String(row.content);
-      this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
-      this.db
-        .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
-        .run(id, category, content);
+      this.reindexNoteSearch(id, category, content, row.description as string | undefined);
       this.upsertNoteVector(id, `${category} ${content}`, now);
       return true;
     });
@@ -1356,11 +1445,15 @@ export class OperatorStore {
       // The un-wrapped insert, not `appendJournalEntry`: `transaction()` issues
       // a bare BEGIN IMMEDIATE and SQLite has no nested transactions, so a
       // helper that opens its own would abort this one.
-      const entry = this.insertJournalEntry({
+      const entry = this.journal.insert({
         slugBase: journal.slugBase,
         day: journal.day,
         body: journal.body,
         source: journal.source ?? (existing.source === "daemon" ? "daemon" : "agent"),
+        // An automatic archive, and labelled as one: it is the single kind the
+        // secretary's daily summary may overrule from the registry (§2.4).
+        kind: "archive",
+        ...(existing.threadRef ? { threadRef: existing.threadRef } : {}),
       });
       this.db
         .prepare("UPDATE now_items SET status='closed',journal_ref=?,updated_at=? WHERE id=?")
@@ -1382,53 +1475,262 @@ export class OperatorStore {
    * worded work on one day get `-2`, `-3`; they do not overwrite each other,
    * because an archive that loses an entry to a name clash is not an archive.
    */
-  appendJournalEntry(input: {
-    slugBase: string;
-    day: string;
-    body: string;
-    source: JournalEntry["source"];
-    createdAt?: string;
-  }): JournalEntry {
-    return this.transaction(() => this.insertJournalEntry(input));
+  appendJournalEntry(input: JournalEntryInput): JournalEntry {
+    return this.journal.append(input);
   }
 
-  private insertJournalEntry(input: {
-    slugBase: string;
-    day: string;
-    body: string;
-    source: JournalEntry["source"];
-    createdAt?: string;
-  }): JournalEntry {
-    const base = (input.slugBase.trim() || input.day).slice(0, 120);
-    const body = redactSecrets(input.body).trim().slice(0, 8_000);
-    const createdAt = input.createdAt ?? nowIso();
-    let slug = base;
-    for (let suffix = 2; this.getJournalEntry(slug) && suffix < 1_000; suffix += 1) {
-      slug = `${base}-${suffix}`;
-    }
-    this.db
-      .prepare("INSERT INTO journal_entries(slug,day,body,source,created_at) VALUES (?,?,?,?,?)")
-      .run(slug, input.day, body, input.source, createdAt);
-    return this.getJournalEntry(slug)!;
+  /**
+   * Write an entry under an EXACT slug, or leave the existing one alone.
+   *
+   * The append path resolves a name clash with `-2`, which is right for
+   * archives (two closes of similar work are two facts). It is wrong for the
+   * secretary's own once-per-period rows: a maintenance tick that ran twice, or
+   * a catch-up that re-covered a day, would otherwise leave `2026-08-25-summary`
+   * next to `2026-08-25-summary-2` and the monthly rollup would read the day
+   * twice. `undefined` means "already written" — the caller decides whether
+   * that is a skip or a no-op.
+   */
+  appendUniqueJournalEntry(
+    input: Omit<JournalEntryInput, "slugBase"> & { slug: string },
+  ): JournalEntry | undefined {
+    return this.journal.appendUnique(input);
   }
 
   getJournalEntry(slug: string): JournalEntry | undefined {
-    const row = this.db.prepare("SELECT * FROM journal_entries WHERE slug=?").get(slug) as
-      | Row
-      | undefined;
-    return row ? rowToJournalEntry(row) : undefined;
+    return this.journal.get(slug);
   }
 
-  listJournalEntries(input: { day?: string; limit?: number } = {}): JournalEntry[] {
-    const limit = Math.max(1, Math.min(input.limit ?? 50, 200));
-    const rows = input.day
-      ? this.db
-          .prepare("SELECT * FROM journal_entries WHERE day=? ORDER BY created_at DESC LIMIT ?")
-          .all(input.day, limit)
-      : this.db
-          .prepare("SELECT * FROM journal_entries ORDER BY day DESC, created_at DESC LIMIT ?")
-          .all(limit);
-    return (rows as Row[]).map(rowToJournalEntry);
+  /**
+   * Read the narrative journal by day, by interval, or by kind.
+   *
+   * `from`/`to` are LOGICAL DAYS (`YYYY-MM-DD`), not instants: `day` is what
+   * §2.4 files an entry under, and comparing it against a timestamp would put
+   * every entry of the boundary day on the wrong side of the range.
+   */
+  listJournalEntries(
+    input: {
+      day?: string;
+      from?: string;
+      to?: string;
+      kinds?: readonly JournalKind[];
+      threadRef?: string;
+      limit?: number;
+    } = {},
+  ): JournalEntry[] {
+    return this.journal.select(input).entries;
+  }
+
+  selectJournalEntries(input: JournalFilter = {}): JournalSelection {
+    return this.journal.select(input);
+  }
+
+  /** Distinct logical days that carry at least one entry, newest first. */
+  listJournalDays(input: { from?: string; to?: string; limit?: number } = {}): string[] {
+    return this.journal.days(input);
+  }
+
+  /**
+   * The now item an entry archived, if one still points at it (§2.2/§2.4).
+   *
+   * This is the whole "реестр важнее журнала" rule in one query: an archive
+   * whose item no longer claims it — reopened work clears `journal_ref` — is a
+   * close the REGISTRY no longer confirms, and the daily summary must not
+   * report it as finished.
+   */
+  getNowItemByJournalRef(slug: string): NowItem | undefined {
+    const row = this.db.prepare("SELECT * FROM now_items WHERE journal_ref=?").get(slug) as
+      | Row
+      | undefined;
+    return row ? rowToNowItem(row) : undefined;
+  }
+
+  // ---------------------------------------------------------------------
+  // The `has_work()` gate (memory-design §5) — counts, never rows.
+  //
+  // "Тихая ночь не стоит ни токена" only holds if ASKING is cheap too. Every
+  // question below is one indexed COUNT with a LIMIT, so the gate costs the
+  // same on a quiet night as the LLM run costs on a busy one: nothing.
+  // ---------------------------------------------------------------------
+
+  /** Events in `[since, …)`, optionally restricted to type prefixes. */
+  countDaemonEventsSince(since: string, typePrefixes: readonly string[] = []): number {
+    const clauses = ["created_at>=?"];
+    const parameters: SQLInputValue[] = [since];
+    const prefixes = typePrefixes.map((prefix) => prefix.trim()).filter(Boolean);
+    if (prefixes.length) {
+      clauses.push(`(${prefixes.map(() => "event_type LIKE ? ESCAPE '\\'").join(" OR ")})`);
+      parameters.push(...prefixes.map((prefix) => `${prefix.replace(/[\\%_]/g, "\\$&")}%`));
+    }
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM daemon_events WHERE ${clauses.join(" AND ")}`)
+      .get(...parameters) as Row;
+    return Number(row.count ?? 0);
+  }
+
+  /**
+   * Telegram messages recorded since an instant — the correspondence delta.
+   *
+   * Counts BOTH directions on purpose: §2.5 distils from "входящие+исходящие",
+   * and a night on which the operator spoke and the owner did not is still a
+   * night with something to reconcile.
+   */
+  countTelegramMessagesSince(since: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count FROM telegram_messages WHERE created_at>=?")
+      .get(since) as Row;
+    return Number(row.count ?? 0);
+  }
+
+  /** Ledger rows this owner touched since an instant, closed ones included. */
+  countNowItemsUpdatedSince(ownerId: string, since: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count FROM now_items WHERE owner_id=? AND updated_at>=?")
+      .get(ownerId, since) as Row;
+    return Number(row.count ?? 0);
+  }
+
+  /**
+   * Open AGENT items whose `valid_until` has passed (§2.2: hidden from the
+   * render at once, filed by the secretary later). Ordered oldest deadline
+   * first, so a capped sweep always drains the longest-overdue work.
+   *
+   * Daemon items are excluded here rather than skipped by the caller, and the
+   * difference is the `has_work()` gate. A daemon item's life is its thread's
+   * life (package 2.2, review B2) so the sweep may not close one — but if the
+   * QUERY still returned it, the gate would see `expired:1` every night for as
+   * long as the thread lived, and every one of those nights would spend a call.
+   * Nothing gives a daemon item a TTL today; this makes sure nothing can.
+   */
+  listExpiredNowItems(input: { ownerId: string; at?: string; limit?: number }): NowItem[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM now_items
+        WHERE owner_id=? AND source!='daemon' AND status!='closed'
+          AND valid_until IS NOT NULL AND valid_until<=?
+        ORDER BY valid_until ASC LIMIT ?
+      `)
+      .all(
+        input.ownerId,
+        input.at ?? nowIso(),
+        Math.max(1, Math.min(input.limit ?? 50, 200)),
+      ) as Row[];
+    return rows.map(rowToNowItem);
+  }
+
+  /**
+   * Active notes still missing the §2.3 index line, oldest first.
+   *
+   * Oldest first, not newest: the legacy notes of §6.4 are precisely the old
+   * ones, and a newest-first sweep on a busy memory would keep re-describing
+   * fresh notes while the 2024 backlog never moved.
+   */
+  listNotesMissingDescription(limit = 20): OperatorNote[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM operator_notes
+        WHERE status='active' AND (description IS NULL OR TRIM(description)='')
+          AND COALESCE(description_attempts,0) < ?
+        ORDER BY updated_at ASC LIMIT ?
+      `)
+      .all(NOTE_DESCRIPTION_MAX_ATTEMPTS, Math.max(1, Math.min(limit, 100))) as Row[];
+    return rows.map(rowToOperatorNote);
+  }
+
+  /**
+   * Record that the secretary offered these notes to the model.
+   *
+   * Counted for every note in the batch, described or not, and that is the
+   * point: a note the model keeps declining has to leave the queue eventually.
+   * The alternative — retrying it nightly — turns one unhelpful note into a
+   * permanent LLM call on an otherwise silent installation.
+   */
+  markDescriptionAttempt(ids: readonly string[]): void {
+    if (!ids.length) return;
+    const statement = this.db.prepare(
+      "UPDATE operator_notes SET description_attempts=COALESCE(description_attempts,0)+1 WHERE id=?",
+    );
+    this.transaction(() => {
+      for (const id of ids) statement.run(id);
+    });
+  }
+
+  /**
+   * Facts whose `expires_at` fell inside a period (§5, "перепроверка фактов").
+   *
+   * Reads notes the per-minute sweep has already retired, and does not
+   * un-retire them: the monthly batch asks the owner what is still true, and
+   * an answer of "that one still holds" is a `memory.remember`, not a
+   * resurrection behind their back.
+   */
+  listNotesExpiredBetween(from: string, to: string, limit = 10): OperatorNote[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM operator_notes
+        WHERE status='obsolete' AND expires_at IS NOT NULL AND expires_at>=? AND expires_at<=?
+        ORDER BY expires_at DESC LIMIT ?
+      `)
+      .all(from, to, Math.max(1, Math.min(limit, 50))) as Row[];
+    return rows.map(rowToOperatorNote);
+  }
+
+  /**
+   * Fill in a note's index line. Content is never touched here: the secretary
+   * describes what a note is FOR, and rewriting what it says would make an
+   * automatic pass capable of losing what the owner wrote (bug №42's lesson).
+   */
+  setNoteDescription(id: string, description: string): boolean {
+    // Cut to the SAME limit the policy layer states (§2.3: an index line is a
+    // trigger, not a summary). A storage cap of its own would accept what the
+    // linter is required to refuse, and the two numbers would drift apart in
+    // exactly the direction that makes the render budget wrong.
+    const trimmed = truncateCodePoints(redactSecrets(description).trim(), NOTE_DESCRIPTION_CHARS);
+    if (!trimmed) return false;
+    return this.transaction(() => {
+      const row = this.db
+        .prepare("SELECT * FROM operator_notes WHERE id=? AND status='active'")
+        .get(id) as Row | undefined;
+      if (!row) return false;
+      // `updated_at` is deliberately NOT touched.
+      //
+      // It is the owner's own ordering: `listOperatorNotes` reads newest-first
+      // and `renderMemoryIndex` cuts that list at a character budget. The
+      // secretary describes the OLDEST undescribed notes, so bumping the
+      // timestamp would march the 2024 backlog to the head of the index every
+      // night and push what the owner actually touched out of the envelope —
+      // a background job quietly rewriting what the agent is shown. The queue
+      // does not need the bump either: a note leaves it by HAVING a
+      // description, not by being recent.
+      this.db.prepare("UPDATE operator_notes SET description=? WHERE id=?").run(trimmed, id);
+      this.reindexNoteSearch(id, String(row.category), String(row.content), trimmed);
+      return true;
+    });
+  }
+
+  /**
+   * Rewrite a note's FTS row.
+   *
+   * The description is indexed WITH the content (§2.3/§6.4): its whole job is
+   * "when will I need this", which is a retrieval question, and a trigger line
+   * that cannot be found by its own words answers nobody. Words that live only
+   * in the description — the category name, the trigger — used to return
+   * nothing from `memory.search`.
+   *
+   * Vectors deliberately stay on content alone until package 3.2: they are
+   * rebuilt from `${category} ${content}` on every boot, so adding the
+   * description on one path only would come apart at the next restart. MiniLM
+   * and that rebuild arrive together.
+   */
+  private reindexNoteSearch(
+    id: string,
+    category: string,
+    content: string,
+    description?: string | null,
+  ): void {
+    const trimmed = description?.trim();
+    this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
+    this.db
+      .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
+      .run(id, category, trimmed ? `${content}\n${trimmed}` : content);
   }
 
   saveArtifact(artifact: Artifact): void {
@@ -2509,6 +2811,7 @@ function rowToOperatorNote(row: Row): OperatorNote {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     ...(row.expires_at ? { expiresAt: String(row.expires_at) } : {}),
+    ...(row.description ? { description: String(row.description) } : {}),
   };
 }
 
@@ -2550,17 +2853,6 @@ function rowToNowItem(row: Row): NowItem {
     ...(row.escalated_at ? { escalatedAt: String(row.escalated_at) } : {}),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
-  };
-}
-
-function rowToJournalEntry(row: Row): JournalEntry {
-  const source = String(row.source);
-  return {
-    slug: String(row.slug),
-    day: String(row.day),
-    body: String(row.body),
-    source: source === "scribe" || source === "daemon" ? source : "agent",
-    createdAt: String(row.created_at),
   };
 }
 

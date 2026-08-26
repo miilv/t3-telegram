@@ -85,6 +85,7 @@ import {
   viewerWallText,
 } from "./commands.js";
 import { ThreadVoice } from "./voice.js";
+import { NightScribe, type ScribeRunOutcome } from "./scribe.js";
 import {
   SHUTDOWN_DEADLINE_MS,
   awaitShutdownSteps,
@@ -682,6 +683,8 @@ export class OperatorDaemon {
   /** Package 3.3: proactive-app orchestration, kept out of the transport daemon. */
   private readonly automationApp: AutomationAppService;
   private readonly localApprovals: LocalApprovalController;
+  /** Package 3.1 — hygiene (memory-design §5); runs inside the maintenance tick. */
+  private readonly scribe: NightScribe;
   private readonly shutdown = new AbortController();
   private reliabilityTask: Promise<void> | undefined;
   private operatorSessionId = "";
@@ -762,6 +765,25 @@ export class OperatorDaemon {
       },
       flush: () => this.flushTelegramOutbox(),
       automationLine: (automation) => this.automationLine(automation),
+    });
+    // Package 3.1: the night secretary (apps/daemon/src/scribe.ts).
+    this.scribe = new NightScribe({
+      store: this.store,
+      logger: this.logger,
+      ownerId: () => this.ownerLedgerId(),
+      timeZone: () => this.config.owner.timezone,
+      language: () => this.config.owner.language,
+      // memory-design §5: the CLAUDE branch, whatever the main session runs.
+      // `backgroundOneShot` is passed only when the runtime actually has one —
+      // an absent channel is a recorded skip, which is the designed outcome,
+      // and falling back to `oneShot` here would put hygiene on whichever
+      // provider happens to be active and reintroduce the exact failure §5
+      // names ("постоянный Codex не должен молча убивать секретаря").
+      ...(this.runtime.backgroundOneShot
+        ? { backgroundOneShot: (input) => this.runtime.backgroundOneShot!(input) }
+        : {}),
+      reconcileNowItems: () => this.reconcileDaemonNowItems(),
+      requestOwnerTurn: (input) => this.requestScribeOwnerTurn(input),
     });
   }
 
@@ -1310,6 +1332,22 @@ export class OperatorDaemon {
     }
 
     if (reason !== "startup") await this.recoverWorkers();
+
+    // Package 3.1 — the night secretary (memory-design §5). Its own gates are
+    // inside: a 02:00–04:00 owner-local window, one attempt per logical day,
+    // and a deterministic `has_work()` before any token is spent. From here it
+    // costs one Intl call on most ticks and three indexed counts on the first
+    // tick of a night.
+    //
+    // It runs OUTSIDE the runtime queue on purpose, exactly like mediation: the
+    // pass belongs to the Claude branch's one-shot channel and must never
+    // occupy, or wait behind, the main session (§5).
+    //
+    // LAST in the tick, because it is the only step here that can take minutes.
+    // Delivery is unaffected either way — the reliability pump owns the outbox
+    // and the T3 drains on its own one-second loop — but worker recovery runs
+    // only from this tick, and it has no business waiting behind hygiene.
+    const scribeRun = await this.runNightScribe();
     const completedAt = nowIso();
     this.store.setRuntimeState("last_maintenance_at", completedAt);
     this.store.appendEvent("maintenance.completed", {
@@ -1322,6 +1360,12 @@ export class OperatorDaemon {
         freedLocalBytes: prunedLocalFiles.freedBytes,
         scheduledAutomations,
         escalatedReminders,
+        // Only when the night actually did something: a `scribe: "already-ran"`
+        // field on every tick of the day would be sixty rows of noise an hour
+        // in the one table the secretary itself has to read back.
+        ...(scribeRun.status === "completed" || scribeRun.status === "skipped"
+          ? { scribe: scribeRun.status }
+          : {}),
         durationMs: Date.now() - startedAt,
       },
     });
@@ -5065,6 +5109,67 @@ export class OperatorDaemon {
   }
 
   /**
+   * Package 3.1 — one night-secretary pass (memory-design §5).
+   *
+   * Public so the maintenance tick, a test and an operator's own hand can all
+   * reach the same code path. `force` bypasses only the clock window and the
+   * once-a-day gate; the `has_work()` gate, the Claude branch and the skip
+   * bookkeeping are not optional.
+   *
+   * NightScribe owns finalization for every failure after its day gate. Keeping
+   * that responsibility at the boundary means a query/projection defect gets
+   * the same durable skip row and event as a later failure; this wrapper does
+   * not silently burn the day with only a runtime-state stamp.
+   */
+  async runNightScribe(options: { force?: boolean } = {}): Promise<ScribeRunOutcome> {
+    return this.scribe.run(options);
+  }
+
+  /**
+   * The secretary's only route to the owner (single-voice, dialogue-flow §1).
+   *
+   * It does NOT send anything. It enqueues a synthetic system message on the
+   * background lane, exactly the shape `dispatchDueAutomations` uses, and the
+   * orchestrator's turn decides what — if anything — the owner hears. Package
+   * 1.2 spent itself removing the daemon's direct paths to the chat; a
+   * background hygiene job is the last place one should grow back.
+   *
+   * The background lane, not `user`: hygiene must never overtake the owner in
+   * their own chat, and the age escalation of package 1.2 keeps it from
+   * starving behind a busy one.
+   */
+  private requestScribeOwnerTurn(input: { dedupeKey: string; prompt: string }): boolean {
+    const chatId = this.ownerChatId();
+    if (chatId === undefined) {
+      // No chat has ever been seen, so there is nobody to tell. The journal
+      // mark and the event stay, which is the whole record either way.
+      this.logger.warn({ dedupeKey: input.dedupeKey }, "Scribe turn requested before any owner chat is known");
+      return false;
+    }
+    const syntheticId = syntheticNegativeMessageId(input.dedupeKey);
+    const update: Extract<TelegramInbound, { type: "message" }> = {
+      type: "message",
+      updateId: syntheticId,
+      edited: false,
+      synthetic: true,
+      chatId,
+      chatType: "private",
+      userId: this.config.telegram.allowedUserId,
+      messageId: syntheticId,
+      messageIds: [syntheticId],
+      date: Math.floor(Date.now() / 1_000),
+      text: input.prompt,
+      attachments: [],
+    };
+    this.enqueueIngressJob(update, "background");
+    this.store.appendEvent("memory.scribe.turn_requested", {
+      payload: { dedupeKey: input.dedupeKey },
+    });
+    this.queueBackgroundIngressDrain();
+    return true;
+  }
+
+  /**
    * Review B1 — an explicit dispatch moves the focus to the work dispatched.
    *
    * Only when that work is a legitimate candidate by §2.2's own rules: its
@@ -5357,6 +5462,11 @@ export class OperatorDaemon {
         content: defangMarkers(note.content),
         updatedAt: note.updatedAt,
         category: note.category,
+        // Package 3.1: once the night secretary has described a legacy note,
+        // the index line stops being "first 100 characters of the content" and
+        // becomes the trigger form of §2.3. Defanged like the content, because
+        // it is derived FROM the content and inherits its trust level.
+        ...(note.description ? { description: defangMarkers(note.description) } : {}),
       }));
     return {
       index: notes.filter((note) => note.category !== ANTI_REDISCOVERY_CATEGORY),

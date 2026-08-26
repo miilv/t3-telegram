@@ -108,6 +108,17 @@ CREATE TABLE IF NOT EXISTS operator_notes (
   status TEXT NOT NULL DEFAULT 'active',
   source TEXT NOT NULL DEFAULT 'manual',
   expires_at TEXT,
+  -- memory-design §2.3/§6.4 — the index line, "ТРИГГЕР → суть". The rest of
+  -- the §2.3 columns (key, verified_at, valid_until, superseded_by) arrive in
+  -- package 3.2 with the supersede transaction that gives them meaning; this
+  -- one comes early because its writer is the night secretary of package 3.1,
+  -- and a pass whose output has nowhere to land is not a pass.
+  description TEXT,
+  -- Nights the secretary offered this note to the model and got nothing back.
+  -- The backlog is drained oldest-first, so without a bound one note the model
+  -- has nothing to say about sits at the head of the queue forever and every
+  -- "quiet" night costs a call.
+  description_attempts INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -422,14 +433,41 @@ CREATE TABLE IF NOT EXISTS now_items (
   updated_at  TEXT NOT NULL
 );
 
--- memory-design §2.4 — the narrative journal. Package 2.2 ships only the
--- daemon's automatic close entries, so the package stands on its own; the
--- secretary and the `journal.*` tools fill it out in package 3.1.
+-- memory-design §2.4 — the narrative journal. Package 2.2 shipped the daemon's
+-- automatic close entries; package 3.1 adds the secretary, the `journal.*`
+-- tools and the monthly rollup.
+--
+-- Two columns beyond the §2.4 list, both forced by the rollup and the
+-- reconciliation rather than by convenience:
+--
+--   `kind` — a rollup is itself a journal entry (§2.4 builds it FROM this
+--   table because `daemon_events` is pruned at 30 days and a monthly summary
+--   needs events up to 60 days old). Without a kind, next month's rollup would
+--   read last month's rollup as input and compress a compression; and the
+--   reconciliation could not tell an automatic archive of a closed now item
+--   from a narrative entry the agent wrote by hand, which is the difference
+--   between "the registry confirms this" and "nobody claimed it".
+--
+--   `thread_ref` — the reconciliation asks "is this finished work already in
+--   the journal", and a `now_items.journal_ref` link is not enough to answer
+--   it: reopening an item CLEARS that link (package 2.2, review B2) while the
+--   entry stays. Matching on prose instead would make the answer depend on how
+--   an LLM happened to word a sentence, and a false negative there duplicates
+--   an entry every single night.
+--
+--   `origin_job` + `create_seq` — durable identity of each agent-authored
+--   `journal.note`. Ingress can replay a whole turn after a crash; the ordinal
+--   distinguishes several notes in that turn while the partial unique index
+--   makes replay return the original row instead of a `slug-2` duplicate.
 CREATE TABLE IF NOT EXISTS journal_entries (
   slug       TEXT PRIMARY KEY,
   day        TEXT NOT NULL,
   body       TEXT NOT NULL,
   source     TEXT NOT NULL,
+  kind       TEXT NOT NULL DEFAULT 'entry',
+  thread_ref TEXT,
+  origin_job TEXT,
+  create_seq INTEGER,
   created_at TEXT NOT NULL
 );
 
@@ -469,7 +507,26 @@ CREATE INDEX IF NOT EXISTS idx_now_items_origin
   ON now_items(origin_kind, status, escalated_at, created_at) WHERE origin_kind IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_journal_entries_day
   ON journal_entries(day DESC, created_at DESC);
+-- Package 3.1: the reconciliation asks "does this thread already have an
+-- entry" once per finished thread per night, and the journal is the one table
+-- with no retention at all — a scan here gets slower every month forever.
+-- PARTIAL, because only archives carry a thread.
+CREATE INDEX IF NOT EXISTS idx_journal_entries_thread
+  ON journal_entries(thread_ref, day DESC) WHERE thread_ref IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_entries_replay
+  ON journal_entries(origin_job, create_seq)
+  WHERE origin_job IS NOT NULL AND create_seq IS NOT NULL;
 
 DELETE FROM operator_note_search;
+-- The description is indexed WITH the content (package 3.1, memory-design
+-- §2.3/§6.4): a trigger line's job is "when will I need this", which is a
+-- retrieval question, and one that cannot be found by its own words answers
+-- nobody. This rebuild runs on EVERY boot, so leaving it on content alone
+-- would quietly undo every description the night secretary indexed the moment
+-- the daemon restarted.
 INSERT INTO operator_note_search(id,category,content)
-  SELECT id,category,content FROM operator_notes WHERE status='active';
+  SELECT id, category,
+         CASE WHEN description IS NOT NULL AND TRIM(description) <> ''
+              THEN content || char(10) || description
+              ELSE content END
+  FROM operator_notes WHERE status='active';

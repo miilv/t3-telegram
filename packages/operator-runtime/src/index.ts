@@ -79,6 +79,16 @@ export interface CodexCliRuntimeOptions extends EnvironmentFilterOptions {
   interruptGraceMs?: number;
 }
 
+/**
+ * The branch background runs are pinned to (memory-design §5).
+ *
+ * A constant rather than "whichever provider happens to expose `oneShot`":
+ * the design names Claude, `main.ts` always registers it, and a rule stated as
+ * a capability probe would quietly change meaning the day a second provider
+ * grows a one-shot channel.
+ */
+export const BACKGROUND_ONESHOT_PROVIDER = "claude";
+
 export class SwitchableOperatorRuntime implements OperatorRuntime {
   private providerId: string;
 
@@ -130,6 +140,33 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
       throw new Error(`Operator provider ${this.providerId} has no one-shot side channel`);
     }
     return current.oneShot(input);
+  }
+
+  /**
+   * The background channel of memory-design §5 — pinned to the Claude branch,
+   * whatever the main session is running.
+   *
+   * `oneShot` above follows the active provider on purpose: mediation speaks
+   * inside the owner's conversation and should sound like whoever is holding
+   * it. Hygiene is the opposite case. Codex has no one-shot channel, so an
+   * owner who switched the session to Codex and left it there would silently
+   * lose the night secretary — and §2.4 makes the secretary the MAIN
+   * consistency mechanism, precisely because turns get preempted and the
+   * in-the-moment check is only a nudge.
+   *
+   * No fallback to the active provider when the Claude branch is missing: a
+   * quiet fallback is how a background job ends up running on a branch that
+   * cannot run it, and the rejection here is what the caller turns into a
+   * recorded skip, a catch-up and — after three — a word to the owner.
+   */
+  async backgroundOneShot(input: { prompt: string; timeoutMs?: number }): Promise<string> {
+    const claude = this.providers[BACKGROUND_ONESHOT_PROVIDER];
+    if (!claude?.oneShot) {
+      throw new Error(
+        `the ${BACKGROUND_ONESHOT_PROVIDER} branch has no one-shot side channel for background runs`,
+      );
+    }
+    return claude.oneShot(input);
   }
 
   async resume(
