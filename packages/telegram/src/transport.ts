@@ -57,6 +57,17 @@ const MAX_ALBUM_WAIT_MS = 5_000;
 /** Quiet period that closes an inbound batch when no more pages are pending. */
 const BATCH_WINDOW_MS = 2_000;
 /**
+ * Package 4.1 review: the shortest gap between two chat actions for one
+ * destination. Telegram expires the indicator at ~5 s and every producer
+ * repeats at 4 s, so this drops only redundant pulses — but it drops a LOT of
+ * them: `pollUpdates` walks a page of up to 100 updates in one synchronous
+ * loop, so a forwarded bundle used to fire 100 chat actions at once, none of
+ * them accounted for by the outbound queue's global pacer.
+ */
+const CHAT_ACTION_MIN_INTERVAL_MS = 4_000;
+/** Cap on the throttle bookkeeping; stale entries are pruned past it. */
+const CHAT_ACTION_THROTTLE_ENTRIES = 512;
+/**
  * Package 1.1: what a superseded turn's preview is overwritten with. An
  * ellipsis reads as "still going" while the replacement turn spins up; a dash
  * reads as a deliberate, content-bearing answer, which is exactly the wrong
@@ -200,6 +211,8 @@ export class TelegramBotTransport implements TelegramTransport {
   private readonly bot: Bot;
   private readonly inbound = new AsyncInputQueue<TelegramInbound>();
   private readonly outboundQueue = new TelegramOutboundQueue();
+  /** Package 4.1 review: when each destination last had a chat action sent. */
+  private readonly lastChatActionAt = new Map<string, number>();
   private readonly albums = new Map<string, AlbumBuffer>();
   private readonly batches = new Map<string, InboundBatch>();
   /**
@@ -456,11 +469,22 @@ export class TelegramBotTransport implements TelegramTransport {
       return;
     }
     if (!draft.messageId) throw new Error("Editable Telegram draft has no message id");
-    await this.outbound(draft.chatId, () =>
-      this.bot.api.editMessageText(draft.chatId, draft.messageId!, plainPreview, {
-        link_preview_options: { is_disabled: true },
-      }),
-    );
+    try {
+      await this.outbound(draft.chatId, () =>
+        this.bot.api.editMessageText(draft.chatId, draft.messageId!, plainPreview, {
+          link_preview_options: { is_disabled: true },
+        }),
+      );
+    } catch (error) {
+      // Package 4.1 review, BLOCKER 2: the one edit site in this file that was
+      // missing the guard every other one has. A heartbeat `refresh` re-sends
+      // the buffer verbatim, so a turn that narrates once and then works
+      // silently repeats the same text every 15 s — Telegram answers 400
+      // "message is not modified", which is not a failure: the preview already
+      // says exactly this. Without the guard the caller concluded the preview
+      // was dead and put a typing indicator next to a perfectly live one.
+      if (!isMessageNotModified(error)) throw error;
+    }
     } finally {
       metrics.observe("telegram_draft_update_latency_ms", Date.now() - startedAt);
     }
@@ -756,12 +780,31 @@ export class TelegramBotTransport implements TelegramTransport {
     action: TelegramChatAction,
     destination: TelegramDestination = {},
   ): Promise<void> {
+    // Bypassing `outbound` also bypasses the only GLOBAL pacer there is
+    // (`minimumGlobalIntervalMs`, ~28.5 req/s), so the burst has to be bounded
+    // here instead. Keyed per destination, not per chat: in a forum the
+    // indicator belongs to a topic, and two active topics owe two indicators.
+    const key = chatActionKey(chatId, destination);
+    const now = Date.now();
+    const last = this.lastChatActionAt.get(key);
+    if (last !== undefined && now - last < CHAT_ACTION_MIN_INTERVAL_MS) return;
+    this.pruneChatActionThrottle(now);
+    this.lastChatActionAt.set(key, now);
     try {
       await this.bot.api.sendChatAction(chatId, action, destinationOptions(destination));
     } catch (error) {
       const disposition = classifyTelegramDeliveryError(error);
-      metrics.increment("telegram_errors_total", { code: disposition.code });
+      // Deliberately NOT `telegram_errors_total`: a blocked bot would add ~15
+      // of these a minute and drown the signal that actual delivery is failing.
+      metrics.increment("telegram_chat_actions_dropped_total", { code: disposition.code });
       this.logger.debug({ chatId, action, errorCode: disposition.code }, "Chat action was dropped");
+    }
+  }
+
+  private pruneChatActionThrottle(now: number): void {
+    if (this.lastChatActionAt.size < CHAT_ACTION_THROTTLE_ENTRIES) return;
+    for (const [key, at] of this.lastChatActionAt) {
+      if (now - at >= CHAT_ACTION_MIN_INTERVAL_MS) this.lastChatActionAt.delete(key);
     }
   }
 
@@ -918,13 +961,21 @@ export class TelegramBotTransport implements TelegramTransport {
     // the window holds it for up to 180 s (an album adds its own 650 ms before
     // that). A chat action creates no message and costs nothing durable, and
     // pulsing on every arriving message covers exactly the moments the window
-    // is extended.
-    void this.sendChatAction(normalized.chatId, "typing", {
-      ...(normalized.messageThreadId ? { messageThreadId: normalized.messageThreadId } : {}),
-      ...(normalized.directMessagesTopicId
-        ? { directMessagesTopicId: normalized.directMessagesTopicId }
-        : {}),
-    });
+    // is extended; `sendChatAction` throttles the burst itself.
+    //
+    // An EDIT is excluded: it usually starts no turn at all, and «печатает»
+    // followed by silence is precisely the lie this package exists to remove.
+    if (!normalized.edited) {
+      void this.sendChatAction(normalized.chatId, "typing", {
+        ...(normalized.messageThreadId ? { messageThreadId: normalized.messageThreadId } : {}),
+        ...(normalized.directMessagesTopicId
+          ? { directMessagesTopicId: normalized.directMessagesTopicId }
+          : {}),
+        // `sendChatAction` swallows Telegram's own failures; this guards the
+        // narrow case of the handler itself throwing (a metrics or logger
+        // fault), which as an unhandled rejection would take the process down.
+      }).catch(() => undefined);
+    }
     // Albums arrive as separate updates sharing a media_group_id; collapse them
     // first, then let the collapsed envelope join the chat-level batch.
     if (normalized.mediaGroupId) {
@@ -1891,6 +1942,15 @@ export function classifyTelegramDeliveryError(error: unknown): TelegramDeliveryE
     return { code: "TELEGRAM_BAD_REQUEST", retryable: false, ambiguous: false };
   }
   return { code: "TELEGRAM_AMBIGUOUS", retryable: true, ambiguous: true };
+}
+
+/**
+ * Package 4.1 review: a chat action belongs to a destination, not a chat — in a
+ * forum each topic shows its own indicator, so throttling per chat would leave
+ * a second active topic permanently silent.
+ */
+function chatActionKey(chatId: number, destination: TelegramDestination): string {
+  return `${chatId}:${destination.messageThreadId ?? ""}:${destination.directMessagesTopicId ?? ""}`;
 }
 
 function isMessageNotModified(error: unknown): boolean {

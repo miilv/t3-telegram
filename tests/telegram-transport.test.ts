@@ -1118,25 +1118,63 @@ describe("Telegram inbound normalization", () => {
     expect(calls[0]!.body).toMatchObject({ chat_id: 7, action: "typing" });
     expect(delivered).toHaveLength(0);
 
-    // Every further message re-arms the window (up to the 180 s ceiling), so
-    // every further message renews the indicator Telegram expires at ~5 s.
+    // A second message one second later re-arms the window, but the indicator
+    // it would renew is still live: `sendChatAction` throttles per destination,
+    // which is what keeps a 100-update page from firing 100 actions at once.
     await vi.advanceTimersByTimeAsync(1_000);
     internals.acceptUpdate(rawTextUpdate(2, 2));
     await vi.advanceTimersByTimeAsync(0);
-    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(2);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
 
     await vi.advanceTimersByTimeAsync(2_500);
     expect(delivered).toHaveLength(1);
     expect(delivered[0]!.messageIds).toEqual([1, 2]);
 
     // An unauthorized sender is filtered before the pulse: no stranger can make
-    // the bot look busy in a chat it does not serve.
+    // the bot look busy in a chat it does not serve. (The throttle window has
+    // passed by now, so silence here is the access policy, not the throttle.)
     internals.acceptUpdate({
       ...rawTextUpdate(3, 3),
       message: { ...rawTextUpdate(3, 3).message, from: { id: 99, first_name: "X" } },
     });
     await vi.advanceTimersByTimeAsync(0);
-    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(2);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
+
+    // An EDIT starts no turn, so it gets no indicator either.
+    internals.acceptUpdate({
+      update_id: 4,
+      edited_message: { ...rawTextUpdate(4, 1).message, text: "msg 1 fixed" },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
+  });
+
+  it("collapses a whole getUpdates page into one indicator (review: 100 updates, 100 actions)", async () => {
+    vi.useFakeTimers();
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport(
+      "test-token",
+      { users: { 42: "owner" }, allowGroups: false },
+      1,
+      logger,
+    );
+    const internals = transport as unknown as {
+      acceptUpdate(update: unknown): void;
+      inbound: { push(item: unknown): void };
+    };
+    internals.inbound.push = () => undefined;
+
+    // `pollUpdates` walks a full page in one synchronous loop, and the pulse
+    // bypasses `outbound` — which is also the only GLOBAL pacer there is
+    // (~28.5 req/s). Unthrottled, a forwarded bundle of 100 fired 100 chat
+    // actions at once and the 429 they earn applies to the chat the real
+    // answer has to go to.
+    for (let updateId = 1; updateId <= 100; updateId += 1) {
+      internals.acceptUpdate(rawTextUpdate(updateId, updateId));
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(1);
   });
 
   it("never parks a chat action behind the per-chat lock (package 4.1)", async () => {
@@ -1170,6 +1208,19 @@ describe("Telegram inbound normalization", () => {
 
     releaseSend();
     await send;
+  });
+
+  it("keeps a second topic's indicator when another topic just pulsed", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    // The indicator belongs to a topic, not to a chat: throttling per chat
+    // would leave a second active forum topic permanently silent.
+    await transport.sendChatAction(7, "typing", { messageThreadId: 11 });
+    await transport.sendChatAction(7, "typing", { messageThreadId: 22 });
+    await transport.sendChatAction(7, "typing", { messageThreadId: 11 });
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(2);
   });
 
   it("swallows a refused chat action instead of failing the turn behind it", async () => {

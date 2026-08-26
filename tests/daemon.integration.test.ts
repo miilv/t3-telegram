@@ -3577,7 +3577,6 @@ describe("OperatorDaemon product flow", () => {
       forwardedCount: 12,
     });
 
-    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Принял 13 сообщ.")));
     await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("User message:")));
     const envelope = runtime.prompts.findLast((prompt) => prompt.includes("User message:"))!;
     expect(envelope).toContain("12 forwarded message(s)");
@@ -3590,7 +3589,7 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("acknowledges a bulk forwarded batch before slow media work", async () => {
+  it("says nothing durable about a bulk with nothing to ingest (package 4.1 review)", async () => {
     const home = tempDirectory("daemon-bulk-ack-");
     const store = tempStore();
     const runtime = new FakeRuntime();
@@ -3612,10 +3611,15 @@ describe("OperatorDaemon product flow", () => {
     await daemon.initialize();
     const run = daemon.run();
 
+    // Seven forwarded lines and not one byte to fetch. The old ack fired on the
+    // message count alone and announced «вложений: 0» — a machine counting its
+    // own nothing. The turn starts immediately here; the typing pulse is the
+    // whole honest answer to «is it alive».
     const batch = message(1, "суммаризируй это всё");
     telegram.push({ ...batch, messageIds: [1, 2, 3, 4, 5, 6, 7] });
-    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Принял 7 сообщ.")));
-    expect(telegram.sent.some((entry) => entry.text.includes("вложений: 0"))).toBe(true);
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    expect(telegram.sent).toHaveLength(1);
+    expect(telegram.chatActions.some((entry) => entry.action === "typing")).toBe(true);
 
     telegram.finish();
     await run;
@@ -3628,6 +3632,7 @@ describe("OperatorDaemon product flow", () => {
     const runtime = new FakeRuntime();
     const broker = new FakeBroker();
     const telegram = new DownloadGateTelegram();
+    telegram.requireSentFirst = (text) => text.startsWith("Принято 3 сообщ.");
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     let daemon: OperatorDaemon;
@@ -3644,9 +3649,9 @@ describe("OperatorDaemon product flow", () => {
     await daemon.initialize();
     const run = daemon.run();
 
-    // Three photos — under the old threshold of five, and the old ack was built
-    // from what had ALREADY been downloaded, so it could only appear once the
-    // silence it was meant to cover was over.
+    // Three photos of 6 MB — 18 MB to fetch before the turn can start. The old
+    // ack was built from what had ALREADY been downloaded, so it could only
+    // appear once the silence it was meant to cover was over.
     telegram.push({
       ...message(1, "глянь эти скрины"),
       messageIds: [1, 2, 3],
@@ -3654,29 +3659,37 @@ describe("OperatorDaemon product flow", () => {
         type: "photo" as const,
         fileId: `photo_${index}`,
         mimeType: "image/jpeg",
-        sizeBytes: 400_000,
+        sizeBytes: 6 * 1024 * 1024,
       })),
     });
 
-    // The download is held open: whatever the owner sees now, he sees BEFORE a
-    // single byte has been fetched.
-    await waitFor(() => telegram.downloadsStarted > 0, 4_000);
-    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("Принял 3 сообщ.")), 4_000);
+    // The fake refuses to fetch a byte until the line is in the chat, so this
+    // flag can only be true if the line was composed from the metadata
+    // Telegram already sent — never from the download it announces.
+    await waitFor(() => telegram.sawRequiredBeforeFirstByte, 6_000);
     expect(telegram.sent.at(-1)!.text).toContain("вложений: 3");
     expect(telegram.downloadsFinished).toBe(0);
 
     telegram.releaseDownloads();
     await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 8_000);
-    const acks = telegram.sent.filter((entry) => entry.text.startsWith("Принял"));
+    const acks = telegram.sent.filter((entry) => entry.text.startsWith("Принято"));
     expect(acks).toHaveLength(1);
 
-    // …but three quickly typed lines are a batch too, and they carry no
-    // ingestion at all: the turn starts at once and the typing pulse covers
-    // it. A durable ack in front of every hurried burst is noise, so the
-    // MESSAGE count keeps its old threshold while the attachment one drops.
-    telegram.push({ ...message(9, "и ещё вопрос"), messageIds: [9, 10, 11] });
+    // …while three small photos are a second of download and, with OCR
+    // unconfigured, nothing else. The trigger is the WORK, never the shape of
+    // the burst: no durable line here.
+    telegram.push({
+      ...message(9, "и эти тоже"),
+      messageIds: [9, 10, 11],
+      attachments: [9, 10, 11].map((index) => ({
+        type: "photo" as const,
+        fileId: `photo_${index}`,
+        mimeType: "image/jpeg",
+        sizeBytes: 400_000,
+      })),
+    });
     await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length === 2, 8_000);
-    expect(telegram.sent.filter((entry) => entry.text.startsWith("Принял"))).toEqual(acks);
+    expect(telegram.sent.filter((entry) => entry.text.startsWith("Принято"))).toEqual(acks);
 
     telegram.finish();
     await run;
@@ -3725,6 +3738,7 @@ describe("OperatorDaemon product flow", () => {
       tools,
       media,
     );
+    daemon.livenessTimings.typingMs = 150;
     await daemon.initialize();
     const run = daemon.run();
 
@@ -3741,22 +3755,37 @@ describe("OperatorDaemon product flow", () => {
       ],
     });
 
-    // Six minutes of audio: the owner learns what the daemon is doing, in a
-    // neutral technical line, instead of watching nothing happen for minutes.
-    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("асшифровыва")), 4_000);
-    const notice = telegram.sent.find((entry) => entry.text.includes("асшифровыва"))!;
-    expect(notice.text).toBe("Расшифровываю голосовое (6 мин).");
-    // A single attachment is not a bulk batch: no «Принял N сообщ.» beside it.
+    // Six minutes of audio: the owner learns what the daemon is doing, in an
+    // impersonal technical line, instead of watching nothing happen for
+    // minutes. Impersonal on purpose — «Расшифровка», not «Расшифровываю» —
+    // because this is the daemon's machine indication, not the Operator's
+    // voice (review finding 4).
+    const startedAt = Date.now();
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("асшифровка")), 4_000);
+    const notice = telegram.sent.find((entry) => entry.text.includes("асшифровка"))!;
+    expect(notice.text).toBe("Расшифровка: голосовое, 6 мин…");
+    // A single attachment is not a bulk batch: no «Принято N сообщ.» beside it.
     expect(telegram.sent).toHaveLength(1);
-    // And the indicator keeps running for as long as the work does.
-    await waitFor(() => telegram.chatActions.filter((entry) => entry.action === "typing").length >= 2, 10_000);
+    // The indicator has to OUTLIVE one interval — Telegram expires it at ~5 s,
+    // and «two pulses within 200 ms» would pass with the interval deleted
+    // (review finding 17).
+    await waitFor(
+      () =>
+        telegram.chatActions.some(
+          (entry) => entry.action === "typing" && entry.at - startedAt > daemon.livenessTimings.typingMs,
+        ),
+      15_000,
+    );
 
     releaseEnrichment();
     await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 8_000);
     // The notice is a standing remark of the daemon, not a preamble the answer
     // repeats: the final turn says its own thing exactly once.
-    expect(telegram.sent.filter((entry) => entry.text.includes("асшифровыва"))).toHaveLength(1);
+    expect(telegram.sent.filter((entry) => entry.text.includes("асшифровка"))).toHaveLength(1);
     expect(runtime.prompts.at(-1)).toContain("длинная запись совещания");
+    // …and the Operator is TOLD the line is already there, which is the only
+    // thing that actually keeps it from repeating it (review finding 4).
+    expect(runtime.prompts.at(-1)).toContain("уже отправлена техническая строка");
 
     telegram.finish();
     await run;
@@ -4405,10 +4434,10 @@ describe("OperatorDaemon product flow", () => {
   it("keeps typing alive past the heartbeat in a chat that has no draft (package 4.1, finding «латентность №1»)", async () => {
     const home = tempDirectory("daemon-no-draft-typing-");
     const store = tempStore();
-    // A long silent turn: no narration at all, one tool step early on. Exactly
-    // the shape that used to go quiet — the heartbeat and the tool step both
+    // A silent turn: no narration at all, one tool step early on. Exactly the
+    // shape that used to go quiet — the heartbeat and the tool step both
     // claimed a preview had been touched, and neither had touched anything.
-    const runtime = new SilentSlowRuntime(18_000);
+    const runtime = new SilentSlowRuntime(2_400);
     const broker = new FakeBroker();
     const telegram = new NoDraftTelegram();
     const logger = pino({ enabled: false });
@@ -4424,23 +4453,126 @@ describe("OperatorDaemon product flow", () => {
     });
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
     daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    // The cadences, not the clock: at production values this assertion costs
+    // eighteen seconds of wall time and leaves one pulse of margin on a loaded
+    // machine (review finding 20 / second review 6).
+    daemon.livenessTimings.heartbeatMs = 400;
+    daemon.livenessTimings.typingMs = 120;
     await daemon.initialize();
     const run = daemon.run();
 
-    const startedAt = Date.now();
     telegram.push(message(1, "разберись, почему падает сборка"));
     await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 25_000);
 
     // No preview ever existed: `startDraft` refused, so the "a preview was
     // touched" claim the old flag made was about nothing at all.
     expect(telegram.visible.filter((entry) => entry.kind === "draft")).toHaveLength(0);
-    // The heartbeat fires at 15 s. Before the fix it set `previewTouched`
-    // unconditionally, so the typing pulse stopped there and the chat was dead
-    // for the rest of the turn — minutes of nothing on a real turn.
+    // Before the fix the FIRST heartbeat set `previewTouched` unconditionally
+    // and the typing pulse stopped there — on a real turn, minutes of nothing.
+    // Counted from the heartbeat rather than from wall-clock deltas: the turn
+    // runs ~6 heartbeats and ~20 pulses, so this cannot pass on timing luck.
     const typing = telegram.chatActions.filter((entry) => entry.action === "typing");
-    expect(typing.some((entry) => entry.at - startedAt > 15_000)).toBe(true);
-    // ~4 s apart for the whole turn, not one lonely pulse at the start.
-    expect(typing.length).toBeGreaterThanOrEqual(4);
+    const firstHeartbeatAt = typing[0]!.at + daemon.livenessTimings.heartbeatMs;
+    expect(typing.filter((entry) => entry.at > firstHeartbeatAt).length).toBeGreaterThanOrEqual(5);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
+  it("keeps a queued message alive while another turn holds the lane (package 4.1 review, finding 8)", async () => {
+    const home = tempDirectory("daemon-lane-wait-");
+    const store = tempStore();
+    // One long turn, and a second message that has to wait behind it.
+    const runtime = new SilentSlowRuntime(2_400);
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    daemon.livenessTimings.heartbeatMs = 400;
+    daemon.livenessTimings.typingMs = 120;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // A SECOND CHAT, so the wait is real: preemption (package 1.1) is scoped to
+    // the conversation, and the lane queue is global — this message waits for
+    // the running turn to finish. Between «the message became a durable job»
+    // and «its turn starts» that chat used to have one accept-pulse worth ~5 s
+    // and then nothing.
+    telegram.push(message(1, "первый вопрос"));
+    await waitFor(() => runtime.prompts.length === 1, 8_000);
+    const queuedAt = Date.now();
+    telegram.push({ ...message(2, "второй вопрос"), chatId: 8 });
+
+    // While the first turn still runs, the WAITING chat keeps its indicator.
+    await waitFor(
+      () =>
+        telegram.chatActions.filter(
+          (entry) => entry.action === "typing" && entry.chatId === 8 && entry.at > queuedAt,
+        ).length >= 4,
+      8_000,
+    );
+    expect(runtime.prompts).toHaveLength(1);
+
+    await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length === 2, 20_000);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+    // The bookkeeping does not outlive the wait it describes.
+    expect((daemon as unknown as { awaitingIngress: Map<number, unknown> }).awaitingIngress.size).toBe(0);
+  }, 40_000);
+
+  it("resumes typing when Telegram refuses the preview it did start (package 4.1 review)", async () => {
+    const home = tempDirectory("daemon-dead-draft-typing-");
+    const store = tempStore();
+    const runtime = new SilentSlowRuntime(2_400);
+    const broker = new FakeBroker();
+    // The draft STARTS here — this is the other half of finding «латентность
+    // №1», and the half no test covered: a preview that exists on paper and is
+    // invisible in the chat because every edit is refused. Removing the
+    // `writer.healthy` term from the daemon's `previewLive` used to leave the
+    // whole suite green.
+    const telegram = new RefusedDraftTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    daemon.livenessTimings.heartbeatMs = 400;
+    daemon.livenessTimings.typingMs = 120;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "разберись, почему падает сборка"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 25_000);
+
+    // A draft was started, and every write to it was refused.
+    expect(telegram.visible.filter((entry) => entry.kind === "draft")).toHaveLength(1);
+    expect(telegram.refusedWrites).toBeGreaterThan(0);
+    // So the chat has nothing to look at, and still owes the owner a pulse.
+    const typing = telegram.chatActions.filter((entry) => entry.action === "typing");
+    const firstHeartbeatAt = typing[0]!.at + daemon.livenessTimings.heartbeatMs;
+    expect(typing.filter((entry) => entry.at > firstHeartbeatAt).length).toBeGreaterThanOrEqual(5);
 
     telegram.finish();
     await run;
@@ -10318,9 +10450,9 @@ class FakeTelegram implements TelegramTransport {
   }
   fetchFile?: TelegramTransport["fetchFile"];
   async react(): Promise<void> {}
-  readonly chatActions: Array<{ action: string; at: number }> = [];
-  async sendChatAction(_chatId: number, action: string): Promise<void> {
-    this.chatActions.push({ action, at: Date.now() });
+  readonly chatActions: Array<{ chatId: number; action: string; at: number }> = [];
+  async sendChatAction(chatId: number, action: string): Promise<void> {
+    this.chatActions.push({ chatId, action, at: Date.now() });
   }
   /** Package 4.3: what the daemon published to Telegram's command menu. */
   readonly publishedCommands: Array<{
@@ -10668,10 +10800,38 @@ class NoDraftTelegram extends FakeTelegram {
   }
 }
 
+/**
+ * Package 4.1 review: a draft Telegram hands out and then refuses every edit
+ * to. The preview exists as far as the daemon's bookkeeping is concerned and
+ * is invisible in the chat — which is the case `DraftWriter.healthy` exists for.
+ */
+class RefusedDraftTelegram extends FakeTelegram {
+  refusedWrites = 0;
+
+  override async updateDraft(): Promise<void> {
+    this.refusedWrites += 1;
+    throw new GrammyError(
+      "Call to method failed",
+      { ok: false, error_code: 400, description: "Bad Request: MESSAGE_ID_INVALID" },
+      "editMessageText",
+      {},
+    );
+  }
+}
+
 /** Package 4.1: holds every attachment download open so ordering is observable. */
 class DownloadGateTelegram extends FakeTelegram {
   downloadsStarted = 0;
   downloadsFinished = 0;
+  /**
+   * Package 4.1 review, finding 18. No byte is fetched until the chat has
+   * shown this — which inverts the proof: an acknowledgement built from
+   * downloaded material (as the old one was) can never satisfy it, so the flag
+   * below stays false and the test fails instead of quietly passing on the
+   * much weaker «before the download finished».
+   */
+  requireSentFirst: ((text: string) => boolean) | undefined;
+  sawRequiredBeforeFirstByte = false;
   private release: (() => void) | undefined;
   private readonly gate = new Promise<void>((resolve) => {
     this.release = resolve;
@@ -10683,6 +10843,16 @@ class DownloadGateTelegram extends FakeTelegram {
 
   override async downloadFile(): Promise<Uint8Array> {
     this.downloadsStarted += 1;
+    const required = this.requireSentFirst;
+    if (required) {
+      const deadline = Date.now() + 5_000;
+      while (!this.sent.some((entry) => required(entry.text))) {
+        // Give up rather than hang: the assertion is what reports the failure.
+        if (Date.now() > deadline) return new Uint8Array([1, 2, 3]);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      this.sawRequiredBeforeFirstByte = true;
+    }
     await this.gate;
     this.downloadsFinished += 1;
     return new Uint8Array([1, 2, 3]);

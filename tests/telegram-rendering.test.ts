@@ -1,3 +1,4 @@
+import { GrammyError } from "grammy";
 import { describe, expect, it, vi } from "vitest";
 import {
   DraftWriter,
@@ -402,11 +403,11 @@ describe("DraftWriter keep-alive", () => {
   });
 
   it("reports a preview Telegram refused, and takes it back when one lands (package 4.1, finding «латентность №1»)", async () => {
-    let refuse = true;
+    let failure: Error | undefined = telegramError(400, "Bad Request: MESSAGE_ID_INVALID");
     const writer = new DraftWriter(
       {
         updateDraft: async () => {
-          if (refuse) throw new Error("Bad Request: MESSAGE_ID_INVALID");
+          if (failure) throw failure;
         },
         finalizeDraft: async () => [],
       } as unknown as ConstructorParameters<typeof DraftWriter>[0],
@@ -421,16 +422,127 @@ describe("DraftWriter keep-alive", () => {
     await settle();
     expect(writer.healthy).toBe(false);
 
-    refuse = false;
+    failure = undefined;
     writer.refresh("⏳ Работаю… 45 с");
     await settle();
     expect(writer.healthy).toBe(true);
+    await writer.closePreview();
+  });
+  it("does not call a preview dead on a blip Telegram never ruled on (review finding 12)", async () => {
+    // A 5xx, a socket reset or an ambiguous transport error says nothing about
+    // what the chat currently shows. Latching «no preview» on those would park
+    // a typing indicator next to a live preview for the rest of the turn.
+    for (const blip of [telegramError(500, "Internal Server Error"), new Error("fetch failed")]) {
+      const writer = new DraftWriter(
+        {
+          updateDraft: async () => {
+            throw blip;
+          },
+          finalizeDraft: async () => [],
+        } as unknown as ConstructorParameters<typeof DraftWriter>[0],
+        draftSlot(10),
+      );
+      writer.refresh("⏳ Работаю…");
+      await settle();
+      expect(writer.healthy).toBe(true);
+      await writer.closePreview();
+    }
+  });
+
+  it("keeps one update in flight against a slow transport, and closes in one round trip (review BLOCKER 1)", async () => {
+    const updates: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const latencyMs = 300;
+    const writer = new DraftWriter(
+      {
+        updateDraft: async (_draft: unknown, text: string) => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, latencyMs));
+          updates.push(text);
+          inFlight -= 1;
+        },
+        finalizeDraft: async () => [],
+      } as unknown as ConstructorParameters<typeof DraftWriter>[0],
+      draftSlot(8),
+      50,
+      80,
+    );
+
+    // A dense stream against a transport slower than the flush cadence. The
+    // writer used to queue one edit per deadline regardless of whether the
+    // previous one had returned, so the queue grew without bound — and
+    // `closePreview`, which the final answer waits on, paid for the whole tail.
+    const startedAt = Date.now();
+    for (let tick = 0; tick < 20; tick += 1) {
+      writer.append(`токен${tick} `);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const streamedFor = Date.now() - startedAt;
+    await writer.closePreview();
+    const closedAfter = Date.now() - startedAt;
+
+    // One update in flight, ever: intermediate frames of a preview are
+    // worthless the moment a newer one exists.
+    expect(maxInFlight).toBe(1);
+    // ~500 ms of stream at 300 ms latency can only fit a couple of edits.
+    expect(updates.length).toBeLessThanOrEqual(Math.ceil(streamedFor / latencyMs) + 1);
+    // And the close costs at most the in-flight update plus the last pending
+    // one — not the whole backlog.
+    expect(closedAfter - streamedFor).toBeLessThan(latencyMs * 3);
+    // Whatever else was dropped, the LAST text is what the chat ends on.
+    expect(updates.at(-1)).toBe(writer.text);
+  });
+
+  it("does not re-send a preview identical to the one already shown (review BLOCKER 2)", async () => {
+    const updates: string[] = [];
+    const writer = new DraftWriter(
+      {
+        updateDraft: async (_draft: unknown, text: string) => {
+          updates.push(text);
+        },
+        finalizeDraft: async () => [],
+      } as unknown as ConstructorParameters<typeof DraftWriter>[0],
+      draftSlot(9),
+    );
+
+    writer.append("Смотрю логи авторизации.");
+    writer.flush();
+    await settle();
+    // Every heartbeat between two tool calls re-sends the same buffer verbatim.
+    // Telegram answers 400 "message is not modified" — a failure the caller
+    // used to read as "this preview is dead", which parked a typing indicator
+    // next to a live one for the rest of the turn.
+    writer.refresh("⏳ Работаю…");
+    writer.refresh("⏳ Работаю…");
+    await settle();
+    expect(updates).toEqual(["Смотрю логи авторизации."]);
+
+    // A real change still goes out.
+    writer.append(" Нашёл причину.");
+    writer.flush();
+    await settle();
+    expect(updates).toEqual([
+      "Смотрю логи авторизации.",
+      "Смотрю логи авторизации. Нашёл причину.",
+    ]);
     await writer.closePreview();
   });
 });
 
 function draftSlot(draftId: number): never {
   return { mode: "rich-draft", chatId: 7, draftId, text: "…" } as never;
+}
+
+/** A verdict Telegram actually returned, as grammY surfaces it. */
+function telegramError(code: number, description: string): Error {
+  return new GrammyError(
+    "Call to method failed",
+    { ok: false, error_code: code, description },
+    "editMessageText",
+    {},
+  );
 }
 
 /** Let the writer's serialized chain settle. */

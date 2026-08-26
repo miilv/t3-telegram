@@ -1,4 +1,5 @@
 import { renderStreamPhase } from "./rendering.js";
+import { classifyTelegramDeliveryError } from "./transport.js";
 import type {
   SentMessage,
   StreamDraft,
@@ -15,6 +16,9 @@ export class DraftWriter {
   private chain = Promise.resolve();
   private closed = false;
   private lastWriteFailed = false;
+  private lastWrittenText: string | undefined;
+  private pendingText: string | undefined;
+  private draining = false;
 
   constructor(
     private readonly transport: TelegramTransport,
@@ -88,7 +92,6 @@ export class DraftWriter {
     if (this.closed) throw new Error("Telegram draft was already finalized");
     this.flush();
     this.closed = true;
-    this.disarm();
     await this.chain;
     return this.transport.finalizeDraft(this.draft, this.buffer || fallbackText);
   }
@@ -106,7 +109,6 @@ export class DraftWriter {
     if (this.closed) return;
     this.flush();
     this.closed = true;
-    this.disarm();
     await this.chain;
   }
 
@@ -115,32 +117,74 @@ export class DraftWriter {
   }
 
   /**
-   * Package 4.1, finding «латентность №1». Whether the last preview write
-   * reached Telegram. The caller uses it to decide if the chat actually has a
-   * live preview to look at, or whether it still owes the user a typing pulse:
-   * a draft that Telegram refuses (destroyed slot, unsupported destination) is
-   * invisible, and treating those writes as a sign of life left the chat silent
-   * for the whole turn.
+   * Package 4.1, finding «латентность №1». Whether the last COMPLETED preview
+   * write reached Telegram — a write still in flight does not change it, so
+   * the answer is always about a frame the chat has actually been shown.
+   *
+   * The caller uses it to decide whether the chat really has a live preview to
+   * look at, or whether it still owes the user a typing pulse: a draft Telegram
+   * refuses (destroyed slot, unsupported destination) is invisible, and
+   * treating those writes as a sign of life left the chat silent for whole
+   * turns. Only a verdict Telegram will repeat counts — see `drain`.
    */
   get healthy(): boolean {
     return !this.lastWriteFailed;
   }
 
-  /**
-   * Draft previews are best-effort. Never let a transient preview error prevent
-   * the persistent final message from being attempted — but do remember it.
-   */
   private write(text: string): void {
-    this.chain = this.chain
-      .then(() => this.transport.updateDraft(this.draft, text))
-      .then(
-        () => {
+    // Package 4.1 review, BLOCKER 2: the buffer is often unchanged since the
+    // last edit — a heartbeat `refresh` between two tool calls re-sends it
+    // verbatim — and Telegram answers such an edit with 400 "message is not
+    // modified". Skipping it costs nothing and removes the whole error path.
+    if (text === this.lastWrittenText) return;
+    this.pendingText = text;
+    if (this.draining) return;
+    this.draining = true;
+    this.chain = this.chain.then(() => this.drain());
+  }
+
+  /**
+   * Package 4.1 review, BLOCKER 1 — backpressure.
+   *
+   * Every flush used to append a link to `chain` without ever asking whether
+   * the previous `updateDraft` had returned. The timers fire on wall clock, so
+   * against a slow transport the queue grew without bound — and `closePreview`
+   * and `finalize`, which await that whole tail BEFORE the final answer may be
+   * sent, paid for every edit the turn had ever queued (measured: 18.8 s to
+   * close a 6 s stream at 3 s latency, against ~3 s before the max-wait
+   * existed). The tail also held the per-chat lock the final answer needs, so
+   * one flood wait mid-stream queued dozens of edits in front of the answer.
+   *
+   * Collapse instead: at most ONE update in flight and ONE pending text, always
+   * the newest. Intermediate frames of a preview are worthless the moment a
+   * newer one exists — showing the latest text is the entire purpose — so
+   * dropping them costs nothing and bounds the close to a single round trip.
+   */
+  private async drain(): Promise<void> {
+    try {
+      while (this.pendingText !== undefined) {
+        const text = this.pendingText;
+        this.pendingText = undefined;
+        // The queued text may have been written by the update that was in
+        // flight when it was queued.
+        if (text === this.lastWrittenText) continue;
+        try {
+          await this.transport.updateDraft(this.draft, text);
+          this.lastWrittenText = text;
           this.lastWriteFailed = false;
-        },
-        () => {
-          this.lastWriteFailed = true;
-        },
-      );
+        } catch (error) {
+          // Draft previews are best-effort: a preview error must never stop the
+          // persistent final message. But only a verdict Telegram will repeat
+          // means the preview is GONE — a network blip, a 5xx or an ambiguous
+          // transport error says nothing about what the chat currently shows,
+          // and treating those as "no preview" would park a typing indicator
+          // next to a live one for the rest of the turn (review finding 12).
+          if (!classifyTelegramDeliveryError(error).retryable) this.lastWriteFailed = true;
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
   }
 }
 

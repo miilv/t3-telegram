@@ -168,30 +168,55 @@ const ATTACHMENT_DOWNLOAD_CONCURRENCY = 2;
 const ATTACHMENT_BATCH_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024;
 /** Package 4.1: how often the ingest indicator is repeated (Telegram expires it at ~5 s). */
 const LIVENESS_PULSE_INTERVAL_MS = 4_000;
+/** Package 4.1: how often a live preview is re-sent so Telegram keeps the draft. */
+const OPERATOR_HEARTBEAT_INTERVAL_MS = 15_000;
+/**
+ * Package 4.1 review, finding 8: how long a queued message may keep claiming
+ * the chat is being worked on. A message that waits longer than this is waiting
+ * on something genuinely long, and an indicator that never stops is a worse lie
+ * than a chat that admits it went quiet.
+ */
+const INGRESS_WAIT_PULSE_MAX_MS = 60_000;
 /**
  * Package 4.1, finding «латентность №3». Media this heavy is worth a line in
  * the chat before the work starts: below it, the STT round trip is over before
  * a message would even be read, and the chat action pulse covers the wait.
+ *
+ * Per type, because a minute means very different things (review finding 13).
+ * A minute of voice is a small file and one STT call; a minute of video is a
+ * much larger download plus an ffmpeg extraction and keyframes before the STT
+ * call even starts. The voice threshold is deliberately high enough that an
+ * ordinary spoken message does not put a durable line in the chat.
  */
-const LONG_MEDIA_SECONDS = 60;
+const LONG_MEDIA_SECONDS: Record<string, number> = { video: 60, video_note: 60 };
+const LONG_MEDIA_SECONDS_DEFAULT = 120;
 const LONG_MEDIA_BYTES = 5 * 1024 * 1024;
+/**
+ * …and per batch: ten thirty-second voices are five minutes of transcription,
+ * which no single-item threshold can see (review finding 13).
+ */
+const LONG_MEDIA_TOTAL_SECONDS = 180;
 /**
  * Package 4.1, finding «латентность №4». What counts as a batch whose mere
  * ingestion is long enough to look like a freeze. The old threshold was 5
  * elements AND the ack was built after the downloads, so it only ever appeared
  * once the silence it was meant to cover had already ended.
  *
- * The attachment threshold drops to 3 and gains a size rule, but the MESSAGE
- * count deliberately stays at 5: three quickly typed lines are one batch too,
- * and they carry no ingestion at all — the turn starts at once and the typing
- * pulse covers it. Acking those would put a durable line in front of every
- * hurried burst the owner writes.
+ * Reviewed twice, and both times the answer was the same: the trigger is the
+ * WORK, never the shape of the burst. Three quickly typed lines carry no
+ * ingestion at all; three 400 KB JPEGs are a second of download and, with OCR
+ * off, nothing else. Neither deserves a durable line in front of the answer —
+ * the rule this package itself wrote down is that a chat action is enough
+ * wherever a chat action is enough. So: enough bytes to make the download
+ * itself slow, or enough items that actually get processed (STT/OCR, and only
+ * when that processing is really configured).
  */
-const BULK_INGEST_MESSAGES = 5;
 const BULK_INGEST_ELEMENTS = 3;
 const BULK_INGEST_BYTES = 10 * 1024 * 1024;
 /** Attachment kinds the media pipeline is expected to transcribe. */
 const TRANSCRIBED_ATTACHMENT_TYPES = new Set(["voice", "audio", "video", "video_note"]);
+/** Attachment kinds OCR is attempted on, when OCR is configured at all. */
+const OCR_ATTACHMENT_TYPES = new Set(["photo", "document"]);
 interface DurableTelegramIngress {
   update: Extract<TelegramInbound, { type: "message" }>;
   processExisting: boolean;
@@ -607,6 +632,25 @@ export class OperatorDaemon {
   /** Recipients with an alert in flight, so a fire-and-forget send is never launched twice. */
   private readonly deliveryAlertsInFlight = new Set<number>();
   private readonly monitorTasks = new Set<Promise<void>>();
+  /**
+   * Package 4.1 — the two indicator cadences, in one place.
+   *
+   * Mutable, and public ONLY so a test can drive them without spending
+   * eighteen seconds of wall clock to observe one heartbeat; nothing in
+   * production writes them. Same reasoning as the public `watchdogTick`.
+   */
+  readonly livenessTimings = {
+    heartbeatMs: OPERATOR_HEARTBEAT_INTERVAL_MS,
+    typingMs: LIVENESS_PULSE_INTERVAL_MS,
+  };
+  /**
+   * Package 4.1 review, finding 8. Chats whose message is enqueued but whose
+   * turn has not started — it is behind another turn in the lane queue. The
+   * transport's accept-pulse covers ~5 s of that; a busy chat can hold it for
+   * much longer, and for anyone but the owner nothing preempts the turn ahead.
+   */
+  private readonly awaitingIngress = new Map<number, { destination: TelegramDestination; until: number }>();
+  private ingressPulseTimer: NodeJS.Timeout | undefined;
   private watchdogTimer: NodeJS.Timeout | undefined;
   /** Package 1.5: last zombie line per chat, so a cascade is not a flood. */
   private readonly zombieNoticeSentAt = new Map<number, number>();
@@ -762,6 +806,11 @@ export class OperatorDaemon {
     // would be a watchdog that stops watching.
     this.watchdogTimer = setInterval(() => this.watchdogTick(), WATCHDOG_TICK_MS);
     this.watchdogTimer.unref();
+    this.ingressPulseTimer = setInterval(
+      () => this.pulseWaitingIngress(),
+      this.livenessTimings.typingMs,
+    );
+    this.ingressPulseTimer.unref();
     // Package 0.1 (H1): a terminal catcher, so a pump that dies outside its own
     // per-iteration try/catch is logged instead of floating as a rejection.
     this.reliabilityTask = this.reliabilityLoop().catch((error: unknown) => {
@@ -838,6 +887,9 @@ export class OperatorDaemon {
     this.scheduler.stop();
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
     this.watchdogTimer = undefined;
+    if (this.ingressPulseTimer) clearInterval(this.ingressPulseTimer);
+    this.ingressPulseTimer = undefined;
+    this.awaitingIngress.clear();
     // Monitors are aborted up front rather than after the scheduler settles, so
     // a wedged scheduler cannot keep them subscribed for the whole deadline.
     for (const controller of this.monitors.values()) controller.abort();
@@ -1359,6 +1411,9 @@ export class OperatorDaemon {
       if (update.userId === this.config.telegram.allowedUserId) {
         this.store.setRuntimeState("owner_chat_id", String(update.chatId));
       }
+      // The wait is over: from here the turn's own indicators take over, and a
+      // stale entry would pulse a chat nobody is waiting on (review finding 8).
+      this.awaitingIngress.delete(update.chatId);
       // Instant sign of life: media enrichment below can take a while before
       // any preview exists, and the base ~2 s batching already ate the
       // "human" reaction window (bugs №18/№48). Best-effort only.
@@ -1393,9 +1448,20 @@ export class OperatorDaemon {
     const pendingAttachments = update.attachments.filter(
       (_, index) => !oversizeNotes[index]!.length,
     );
-    const workNotice = update.synthetic
-      ? undefined
-      : ingressWorkNotice(update, pendingAttachments);
+    // A remainder of a split burst (bug №35, package 4.3) carries the parent's
+    // attachments AND its media context. The parent already announced this very
+    // work, so a second notice would be the same sentence with a smaller count
+    // (review finding 6). `mediaContext` is set only on such a re-enqueued
+    // envelope, which makes it the precise signal for "already announced".
+    const alreadyAnnounced = (update.mediaContext?.length ?? 0) > 0;
+    const workNotice =
+      update.synthetic || alreadyAnnounced
+        ? undefined
+        : ingressWorkNotice(update, pendingAttachments, {
+            transcribes: Boolean(this.media),
+            ocrs: Boolean(this.media) && this.config.media.ocr.enabled,
+            maxMediaBytes: this.config.media.maxInputBytes,
+          });
     if (workNotice) {
       this.enqueueTelegramOutbox(
         `telegram:bulk-ack:${update.chatId}:${update.messageId}`,
@@ -1408,7 +1474,16 @@ export class OperatorDaemon {
           correlationId: correlationForUpdate(update),
         },
       );
-      await this.flushTelegramOutbox();
+      // NOT awaited (review finding 4): the row is durable the moment it is
+      // enqueued, and the flush drains up to a hundred items serially, each of
+      // them allowed a flood wait. Waiting for that before starting the very
+      // download this line announces would delay the work to announce the work.
+      void this.flushTelegramOutbox().catch((error: unknown) => {
+        this.logger.debug(
+          { errorCode: classifyOperationalError(error).code },
+          "Ingest notice flush failed; the durable row is retried by the pump",
+        );
+      });
     }
     // Bug №24: downloading a whole forwarded batch with one Promise.all
     // buffered every file in memory at once — with a local Bot API server
@@ -1599,6 +1674,16 @@ export class OperatorDaemon {
     } else {
       mediaContext.push(...oversizeNotes.flat());
     }
+    if (workNotice) {
+      // Review finding 4 — single-voice. Without this the Operator has no idea
+      // the chat already shows a line about this media and can open its answer
+      // with the same sentence. It travels in `mediaContext` because that is
+      // already the channel for daemon facts about this batch, so it reaches
+      // the envelope without touching how the envelope is assembled.
+      mediaContext.push(
+        `[daemon: в чат уже отправлена техническая строка «${workNotice}» — не повторяй её в ответе]`,
+      );
+    }
     if (mediaContext.length) {
       const userText = isMediaPlaceholder(update.text) ? "" : update.text.trim();
       update = {
@@ -1738,12 +1823,34 @@ export class OperatorDaemon {
         .catch(() => undefined);
     };
     pulse();
-    const timer = setInterval(pulse, LIVENESS_PULSE_INTERVAL_MS);
+    const timer = setInterval(pulse, this.livenessTimings.typingMs);
     timer.unref();
     try {
       return await work();
     } finally {
       clearInterval(timer);
+    }
+  }
+
+  /**
+   * Package 4.1 review, finding 8 — the wait nobody was covering.
+   *
+   * Between «the message became a durable job» and «its turn actually starts»
+   * the chat has had exactly one accept-pulse from the transport, worth about
+   * five seconds. The turn ahead of it in the lane can run for minutes, and
+   * only the OWNER's message preempts it (package 1.1) — a group member or a
+   * viewer just waits. Keep the indicator alive for that wait, but not
+   * indefinitely: past the cap the daemon stops claiming to be busy.
+   */
+  private pulseWaitingIngress(): void {
+    if (!this.awaitingIngress.size) return;
+    const now = Date.now();
+    for (const [chatId, waiting] of this.awaitingIngress) {
+      if (now > waiting.until) {
+        this.awaitingIngress.delete(chatId);
+        continue;
+      }
+      void this.telegram.sendChatAction(chatId, "typing", waiting.destination).catch(() => undefined);
     }
   }
 
@@ -1768,6 +1875,14 @@ export class OperatorDaemon {
       undefined,
       { id: jobId, dedupeKey: jobId },
     );
+    // Package 4.1 review, finding 8. A synthetic update is the daemon talking
+    // to itself — nobody is watching that chat for a reply to it.
+    if (!update.synthetic) {
+      this.awaitingIngress.set(update.chatId, {
+        destination: destinationFromUpdate(update),
+        until: Date.now() + INGRESS_WAIT_PULSE_MAX_MS,
+      });
+    }
     return jobId;
   }
 
@@ -2494,7 +2609,7 @@ export class OperatorDaemon {
       if (!writer) return;
       writer.refresh(operatorHeartbeatText(Date.now() - operatorStartedAt, toolSteps));
       previewTouched = true;
-    }, 15_000);
+    }, this.livenessTimings.heartbeatMs);
     heartbeat.unref();
     // Telegram's typing indicator expires after ~5 s; repeat it until the first
     // preview edit takes over so the chat is alive from the first second (№48).
@@ -2506,7 +2621,7 @@ export class OperatorDaemon {
         .catch(() => undefined);
     };
     sendTyping();
-    const typing = setInterval(sendTyping, 4_000);
+    const typing = setInterval(sendTyping, this.livenessTimings.typingMs);
     typing.unref();
     let observedFirstToken = false;
     let finalText: string;
@@ -8306,8 +8421,9 @@ function isMediaPlaceholder(text: string): boolean {
  */
 function isLongTranscribable(attachment: TelegramAttachment): boolean {
   if (!TRANSCRIBED_ATTACHMENT_TYPES.has(attachment.type)) return false;
+  const threshold = LONG_MEDIA_SECONDS[attachment.type] ?? LONG_MEDIA_SECONDS_DEFAULT;
   return (
-    (attachment.durationSeconds ?? 0) > LONG_MEDIA_SECONDS ||
+    (attachment.durationSeconds ?? 0) > threshold ||
     (attachment.sizeBytes ?? 0) > LONG_MEDIA_BYTES
   );
 }
@@ -8319,51 +8435,87 @@ function mediaKindLabel(attachment: TelegramAttachment): string {
   return "аудио";
 }
 
-/** «3 мин» when Telegram declared a duration, «7.2 МБ» when it only declared a size. */
+/**
+ * «3 мин» when Telegram declared a duration, «7.2 МБ» when it only declared a
+ * size. Minutes are FLOORED (review finding 14): rounding 90 s up to «2 мин»
+ * promises more waiting than there is, and this line exists to be trusted.
+ */
 function mediaSizeLabel(attachment: TelegramAttachment): string {
   const seconds = attachment.durationSeconds ?? 0;
-  if (seconds > LONG_MEDIA_SECONDS) return `${Math.round(seconds / 60)} мин`;
+  if (seconds >= 60) return `${Math.floor(seconds / 60)} мин`;
   return `${((attachment.sizeBytes ?? 0) / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+/** What the media pipeline will actually be asked to do with this batch. */
+export interface IngestWorkCapabilities {
+  /** A media processor exists at all. */
+  transcribes: boolean;
+  /** …and OCR is configured, so photos and documents cost a pass too. */
+  ocrs: boolean;
+  /** Above this the artifact is never ingested, so nothing transcribes it. */
+  maxMediaBytes: number;
 }
 
 /**
  * Package 4.1, findings «латентность №3» and «№4». The one line the daemon may
  * put in the chat BEFORE it starts downloading — or `undefined` when the chat
- * action pulse alone is enough (a single short voice is transcribed faster than
- * a message about it would be read; §«не создавай durable-сообщений там, где
- * хватает chat action»).
+ * action pulse alone is enough. That is the common case by design: a short
+ * voice is transcribed faster than a line about it would be read, and three
+ * small photos are a second of download.
  *
- * Deliberately ONE message covering both findings: a long voice inside a
- * forwarded bulk is one wait, and the ack and the «расшифровываю» notice would
+ * Deliberately ONE message covering both findings: a long recording inside a
+ * forwarded bulk is one wait, and the ack and the transcription notice would
  * otherwise land as two consecutive technical lines saying the same thing.
- * It is not repeated at the end either — the notice is a separate, standing
- * remark of the daemon, and the turn's own answer never restates it.
  *
- * Single-voice: this is the daemon's machine indication, not the Operator
- * speaking, so it stays neutral, short and factual.
+ * It never promises work that will not happen (review finding 5): without a
+ * media processor nothing is transcribed, above `maxMediaBytes` the artifact is
+ * never ingested, and with OCR unconfigured a photo costs only its download.
+ *
+ * Single-voice (review finding 4): this is the daemon's machine indication, not
+ * the Operator speaking. Hence the impersonal register — «Принято», «Расшифровка»
+ * — rather than the first person the Operator answers in; and hence the note
+ * that goes into the envelope so the Operator knows the line is already there.
  */
 function ingressWorkNotice(
   update: Extract<TelegramInbound, { type: "message" }>,
   pending: TelegramAttachment[],
+  capabilities: IngestWorkCapabilities,
 ): string | undefined {
   const declaredBytes = pending.reduce((total, item) => total + (item.sizeBytes ?? 0), 0);
-  const long = pending.filter(isLongTranscribable);
-  const bulky =
-    update.messageIds.length >= BULK_INGEST_MESSAGES ||
-    pending.length >= BULK_INGEST_ELEMENTS ||
-    declaredBytes > BULK_INGEST_BYTES;
-  if (!bulky && !long.length) return undefined;
+  const transcribable = capabilities.transcribes
+    ? pending.filter(
+        (item) =>
+          TRANSCRIBED_ATTACHMENT_TYPES.has(item.type) &&
+          (item.sizeBytes ?? 0) <= capabilities.maxMediaBytes,
+      )
+    : [];
+  const processed =
+    transcribable.length +
+    (capabilities.ocrs ? pending.filter((item) => OCR_ATTACHMENT_TYPES.has(item.type)).length : 0);
+  // Long enough item by item, or long enough taken together.
+  const individually = transcribable.filter(isLongTranscribable);
+  const totalSeconds = transcribable.reduce((total, item) => total + (item.durationSeconds ?? 0), 0);
+  const slow = individually.length
+    ? individually
+    : totalSeconds > LONG_MEDIA_TOTAL_SECONDS
+      ? transcribable
+      : [];
+  const heavy = declaredBytes > BULK_INGEST_BYTES;
+  if (!slow.length && !heavy && processed < BULK_INGEST_ELEMENTS) return undefined;
   // «шт.» dodges the Russian plural of «файл», which differs at 2–4 and 5+.
-  const work = long.length
-    ? long.length === 1
-      ? `расшифровываю ${mediaKindLabel(long[0]!)} (${mediaSizeLabel(long[0]!)})`
-      : `расшифровываю медиа (${long.length} шт.)`
-    : "разбираю";
-  // «Принял N сообщ.» describes a batch; one message with one file is not one,
-  // and counting it would read as a machine talking to itself.
-  const counted = update.messageIds.length >= 2 || pending.length >= 2;
-  if (!bulky || !counted) return `${work.charAt(0).toUpperCase()}${work.slice(1)}.`;
-  return `Принял ${update.messageIds.length} сообщ. (вложений: ${pending.length}) — ${work}.`;
+  const detail = slow.length === 1 ? mediaSizeLabel(slow[0]!) : `${slow.length} шт.`;
+  // An album is ONE thing the owner sent, however many updates Telegram split
+  // it into; counting its parts as messages is machine noise (review finding 9).
+  const messages = update.mediaGroupId ? 1 : update.messageIds.length;
+  if (messages < 2) {
+    return slow.length === 1
+      ? `Расшифровка: ${mediaKindLabel(slow[0]!)}, ${detail}…`
+      : slow.length
+        ? `Расшифровка медиа: ${detail}…`
+        : "Обработка вложений…";
+  }
+  const head = `Принято ${messages} сообщ., вложений: ${pending.length}.`;
+  return slow.length ? `${head} Расшифровка: ${detail}…` : `${head} Обработка…`;
 }
 
 class SerialQueue {
