@@ -106,9 +106,20 @@ export interface RenderOptions {
   fence?: Fence;
 }
 
+/**
+ * Flatten to one line and cut to `limit` CODE POINTS.
+ *
+ * Not `String.slice`, which cuts by UTF-16 unit: an emoji in a worker-written
+ * title or a note body sits on two of them, and cutting between the halves
+ * emits a lone surrogate into the trusted head of the envelope. Code points are
+ * also what the write linter counts, so the two agree on what "200 characters"
+ * means.
+ */
 function clean(value: string, limit: number): string {
   const flat = value.replace(/\s+/gu, " ").trim();
-  return flat.length > limit ? `${flat.slice(0, Math.max(0, limit - 1)).trimEnd()}…` : flat;
+  const points = [...flat];
+  if (points.length <= limit) return flat;
+  return `${points.slice(0, Math.max(0, limit - 1)).join("").trimEnd()}…`;
 }
 
 function byRecencyDesc(a: { updatedAt: string }, b: { updatedAt: string }): number {

@@ -5,6 +5,7 @@ import {
   LOGICAL_DAY_BOUNDARY_HOUR,
   MEMORY_INDEX_BUDGET_CHARS,
   MEMORY_INDEX_EMPTY,
+  NOW_ITEM_CONTENT_CHARS,
   NOW_STATE_BUDGET_CHARS,
   NOW_STATE_EMPTY,
   NOW_STATE_HEADER,
@@ -333,6 +334,19 @@ describe("layer renderers and their budgets", () => {
     for (const item of notes) expect(rendered).toContain(item.id);
     // …and the old number genuinely did not, so the raise is not decoration.
     expect(renderMemoryIndex(notes, { budget: 20_000 })).toContain("(+");
+  });
+
+  it("cuts an over-long item by code point, never through an emoji", () => {
+    // Titles are worker-written and now-items are agent-written, so an emoji in
+    // one is ordinary. `String.slice` cuts by UTF-16 unit and would drop a lone
+    // surrogate into the trusted head of the envelope.
+    const rendered = renderNowState([nowItem("t_emoji", { content: "🙂".repeat(300) })]);
+    expect(rendered).toMatch(/🙂…/u);
+    expect(rendered).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+    // …and the cut still honours the per-item cap, counted the same way the
+    // write linter counts it.
+    const line = /^- (.+)$/mu.exec(rendered)![1]!;
+    expect([...line].length).toBeLessThanOrEqual(NOW_ITEM_CONTENT_CHARS);
   });
 
   it("indexes legacy notes as ~100 characters of content pointing at the id (§6.4)", () => {

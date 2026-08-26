@@ -4575,7 +4575,10 @@ export class OperatorDaemon {
     const label = project?.name ? `[${project.name}] ${thread.title}` : thread.title;
     return {
       section: waiting ? "waiting" : "active",
-      content: `${label}${suffix}`.slice(0, NOW_ITEM_CONTENT_CHARS),
+      // Cut by CODE POINT, like the linter counts: a worker-written title can
+      // carry an emoji, and `String.slice` cuts by UTF-16 unit — which would
+      // leave a lone surrogate in the trusted head of the envelope.
+      content: [...`${label}${suffix}`].slice(0, NOW_ITEM_CONTENT_CHARS).join(""),
     };
   }
 
