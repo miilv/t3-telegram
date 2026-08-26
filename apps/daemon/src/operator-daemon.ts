@@ -1628,6 +1628,11 @@ export class OperatorDaemon {
 
   /** Free the queue slot of a turn that ignored its interrupt (package 1.5). */
   private declareZombieTurn(turn: ActiveOperatorTurn): void {
+    // Nothing to abandon yet: the turn has not reached the provider call (it is
+    // still downloading media, or waiting on the transcription). It will see
+    // the supersession itself the moment it gets there and release the slot on
+    // its own, so the watchdog keeps waiting rather than faking an event.
+    if (!turn.abandon) return;
     turn.zombie = true;
     metrics.increment("operator_turns_zombie_total");
     this.store.appendEvent("operator.turn.zombie", {
@@ -5721,24 +5726,61 @@ export class OperatorDaemon {
     onToolStarted?: (tool: string) => void,
     turnToken?: string,
   ): Promise<string> {
-    {
-      let streamed = "";
-      let segment = "";
-      let lastInterSegment = "";
-      let sawTool = false;
-      let toolCount = 0;
-      let result = "";
-      // Bug №40: the final answer never resurrects the pre-tool preamble the
-      // live preview already dropped. Prefer the text after the LAST tool
-      // call; without it fall back to the last inter-tool commentary, and as
-      // a last resort report the completed steps instead of the preamble.
-      const finalAnswer = (): string => {
-        if (!sawTool) return streamed || result;
-        if (segment.trim()) return segment;
-        if (lastInterSegment.trim()) return lastInterSegment;
-        return `Готово — выполнено шагов: ${toolCount}.`;
-      };
-      try {
+    let streamed = "";
+    let segment = "";
+    let lastInterSegment = "";
+    let sawTool = false;
+    let toolCount = 0;
+    let result = "";
+    // Bug №40: the final answer never resurrects the pre-tool preamble the
+    // live preview already dropped. Prefer the text after the LAST tool
+    // call; without it fall back to the last inter-tool commentary, and as
+    // a last resort report the completed steps instead of the preamble.
+    const finalAnswer = (): string => {
+      if (!sawTool) return streamed || result;
+      if (segment.trim()) return segment;
+      if (lastInterSegment.trim()) return lastInterSegment;
+      return `Готово — выполнено шагов: ${toolCount}.`;
+    };
+    try {
+      for await (const event of this.runtime.sendTurn({
+        sessionId: this.operatorSessionId,
+        prompt,
+        ...(toolAccess ? { toolAccess } : {}),
+        ...(turnToken ? { turnToken } : {}),
+      })) {
+        if (event.type === "text_delta") {
+          streamed += event.text;
+          segment += event.text;
+          onDelta?.(event.text);
+        } else if (event.type === "tool_started") {
+          // Text before the first tool call is throwaway narration; text
+          // between later tool calls is real commentary worth keeping.
+          if (sawTool && segment.trim()) lastInterSegment = segment;
+          sawTool = true;
+          toolCount += 1;
+          segment = "";
+          onToolStarted?.(event.tool);
+        } else if (event.type === "result") {
+          result = event.text;
+          this.recordOperatorUsage(event.usage);
+          if (event.sessionId && event.sessionId !== this.operatorSessionId) {
+            this.operatorSessionId = event.sessionId;
+            this.store.setRuntimeState("operator_session_id", event.sessionId);
+          }
+        }
+      }
+      return finalAnswer();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/session|resume|conversation.*not found/i.test(message)) {
+        await this.createOperatorSession();
+        streamed = "";
+        result = "";
+        segment = "";
+        lastInterSegment = "";
+        sawTool = false;
+        toolCount = 0;
         for await (const event of this.runtime.sendTurn({
           sessionId: this.operatorSessionId,
           prompt,
@@ -5750,8 +5792,6 @@ export class OperatorDaemon {
             segment += event.text;
             onDelta?.(event.text);
           } else if (event.type === "tool_started") {
-            // Text before the first tool call is throwaway narration; text
-            // between later tool calls is real commentary worth keeping.
             if (sawTool && segment.trim()) lastInterSegment = segment;
             sawTool = true;
             toolCount += 1;
@@ -5760,48 +5800,11 @@ export class OperatorDaemon {
           } else if (event.type === "result") {
             result = event.text;
             this.recordOperatorUsage(event.usage);
-            if (event.sessionId && event.sessionId !== this.operatorSessionId) {
-              this.operatorSessionId = event.sessionId;
-              this.store.setRuntimeState("operator_session_id", event.sessionId);
-            }
           }
         }
         return finalAnswer();
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (/session|resume|conversation.*not found/i.test(message)) {
-          await this.createOperatorSession();
-          streamed = "";
-          result = "";
-          segment = "";
-          lastInterSegment = "";
-          sawTool = false;
-          toolCount = 0;
-          for await (const event of this.runtime.sendTurn({
-            sessionId: this.operatorSessionId,
-            prompt,
-            ...(toolAccess ? { toolAccess } : {}),
-            ...(turnToken ? { turnToken } : {}),
-          })) {
-            if (event.type === "text_delta") {
-              streamed += event.text;
-              segment += event.text;
-              onDelta?.(event.text);
-            } else if (event.type === "tool_started") {
-              if (sawTool && segment.trim()) lastInterSegment = segment;
-              sawTool = true;
-              toolCount += 1;
-              segment = "";
-              onToolStarted?.(event.tool);
-            } else if (event.type === "result") {
-              result = event.text;
-              this.recordOperatorUsage(event.usage);
-            }
-          }
-          return finalAnswer();
-        }
-        throw error;
       }
+      throw error;
     }
   }
 

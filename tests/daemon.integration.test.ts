@@ -4562,6 +4562,82 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   }, 20_000);
 
+  it("interrupts a turn that fell silent while someone waits, without calling it a zombie yet (package 1.5)", async () => {
+    const home = tempDirectory("daemon-watchdog-stall-");
+    const store = tempStore();
+    const runtime = new WedgedRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      // A long grace: this test is about step one only — the interrupt.
+      watchdogConfig(home, { watchdogStallMs: 60, watchdogGraceMs: 30_000 }),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    const ticker = setInterval(() => daemon.watchdogTick(), 5);
+    try {
+      telegram.push({ ...message(1, "зависший вопрос про миграцию"), messageThreadId: 11 });
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("зависший вопрос")));
+
+      // Nothing happens while nobody waits: a long silent turn is allowed.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(runtime.interrupts).toBe(0);
+
+      // Another topic (so nothing is preempted) puts a job in the user lane —
+      // and now the silence has a budget.
+      telegram.push({ ...message(2, "вопрос в другом топике"), messageThreadId: 22 });
+      await waitFor(() => runtime.interrupts >= 1, 5_000);
+      expect(
+        store.db
+          .prepare(
+            "SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.superseded' AND payload_json LIKE '%watchdog_stall%'",
+          )
+          .get(),
+      ).toMatchObject({ count: 1 });
+      // The grace has not expired, so nothing has been abandoned and the owner
+      // has been told nothing.
+      expect(
+        store.db
+          .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.zombie'")
+          .get(),
+      ).toMatchObject({ count: 0 });
+      expect(telegram.sent.some((sent) => sent.text.includes("Предыдущий ответ завис"))).toBe(false);
+
+      // The turn finally reacts: interrupted means undeliverable, and the
+      // waiting message is served as usual.
+      runtime.release();
+      await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."), 10_000);
+      expect(telegram.sent.some((sent) => sent.text.includes("поздний ответ зомби"))).toBe(false);
+    } finally {
+      clearInterval(ticker);
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
   it("leaves a long turn alone while it keeps producing events (package 1.5)", async () => {
     const home = tempDirectory("daemon-watchdog-healthy-");
     const store = tempStore();
