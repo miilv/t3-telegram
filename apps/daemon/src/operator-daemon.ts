@@ -34,6 +34,9 @@ import type {
   ThreadTerminalOutcome,
 } from "../../../packages/shared/src/index.js";
 import {
+  approvalRiskRu,
+  threadStatusRu,
+  AUTOMATION_STATUS_RU,
   fenceUntrusted,
   knownFenceNonces,
   LaneQueue,
@@ -1148,7 +1151,7 @@ export class OperatorDaemon {
       const megabytes = (attachment.sizeBytes / (1024 * 1024)).toFixed(1);
       const label = attachment.filename ?? attachment.type;
       return [
-        `[файл ${label} (${megabytes} MB) превышает лимит облачного Bot API 20 MB — недоступен]`,
+        `[файл ${label} (${megabytes} МБ) превышает лимит облачного Bot API 20 МБ — недоступен]`,
       ];
     });
     // Bug №24: downloading a whole forwarded batch with one Promise.all
@@ -1162,7 +1165,7 @@ export class OperatorDaemon {
     const budgetNote = (attachment: TelegramAttachment): string => {
       const label = attachment.filename ?? attachment.type;
       const budgetMb = Math.round(ATTACHMENT_BATCH_MEMORY_BUDGET_BYTES / (1024 * 1024));
-      return `[файл ${label} пропущен: суммарный размер батча превышает лимит ${budgetMb} MB]`;
+      return `[файл ${label} пропущен: суммарный размер батча превышает лимит ${budgetMb} МБ]`;
     };
     const ingestOne = async (attachment: TelegramAttachment, index: number): Promise<void> => {
       if (oversizeNotes[index]!.length) return;
@@ -3583,7 +3586,7 @@ export class OperatorDaemon {
     });
     if (pending.chatId !== undefined && pending.messageId !== undefined) {
       this.enqueueTelegramOutbox(`telegram:user-input:${pending.id}:submitted`, pending.chatId, "rich", {
-        text: `Ответ для **${escapeMarkdownText(this.store.getThread(pending.threadId)?.title ?? "worker")}** отправлен.`,
+        text: `Ответ для **${escapeMarkdownText(this.store.getThread(pending.threadId)?.title ?? "работы")}** отправлен.`,
         options: {},
         messageType: "user_input_submitted",
         threadId: pending.threadId,
@@ -4029,7 +4032,7 @@ export class OperatorDaemon {
     if (userInputMatch) {
       const pending = this.store.getUserInput(userInputMatch[1]!);
       if (!pending || !this.canEditThread(update.userId, pending.threadId)) {
-        await this.telegram.answerCallback(update.callbackId, "You do not have permission for this work item");
+        await this.telegram.answerCallback(update.callbackId, "У вас нет доступа к этой работе");
         this.store.completeEvent(eventKey);
         return;
       }
@@ -4044,7 +4047,7 @@ export class OperatorDaemon {
     }
     const match = /^a:([A-Za-z0-9_-]+):(1|s|0)$/.exec(update.data);
     if (!match) {
-      await this.telegram.answerCallback(update.callbackId, "Unknown action");
+      await this.telegram.answerCallback(update.callbackId, "Неизвестное действие");
       this.store.completeEvent(eventKey);
       return;
     }
@@ -4218,7 +4221,7 @@ export class OperatorDaemon {
     }
     await this.commandReply(
       update,
-      `Остановил **${this.store.getThread(threadId)?.title ?? "текущую работу"}**.`,
+      `Остановил **${escapeMarkdownText(this.store.getThread(threadId)?.title ?? "текущую работу")}**.`,
       "command_reply",
       threadId,
     );
@@ -4365,9 +4368,9 @@ export class OperatorDaemon {
         .filter((thread) => ["completed", "failed", "cancelled"].includes(thread.status))
         .slice(0, 5);
       const lines = ["## Работа", ""];
-      if (!active.length) lines.push("Активных workers нет.");
+      if (!active.length) lines.push("Активных работ нет.");
       for (const thread of active) {
-        lines.push(`- **${escapeMarkdownText(thread.title)}** — ${thread.status}`);
+        lines.push(`- **${escapeMarkdownText(thread.title)}** — ${threadStatusRu(thread.status)}`);
       }
       if (approvals.length) lines.push("", `Ожидают разрешения: ${approvals.length}`);
       if (userInputs.length) lines.push("", `Ожидают ответа: ${userInputs.length}`);
@@ -4377,7 +4380,7 @@ export class OperatorDaemon {
           "**Недавние завершения**",
           ...recentCompletions.map(
             (thread) =>
-              `- ${thread.status === "completed" ? "✓" : thread.status === "failed" ? "✗" : "○"} ${escapeMarkdownText(thread.title)} — ${escapeMarkdownText(thread.status)}`,
+              `- ${thread.status === "completed" ? "✓" : thread.status === "failed" ? "✗" : "○"} ${escapeMarkdownText(thread.title)} — ${escapeMarkdownText(threadStatusRu(thread.status))}`,
           ),
         );
       }
@@ -4389,13 +4392,13 @@ export class OperatorDaemon {
         update.userId,
         await this.broker.listProjects().catch(() => this.store.listProjects()),
       );
-      await this.commandReply(update, projects.length ? `## Проекты\n\n${projects.map((project) => `- **${project.name}**`).join("\n")}` : "Проектов пока нет.");
+      await this.commandReply(update, projects.length ? `## Проекты\n\n${projects.map((project) => `- **${escapeMarkdownText(project.name)}**`).join("\n")}` : "Проектов пока нет.");
       return true;
     }
     if (command === "/work") {
       const threads = visibleThreads.slice(0, 20);
       await this.commandReply(update, threads.length
-          ? `## Последние работы\n\n${threads.map((thread) => `- **${thread.title}** — ${thread.status}`).join("\n")}`
+          ? `## Последние работы\n\n${threads.map((thread) => `- **${escapeMarkdownText(thread.title)}** — ${threadStatusRu(thread.status)}`).join("\n")}`
           : "Рабочих тредов пока нет.");
       return true;
     }
@@ -4405,7 +4408,7 @@ export class OperatorDaemon {
     // emergency hatch is the bare cancel word (dialogue-flow §4, paths A and B).
     if (command === "/memory") {
       if (!this.isAdministrator(update.userId)) {
-        await this.commandReply(update, "Память Operator доступна только owner/admin.");
+        await this.commandReply(update, "Память доступна только владельцу и админам.");
         return true;
       }
       await this.handleMemoryCommand(update);
@@ -4442,19 +4445,19 @@ export class OperatorDaemon {
       await this.commandReply(update, [
           "## Operator",
           "",
-          "Пишите обычным языком: короткие вопросы я отвечу сам, существенную работу передам persistent T3 workers.",
+          "Пишите обычным языком: короткие вопросы я отвечу сам, существенную работу возьму в долгую фоновую работу.",
           "",
           "- `/status` — активная и недавняя работа",
           "- `/projects` — проекты",
-          "- `/work` — work threads",
-          "- `/memory` — durable notes; `remember`, `search`, `forget`, `restore`, `compact`",
-          "- `/team` — роли команды (owner/admin)",
-          "- `/share <project> <user-id> <editor|viewer>` — доступ к проекту",
-          "- `/automation` — proactive scheduled work",
-          "- `/dashboard` и `/policy` — локальные owner/admin controls",
-          "- `/operator` — runtime provider status and switch (owner/admin)",
-          "- `/alias <project> | <alias>` — durable project alias",
-          "- `/debug` — owner-only runtime diagnostics",
+          "- `/work` — рабочие треды",
+          "- `/memory` — долговременные заметки; `remember`, `search`, `forget`, `restore`, `compact`",
+          "- `/team` — роли команды (владелец/админ)",
+          "- `/share <проект> <id-пользователя> <editor|viewer>` — доступ к проекту",
+          "- `/automation` — регулярные задачи по расписанию",
+          "- `/dashboard` и `/policy` — локальные настройки (владелец/админ)",
+          "- `/operator` — какой движок сейчас работает и переключение (владелец/админ)",
+          "- `/alias <проект> | <алиас>` — постоянный алиас проекта",
+          "- `/debug` — диагностика (только владелец)",
         ].join("\n"));
       return true;
     }
@@ -4549,17 +4552,17 @@ export class OperatorDaemon {
         ? this.store.listAutomations()
         : this.store.listAutomations(String(update.userId));
       await this.commandReply(update, automations.length
-          ? `## Automations\n\n${automations.map((automation) => [
+          ? `## Автоматизации\n\n${automations.map((automation) => [
               `- **${escapeMarkdownText(automation.name)}** · \`${automation.id}\``,
-              `  ${automationScheduleLabel(automation.schedule)} · ${automation.status}${automation.nextRunAt ? ` · next ${automation.nextRunAt}` : ""}`,
+              `  ${automationScheduleLabel(automation.schedule)} · ${AUTOMATION_STATUS_RU[automation.status] ?? automation.status}${automation.nextRunAt ? ` · следующий запуск ${automation.nextRunAt}` : ""}`,
             ].join("\n")).join("\n")}`
-          : "Automations пока нет. Создайте: `/automation add daily 09:00 Europe/Moscow | Утренний обзор | Проверь активные проекты и пришли краткий обзор`.");
+          : "Автоматизаций пока нет. Создайте: `/automation add daily 09:00 Europe/Moscow | Утренний обзор | Проверь активные проекты и пришли краткий обзор`.");
       return;
     }
     if (["pause", "resume", "delete"].includes(action.toLocaleLowerCase())) {
       const automation = id ? this.store.getAutomation(id) : undefined;
       if (!automation || (!this.isAdministrator(update.userId) && automation.ownerId !== String(update.userId))) {
-        await this.commandReply(update, "Automation не найдена или недоступна.");
+        await this.commandReply(update, "Автоматизация не найдена или недоступна.");
         return;
       }
       const status = action.toLocaleLowerCase() === "pause"
@@ -4586,7 +4589,7 @@ export class OperatorDaemon {
       this.store.appendEvent("automation.status.updated", {
         payload: { automationId: automation.id, status, actorUserId: String(update.userId) },
       });
-      await this.commandReply(update, `Automation **${escapeMarkdownText(automation.name)}**: ${status}.${resumeNote}`);
+      await this.commandReply(update, `Автоматизация **${escapeMarkdownText(automation.name)}**: ${AUTOMATION_STATUS_RU[status] ?? status}.${resumeNote}`);
       return;
     }
     if (action.toLocaleLowerCase() !== "add") {
@@ -4635,7 +4638,7 @@ export class OperatorDaemon {
     const input = update.text.replace(/^\/policy(?:@\w+)?\s*/iu, "").trim();
     if (!input) {
       const policy = this.getPolicy();
-      await this.commandReply(update, `## Live policy\n\n${Object.entries(policy).map(([key, value]) => `- **${key}**: \`${Array.isArray(value) ? value.join(",") : value}\``).join("\n")}\n\nИзменить: \`/policy set <key> <value>\`.`);
+      await this.commandReply(update, `## Live policy\n\n${Object.entries(policy).map(([key, value]) => `- **${escapeMarkdownText(key)}**: \`${Array.isArray(value) ? value.join(",") : value}\``).join("\n")}\n\nИзменить: \`/policy set <key> <value>\`.`);
       return;
     }
     const match = /^set\s+(\w+)\s+(.+)$/iu.exec(input);
@@ -4653,7 +4656,7 @@ export class OperatorDaemon {
     try {
       const policy = this.updatePolicy({ [key]: value }, String(update.userId));
       this.store.appendEvent("policy.updated", { payload: { source: "telegram", key } });
-      await this.commandReply(update, `Policy **${key}** сохранена: \`${Array.isArray(policy[key]) ? policy[key].join(",") : policy[key]}\`.`);
+      await this.commandReply(update, `Настройка **${escapeMarkdownText(key)}** сохранена: \`${Array.isArray(policy[key]) ? policy[key].join(",") : policy[key]}\`.`);
     } catch (error) {
       await this.commandReply(update, `Policy отклонена: ${escapeMarkdownText(error instanceof Error ? error.message : "invalid value")}`);
     }
@@ -4724,7 +4727,7 @@ export class OperatorDaemon {
           restored: restored.trim() === "PROVIDER_CONTEXT_RESTORED",
         },
       });
-      await this.commandReply(update, `Operator переключён: **${escapeMarkdownText(current)}** → **${escapeMarkdownText(providerId)}**. Durable context restored.`);
+      await this.commandReply(update, `Operator переключён: **${escapeMarkdownText(current)}** → **${escapeMarkdownText(providerId)}**. Контекст восстановлен.`);
     } catch (error) {
       await this.commandReply(update, `Переключение не выполнено: ${escapeMarkdownText(error instanceof Error ? error.message : "runtime error")}`);
     }
@@ -4769,7 +4772,7 @@ export class OperatorDaemon {
     this.store.appendEvent("team.role.updated", {
       payload: { actorUserId: String(update.userId), targetUserId: rawUserId, role: rawRole },
     });
-    await this.commandReply(update, `Роль \`${rawUserId}\` обновлена: **${rawRole}**.`);
+    await this.commandReply(update, `Роль \`${rawUserId}\` обновлена: **${escapeMarkdownText(rawRole)}**.`);
   }
 
   private async handleShareCommand(
@@ -4811,7 +4814,7 @@ export class OperatorDaemon {
       projectId: project.id,
       payload: { actorUserId: String(update.userId), targetUserId: rawUserId, access: rawAccess },
     });
-    await this.commandReply(update, `Доступ к **${escapeMarkdownText(project.name)}** для \`${rawUserId}\`: **${rawAccess}**.`);
+    await this.commandReply(update, `Доступ к **${escapeMarkdownText(project.name)}** для \`${rawUserId}\`: **${escapeMarkdownText(rawAccess)}**.`);
   }
 
   private async handleMemoryCommand(
@@ -4832,12 +4835,12 @@ export class OperatorDaemon {
         source: "manual",
       });
       this.store.appendEvent("memory.note.remembered", { payload: { noteId: note.id } });
-      await this.commandReply(update, `Запомнил durable note **${escapeMarkdownText(note.id)}** в категории **${escapeMarkdownText(note.category)}**.`);
+      await this.commandReply(update, `Запомнил заметку **${escapeMarkdownText(note.id)}** в категории **${escapeMarkdownText(note.category)}**.`);
       return;
     }
     if (["forget", "delete", "забудь"].includes(action.toLocaleLowerCase())) {
       const removed = detail ? this.store.markOperatorNoteObsolete(detail) : false;
-      await this.commandReply(update, removed ? `Пометил **${escapeMarkdownText(detail)}** как obsolete.` : "Активная note с таким ID не найдена.");
+      await this.commandReply(update, removed ? `Пометил **${escapeMarkdownText(detail)}** как устаревшую.` : "Активная заметка с таким ID не найдена.");
       return;
     }
     if (["restore", "восстанови"].includes(action.toLocaleLowerCase())) {
@@ -4846,8 +4849,8 @@ export class OperatorDaemon {
       await this.telegram.sendRich(
         update.chatId,
         restored
-          ? `Восстановил note **${escapeMarkdownText(detail)}** — снова active.`
-          : "Obsolete note с таким ID не найдена.",
+          ? `Восстановил заметку **${escapeMarkdownText(detail)}** — снова активна.`
+          : "Устаревшая заметка с таким ID не найдена.",
         replyOptions(update),
       );
       return;
@@ -4855,25 +4858,25 @@ export class OperatorDaemon {
     if (["search", "find", "найди"].includes(action.toLocaleLowerCase())) {
       const notes = detail ? this.store.searchOperatorNotes(detail, 10) : [];
       await this.commandReply(update, notes.length
-          ? `## Memory search\n\n${notes.map(renderOperatorNote).join("\n")}`
-          : "Совпадающих active notes нет.");
+          ? `## Поиск по памяти\n\n${notes.map(renderOperatorNote).join("\n")}`
+          : "Подходящих активных заметок нет.");
       return;
     }
     if (["compact", "сжать"].includes(action.toLocaleLowerCase())) {
       await this.compact("manual /memory compact");
-      await this.commandReply(update, "Operator context compacted; authoritative focus, summaries, open loops and durable notes restored.");
+      await this.commandReply(update, "Контекст сжат: главный фокус, выжимки, незакрытые вопросы и долговременные заметки восстановлены.");
       return;
     }
     const notes = this.store.listOperatorNotes({ status: "active", limit: 12 });
     const compaction = this.store.listCompactions(1)[0];
     await this.commandReply(update, [
-        "## Durable memory",
+        "## Долговременная память",
         "",
-        ...(notes.length ? notes.map(renderOperatorNote) : ["Active notes нет."]),
+        ...(notes.length ? notes.map(renderOperatorNote) : ["Активных заметок нет."]),
         "",
         compaction
-          ? `Последний compact: ${escapeMarkdownText(compaction.createdAt)} — ${escapeMarkdownText(compaction.reason)}`
-          : "Compaction history пока пуста.",
+          ? `Последнее сжатие: ${escapeMarkdownText(compaction.createdAt)} — ${escapeMarkdownText(compaction.reason)}`
+          : "История сжатий пока пуста.",
       ].join("\n"));
   }
 
@@ -4883,7 +4886,7 @@ export class OperatorDaemon {
     const intent = parseNaturalMemoryIntent(update.text);
     if (!intent) return false;
     if (!this.isAdministrator(update.userId)) {
-      await this.commandReply(update, "Глобальная память Operator доступна только owner/admin.");
+      await this.commandReply(update, "Глобальная память доступна только владельцу и админам.");
       return true;
     }
     if (intent.action === "remember") {
@@ -4898,15 +4901,15 @@ export class OperatorDaemon {
     }
     if (intent.action === "forget") {
       const removed = this.store.markOperatorNoteObsolete(intent.id);
-      await this.commandReply(update, removed ? "Забыл эту durable note." : "Активная note с таким ID не найдена.");
+      await this.commandReply(update, removed ? "Забыл эту заметку." : "Активная заметка с таким ID не найдена.");
       return true;
     }
     const notes = intent.query
       ? this.store.searchOperatorNotes(intent.query, 10)
       : this.store.listOperatorNotes({ status: "active", limit: 10 });
     await this.commandReply(update, notes.length
-        ? `Вот durable notes:\n\n${notes.map(renderOperatorNote).join("\n")}`
-        : "Подходящих durable notes нет.");
+        ? `Вот сохранённые заметки:\n\n${notes.map(renderOperatorNote).join("\n")}`
+        : "Подходящих заметок нет.");
     return true;
   }
 
@@ -5789,7 +5792,7 @@ export class OperatorDaemon {
       const limit = this.getPolicy().maxParallelWorkers;
       this.store.retryBackgroundJob(job.id, "PARALLEL_WORKER_LIMIT", Number.MAX_SAFE_INTEGER);
       this.enqueueTelegramOutbox(`telegram:${payload.commandId}:worker-limit`, payload.chatId, "rich", {
-        text: `Достигнут лимит ${limit} параллельных воркеров — запуск отложен до освобождения слота.`,
+        text: `Достигнут лимит ${limit} параллельных работ — запуск отложен до освобождения слота.`,
         options: { ...payload.destination, replyToMessageId: payload.originMessageId },
         messageType: "t3_dispatch_deferred",
         projectId: payload.projectId,
@@ -6524,7 +6527,7 @@ function replyOptions(update: Extract<TelegramInbound, { type: "message" }>): Te
 
 function renderUserInputPrompt(pending: PendingUserInput, threadTitle?: string): string {
   const question = pending.questions[pending.currentQuestion];
-  if (!question) return "Worker запросил ввод, но не прислал ни одного вопроса.";
+  if (!question) return "Работа запросила ввод, но не прислала ни одного вопроса.";
   const mediated = pending.mediation?.questions?.find((entry) => entry.id === question.id);
   const options = question.options.flatMap((option, index) => [
     `- **${escapeMarkdownText(mediated?.optionLabels?.[index] ?? option.label)}** — ${escapeMarkdownText(option.description)}`,
@@ -6538,7 +6541,7 @@ function renderUserInputPrompt(pending: PendingUserInput, threadTitle?: string):
       ].map((line) => `> ${escapeMarkdownText(line)}`)
     : [];
   return [
-    `**Вопрос по работе «${escapeMarkdownText(threadTitle ?? "Worker")}»**`,
+    `**Вопрос по работе «${escapeMarkdownText(threadTitle ?? "без названия")}»**`,
     "",
     `_${escapeMarkdownText(question.header)} · ${pending.currentQuestion + 1}/${pending.questions.length}_`,
     ...(pending.mediation ? [escapeMarkdownText(pending.mediation.intro), ""] : []),
@@ -6600,7 +6603,7 @@ function renderApprovalPrompt(payload: Record<string, unknown>, threadTitle: str
           ...(detail ? ["", `_${escapeMarkdownText(detail)}_`] : []),
         ]),
     "",
-    `Категория риска: **${risk}**`,
+    `Категория риска: **${escapeMarkdownText(approvalRiskRu(risk))}**`,
     ...(originalQuote.length ? ["", ...originalQuote] : []),
   ].join("\n");
 }

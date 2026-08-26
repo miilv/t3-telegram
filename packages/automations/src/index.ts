@@ -155,7 +155,7 @@ function timeZoneOffsetMs(date: Date, timeZone: string): number {
 }
 
 export function automationScheduleLabel(schedule: AutomationSchedule): string {
-  if (schedule.type === "once") return `once ${schedule.runAt}`;
-  if (schedule.type === "interval") return `every ${schedule.intervalMinutes} min`;
-  return `daily ${schedule.timeOfDay} ${schedule.timeZone}`;
+  if (schedule.type === "once") return `однократно ${schedule.runAt}`;
+  if (schedule.type === "interval") return `каждые ${schedule.intervalMinutes} мин`;
+  return `ежедневно ${schedule.timeOfDay} ${schedule.timeZone}`;
 }
