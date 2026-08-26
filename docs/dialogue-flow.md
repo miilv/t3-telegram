@@ -226,6 +226,20 @@ The ledger is kept by **two writers** ("двойная бухгалтерия"):
   regenerates that text, so an accepted edit would be silently undone. The one
   wrinkle: the daemon derives only `active` and `waiting`, so a section outside
   that pair can only be the agent's judgement and the daemon leaves it standing.
+  It may not **close** one either: a daemon item's life is its thread's life,
+  and "stop this work" is `t3.interrupt_thread`, which actually stops it.
+
+Because the daemon's half is a projection it also **reopens**: a closed item
+whose thread is live again — package 1.3 deliberately lets a finished thread run
+again — comes back with its original `created_at` and no `journal_ref`, while
+the entry recording the earlier close stays in the journal. That is the
+property hooks cannot have, and it is why the ledger cannot be permanently
+corrupted by a single bad write.
+
+**On a database upgraded in place** the ledger starts empty, so the first turn
+after the upgrade reconciles every live thread into it at once and the
+in-episode diff reports them all as new. It is accurate — the agent has indeed
+never been shown this layer — and it happens once.
 
 Writes are keyed for **replay idempotency** on `(origin_job, ordinal of the
 create within the turn)` — deliberately not on the section, because one turn may
@@ -241,6 +255,15 @@ tersely in Codex, and a rule only one branch can read is a rule that disappears
 on provider switch. There is no aggregate budget check on the write path at all:
 the budget belongs to the render (memory-design §2.2), and refusing a write
 mid-turn costs iterations while the owner waits.
+
+A now line carries the item's id, its thread when it has one, its `updated`
+instant and its hiding deadline in the owner's zone, blick's `[~]` box when the
+item is `half`, and `→ journal <slug>` when it is archived — the shape of the
+memory-design §2.2 example. That costs ~45 characters an item, so the layer
+reaches the overflow tail at roughly **40 items** rather than ~90; the tail is
+the designed answer, and the daemon's `active`/`blocked` items are pinned in
+front of it. Item ids in the line exist so a correction needs no `now.get`
+round trip for something the envelope already showed.
 
 `status='closed'` archives the item into `journal_entries` in the **same
 transaction** (a close whose archive failed would erase work with nothing left
