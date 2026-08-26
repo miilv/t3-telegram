@@ -27,13 +27,25 @@ describe("proactive automations", () => {
   it("defaults a zone-less daily schedule to UTC rather than the host clock", () => {
     // The daemon's own zone is an accident of the machine it runs on; pinning
     // a stored schedule to it would move the schedule when the daemon moves.
-    expect(parseAutomationSchedule("daily 09:30")).toEqual({
-      type: "daily",
-      timeOfDay: "09:30",
-      timeZone: "UTC",
-    });
-    expect(firstAutomationRun(parseAutomationSchedule("daily 09:30"), new Date("2026-08-21T05:00:00Z")))
-      .toBe("2026-08-21T09:30:00.000Z");
+    //
+    // Roadmap 0.3 debt, closed in package 2.1: the host that runs CI is itself
+    // on UTC, so this assertion used to hold whether the code read the zone
+    // from the schedule or from the machine. The host clock is moved for the
+    // duration of the check, which is the only way the difference shows.
+    const hostZone = process.env.TZ;
+    process.env.TZ = "Asia/Tokyo";
+    try {
+      expect(parseAutomationSchedule("daily 09:30")).toEqual({
+        type: "daily",
+        timeOfDay: "09:30",
+        timeZone: "UTC",
+      });
+      expect(firstAutomationRun(parseAutomationSchedule("daily 09:30"), new Date("2026-08-21T05:00:00Z")))
+        .toBe("2026-08-21T09:30:00.000Z");
+    } finally {
+      if (hostZone === undefined) delete process.env.TZ;
+      else process.env.TZ = hostZone;
+    }
   });
 
   it("canonicalizes a daily zone and rejects an unknown one", () => {
