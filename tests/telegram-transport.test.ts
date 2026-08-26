@@ -1092,6 +1092,95 @@ describe("Telegram inbound normalization", () => {
     expect(observed).toHaveLength(2);
   });
 
+  it("pulses typing while the batch window holds a burst (package 4.1, finding «латентность №5»)", async () => {
+    vi.useFakeTimers();
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport(
+      "test-token",
+      { users: { 42: "owner" }, allowGroups: false },
+      1,
+      logger,
+    );
+    const internals = transport as unknown as {
+      acceptUpdate(update: unknown): void;
+      inbound: { push(item: unknown): void };
+    };
+    const delivered: TelegramMessageInbound[] = [];
+    internals.inbound.push = (item) => delivered.push(item as TelegramMessageInbound);
+
+    // Nothing downstream has seen the message yet — it leaves as one envelope
+    // when the window closes — so the batch window is dead air unless the
+    // transport itself signals. A chat action creates no message.
+    internals.acceptUpdate(rawTextUpdate(1, 1));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.map((call) => call.method)).toEqual(["sendChatAction"]);
+    expect(calls[0]!.body).toMatchObject({ chat_id: 7, action: "typing" });
+    expect(delivered).toHaveLength(0);
+
+    // Every further message re-arms the window (up to the 180 s ceiling), so
+    // every further message renews the indicator Telegram expires at ~5 s.
+    await vi.advanceTimersByTimeAsync(1_000);
+    internals.acceptUpdate(rawTextUpdate(2, 2));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(2);
+
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.messageIds).toEqual([1, 2]);
+
+    // An unauthorized sender is filtered before the pulse: no stranger can make
+    // the bot look busy in a chat it does not serve.
+    internals.acceptUpdate({
+      ...rawTextUpdate(3, 3),
+      message: { ...rawTextUpdate(3, 3).message, from: { id: 99, first_name: "X" } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.filter((call) => call.method === "sendChatAction")).toHaveLength(2);
+  });
+
+  it("never parks a chat action behind the per-chat lock (package 4.1)", async () => {
+    const calls: ApiCall[] = [];
+    let releaseSend!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        // The lock holder is a send that Telegram is making wait — in
+        // production a flood wait parks it for up to 30 s inside `outbound`.
+        if (call.method === "sendRichMessage") await blocked;
+        return telegramResponse(messageResult(101));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    const send = transport.sendRich(7, "долгий ответ");
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    // Same chat, so `outbound` would serialize the pulse behind the stuck send
+    // and it would land after its own ~5 s lifetime had expired — an indicator
+    // that arrives late is a lie, and it would have delayed the answer too.
+    // This await returning at all, with the send still parked, is the assertion.
+    await transport.sendChatAction(7, "typing");
+    expect(calls.map((call) => call.method)).toEqual(["sendRichMessage", "sendChatAction"]);
+
+    releaseSend();
+    await send;
+  });
+
+  it("swallows a refused chat action instead of failing the turn behind it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => telegramResponse({ ok: false, error_code: 403, description: "Forbidden: bot was blocked" }, 403)),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    await expect(transport.sendChatAction(7, "typing")).resolves.toBeUndefined();
+  });
+
   it("holds an album open across getUpdates page boundaries instead of splitting it", async () => {
     vi.useFakeTimers();
     const transport = new TelegramBotTransport("test-token", 42, 1, logger);

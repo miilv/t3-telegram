@@ -1177,6 +1177,45 @@ chat differs. `"message is not modified"` counts as delivered. On a
 `TELEGRAM_BAD_REQUEST` that is not ambiguous, an edit falls back to a fresh
 send; anything else is rethrown so nothing duplicates.
 
+### Signs of life (package 4.1, audit «латентность №1–5»)
+
+Two indicators, and a rule about which one is owed:
+
+```
+draft preview  — durable-looking, carries content, one per Operator turn
+chat action    — ephemeral (~5 s), carries nothing, creates no message
+```
+
+`sendChatAction` **bypasses `outbound`** — no per-chat lock, one attempt, no
+inline flood wait, errors swallowed — for the same reason `sendAlert` does
+(package 0.7): a pulse that queues behind a rate-limited send lands after its
+own lifetime has expired, having delayed the answer it was queued in front of.
+An indicator that arrives late is a lie.
+
+Where each fires:
+
+```
+message accepted (transport)      → typing, per message, while the batch window holds it
+ingress starts (daemon)           → typing
+attachment download / enrichment  → typing every 4 s for as long as the work runs
+Operator turn, no live preview    → typing every 4 s
+Operator turn, live preview       → preview only; heartbeat refresh every 15 s
+```
+
+The turn's typing pulse stops only when the chat really has a preview to look
+at: a write must have been *issued through an existing writer* and Telegram
+must not have refused it (`DraftWriter.healthy`). A draft that never started —
+`startDraft` threw, the destination refuses drafts — or one Telegram later
+rejects keeps the pulse running for the whole turn. The old flag meant "a write
+was attempted", so such a chat went silent 15 s in and stayed silent.
+
+`DraftWriter` flushes on a 300 ms quiet timer **and** on an 800 ms max-wait
+deadline that later appends do not push back. Under a continuous token stream
+the quiet timer never expires, so before the deadline existed the preview only
+moved when the 15 s heartbeat pushed it — in jumps. `reset`, `finalize` and
+`closePreview` disarm both timers, so a dropped preamble cannot be resurrected
+by a deadline armed before it (package 1.1/bug №40).
+
 ### Retry classification
 
 | input | code | retryable | ambiguous |
@@ -1261,6 +1300,31 @@ inbound size gate
 Local Bot API path checks throw
 `Local Bot API returned a file outside the configured root` and
 `Local Bot API file path escaped the configured root`.
+
+**One line before the first byte** (package 4.1, «латентность №3/№4»). Ingestion
+is the longest silence the system can produce — download, ffmpeg, then an STT
+call whose long deadline is 30 minutes — so the daemon says what it is doing
+*before* it starts, from the metadata Telegram already sent. Exactly one message,
+never two, and the turn's own answer never restates it:
+
+```
+long transcribable media (declared > 60 s or > 5 MiB)
+├─ alone   → "Расшифровываю голосовое (6 мин)."
+└─ in bulk → "Принял 7 сообщ. (вложений: 4) — расшифровываю медиа (3 шт.)."
+bulk only (≥ 5 messages or ≥ 3 attachments or > 10 MiB declared)
+           → "Принял 7 сообщ. (вложений: 4) — разбираю."
+otherwise  → nothing; the typing pulse is enough
+```
+
+The attachment threshold dropped 5 → 3 and gained a size rule; the **message**
+count stays at 5 on purpose. Three quickly typed lines are one batch too, and
+they carry no ingestion at all — acking those would put a durable line in front
+of every hurried burst. A short voice gets no message either: it is transcribed
+faster than a notice about it would be read, and single-voice keeps durable
+lines for the Operator.
+The notice itself is the daemon's machine indication, not the Operator speaking
+— neutral, short, factual. Its outbox key is per `(chat, message)`, so a
+replayed ingress job never posts it twice.
 
 ```
 voice / audio / video_note / video

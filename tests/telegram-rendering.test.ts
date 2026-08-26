@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   DraftWriter,
   markdownToTelegramHtml,
@@ -297,11 +297,14 @@ describe("Telegram rich rendering", () => {
 describe("DraftWriter keep-alive", () => {
   function fakeTransport() {
     const updates: string[] = [];
+    const updatedAt: number[] = [];
     return {
       updates,
+      updatedAt,
       transport: {
         updateDraft: async (_draft: unknown, text: string) => {
           updates.push(text);
+          updatedAt.push(Date.now());
         },
         finalizeDraft: async () => [],
       } as unknown as ConstructorParameters<typeof DraftWriter>[0],
@@ -334,4 +337,103 @@ describe("DraftWriter keep-alive", () => {
     writer.refresh("⏳ Работаю…");
     expect(updates).toEqual([]);
   });
+
+  it("advances a continuous stream on the max-wait deadline (package 4.1, finding «латентность №2»)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { updates, updatedAt, transport } = fakeTransport();
+      const writer = new DraftWriter(transport, draftSlot(4));
+      // A dense token stream: every delta arrives before the 300 ms quiet timer
+      // can expire, so the pure debounce re-armed itself forever and NEVER
+      // flushed — the preview only moved when the daemon's 15 s heartbeat
+      // pushed it, in jumps, with the chat frozen in between.
+      const startedAt = Date.now();
+      for (let tick = 0; tick < 20; tick += 1) {
+        writer.append("сло ");
+        await vi.advanceTimersByTimeAsync(100);
+      }
+      // 2 s of unbroken stream: at least two deadline flushes, the first within
+      // a second of the first token.
+      expect(updates.length).toBeGreaterThanOrEqual(2);
+      expect(updatedAt[0]! - startedAt).toBeLessThanOrEqual(1_000);
+      // Each edit carries everything streamed so far, and the last one lands
+      // well before the stream ends.
+      expect(updates.at(-1)!.length).toBeGreaterThan(updates[0]!.length);
+      await writer.closePreview();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still coalesces a pause into one edit instead of one edit per token", async () => {
+    vi.useFakeTimers();
+    try {
+      const { updates, transport } = fakeTransport();
+      const writer = new DraftWriter(transport, draftSlot(5));
+      writer.append("Смотрю ");
+      writer.append("логи ");
+      writer.append("авторизации.");
+      await vi.advanceTimersByTimeAsync(300);
+      // The max-wait is a ceiling, not a second schedule: a burst that stops
+      // still costs exactly one API call.
+      expect(updates).toEqual(["Смотрю логи авторизации."]);
+      await writer.closePreview();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never lets the max-wait deadline resurrect text a reset dropped (package 1.1)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { updates, transport } = fakeTransport();
+      const writer = new DraftWriter(transport, draftSlot(6));
+      // The throwaway pre-tool preamble arms both timers…
+      writer.append("Сейчас посмотрю");
+      await vi.advanceTimersByTimeAsync(100);
+      // …and the first tool call drops it for the working placeholder (bug №40).
+      writer.reset("⏳ Работаю…");
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(updates).toEqual(["⏳ Работаю…"]);
+      await writer.closePreview();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a preview Telegram refused, and takes it back when one lands (package 4.1, finding «латентность №1»)", async () => {
+    let refuse = true;
+    const writer = new DraftWriter(
+      {
+        updateDraft: async () => {
+          if (refuse) throw new Error("Bad Request: MESSAGE_ID_INVALID");
+        },
+        finalizeDraft: async () => [],
+      } as unknown as ConstructorParameters<typeof DraftWriter>[0],
+      draftSlot(7),
+    );
+    expect(writer.healthy).toBe(true);
+
+    // A refused edit is invisible in the chat. The caller reads this to decide
+    // whether it still owes the user a typing pulse — treating a failed write
+    // as a sign of life is exactly what left the chat silent for whole turns.
+    writer.refresh("⏳ Работаю… 30 с");
+    await settle();
+    expect(writer.healthy).toBe(false);
+
+    refuse = false;
+    writer.refresh("⏳ Работаю… 45 с");
+    await settle();
+    expect(writer.healthy).toBe(true);
+    await writer.closePreview();
+  });
 });
+
+function draftSlot(draftId: number): never {
+  return { mode: "rich-draft", chatId: 7, draftId, text: "…" } as never;
+}
+
+/** Let the writer's serialized chain settle. */
+async function settle(): Promise<void> {
+  for (let tick = 0; tick < 5; tick += 1) await Promise.resolve();
+}

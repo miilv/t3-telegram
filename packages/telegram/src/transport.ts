@@ -739,12 +739,30 @@ export class TelegramBotTransport implements TelegramTransport {
     );
   }
 
+  /**
+   * Ephemeral sign of life. Creates no message and lives ~5 s in the client.
+   *
+   * Package 4.1: deliberately bypasses `outbound`, for the same reason
+   * `sendAlert` does (package 0.7). A chat action queued behind the per-chat
+   * lock waits out whatever the lock holds — including the 30 s inline flood
+   * wait a rate-limited send is allowed to park for — and lands long after the
+   * indicator it carries has expired, having delayed the real answer behind it.
+   * One attempt, no retry, no flood wait: this is exactly the class of call
+   * whose late delivery is worse than its loss. Failures are swallowed —
+   * every caller treats the pulse as best-effort anyway.
+   */
   async sendChatAction(
     chatId: number,
     action: TelegramChatAction,
     destination: TelegramDestination = {},
   ): Promise<void> {
-    await this.outbound(chatId, () => this.bot.api.sendChatAction(chatId, action, destinationOptions(destination)));
+    try {
+      await this.bot.api.sendChatAction(chatId, action, destinationOptions(destination));
+    } catch (error) {
+      const disposition = classifyTelegramDeliveryError(error);
+      metrics.increment("telegram_errors_total", { code: disposition.code });
+      this.logger.debug({ chatId, action, errorCode: disposition.code }, "Chat action was dropped");
+    }
   }
 
   /**
@@ -894,6 +912,19 @@ export class TelegramBotTransport implements TelegramTransport {
         this.logger.warn({ err: error }, "Inbound message observer failed");
       }
     }
+    // Package 4.1, finding «латентность №5»: from here until the batch window
+    // closes the chat is dead air — the daemon has not been handed the message
+    // yet, so nothing else can answer for it, and a burst that keeps re-arming
+    // the window holds it for up to 180 s (an album adds its own 650 ms before
+    // that). A chat action creates no message and costs nothing durable, and
+    // pulsing on every arriving message covers exactly the moments the window
+    // is extended.
+    void this.sendChatAction(normalized.chatId, "typing", {
+      ...(normalized.messageThreadId ? { messageThreadId: normalized.messageThreadId } : {}),
+      ...(normalized.directMessagesTopicId
+        ? { directMessagesTopicId: normalized.directMessagesTopicId }
+        : {}),
+    });
     // Albums arrive as separate updates sharing a media_group_id; collapse them
     // first, then let the collapsed envelope join the chat-level batch.
     if (normalized.mediaGroupId) {
