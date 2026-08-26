@@ -17,6 +17,8 @@ import type {
   ArtifactRef,
   AutomationSchedule,
   Fence,
+  JournalEntry,
+  NowItem,
   OperatorPolicySettings,
   OperatorToolAccess,
   Project,
@@ -27,18 +29,34 @@ import type {
 } from "../../shared/src/index.js";
 import {
   DEFAULT_TIME_ZONE,
+  NOW_AGENT_WRITE_KEY,
+  NOW_SECTIONS,
+  NOW_STATUSES,
   forgetOwnDispatchMarker,
   isValidTimeZone,
   knownFenceNonces,
   newId,
   nowIso,
   openFence,
+  ownerLogicalDay,
   resolveTimeZone,
   raiseOwnDispatchPending,
   redactSecretsDeep,
   releaseOwnDispatchPending,
   truncateFenceAware,
 } from "../../shared/src/index.js";
+import {
+  NOW_HINT_CLOSE_NEEDS_ID,
+  NOW_HINT_CREATE_NEEDS_FIELDS,
+  NOW_HINT_DAEMON_CLOSE,
+  NOW_HINT_DAEMON_CONTENT,
+  NOW_HINT_UNKNOWN_ITEM,
+  journalSlugBase,
+  lintNowContent,
+  mayAgentEditContent,
+  renderClosedItemJournalBody,
+  selectNowItemsForRender,
+} from "../../policy/src/now-items.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 import type {
   SentMessage,
@@ -74,6 +92,8 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "memory.get",
   "memory.remember",
   "memory.journal",
+  "now.get",
+  "now.update",
   "scheduler.list_automations",
   "scheduler.create_automation",
   "scheduler.pause_automation",
@@ -146,6 +166,19 @@ export interface OperatorToolServerOptions {
   updatePolicy?: (patch: Partial<OperatorPolicySettings>, updatedBy: string) => OperatorPolicySettings;
   /** Bug №13: live worker occupancy so t3.send_turn can enforce maxParallelWorkers. */
   activeWorkers?: () => { count: number; threadIds: string[] };
+  /**
+   * The owner's IANA zone, for the logical DAY a journal entry is filed under
+   * (§2.4). A journal keyed by UTC dates would file the owner's late evening
+   * under tomorrow — and the 03:00 boundary of §2.7 exists precisely so that a
+   * night's work lands in the day it belongs to.
+   */
+  ownerTimeZone?: () => string | undefined;
+  /**
+   * Bring the daemon's half of the now-state ledger up to date before a read
+   * (review S5). Optional like `activeWorkers`: a tool server booted without a
+   * daemon still answers, it just answers from the table as it stands.
+   */
+  reconcileNowItems?: () => void;
   logger: Logger;
   onThreadStarted?: (input: ToolStartedThread) => void | Promise<void>;
   fetchImpl?: typeof fetch;
@@ -156,6 +189,17 @@ interface TurnCapability {
   context: OperatorToolTurnContext;
   expiresAt: number;
   sentMessageIds: Set<number>;
+  /**
+   * How many now items THIS turn attempt has created (memory-design §2.2).
+   *
+   * The second half of the replay-idempotency key, and it lives on the
+   * capability rather than in the database on purpose: a crash-replay of an
+   * ingress job is a NEW capability, so the counter restarts at zero and the
+   * replay's first create lands on the row the first attempt already wrote.
+   * Counting stored rows instead would make every replay start where the
+   * previous attempt stopped and duplicate the whole set.
+   */
+  nowCreateSeq: number;
 }
 
 interface ToolResult {
@@ -286,6 +330,7 @@ export class OperatorToolServer {
       },
       expiresAt: Date.now() + CAPABILITY_TTL_MS,
       sentMessageIds: new Set(),
+      nowCreateSeq: 0,
     });
     let revoked = false;
     return {
@@ -776,6 +821,166 @@ export class OperatorToolServer {
           ...(types?.length ? { typePrefixes: types } : {}),
           ...(limit !== undefined ? { limit } : {}),
         });
+      },
+    });
+
+    // Package 2.2 (memory-design §2.2): the now-state ledger, both halves.
+    //
+    // `now.get` is the pull side of the push — the overflow tail of the pushed
+    // now layer names it, and persona rule 6 sends the agent here whenever it
+    // is unsure what is currently happening. It answers about the LEDGER, which
+    // is what "current state" means; `memory.search` answers about what was
+    // once written down, and `t3.search_threads` about the worker runtime.
+    this.addTool(server, token, {
+      name: "now.get",
+      description:
+        "Read the COMPLETE current now-state: everything you and the daemon are tracking as active, blocked, waiting, next or debt. This is the full list the pushed state layer only shows the top of.",
+      schema: z.object({
+        includeClosed: z
+          .boolean()
+          .optional()
+          .describe("Also return items already closed (their journal entries are named)."),
+      }),
+      readOnly: true,
+      handler: ({ includeClosed }, capability) => {
+        this.requireAdministrativeRole(capability, "read the Operator now-state");
+        // Review S5: persona rule 6 sends the agent here ON DOUBT, and the
+        // description promises the complete state — so this must not answer
+        // from a ledger the daemon has not reconciled since the last push. A
+        // finished thread would otherwise be reported as active to the one
+        // caller that asked precisely because it did not trust its memory.
+        this.options.reconcileNowItems?.();
+        const items = this.options.store.listNowItems({
+          ownerId: capability.context.ownerId,
+          ...(includeClosed ? { includeClosed: true } : {}),
+        });
+        const open = items.filter((item) => item.status !== "closed");
+        const shown = new Set(
+          selectNowItemsForRender(open, this.now()).map((item) => item.id),
+        );
+        return {
+          ok: true,
+          items: open.filter((item) => shown.has(item.id)).map(compactNowItem),
+          // Hidden ≠ gone: an expired item is out of the render but still in
+          // the ledger until the secretary files it (§2.2). Saying how many
+          // there are keeps `now.get` honest about being the FULL list without
+          // re-surfacing what the design decided to stop showing. Counted over
+          // the OPEN items only — a closed item is archived, not hidden, and it
+          // has a journal entry that says where it went.
+          ...(open.length > shown.size
+            ? {
+                hidden: open.length - shown.size,
+                hiddenNote:
+                  "Items past their valid_until are no longer shown; they stay in the ledger until the daily pass files them.",
+              }
+            : {}),
+          ...(includeClosed
+            ? { closed: items.filter((item) => item.status === "closed").map(compactNowItem) }
+            : {}),
+        };
+      },
+    });
+    this.addTool(server, token, {
+      name: "now.update",
+      description:
+        "Create or change ONE now-state item — what is active, blocked, waiting on someone, next, or owed. Omit id to create; pass an id from now.get to change one. Setting status='closed' archives it into the journal. Content is one line of at most 200 characters.",
+      schema: z.object({
+        id: z.string().trim().min(1).max(120).optional(),
+        section: z.enum(NOW_SECTIONS).optional(),
+        // The 200-character rule is the LINTER's, not the schema's, on purpose:
+        // a schema rejection surfaces as a thrown MCP error, which Claude
+        // renders loudly and Codex renders as a terse line — the exact
+        // asymmetry §5 wants gone. The generous bound here only keeps a
+        // runaway payload out of the database; the hint does the teaching.
+        content: z.string().max(4_000).optional(),
+        status: z.enum(NOW_STATUSES).optional(),
+        validUntil: z
+          .string()
+          .datetime()
+          .nullable()
+          .optional()
+          .describe(
+            "Hide the item from the pushed state after this instant; pass null to remove a deadline you set earlier.",
+          ),
+      }),
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "write the Operator now-state");
+        const store = this.options.store;
+        const ownerId = capability.context.ownerId;
+        if (input.id) {
+          const existing = store.getNowItem(input.id);
+          // Scoped by owner as well as by id: the ledger is per-owner, and an
+          // id from another owner's ledger must read as absent, not as denied.
+          //
+          // A CLOSED item reads as absent too (review L9). It is archived: its
+          // journal entry already describes it in the past tense, and letting
+          // an update resurrect it would leave that entry describing something
+          // alive — and, for a daemon item, hand the reconciliation a second
+          // close to write a second entry for.
+          if (!existing || existing.ownerId !== ownerId || existing.status === "closed") {
+            return { ok: false, hint: NOW_HINT_UNKNOWN_ITEM };
+          }
+          const rewording =
+            input.content !== undefined && input.content.trim() !== existing.content.trim();
+          // §2.2, double bookkeeping: the agent owns where a daemon item SITS
+          // and how it is marked, never what it SAYS — the daemon regenerates
+          // that from the thread, so an accepted edit would be silently undone.
+          if (rewording && !mayAgentEditContent(existing)) {
+            return { ok: false, hint: NOW_HINT_DAEMON_CONTENT };
+          }
+          if (input.content !== undefined) {
+            const lint = lintNowContent(input.content);
+            if (!lint.ok) return lint;
+          }
+          const content = rewording ? input.content!.trim() : existing.content;
+          if (input.status === "closed") {
+            // Review B2: a daemon item's life is its thread's life. Closing one
+            // by hand removed live work from the state for good — the unique
+            // `thread_ref` refuses a replacement — and "stop this" has a real
+            // tool that actually stops it.
+            if (existing.source === "daemon") {
+              return { ok: false, hint: NOW_HINT_DAEMON_CLOSE };
+            }
+            const closed = this.closeNowItemWithJournal(existing.id, content);
+            if (closed.ok) this.markNowWrite(capability);
+            return closed;
+          }
+          const updated = store.updateNowItem(input.id, {
+            ...(input.section ? { section: input.section } : {}),
+            ...(rewording ? { content } : {}),
+            ...(input.status ? { status: input.status } : {}),
+            // `null` clears the deadline, `undefined` leaves it alone — the two
+            // are different intentions and the schema keeps them apart (L10).
+            ...(input.validUntil !== undefined ? { validUntil: input.validUntil } : {}),
+          });
+          if (!updated) return { ok: false, hint: NOW_HINT_UNKNOWN_ITEM };
+          this.markNowWrite(capability);
+          return { ok: true, item: compactNowItem(updated) };
+        }
+        if (input.status === "closed") return { ok: false, hint: NOW_HINT_CLOSE_NEEDS_ID };
+        if (!input.section || input.content === undefined) {
+          return { ok: false, hint: NOW_HINT_CREATE_NEEDS_FIELDS };
+        }
+        const lint = lintNowContent(input.content);
+        if (!lint.ok) return lint;
+        // The ordinal is consumed only by a create that got this far: a create
+        // the linter refused never happened, so it must not shift the key of
+        // the next one — otherwise a lint failure on a replayed turn would
+        // re-key every item after it and duplicate the lot.
+        capability.nowCreateSeq += 1;
+        const item = store.createNowItem({
+          ownerId,
+          section: input.section,
+          content: input.content.trim(),
+          source: "agent",
+          ...(capability.context.ingressJobId
+            ? { originJob: capability.context.ingressJobId, createSeq: capability.nowCreateSeq }
+            : {}),
+          ...(input.status === "half" ? { status: "half" as const } : {}),
+          ...(input.validUntil ? { validUntil: input.validUntil } : {}),
+        });
+        this.markNowWrite(capability);
+        return { ok: true, item: compactNowItem(item) };
       },
     });
 
@@ -1609,6 +1814,41 @@ export class OperatorToolServer {
     return { query, results };
   }
 
+  /** §2.4.2: the turn's now-write is a fact only once the row exists. */
+  private markNowWrite(capability: TurnCapability): void {
+    this.options.store.setRuntimeState(
+      NOW_AGENT_WRITE_KEY,
+      capability.context.operatorTurnId,
+    );
+  }
+
+  /**
+   * Close an item and write its archive entry (§2.2). Shared by the tool and
+   * kept next to it rather than inlined, because the daemon closes items too
+   * (its own thread bookkeeping) and the two must produce the same archive.
+   */
+  private closeNowItemWithJournal(
+    id: string,
+    content: string,
+  ): { ok: true; item: ReturnType<typeof compactNowItem>; journalRef: string } | { ok: false; hint: string } {
+    const existing = this.options.store.getNowItem(id);
+    if (!existing) return { ok: false, hint: NOW_HINT_UNKNOWN_ITEM };
+    const at = this.now();
+    const day = ownerLogicalDay(at, this.options.ownerTimeZone?.());
+    const closing: NowItem = { ...existing, content };
+    const closed = this.options.store.closeNowItem(id, {
+      slugBase: journalSlugBase(day, content),
+      day,
+      body: renderClosedItemJournalBody(closing, at.toISOString()),
+      // Review L12: the entry's `source` is who KEPT the item, not who asked
+      // for the close. An archive attributed to the wrong bookkeeper is a
+      // journal the secretary cannot reconcile against the event log.
+      source: existing.source === "daemon" ? "daemon" : "agent",
+    });
+    if (!closed) return { ok: false, hint: NOW_HINT_UNKNOWN_ITEM };
+    return { ok: true, item: compactNowItem(closed.item), journalRef: closed.entry.slug };
+  }
+
   private getCapability(token: string): TurnCapability | undefined {
     const capability = this.capabilities.get(token);
     if (!capability) return undefined;
@@ -1643,6 +1883,28 @@ function destination(context: OperatorToolTurnContext): TelegramDestination {
   return {
     ...(context.messageThreadId ? { messageThreadId: context.messageThreadId } : {}),
     ...(context.directMessagesTopicId ? { directMessagesTopicId: context.directMessagesTopicId } : {}),
+  };
+}
+
+/**
+ * A now item as the agent sees it.
+ *
+ * `originJob` and `createSeq` are the daemon's replay bookkeeping and are
+ * deliberately withheld: they are internals in the sense of persona rule 3, and
+ * an agent that could read the ordinal would be tempted to reason about it.
+ * `source` stays, because the agent has to know which items it may reword.
+ */
+function compactNowItem(item: NowItem): Record<string, unknown> {
+  return {
+    id: item.id,
+    section: item.section,
+    content: item.content,
+    status: item.status,
+    source: item.source,
+    ...(item.threadRef ? { threadRef: item.threadRef } : {}),
+    ...(item.journalRef ? { journalRef: item.journalRef } : {}),
+    ...(item.validUntil ? { validUntil: item.validUntil } : {}),
+    updatedAt: item.updatedAt,
   };
 }
 

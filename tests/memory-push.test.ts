@@ -5,6 +5,7 @@ import {
   LOGICAL_DAY_BOUNDARY_HOUR,
   MEMORY_INDEX_BUDGET_CHARS,
   MEMORY_INDEX_EMPTY,
+  NOW_ITEM_CONTENT_CHARS,
   NOW_STATE_BUDGET_CHARS,
   NOW_STATE_EMPTY,
   NOW_STATE_HEADER,
@@ -31,8 +32,21 @@ import type {
   PauseAssessment,
   PushBaseline,
 } from "../packages/policy/src/index.js";
+import { MAINTENANCE_INDEX_BUDGET_CHARS } from "../packages/policy/src/index.js";
+import { newId, ownerLogicalDay } from "../packages/shared/src/index.js";
 
 const ZONE = "Europe/Moscow"; // UTC+3, no DST — arithmetic in the tests stays readable.
+
+/** The owner-local hour, read the way the classifier reads it. */
+function localHour(instant: Date): number {
+  return Number(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: ZONE,
+      hour: "2-digit",
+      hour12: false,
+    }).format(instant),
+  );
+}
 
 function pause(overrides: Partial<PauseAssessment> = {}): PauseAssessment {
   return {
@@ -136,6 +150,39 @@ describe("pause classifier (memory-design §2.7)", () => {
     expect(assessment.onlyWhenChanged).toBe(false);
   });
 
+  /**
+   * Package 2.1 backlog: pin the ZONE itself.
+   *
+   * Both boundary cases below are written as local wall-clock times in their
+   * comments, and every one of those claims rests on `Europe/Moscow` being
+   * UTC+3 with no DST at these instants. If `ownerLogicalDay` quietly ignored
+   * its zone argument, the first case would still be four hours long and the
+   * second still forty minutes — the duration margin would carry the assertions
+   * and the zone bug would ride along invisibly. So: assert the crossing is a
+   * fact about the OWNER'S day and not about UTC's.
+   */
+  it("pins the zone the boundary cases are written in", () => {
+    const evening = new Date("2026-08-25T20:30:00.000Z"); // 23:30 local
+    const earlyMorning = new Date("2026-08-26T00:30:00.000Z"); // 03:30 local
+    expect(localHour(evening)).toBe(23);
+    expect(localHour(earlyMorning)).toBe(3);
+    expect(localHour(new Date("2026-08-25T23:40:00.000Z"))).toBe(2);
+    expect(localHour(new Date("2026-08-26T00:20:00.000Z"))).toBe(3);
+    // Owner-local: two different logical days. In UTC: the same one — which is
+    // exactly the discrimination the next test depends on.
+    expect(ownerLogicalDay(evening, ZONE, LOGICAL_DAY_BOUNDARY_HOUR)).not.toBe(
+      ownerLogicalDay(earlyMorning, ZONE, LOGICAL_DAY_BOUNDARY_HOUR),
+    );
+    expect(ownerLogicalDay(evening, "UTC", LOGICAL_DAY_BOUNDARY_HOUR)).toBe(
+      ownerLogicalDay(earlyMorning, "UTC", LOGICAL_DAY_BOUNDARY_HOUR),
+    );
+    // …and the same gap read in UTC is therefore NOT a cold resume, so the
+    // classifier below is genuinely reading the zone it was handed.
+    expect(
+      classifyPause({ previousAt: evening, now: earlyMorning, timeZone: "UTC" }).pauseClass,
+    ).toBe("significant");
+  });
+
   it("makes a shorter gap cold when it crosses the 03:00 owner-local day boundary", () => {
     // 23:30 local -> 03:30 local next logical day: four hours, but a different
     // day by the 03:00 boundary, so it resumes rather than continues.
@@ -227,6 +274,81 @@ describe("layer renderers and their budgets", () => {
     const rendered = renderNowState(items);
     expect(rendered).toContain("Старый, но закреплённый пункт демона");
     expect(rendered.length).toBeLessThanOrEqual(NOW_STATE_BUDGET_CHARS);
+  });
+
+  /**
+   * Package 2.1 backlog: the budget search must run the FULL range of prefix
+   * lengths, never stop at the first overflow.
+   *
+   * Length is not monotonic in the item count. The last item to be added is
+   * also the one that removes the `(+1 items — …)` tail, and when the tail is
+   * longer than that item's own line, the complete list is SHORTER than the
+   * list with one item missing. A `break` on the first candidate that does not
+   * fit would return the shorter selection, print a tail nobody needed, and
+   * send the agent to `now.get` for an item that would have fitted.
+   *
+   * The budget is set to exactly the full render, so the mutation is fatal:
+   * with an early break the result is a strictly smaller list with a tail.
+   */
+  it("takes the largest fitting prefix, not the first one that overflows", () => {
+    const items = [
+      nowItem("t_1", { content: `Первая работа ${"хвост ".repeat(12).trim()}`, updatedAt: "2026-08-26T12:00:03.000Z" }),
+      nowItem("t_2", { content: `Вторая работа ${"хвост ".repeat(12).trim()}`, updatedAt: "2026-08-26T12:00:02.000Z" }),
+      // Deliberately tiny: its line is far shorter than the overflow tail.
+      nowItem("t_3", { content: "х", updatedAt: "2026-08-26T12:00:01.000Z" }),
+    ];
+    const full = renderNowState(items, { budget: 100_000 });
+    const withoutLast = renderNowState(items.slice(0, 2), { budget: 100_000 });
+    const tail = "\n(+1 items — call now.get for the full list)";
+    // The precondition the whole test rests on: dropping the last item and
+    // printing the tail instead makes the render LONGER, not shorter.
+    expect(withoutLast.length + tail.length).toBeGreaterThan(full.length);
+
+    const tight = renderNowState(items, { budget: full.length });
+    // Same render (the fence nonce is drawn fresh, so compare shape, not text):
+    // every item present, no tail, exactly the length of the complete list.
+    expect(tight.length).toBe(full.length);
+    expect(tight).not.toContain("(+");
+    for (const item of items) expect(tight).toContain(item.content);
+  });
+
+  /**
+   * Package 2.1 backlog: 20 000 → 32 000 for the maintenance one-shot.
+   *
+   * The pass names the note ids it wants to retire, so a note it never saw is a
+   * note this mechanism can never retire — and the render says so with a tail
+   * rather than an error, which is precisely why the shortfall was invisible.
+   */
+  it("shows the maintenance one-shot every note it may retire", () => {
+    // The real shape: 200 notes (the store's ceiling) indexed by the temporary
+    // §6.4 format, whose reference is a 41-character `note_<uuid>` id.
+    const notes = Array.from({ length: 200 }, (_, index) =>
+      note(newId("note"), {
+        content: `Заметка ${index}: ${"содержимое ".repeat(12)}`,
+        updatedAt: new Date(Date.UTC(2026, 7, 26, 12, 0, index)).toISOString(),
+      }),
+    );
+    expect(notes[0]!.id).toHaveLength(41);
+    const rendered = renderMemoryIndex(notes, { budget: MAINTENANCE_INDEX_BUDGET_CHARS });
+    expect(rendered).not.toContain("(+");
+    for (const item of notes) expect(rendered).toContain(item.id);
+    // …and the old number genuinely did not, so the raise is not decoration.
+    expect(renderMemoryIndex(notes, { budget: 20_000 })).toContain("(+");
+  });
+
+  it("cuts an over-long item by code point, never through an emoji", () => {
+    // Titles are worker-written and now-items are agent-written, so an emoji in
+    // one is ordinary. `String.slice` cuts by UTF-16 unit and would drop a lone
+    // surrogate into the trusted head of the envelope.
+    const rendered = renderNowState([nowItem("t_emoji", { content: "🙂".repeat(300) })]);
+    expect(rendered).toMatch(/🙂…/u);
+    expect(rendered).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+    // …and the cut still honours the per-item cap, counted the same way the
+    // write linter counts it: the content is 199 emoji plus the ellipsis, and
+    // the annotations that follow it are the daemon's own words, not content.
+    expect([...rendered].filter((point) => point === "🙂")).toHaveLength(
+      NOW_ITEM_CONTENT_CHARS - 1,
+    );
   });
 
   it("indexes legacy notes as ~100 characters of content pointing at the id (§6.4)", () => {
@@ -608,13 +730,17 @@ describe("persona rules (memory-design §2.1)", () => {
   it("carries the rules required by §2.1", () => {
     const rules = renderPersonaRules();
     // verified_at discipline, the routing self-correction protocol, and
-    // "when in doubt, re-read the state" (now.get lands in package 2.2, so the
-    // rule points at what exists today).
+    // "when in doubt, re-read the state".
     expect(rules).toContain("checked before it is written down");
     expect(rules).toContain("you knew about X");
-    // Review No.6: "what is running right now" is a question for the thread
-    // tools; memory.search answers "what did I once write down".
-    expect(rules).toContain("t3.search_threads");
+    // Package 2.2: "what is happening right now" is a question for the LEDGER,
+    // so rule 6 finally points at `now.get` instead of the thread search the
+    // 2.1 placeholder source made it point at. `memory.search` answers the
+    // different question "what did I once write down" (review No.6), and
+    // `now.update` is the writing half of the same rule.
+    expect(rules).toContain("now.get");
+    expect(rules).toContain("now.update");
+    expect(rules).not.toContain("t3.search_threads");
     expect(rules).toContain("[gap: …]");
   });
 

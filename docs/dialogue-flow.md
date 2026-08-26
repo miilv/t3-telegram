@@ -222,10 +222,10 @@ duplicate callback        → beginEvent false → silent return
 
 ## 3. The turn envelope
 
-Two segments, joined by blank lines: the **push head** (package 2.1) and the
-**turn instruction** (the lines that used to be the whole envelope).
+Two segments, joined by blank lines: the **push head** (packages 2.1–2.2) and
+the **turn instruction** (the lines that used to be the whole envelope).
 
-### The push head (package 2.1, memory-design §1/§4)
+### The push head (packages 2.1–2.2, memory-design §1/§4)
 
 The daemon assembles it in `buildPushSections`; the renderers themselves live in
 `packages/policy/src/memory-layers.ts`, beside `buildOperatorSystemPrompt` —
@@ -259,11 +259,69 @@ legacy note is indexed by the temporary format of memory-design §6.4 — the fi
 ~100 characters of its content pointing at its id, which `memory.get` accepts as
 a reference.
 
-The now-state source is **temporary** in package 2.1: the daemon's own live work
-threads, ranked and defanged. The `now_items` table, the agent's own entries and
-`now.get` arrive in package 2.2; until then the overflow tail points at
-`t3.search_threads`, because naming a tool that does not exist is worse than no
-tail at all.
+The now-state source is the **`now_items` ledger** (package 2.2, memory-design
+§2.2). Its overflow tail names `now.get`, which returns the complete list.
+
+The ledger is kept by **two writers** ("двойная бухгалтерия"):
+
+- the **daemon** keeps one item per work thread (`source='daemon'`,
+  `thread_ref`), opened when the thread starts and closed when it reaches a
+  terminal state. That bookkeeping is a **projection**, reconciled from the
+  thread table whenever the layer is read (`reconcileDaemonNowItems`), not a
+  hook at each of the dozen sites that move a thread's status — so a daemon that
+  died between a terminal event and its bookkeeping catches up on the next read
+  instead of leaving a finished work in the state forever;
+- the **agent** keeps everything else through `now.update`, and may move
+  (`section`) or mark (`status`) a daemon item but not reword it — the daemon
+  regenerates that text, so an accepted edit would be silently undone. The one
+  wrinkle: the daemon derives only `active` and `waiting`, so a section outside
+  that pair can only be the agent's judgement and the daemon leaves it standing.
+  It may not **close** one either: a daemon item's life is its thread's life,
+  and "stop this work" is `t3.interrupt_thread`, which actually stops it.
+
+Because the daemon's half is a projection it also **reopens**: a closed item
+whose thread is live again — package 1.3 deliberately lets a finished thread run
+again — comes back with its original `created_at` and no `journal_ref`, while
+the entry recording the earlier close stays in the journal. That is the
+property hooks cannot have, and it is why the ledger cannot be permanently
+corrupted by a single bad write.
+
+**On a database upgraded in place** the ledger starts empty, so the first turn
+after the upgrade reconciles every live thread into it at once and the
+in-episode diff reports them all as new. It is accurate — the agent has indeed
+never been shown this layer — and it happens once.
+
+Writes are keyed for **replay idempotency** on `(origin_job, ordinal of the
+create within the turn)` — deliberately not on the section, because one turn may
+legitimately open two `next` items and a partial replay must top the missing one
+up rather than merge them. The ordinal lives on the per-turn tool capability, so
+a crash-replay (a new capability for the same ingress job) restarts the count
+and lands back on the rows the first attempt wrote.
+
+The **write linter** is per-item only (`content` ≤200 characters, no code
+blocks) and reports structurally as `{ok: false, hint}` with texts fixed in
+`packages/policy/src/now-items.ts` — a thrown error renders loudly in Claude and
+tersely in Codex, and a rule only one branch can read is a rule that disappears
+on provider switch. There is no aggregate budget check on the write path at all:
+the budget belongs to the render (memory-design §2.2), and refusing a write
+mid-turn costs iterations while the owner waits.
+
+A now line carries the item's id, its thread when it has one, its `updated`
+instant and its hiding deadline in the owner's zone, blick's `[~]` box when the
+item is `half`, and `→ journal <slug>` when it is archived — the shape of the
+memory-design §2.2 example. That costs ~45 characters an item, so the layer
+reaches the overflow tail at roughly **40 items** rather than ~90; the tail is
+the designed answer, and the daemon's `active`/`blocked` items are pinned in
+front of it. Item ids in the line exist so a correction needs no `now.get`
+round trip for something the envelope already showed.
+
+`status='closed'` archives the item into `journal_entries` in the **same
+transaction** (a close whose archive failed would erase work with nothing left
+behind it); the item leaves the render immediately. An item past `valid_until` is
+**hidden** from the render immediately but stays in the ledger — filing it into
+the journal is the secretary's job in package 3.1, and it cannot file a row this
+layer already deleted. `now.get` reports how many it hid, so its claim to be the
+full list stays true.
 
 After the layers comes the `[gap: …]` line, on a `significant` or `cold-resume`
 pause only. The classifier (memory-design §2.7, `packages/policy/src/pauses.ts`)
@@ -284,12 +342,34 @@ The gap line's wording follows what the envelope actually contains: after a
 `significant` pause where nothing moved there is no state section above it, so
 it says so instead of pointing at state that is not there.
 
+Last in the head comes the **in-the-moment check** (package 2.2, memory-design
+§2.4.2): when the previous turn called a mutating tool and recorded nothing in
+the now-state, the next envelope carries one fixed `[state check: …]` line. It
+is deliberately narrow. Only on the owner's own turn, and only *inside* the
+episode (`same-episode`/`light`) — past a `significant` pause the turn it refers
+to is not what either of them is doing, and the reminder is dropped rather than
+delivered stale, because the secretary reconciles that window from the event log
+anyway. At most **two in a row** (`now_check_streak`), then it becomes the
+secretary's problem: a third repetition has never been what changes a model's
+behaviour. And never after a **preemption** — the check runs past the supersede
+branch, so a turn the owner's own next message replaced is never blamed for the
+record it was not given time to write. Both flags live in `runtime_state`
+(`now_check_pending_turn`, `now_check_streak`) and survive a restart; the
+"did the agent write" half is `now_agent_write_turn`, set by `now.update` only
+when a row actually landed, so a call the linter refused does not count. The
+line itself explicitly sanctions ignoring it — a nudge that cannot be declined
+is a loop.
+
 The diff baseline is persistent: `memory_push_baseline` in `runtime_state` holds
 `(sessionId, epoch, nowHash, snapshotHash, ownerSnapshotHash, per-item
 fingerprints)`. The two hashes answer two different questions: `snapshotHash` is
 what the SESSION last had pushed into it (background digests move it, and they
 must — the diff is computed against it), while `ownerSnapshotHash` is what the
-OWNER last saw, and only their own turn advances it. "Did anything change while
+OWNER last saw, and only their own turn advances it — and only on a **full**
+push (package 2.2). A diff turn shows them the now layer alone, so a durable
+note that changed in the same window is invisible in it; letting an ordinary
+in-episode reply advance the hash would make the next significant pause answer
+"nothing moved" about state the owner never saw. "Did anything change while
 they were away" can only be measured against the second one. It moves
 when the provider **accepts** the prompt (the first event of the stream), not
 when the answer is delivered — a turn preempted after its prompt was sent still
@@ -343,11 +423,29 @@ segment. The thread-event branch of `answerDirect` carries the same head, for
 the same reason — a digest interpreted without the current state is exactly the
 turn most likely to contradict it.
 
-`focus_state` itself is untouched: it is the machine binding for
-`relatedThreadIds` on outgoing messages and for path B of §4, and the model
-neither reads nor writes it (`memory.update_focus` is gone too). The agent
-identifies "that work" from the conversation, the reply line, or
-`t3.search_threads`.
+`focus_state` is still the machine binding for `relatedThreadIds` on outgoing
+messages and for path B of §4, and the model still neither reads nor writes it
+(`memory.update_focus` is gone too). What changed in package 2.2 is where it
+comes from: it is **derived** from the daemon's own `active` items — the one
+created last, which is the work started last, `blocked` ones excluded. Ranking
+by `updated_at` would hand the focus to whichever worker was last chatty.
+
+Passive ranking alone was not enough, and package 2.2's review proved it with a
+probe: after starting two works and then returning to the first one, a bare
+"стоп" cancelled the *second* — the hatch killed a live work the owner was not
+talking about. So an **explicit dispatch promotes the focus**: when the agent
+sends a turn into a thread, `promoteFocusToDispatchedThread` moves the binding
+there, provided that thread's daemon item is a valid candidate (`open`,
+`active`). Deliberately excluded: a thread the agent itself moved to `blocked`
+and then continued without unblocking — promoting it would let a routine
+`send_turn` silently overturn the agent's own judgement, which §2.2 leaves to
+the agent. The owner's reply on that answer still routes correctly (package
+1.4 binds the final to the dispatched thread), so the escape hatch is one
+`now.update {section:"active"}` away.
+
+Another user's focus is not derived at all: the ledger is the
+owner's, so a team member's binding is still written directly at dispatch. The
+agent identifies "that work" from the conversation, the reply line, or `now.get`.
 
 ### Structural fencing
 
@@ -1203,10 +1301,12 @@ advertise `max(4_096)`. `send_voice` advertises `1_024` and matches;
 
 ## 13. Tools and the per-turn lease
 
-The tool list is constant (47 names). Narrowing is entirely in the capability
+The tool list is constant (50 names — `now.get` and `now.update` joined in
+package 2.2). Narrowing is entirely in the capability
 context: fixed destination, `originMessageId` as the only reply target,
 `allowedMessageIds` for reactions, `allowedArtifactIds` bypassing project ACLs,
-`teamRole`, `ingressJobId`. TTL 2 h; expired → HTTP 401
+`teamRole`, `ingressJobId`, and the per-turn `now.update` create counter that
+keys replay idempotency (§3). TTL 2 h; expired → HTTP 401
 `{"error":"invalid_or_expired_capability"}`. The server binds `127.0.0.1:0`
 with host and origin validation.
 

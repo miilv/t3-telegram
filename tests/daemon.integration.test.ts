@@ -8366,6 +8366,574 @@ describe("Operator push envelope (package 2.1)", () => {
   }, 20_000);
 });
 
+/**
+ * Package 2.2 — the now-state ledger, end to end.
+ *
+ * These are the assertions that need a whole daemon: the daemon's own half of
+ * the double bookkeeping, the focus it derives from that half, the reminder the
+ * next envelope carries, and the two push-baseline questions whose answers only
+ * differ once the state is NOT empty.
+ */
+describe("Now-state ledger (package 2.2)", () => {
+  const directEnvelopes = (runtime: FakeRuntime): string[] =>
+    runtime.prompts.filter((prompt) => prompt.includes("User message:"));
+
+  /** See the 2.1 block: pin the owner to a zone where "now" is local midday. */
+  function ownerConfigAtLocalNoon(home: string): Config {
+    const offset = 12 - new Date().getUTCHours();
+    const zone = offset === 0 ? "Etc/GMT" : `Etc/GMT${offset > 0 ? "-" : "+"}${Math.abs(offset)}`;
+    const base = config(home);
+    return { ...base, owner: { ...base.owner, timezone: zone } };
+  }
+
+  const hoursAgo = (hours: number): string =>
+    new Date(Date.now() - hours * 60 * 60_000).toISOString();
+
+  interface Harness {
+    store: OperatorStore;
+    runtime: FakeRuntime;
+    broker: FakeBroker;
+    telegram: FakeTelegram;
+    daemon: OperatorDaemon;
+    run: Promise<void>;
+  }
+
+  async function boot(
+    prefix: string,
+    runtime: FakeRuntime,
+    options: { localNoon?: boolean; broker?: FakeBroker; keepWorkRunning?: boolean } = {},
+  ): Promise<Harness> {
+    const home = tempDirectory(prefix);
+    const store = tempStore();
+    const broker = options.broker ?? new FakeBroker();
+    // The scripted worker finishes the instant it starts, which would empty the
+    // ledger before any of these assertions could look at it. Holding the
+    // terminal is what gives the now-state a life to be observed.
+    if (options.keepWorkRunning) broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      ownerTimeZone: () => "Europe/Moscow",
+      reconcileNowItems: () => daemon.reconcileNowState(),
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(
+      options.localNoon ? ownerConfigAtLocalNoon(home) : config(home),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    return { store, runtime, broker, telegram, daemon, run: daemon.run() };
+  }
+
+  it("opens a daemon item when a thread starts and archives it when the work ends", async () => {
+    const broker = new FakeBroker();
+    // The work runs, then finishes: one item's whole life in one turn's wake.
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "completed", threadId: "th_1", result: "Готово" },
+    ];
+    const harness = await boot(
+      "daemon-now-ledger-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, title: "Логирование" })),
+      { broker },
+    );
+    const { store, telegram, runtime } = harness;
+
+    // Hold the terminal so the item's OPEN life is observable at all: without
+    // the gate the scripted worker finishes before the assertions can look.
+    broker.holdTerminal();
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Запустил работу")), 10_000);
+
+    // The daemon keeps ONE item per thread, and it is the daemon's, not the
+    // agent's: the agent never called now.update in this turn.
+    await waitFor(() => store.listNowItems({ ownerId: "42" }).length > 0, 10_000);
+    const opened = store.listNowItems({ ownerId: "42" });
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({ source: "daemon", section: "active", status: "open" });
+    expect(opened[0]?.threadRef).toBe(harness.broker.threads[0]?.id);
+    expect(opened[0]?.content).toContain("Логирование");
+    // Review L8: the item is as old as the WORK, not as old as the sweep that
+    // noticed it. Focus ranks by this instant (§2.2), so stamping it with the
+    // reconciliation time would let a daemon restart silently reorder which
+    // work counts as current.
+    expect(opened[0]?.createdAt).toBe(harness.broker.threads[0]?.createdAt);
+
+    // The terminal event closes it — and the close is an ARCHIVE, not a delete.
+    broker.releaseTerminal();
+    await waitFor(
+      () => store.listNowItems({ ownerId: "42", includeClosed: true })[0]?.status === "closed",
+      10_000,
+    );
+    const closed = store.listNowItems({ ownerId: "42", includeClosed: true })[0]!;
+    expect(store.listNowItems({ ownerId: "42" })).toHaveLength(0);
+    const entry = store.getJournalEntry(closed.journalRef!)!;
+    expect(entry.source).toBe("daemon");
+    expect(entry.body).toContain("Логирование");
+    expect(entry.body).toContain(closed.threadRef!);
+    // …and the closed item is out of the pushed layer at once.
+    telegram.push(message(2, "спасибо"));
+    await waitFor(() => directEnvelopes(runtime).length >= 2, 10_000);
+
+    // Let the held work finish before teardown: a monitor parked on the gate
+    // would otherwise keep the shutdown waiting for its full grace period.
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  it("derives the owner's focus from the daemon's active items, blocked excluded", async () => {
+    // Two works, started in order. The script dispatches a fresh thread per
+    // message instead of continuing one, so the ledger gets two daemon items.
+    let created = 0;
+    const script: OperatorScript = async (envelope, call) => {
+      const task = userText(envelope);
+      if (!/исправь/u.test(task)) return "Париж.";
+      created += 1;
+      const projects = (await call("t3.list_projects", {})) as Array<{ id: string }>;
+      const project =
+        projects[0] ??
+        ((await call("t3.create_project", {
+          name: "Operator Work",
+          workspaceRoot: `${/New project workspaces belong under (\S+)\./u.exec(envelope)?.[1] ?? "/tmp"}/w`,
+        })) as { id: string });
+      const thread = (await call("t3.create_thread", {
+        projectId: project.id,
+        title: `Работа ${created}`,
+      })) as { id: string };
+      await call("t3.send_turn", { threadId: thread.id, text: task });
+      return `Запустил работу ${created}.`;
+    };
+    const harness = await boot("daemon-now-focus-", new DelegatingRuntime(script), {
+      keepWorkRunning: true,
+    });
+    const { store, telegram, broker } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Запустил работу 1")), 10_000);
+    telegram.push(message(2, "исправь ретраи"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Запустил работу 2")), 10_000);
+    await waitFor(() => store.listNowItems({ ownerId: "42" }).length >= 2, 10_000);
+
+    const [firstThread, secondThread] = broker.threads.map((thread) => thread.id);
+    // The work started LAST is the focus — by item creation, not by activity.
+    expect(store.getFocus("42").primary?.threadId).toBe(secondThread);
+
+    // The agent moves the newest work to `blocked`: it is no longer what is
+    // happening now, so it stops being a focus candidate and the focus falls
+    // back to the work still running (§2.2).
+    const newest = store
+      .listNowItems({ ownerId: "42" })
+      .find((item) => item.threadRef === secondThread)!;
+    store.updateNowItem(newest.id, { section: "blocked" });
+    telegram.push(message(3, "столица Франции?"));
+    await waitFor(() => store.getFocus("42").primary?.threadId === firstThread, 10_000);
+    // The daemon regenerating the item must not undo the agent's move.
+    expect(store.getNowItem(newest.id)?.section).toBe("blocked");
+
+    // Let the held work finish before teardown: a monitor parked on the gate
+    // would otherwise keep the shutdown waiting for its full grace period.
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  /**
+   * Review B1, the reviewer's own probe: the owner starts two works, comes back
+   * to the first, and types "стоп". Under pure §2.2 ranking (last STARTED item)
+   * the focus was still on the second work, so the cancel hatch would have
+   * stopped the wrong one — and §2.2 calls that binding a deterministic
+   * emergency hatch, which is the one thing it may not get wrong.
+   */
+  it("follows the work the agent just continued, not the one started last", async () => {
+    // Message 1 and 2 open a thread each; message 3 continues the FIRST one.
+    const started: string[] = [];
+    const script: OperatorScript = async (envelope, call) => {
+      const task = userText(envelope);
+      if (/вернись/u.test(task)) {
+        await call("t3.send_turn", { threadId: started[0]!, text: task });
+        return "Вернулся к первой работе.";
+      }
+      if (!/исправь/u.test(task)) return "Париж.";
+      const projects = (await call("t3.list_projects", {})) as Array<{ id: string }>;
+      const project =
+        projects[0] ??
+        ((await call("t3.create_project", {
+          name: "Operator Work",
+          workspaceRoot: `${/New project workspaces belong under (\S+)\./u.exec(envelope)?.[1] ?? "/tmp"}/w`,
+        })) as { id: string });
+      const thread = (await call("t3.create_thread", {
+        projectId: project.id,
+        title: `Работа ${started.length + 1}`,
+      })) as { id: string };
+      started.push(thread.id);
+      await call("t3.send_turn", { threadId: thread.id, text: task });
+      return `Запустил работу ${started.length}.`;
+    };
+    const harness = await boot("daemon-now-b1-", new DelegatingRuntime(script), {
+      keepWorkRunning: true,
+    });
+    const { store, telegram } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => telegram.sent.length >= 1, 10_000);
+    telegram.push(message(2, "исправь ретраи"));
+    await waitFor(() => telegram.sent.length >= 2, 10_000);
+    expect(store.getFocus("42").primary?.threadId).toBe(started[1]);
+
+    telegram.push(message(3, "вернись к логированию"));
+    await waitFor(() => telegram.sent.length >= 3, 10_000);
+    // An explicit send_turn is the agent acting for the owner exactly as a
+    // start is, so the binding a bare "стоп" would use follows it.
+    expect(store.getFocus("42").primary?.threadId).toBe(started[0]);
+    // …and the passive ranking of §2.2 still holds for everything else: both
+    // items are open and neither was reordered by the daemon's own refresh.
+    expect(store.listNowItems({ ownerId: "42" })).toHaveLength(2);
+
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  /**
+   * Review B2, second half. The projection's advantage over hooks is that it
+   * converges on reality — including the case package 1.3 explicitly supports,
+   * a finished thread running again.
+   */
+  it("reopens the item of a work that came back to life", async () => {
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "completed", threadId: "th_1", result: "Готово" },
+    ];
+    const harness = await boot(
+      "daemon-now-reopen-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, title: "Логирование" })),
+      { broker },
+    );
+    const { store, telegram, daemon } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(
+      () => store.listNowItems({ ownerId: "42", includeClosed: true })[0]?.status === "closed",
+      10_000,
+    );
+    const archived = store.listNowItems({ ownerId: "42", includeClosed: true })[0]!;
+    expect(archived.journalRef).toBeDefined();
+
+    // The work runs again. Without the reopen the unique thread_ref refuses a
+    // replacement and the thread is gone from the state for good.
+    store.updateThreadStatus(archived.threadRef!, "running");
+    daemon.reconcileNowState();
+    const live = store.listNowItems({ ownerId: "42" });
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ id: archived.id, status: "open", section: "active" });
+    expect(live[0]?.journalRef).toBeUndefined();
+    // The earlier close is still on the record.
+    expect(store.getJournalEntry(archived.journalRef!)).toBeDefined();
+
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  /**
+   * Review S3. §2.4 builds the daily summary and the monthly rollup out of
+   * `day`, so filing by the reconciliation instant makes both fiction: a daemon
+   * down over a weekend would file Friday's work under Monday.
+   */
+  it("files the archive under the day the work ended, not the day it was noticed", async () => {
+    const harness = await boot(
+      "daemon-now-journal-day-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, title: "Логирование" })),
+      { keepWorkRunning: true },
+    );
+    const { store, telegram, daemon } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => store.listNowItems({ ownerId: "42" }).length > 0, 10_000);
+    const item = store.listNowItems({ ownerId: "42" })[0]!;
+
+    // The work ended two days ago; nobody looked until now.
+    store.updateThreadStatus(item.threadRef!, "completed", { result: "готово" });
+    store.db
+      .prepare("UPDATE threads SET updated_at=? WHERE id=?")
+      .run("2026-08-24T18:30:00.000Z", item.threadRef!);
+    daemon.reconcileNowState();
+
+    const closed = store.listNowItems({ ownerId: "42", includeClosed: true })[0]!;
+    const entry = store.getJournalEntry(closed.journalRef!)!;
+    // 18:30 UTC is 21:30 in Europe/Moscow — still the 24th, and the logical day
+    // of §2.7 does not roll until 03:00.
+    expect(entry.day).toBe("2026-08-24");
+    expect(entry.source).toBe("daemon");
+
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  it("nudges a mutating turn that recorded nothing, at most twice in a row", async () => {
+    // Every message dispatches work and none of them calls now.update — the
+    // exact habit §2.4.2 is meant to correct.
+    const harness = await boot(
+      "daemon-now-check-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, rememberOwnThread: true })),
+      { localNoon: true, keepWorkRunning: true },
+    );
+    const { store, telegram, runtime } = harness;
+
+    // Each turn is allowed to FINISH before the next message lands. A message
+    // that arrives mid-turn preempts it, and a preempted turn is exactly the
+    // one this mechanism must not blame (the test below) — so overlapping the
+    // sends here would measure the wrong rule.
+    const answered = async (count: number): Promise<void> => {
+      await waitFor(() => telegram.sent.length >= count, 10_000);
+    };
+
+    telegram.push(message(1, "исправь логирование"));
+    await answered(1);
+    // Nothing to remind about yet: this is the turn that mutates.
+    expect(directEnvelopes(runtime).at(-1)).not.toContain("[state check:");
+    expect(store.getRuntimeState("now_check_pending_turn")).toBeDefined();
+
+    telegram.push(message(2, "исправь ретраи"));
+    await answered(2);
+    expect(directEnvelopes(runtime).at(-1)).toContain("[state check:");
+    // It sanctions doing nothing — a nudge that cannot be declined is a loop.
+    expect(directEnvelopes(runtime).at(-1)).toContain("ignore this line");
+
+    telegram.push(message(3, "исправь таймауты"));
+    await answered(3);
+    expect(directEnvelopes(runtime).at(-1)).toContain("[state check:");
+    expect(store.getRuntimeState("now_check_streak")).toBe("2");
+
+    // Two in a row is the ceiling: the third time it is the secretary's job.
+    telegram.push(message(4, "исправь метрики"));
+    await answered(4);
+    expect(directEnvelopes(runtime).at(-1)).not.toContain("[state check:");
+    expect(
+      store
+        .listDaemonEvents({ typePrefixes: ["memory.now_check."] })
+        .map((event) => event.eventType),
+    ).toContain("memory.now_check.exhausted");
+
+    // Review S4: and it STAYS handed over. Resetting the counter at the
+    // ceiling made the anti-loop a two-on-one-off cycle that nagged forever —
+    // which is exactly what §2.4.2(b) is written to stop.
+    for (const [index, text] of ["исправь алерты", "исправь дашборд"].entries()) {
+      telegram.push(message(5 + index, text));
+      await answered(5 + index);
+      expect(directEnvelopes(runtime).at(-1)).not.toContain("[state check:");
+    }
+    expect(store.getRuntimeState("now_check_streak")).toBe("2");
+
+    // Let the held work finish before teardown: a monitor parked on the gate
+    // would otherwise keep the shutdown waiting for its full grace period.
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 40_000);
+
+  it("drops the nudge instead of delivering it stale after the episode ended", async () => {
+    const harness = await boot(
+      "daemon-now-check-stale-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, rememberOwnThread: true })),
+      { localNoon: true, keepWorkRunning: true },
+    );
+    const { store, telegram, runtime } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => store.getRuntimeState("now_check_pending_turn") !== undefined, 10_000);
+
+    // Three hours later the turn it refers to is not what either of them is
+    // doing; the secretary reconciles that window from the event log instead.
+    store.setRuntimeState("owner_last_message_at", hoursAgo(3));
+    telegram.push(message(2, "исправь ретраи"));
+    await waitFor(() => directEnvelopes(runtime).length >= 2, 10_000);
+    const envelope = directEnvelopes(runtime).at(-1)!;
+    expect(envelope).toContain("[gap:");
+    expect(envelope).not.toContain("[state check:");
+    expect(store.getRuntimeState("now_check_streak")).toBe("0");
+
+    // Let the held work finish before teardown: a monitor parked on the gate
+    // would otherwise keep the shutdown waiting for its full grace period.
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  it("never blames a turn the owner's own next message preempted", async () => {
+    let release = (): void => undefined;
+    const preempted = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const script: OperatorScript = async (envelope, call) => {
+      const task = userText(envelope);
+      if (!/исправь/u.test(task)) return "Ответ на второй вопрос.";
+      // A real mutation, journalled under this turn's own id…
+      await call("t3.create_project", { name: "Operator Work", workspaceRoot: "/tmp/preempt-w" });
+      // …and then the turn hangs until the owner replaces it.
+      await preempted;
+      return "поздний ответ";
+    };
+    const harness = await boot("daemon-now-check-preempt-", new DelegatingRuntime(script));
+    const { store, telegram, runtime } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("исправь логирование")), 10_000);
+    telegram.push(message(2, "забудь, другой вопрос"));
+    // The daemon preempts on ARRIVAL, independent of the runtime, so this is
+    // deterministic: the turn is already dead when the script finally returns.
+    await waitFor(
+      () => store.listDaemonEvents({ typePrefixes: ["operator.turn.superseded"] }).length > 0,
+      10_000,
+    );
+    release();
+    await waitFor(
+      () => telegram.sent.some((entry) => entry.text.includes("Ответ на второй вопрос")),
+      10_000,
+    );
+
+    // The preempted turn mutated and recorded nothing — and is still owed no
+    // reminder: it was never given the chance. A stale nudge for work the owner
+    // themselves cancelled is the daemon blaming the agent for its own
+    // interruption.
+    expect(
+      store
+        .listDaemonEvents({ typePrefixes: ["operator.turn.superseded"] })
+        .length,
+    ).toBeGreaterThan(0);
+    expect(store.getRuntimeState("now_check_pending_turn")).toBeUndefined();
+    expect(runtime.prompts.some((prompt) => prompt.includes("[state check:"))).toBe(false);
+
+    // Let the held work finish before teardown: a monitor parked on the gate
+    // would otherwise keep the shutdown waiting for its full grace period.
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 30_000);
+
+  it("keeps a diff turn from swallowing what the owner never saw (package 2.1 backlog)", async () => {
+    const harness = await boot(
+      "daemon-now-owner-hash-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, rememberOwnThread: true })),
+      { localNoon: true, keepWorkRunning: true },
+    );
+    const { store, telegram, runtime } = harness;
+
+    // Turn 1: a full snapshot, and it dispatches work — the ledger is no longer
+    // empty, which is what makes the rest of this test meaningful.
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Запустил работу")), 10_000);
+    await waitFor(() => store.listNowItems({ ownerId: "42" }).length > 0, 10_000);
+    const afterFull = ownerHash(store);
+
+    // A durable note changes inside the episode. It lives in the memory-index
+    // layer, which a DIFF turn does not carry — the owner cannot see it.
+    store.rememberOperatorNote({ category: "general", content: "Даня теперь отвечает за склад" });
+
+    // Turn 2 is a diff (the now layer moved, so the diff is non-empty and the
+    // baseline does move) — but what the OWNER has seen must not move with it.
+    telegram.push(message(2, "спасибо"));
+    await waitFor(() => directEnvelopes(runtime).length >= 2, 10_000);
+    const second = directEnvelopes(runtime).at(-1)!;
+    expect(second).not.toContain("Operator state snapshot");
+    expect(ownerHash(store)).toBe(afterFull);
+
+    // …so the significant pause that follows still has something to tell them.
+    store.setRuntimeState("owner_last_message_at", hoursAgo(3));
+    telegram.push(message(3, "что нового?"));
+    await waitFor(() => directEnvelopes(runtime).length >= 3, 10_000);
+    const third = directEnvelopes(runtime).at(-1)!;
+    expect(third).toContain("Operator state snapshot");
+    expect(third).toContain("Даня теперь отвечает за склад");
+    expect(third).toContain("significant");
+
+    // Let the held work finish before teardown: a monitor parked on the gate
+    // would otherwise keep the shutdown waiting for its full grace period.
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 40_000);
+
+  it("spends only a gap line on a significant pause over a NON-empty state", async () => {
+    // The 2.1 version of this test ran on an empty ledger, where the two
+    // snapshot hashes are equal for the trivial reason that both renders are
+    // placeholders. With live work in the state, "nothing moved" is a real
+    // comparison of a real render.
+    const harness = await boot(
+      "daemon-now-quiet-nonempty-",
+      new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u, rememberOwnThread: true })),
+      { localNoon: true, keepWorkRunning: true },
+    );
+    const { store, telegram, runtime } = harness;
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Запустил работу")), 10_000);
+    await waitFor(() => store.listNowItems({ ownerId: "42" }).length > 0, 10_000);
+
+    // Turn 2 inside the episode: the diff carries the new item and moves the
+    // session baseline, so the state the owner has now SEEN includes the work.
+    telegram.push(message(2, "ага"));
+    await waitFor(() => directEnvelopes(runtime).length >= 2, 10_000);
+    // The owner's baseline only moves on a full push, so give them one.
+    store.setRuntimeState("owner_last_message_at", hoursAgo(20));
+    telegram.push(message(3, "что там?"));
+    await waitFor(() => directEnvelopes(runtime).length >= 3, 10_000);
+    expect(directEnvelopes(runtime).at(-1)).toContain("Operator state snapshot");
+
+    // Now a significant pause with a non-empty, unchanged state: a gap line and
+    // nothing else. The item is still open and still rendered — this is not the
+    // empty case wearing a disguise.
+    store.setRuntimeState("owner_last_message_at", hoursAgo(3));
+    telegram.push(message(4, "и?"));
+    await waitFor(() => directEnvelopes(runtime).length >= 4, 10_000);
+    const fourth = directEnvelopes(runtime).at(-1)!;
+    expect(store.listNowItems({ ownerId: "42" })).toHaveLength(1);
+    expect(fourth).not.toContain("Operator state snapshot");
+    expect(fourth).toContain("[gap:");
+    expect(fourth).toContain("Nothing in the tracked state has changed");
+
+    // Let the held work finish before teardown: a monitor parked on the gate
+    // would otherwise keep the shutdown waiting for its full grace period.
+    harness.broker.releaseTerminal();
+    telegram.finish();
+    await harness.run;
+    await harness.daemon.stop();
+  }, 40_000);
+});
+
+/** What the OWNER last saw, out of the persistent push baseline. */
+function ownerHash(store: OperatorStore): string {
+  return (
+    JSON.parse(store.getRuntimeState("memory_push_baseline")!) as { ownerSnapshotHash: string }
+  ).ownerSnapshotHash;
+}
+
 describe("answerPartUpdate (package 1.4)", () => {
   const merged = {
     type: "message" as const,
