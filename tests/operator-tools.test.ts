@@ -213,6 +213,12 @@ describe("OperatorToolServer", () => {
         iso: "2026-08-21T09:10:11.000Z",
         timeZone: "Europe/Moscow",
       });
+      // Roadmap 0.3 debt, closed in package 2.1: the zone here is MODEL-supplied
+      // and used to reach Intl raw, so a typo threw out of the tool. It now
+      // degrades to UTC and reports what it rejected.
+      expect(await callJson(client, "utility.time", { timeZone: "Mars/Olympus_Mons" })).toMatchObject(
+        { timeZone: "UTC", note: 'Unknown time zone "Mars/Olympus_Mons"; answered in UTC.' },
+      );
       // Roadmap 0.5: remote titles and snippets are fenced, the URL and the
       // echoed query stay raw so the shape remains machine-readable.
       const search = await callJson(client, "utility.web_search", { query: "test" }) as {
@@ -262,9 +268,28 @@ describe("OperatorToolServer", () => {
       expect(status.status).toBe(thread.status);
       expect(FENCED_WORKER.test(status.summary)).toBe(true);
 
-      await callJson(client, "memory.remember", { category: "decision", content: "Use MCP capabilities" });
+      const noteWritten = await callJson(client, "memory.remember", {
+        category: "decision",
+        content: "Use MCP capabilities",
+      }) as { id: string };
       const memory = await callJson(client, "memory.search", { query: "capabilities" });
       expect(memory).toMatchObject({ notes: [{ category: "decision", content: "Use MCP capabilities" }] });
+      // Package 2.1 (memory-design §2.2 pull layer): the pushed index carries
+      // only a trigger and a reference; this is the tool that turns the
+      // reference back into the note. Until package 3.2 adds the `key` column,
+      // the reference printed by the legacy index (§6.4) is the note id.
+      expect(await callJson(client, "memory.get", { key: noteWritten.id })).toMatchObject({
+        ok: true,
+        note: { id: noteWritten.id, content: "Use MCP capabilities" },
+      });
+      // A miss is a structured hint, not an error: identical for Claude and
+      // Codex, and it names the way out.
+      const missing = await callJson(client, "memory.get", { key: "note_nope" }) as {
+        ok: boolean;
+        hint: string;
+      };
+      expect(missing.ok).toBe(false);
+      expect(missing.hint).toContain("memory.search");
 
       store.appendEvent("worker.completed", { threadId: thread.id, payload: { status: "completed" } });
       store.appendEvent("automation.dispatched", { payload: { automationId: "auto_brief" } });

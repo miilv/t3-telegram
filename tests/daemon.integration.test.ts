@@ -7939,6 +7939,206 @@ describe("OperatorDaemon product flow", () => {
   }, 40_000);
 });
 
+/**
+ * Package 2.1 — the push envelope (memory-design §1, §4).
+ *
+ * The unit half of this lives in `tests/memory-push.test.ts` (renderers,
+ * budgets, the pause table, the decision function). What can only be asserted
+ * against a running daemon is here: that the snapshot reaches the envelope,
+ * that an episode costs a diff and usually nothing, that the persistent
+ * baseline moves exactly when the provider accepted the prompt, and that a
+ * session lost underneath a diff turn is re-seeded with a full snapshot.
+ */
+describe("Operator push envelope (package 2.1)", () => {
+  const directEnvelopes = (runtime: FakeRuntime): string[] =>
+    runtime.prompts.filter((prompt) => prompt.includes("User message:"));
+
+  it("pushes a full snapshot once, then diffs inside the episode, then re-pushes after a cold gap", async () => {
+    const home = tempDirectory("daemon-push-snapshot-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // (a) The first turn of a session has no baseline: full snapshot, with
+    // explicit placeholders for the layers that are empty.
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length >= 1);
+    const first = directEnvelopes(runtime).at(-1)!;
+    expect(first).toContain("Operator state snapshot");
+    expect(first).toContain("No current work items.");
+    expect(first).toContain("No durable notes yet.");
+    expect(first).toContain("No do-not-reopen entries yet.");
+    // The state stands at the HEAD of the envelope, before the turn instruction.
+    expect(first.indexOf("Operator state snapshot")).toBeLessThan(
+      first.indexOf("Handle the user's Telegram message"),
+    );
+    expect(first).not.toContain("[gap:");
+    const afterFirst = JSON.parse(store.getRuntimeState("memory_push_baseline")!) as {
+      sessionId: string;
+      epoch: string;
+      nowHash: string;
+    };
+    expect(afterFirst.sessionId).toBe("operator-session");
+    expect(afterFirst.nowHash).toMatch(/^[0-9a-f]{16}$/u);
+
+    // (b) Inside the episode nothing moved, so the envelope carries no state
+    // section at all — not a placeholder, not an empty diff.
+    telegram.push(message(2, "а столица Италии?"));
+    await waitFor(() => directEnvelopes(runtime).length >= 2);
+    const second = directEnvelopes(runtime).at(-1)!;
+    expect(second).not.toContain("Operator state snapshot");
+    expect(second).not.toContain("Current state changed since your last turn");
+    expect(second.startsWith("Handle the user's Telegram message")).toBe(true);
+
+    // (c) A cold gap re-pushes the whole state and says so in the envelope.
+    store.setRuntimeState(
+      "owner_last_message_at",
+      new Date(Date.now() - 20 * 60 * 60_000).toISOString(),
+    );
+    telegram.push(message(3, "с чего мы остановились?"));
+    await waitFor(() => directEnvelopes(runtime).length >= 3);
+    const third = directEnvelopes(runtime).at(-1)!;
+    expect(third).toContain("Operator state snapshot");
+    expect(third).toContain("[gap:");
+    expect(third).toContain("cold-resume");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("leaves the diff baseline where it was when the provider never took the turn", async () => {
+    const home = tempDirectory("daemon-push-baseline-");
+    const store = tempStore();
+    // Never accepts a direct envelope: the prompt is composed, the state is
+    // rendered, and none of it ever reaches a session.
+    const runtime = new FlakyProviderRuntime(
+      new Error("429 Too Many Requests: rate limit exceeded"),
+      Infinity,
+    );
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() =>
+      telegram.sent.some((entry) => entry.text === "Уперся в лимит модели — повторю через минуту."),
+    );
+    expect(directEnvelopes(runtime).at(-1)).toContain("Operator state snapshot");
+    // A failed push is not a push: the next turn must re-send the snapshot.
+    expect(store.getRuntimeState("memory_push_baseline")).toBeUndefined();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("rebuilds a diff turn as a full snapshot when the runtime loses the session (§1г)", async () => {
+    const home = tempDirectory("daemon-push-replay-");
+    const store = tempStore();
+    const runtime = new SessionLossRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length >= 1);
+    // The second turn is a diff — and the session it targets is gone.
+    telegram.push(message(2, "а столица Италии?"));
+    await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length >= 2, 8_000);
+
+    expect(runtime.lostPrompts).toHaveLength(1);
+    expect(runtime.lostPrompts[0]).not.toContain("Operator state snapshot");
+    const replayed = directEnvelopes(runtime).at(-1)!;
+    // The replay is not the diff that failed: it carries the whole state, so a
+    // brand-new session is not blind until the next compaction.
+    expect(replayed).toContain("Operator state snapshot");
+    expect(replayed).toContain("а столица Италии?");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("makes the compaction recovery the first turn of the epoch: rules digest plus full snapshot", async () => {
+    const home = tempDirectory("daemon-push-compact-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+
+    await daemon.compact("test compaction");
+    const restore = runtime.prompts.find((prompt) => prompt.includes("CONTEXT_RESTORED"))!;
+    expect(restore).toContain("Persona rules still in force");
+    expect(restore).toContain("Operator state snapshot");
+    expect(restore).toContain("No current work items.");
+    const baseline = JSON.parse(store.getRuntimeState("memory_push_baseline")!) as { epoch: string };
+    // The restoration turn IS the snapshot of the new epoch, so the baseline
+    // moved with it and the owner's next message costs a diff, not a re-push.
+    expect(baseline.epoch).toBe(store.getRuntimeState("last_compaction_at"));
+
+    await daemon.stop();
+  }, 20_000);
+});
+
 describe("answerPartUpdate (package 1.4)", () => {
   const merged = {
     type: "message" as const,
@@ -8278,6 +8478,36 @@ class FakeRuntime implements OperatorRuntime {
   async resume(_sessionId?: string, _providerId?: string): Promise<void> {}
   async health(): Promise<{ healthy: boolean }> {
     return { healthy: true };
+  }
+}
+
+/**
+ * Package 2.1: loses its session under a DIFF envelope — the exact shape of the
+ * fresh-session replay of §1г. A prompt that already carries the full state is
+ * served normally, so the loss can only strike the turn the replay must repair.
+ */
+class SessionLossRuntime extends FakeRuntime {
+  readonly lostPrompts: string[] = [];
+
+  constructor(private lossesLeft = 1) {
+    super();
+  }
+
+  override async *stream(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (
+      input.prompt.includes("User message:") &&
+      !input.prompt.includes("Operator state snapshot") &&
+      this.lossesLeft > 0
+    ) {
+      this.lossesLeft -= 1;
+      this.lostPrompts.push(input.prompt);
+      throw new Error("conversation session not found");
+    }
+    yield* super.stream(input);
   }
 }
 

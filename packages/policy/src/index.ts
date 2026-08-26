@@ -1,25 +1,96 @@
 import type { ApprovalRiskCategory } from "../../shared/src/index.js";
+import { renderPersonaRules } from "./persona.js";
 
 export { readOperatorPolicy, updateOperatorPolicy } from "./settings.js";
+export {
+  PERSONA_RULES,
+  PERSONA_HEADER,
+  PERSONA_DIGEST_HEADER,
+  renderPersonaRules,
+  renderPersonaDigest,
+} from "./persona.js";
+export type { PersonaRule } from "./persona.js";
+export {
+  ANTI_REDISCOVERY_BUDGET_CHARS,
+  ANTI_REDISCOVERY_CATEGORY,
+  ANTI_REDISCOVERY_EMPTY,
+  ANTI_REDISCOVERY_HEADER,
+  LEGACY_INDEX_EXCERPT_CHARS,
+  MEMORY_INDEX_BUDGET_CHARS,
+  MEMORY_INDEX_EMPTY,
+  MEMORY_INDEX_HEADER,
+  NOW_DIFF_HEADER,
+  NOW_ITEM_CONTENT_CHARS,
+  NOW_STATE_BUDGET_CHARS,
+  NOW_STATE_EMPTY,
+  NOW_STATE_HEADER,
+  SNAPSHOT_LEAD,
+  diffNowItems,
+  fingerprintNowItems,
+  hashText,
+  renderAntiRediscovery,
+  renderMemoryIndex,
+  renderNowDiff,
+  renderNowState,
+  renderStateLayers,
+} from "./memory-layers.js";
+export type {
+  MemoryIndexNote,
+  NowDiffEntry,
+  NowItemFingerprints,
+  NowSection,
+  NowStateItem,
+  RenderedStateLayers,
+  RenderOptions,
+  StateLayerInput,
+} from "./memory-layers.js";
+export {
+  LOGICAL_DAY_BOUNDARY_HOUR,
+  PAUSE_COLD_AFTER_MS,
+  PAUSE_LIGHT_AFTER_MS,
+  PAUSE_SIGNIFICANT_AFTER_MS,
+  classifyPause,
+  humanGap,
+} from "./pauses.js";
+export type { PauseAssessment, PauseClass, PauseInput } from "./pauses.js";
+export {
+  decidePushMode,
+  parsePushBaseline,
+  serializePushBaseline,
+} from "./push.js";
+export type { PushBaseline, PushDecision, PushDecisionInput, PushMode, PushReason } from "./push.js";
 
 export interface OwnerProfile {
   /** Owner's human name; empty when not configured. */
   name?: string;
   /** Owner's preferred reply language code, e.g. "ru". */
   language?: string;
+  /** Owner's IANA time zone; absent when unconfigured (consumers fall back to UTC). */
+  timezone?: string | undefined;
 }
 
 export function buildOperatorSystemPrompt(owner: OwnerProfile = {}): string {
   const language = owner.language?.trim() || "ru";
   const name = owner.name?.trim();
+  const timezone = owner.timezone?.trim();
   const ownerBlock = [
     "Owner profile:",
     ...(name ? [`- The owner you work for is ${name}.`] : []),
     `- The owner's preferred language is "${language}". Always reply in it unless they write otherwise, including brief heads-up messages.`,
+    // Package 2.1: the second half of the two-layer rule behind persona rule 11
+    // — the renderers format owner-local human dates, and the model is told
+    // which zone "today" and "tomorrow" mean.
+    ...(timezone
+      ? [
+          `- The owner lives in time zone ${timezone}. Their "today", "tomorrow" and "вечером" are in that zone, and every time you show them is written in it, in human form — never raw ISO or UTC.`,
+        ]
+      : []),
   ].join("\n");
   return `You are Operator, the user's always-available general-purpose AI coworker in Telegram.
 
 ${ownerBlock}
+
+${renderPersonaRules()}
 
 Core behavior:
 - Answer simple, quick, general questions yourself.

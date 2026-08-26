@@ -172,6 +172,75 @@ duplicate callback        → beginEvent false → silent return
 
 ## 3. The turn envelope
 
+Two segments, joined by blank lines: the **push head** (package 2.1) and the
+**turn instruction** (the lines that used to be the whole envelope).
+
+### The push head (package 2.1, memory-design §1/§4)
+
+The daemon assembles it in `buildPushSections`; the renderers themselves live in
+`packages/policy/src/memory-layers.ts`, beside `buildOperatorSystemPrompt` —
+data from storage, shape in policy, call from the daemon, so every budget is
+testable without booting a daemon.
+
+**A full snapshot** — `now-state → memory index → do-not-reopen`, under one lead
+line — appears in exactly four situations, and nowhere else:
+
+| # | Situation | How it is detected |
+| --- | --- | --- |
+| a | first turn of a new or recreated session | no baseline, or a baseline naming another `sessionId` |
+| b | first turn after a compaction | the restore prompt IS that snapshot, and it carries the persona-rules digest with it; a stale `epoch` catches the case where it never landed |
+| c | first turn after a `significant`/`cold-resume` pause | the pause class, and for `significant` only when the snapshot hash actually moved |
+| d | the fresh-session replay inside `streamOperatorTurn` | the prompt is **rebuilt**, not replayed — a diff sent into a brand-new session would leave the agent blind until the next compaction |
+
+**Inside an episode** the head is a now-state diff, and when nothing moved there
+is no section at all — not a placeholder, not an empty header. That asymmetry is
+the entire economy of the model: a full layer is ~6 KB, our session is
+persistent, and 50 turns of habit would be 100 K tokens of duplicates.
+
+Empty layers inside a *full* snapshot do render explicit placeholders
+(`No current work items.`, `No durable notes yet.`, `No do-not-reopen entries
+yet.`) — the structure must not wobble.
+
+Budgets are in **characters**, enforced by the render through ranking plus an
+overflow tail, never by refusing a write: now-state 3000 (pinned daemon items
+first, then by recency), memory index 3000 (`trigger → reference`, newest
+first), do-not-reopen 1000. Until package 3.2 fills in `key`/`description`, a
+legacy note is indexed by the temporary format of memory-design §6.4 — the first
+~100 characters of its content pointing at its id, which `memory.get` accepts as
+a reference.
+
+The now-state source is **temporary** in package 2.1: the daemon's own live work
+threads, ranked and defanged. The `now_items` table, the agent's own entries and
+`now.get` arrive in package 2.2; until then the overflow tail points at
+`t3.search_threads`, because naming a tool that does not exist is worse than no
+tail at all.
+
+After the layers comes the `[gap: …]` line, on a `significant` or `cold-resume`
+pause only. The classifier (memory-design §2.7, `packages/policy/src/pauses.ts`)
+measures the **owner's** silence — `owner_last_message_at` in `runtime_state`,
+which synthetic automation turns and thread-event digests deliberately do not
+move — and the 03:00 logical-day boundary is read in `owner.timezone`.
+
+The diff baseline is persistent: `memory_push_baseline` in `runtime_state` holds
+`(sessionId, epoch, nowHash, snapshotHash, per-item fingerprints)`. It moves
+when the provider **accepts** the prompt (the first event of the stream), not
+when the answer is delivered — a turn preempted after its prompt was sent still
+put the state into the session's history, while a provider error before
+acceptance leaves the session knowing nothing and must not move it.
+
+The head is **administrative state**: it renders every live thread and every
+durable note, which is exactly what the viewer wall of §1 and `memory.search`'s
+own role check keep from members and viewers. A non-admin turn carries no state
+at all — and one shared baseline stays coherent, since two admins see the same
+everything.
+
+Push points, per memory-design §4: `answerDirect` (snapshot or diff),
+compaction recovery and the provider-switch handoff (full snapshot + rules
+digest), the fresh-session replay (rebuilt as a full snapshot). Failure recovery
+and memory maintenance get **none** — they are service one-shots.
+
+### The turn instruction
+
 Nine lines, `undefined` filtered, joined by blank lines:
 
 1. Handle the message; answer quick questions yourself, route durable work with `t3.*`.
@@ -199,12 +268,12 @@ message of ours that named no work), and a binding can arrive with a quote whose
 text is empty. The agent gets whichever signals exist and decides itself.
 
 Package 1.3 removed the focus line that used to sit at position 7 (`Current
-durable work focus: …` / `No current durable work focus.`). Nothing takes that
-position: the phase-2 now-state is pushed at the **head** of the envelope, not
-here — `now-state → memory index → do-not-reopen → [gap: …] → synthetic → turn
-instruction → fenced message` (memory-design §4), which turns these eight lines
-into the "turn instruction" segment. Empty layers there render as explicit
-placeholders (`No current work items.`), never as silence.
+durable work focus: …` / `No current durable work focus.`). Nothing took that
+position: package 2.1 pushes the now-state at the **head** of the envelope
+instead (above), which turned these nine lines into the "turn instruction"
+segment. The thread-event branch of `answerDirect` carries the same head, for
+the same reason — a digest interpreted without the current state is exactly the
+turn most likely to contradict it.
 
 `focus_state` itself is untouched: it is the machine binding for
 `relatedThreadIds` on outgoing messages and for path B of §4, and the model
@@ -250,7 +319,8 @@ without being explained to the model.
 | daemon turn envelope | the quoted message the owner replied to (package 1.4), truncated to 700 chars | `quote` |
 | daemon thread-event turn (`enqueueThreadEventTurn`) | every digested worker event — progress, the worker's notes, and the final report of a finished work — under ONE marker for the whole turn | `worker` |
 | daemon `mediateUserInput` / `mediateApproval` | the worker's questions, approval request, and thread context — its intermediate words on the way into the operator LLM (the Telegram delivery path is untouched) | `worker` |
-| daemon `buildOperatorMemorySnapshot` | thread titles, short summaries, and every prose field of the structured summaries, under one marker for the whole snapshot | `worker` |
+| daemon `buildOperatorMemorySnapshot` | project names, short summaries, and every prose field of the structured summaries, under one marker for the whole snapshot | `worker` |
+| daemon push head (package 2.1) | **defanged, not fenced**: thread titles and note bodies are worker- and model-written, but a fence per line would eat the character budget and read as noise, so the daemon defangs every marker-shaped sequence instead. The lines are state the daemon vouches for, and each one is capped at 200 characters | — |
 | `t3.get_thread_status` / `get_thread_summary` / `get_thread` / `search_threads` / `memory.search` | worker-written titles and summary prose | `worker` |
 | `utility.web_search` | each result's `title` and `snippet` (`url` stays raw) | `tool` |
 | `email.search` | `subject`, `snippet`, and the display names; the connector splits a bare validated `fromAddress`/`toAddress` out of each header and normalizes `date` to ISO, so those stay raw and reusable | `tool` |
@@ -483,6 +553,28 @@ frame, a `completion` evicts that thread's pending progress, each distinct
 
 ## 5. Operator runtime
 
+### The system prompt
+
+`buildOperatorSystemPrompt(owner)` assembles three kinds of thing, and package
+2.1 decoupled the middle one (memory-design §2.1):
+
+1. **Owner profile** — name, language, and the IANA zone from `owner.timezone`,
+   which makes persona rule 11 ("human dates, never ISO/UTC") a two-layer rule:
+   the renderers format owner-local, the model is told what "tomorrow" means.
+2. **Persona** — the numbered voice/behaviour rules from
+   `packages/policy/src/persona.ts`. The number is a stable identifier the agent
+   cites to justify an action *or a deliberate inaction*, so rules may only be
+   appended and a retired rule keeps its number; `tests/memory-push.test.ts`
+   freezes the (number, id) pairs and fails on any renumbering. Their short form
+   is what gets reinjected after a compaction.
+3. **Policy** — the prose that follows: routing, thread events, tools, evidence,
+   and the fence-label contract.
+
+There is no CLAUDE.md autoload and there will not be one (`--setting-sources ""`
+is a privilege boundary): the prompt is assembled by daemon code, which is
+exactly the single point of failure smartex' constitution-autoload turned out to
+be.
+
 ### Default posture
 
 Without `OPERATOR_FULL_ACCESS=true` (default `false`) the Claude CLI is launched
@@ -601,6 +693,17 @@ told: `Провожу плановое обслуживание памяти, о
 
 Claude compacts in place and keeps the session id; Codex summarizes and starts a
 **new** session seeded from the stored system prompt.
+
+The restoration turn that follows is the **first turn of the new epoch**
+(package 2.1): it carries the digest of the numbered persona rules
+(`renderPersonaDigest`, memory-design §2.1 — the rules survive in the system
+prompt, but the compacted history no longer shows them being followed), the full
+push snapshot, and the residual snapshot JSON (projects, thread summaries,
+artifacts, pending interactions). Live work and durable notes are **not** in
+that JSON any more: there is one format of state, the push layers, and the
+provider-switch handoff uses the same pair. Accepting the restore prompt is what
+moves the diff baseline into the new epoch, so the owner's next message costs a
+diff rather than a second full push.
 
 ---
 

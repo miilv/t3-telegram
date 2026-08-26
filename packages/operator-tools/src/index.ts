@@ -26,11 +26,14 @@ import type {
   WorkThread,
 } from "../../shared/src/index.js";
 import {
+  DEFAULT_TIME_ZONE,
   forgetOwnDispatchMarker,
+  isValidTimeZone,
   knownFenceNonces,
   newId,
   nowIso,
   openFence,
+  resolveTimeZone,
   raiseOwnDispatchPending,
   redactSecretsDeep,
   releaseOwnDispatchPending,
@@ -68,6 +71,7 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "t3.get_thread_artifacts",
   "t3.respond_approval",
   "memory.search",
+  "memory.get",
   "memory.remember",
   "memory.journal",
   "scheduler.list_automations",
@@ -689,6 +693,32 @@ export class OperatorToolServer {
         };
       },
     });
+    // Package 2.1 (memory-design §2.2 pull layer, §8.1): the map is pushed,
+    // the territory is pulled. Every line of the pushed memory index ends in a
+    // reference; this is the tool that turns one into the note itself.
+    //
+    // `key` is the durable slug of package 3.2. No note has one yet, so a key
+    // that matches nothing falls back to an id lookup — which is exactly the
+    // reference the temporary legacy index (§6.4) prints today. When the column
+    // lands, the same call keeps working and the fallback quietly stops firing.
+    this.addTool(server, token, {
+      name: "memory.get",
+      description:
+        "Read ONE durable Operator note in full by the reference printed in the pushed memory index (a note key, or a note id for notes written before keys existed).",
+      schema: z.object({ key: z.string().trim().min(1).max(200) }),
+      readOnly: true,
+      handler: ({ key }, capability) => {
+        this.requireAdministrativeRole(capability, "read global Operator memory");
+        const note = this.options.store.getOperatorNote(key);
+        if (!note) {
+          return {
+            ok: false,
+            hint: `No note with reference "${key}". Use the reference exactly as printed in the memory index, or search with memory.search.`,
+          };
+        }
+        return { ok: true, note };
+      },
+    });
     this.addTool(server, token, {
       name: "memory.remember",
       description: "Persist a redacted durable Operator note for future turns.",
@@ -1049,10 +1079,19 @@ export class OperatorToolServer {
       readOnly: true,
       handler: ({ timeZone }) => {
         const now = this.now();
-        const zone = timeZone ?? "UTC";
+        // Roadmap 0.3 debt, closed in package 2.1: the zone here is MODEL-
+        // supplied, i.e. the one untrusted call site that was still handing a
+        // raw string to Intl. A typo used to throw out of the tool; it now
+        // degrades to UTC and says so, which is an answer the agent can correct
+        // rather than an error it has to interpret.
+        const zone = resolveTimeZone(timeZone, DEFAULT_TIME_ZONE);
+        const rejected = timeZone !== undefined && !isValidTimeZone(timeZone);
         return {
           iso: now.toISOString(),
           timeZone: zone,
+          ...(rejected
+            ? { note: `Unknown time zone "${timeZone}"; answered in ${zone}.` }
+            : {}),
           local: new Intl.DateTimeFormat("en-CA", {
             timeZone: zone,
             dateStyle: "full",
