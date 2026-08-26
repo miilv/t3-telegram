@@ -469,6 +469,86 @@ process.stdin.on("end", () => {
     // forever, leaving both the superseded and the new message unanswered.
     expect(Date.now() - startedAt).toBeLessThan(5_000);
   });
+
+  it("releases the turn slot for an abandoned turn so the next one can start (package 1.5)", async () => {
+    const directory = tempDirectory("fake-claude-abandon-");
+    const binary = join(directory, "claude");
+    writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+// A CLI that ignores SIGINT entirely: the exact process the watchdog has to
+// write off. The second turn ("next") answers normally, which is the point —
+// the runtime must be usable again the moment the first one is abandoned.
+process.on("SIGINT", () => {});
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  console.log(JSON.stringify({ type: "system", session_id: "abandon-session" }));
+  if (input.includes("next")) {
+    console.log(JSON.stringify({ type: "result", result: "ответ", session_id: "abandon-session" }));
+    return;
+  }
+  console.log(JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "думаю" } } }));
+  setInterval(() => {}, 1000);
+});
+`,
+      { mode: 0o700 },
+    );
+    chmodSync(binary, 0o700);
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+      interruptGraceMs: 500,
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+
+    // The wedged turn: consumed in the background, exactly as the daemon does
+    // when it stops awaiting one.
+    const wedged = (async () => {
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "hang",
+        turnToken: "turn-1",
+      })) {
+        void event;
+      }
+    })().catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Until it is abandoned, the runtime refuses the next turn outright — this
+    // is what made "release the queue slot" insufficient on its own: the owner
+    // would have got an apology instead of an answer.
+    await expect(
+      runtime.sendTurn({ sessionId: session.id, prompt: "next", turnToken: "turn-2" })[
+        Symbol.asyncIterator
+      ]().next(),
+    ).rejects.toThrow(/already has an active turn/u);
+
+    // A foreign token is a no-op: abandoning is as targeted as interrupting.
+    runtime.abandon("turn-other");
+    await expect(
+      runtime.sendTurn({ sessionId: session.id, prompt: "next", turnToken: "turn-2" })[
+        Symbol.asyncIterator
+      ]().next(),
+    ).rejects.toThrow(/already has an active turn/u);
+
+    runtime.abandon("turn-1");
+    // The slot is free immediately, and the wedged child is killed outright
+    // rather than left to hold a CPU and its session.
+    let answer = "";
+    for await (const event of runtime.sendTurn({
+      sessionId: session.id,
+      prompt: "next",
+      turnToken: "turn-2",
+    })) {
+      if (event.type === "result") answer = event.text;
+    }
+    await wedged;
+    expect(answer).toBe("ответ");
+  }, 20_000);
 });
 
 describe("child environment allowlist", () => {

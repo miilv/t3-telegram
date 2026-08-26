@@ -56,6 +56,16 @@ describe("media configuration", () => {
     // Out-of-range values are a boot error, not a silently clamped watchdog.
     expect(() => loadConfig({ ...base, WATCHDOG_GRACE_SECONDS: "0" })).toThrow();
     expect(() => loadConfig({ ...base, THREAD_STALL_MINUTES: "0" })).toThrow();
+    // A grace shorter than the runtime's own SIGINT→SIGKILL escalation would
+    // declare a turn a zombie while it is still being killed politely, so every
+    // ordinary preemption would end in a "предыдущий ответ завис" line.
+    expect(() =>
+      loadConfig({ ...base, WATCHDOG_GRACE_SECONDS: "5", OPERATOR_INTERRUPT_GRACE_MS: "8000" }),
+    ).toThrow(/WATCHDOG_GRACE_SECONDS/u);
+    expect(
+      loadConfig({ ...base, WATCHDOG_GRACE_SECONDS: "5", OPERATOR_INTERRUPT_GRACE_MS: "3000" })
+        .operator.watchdogGraceMs,
+    ).toBe(5_000);
   });
 
   it("accepts an explicit approval TTL in hours", () => {

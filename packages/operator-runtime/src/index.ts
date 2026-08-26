@@ -115,6 +115,11 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
     return this.current().interrupt(turnToken);
   }
 
+  /** Package 1.5: release the slot of a turn the watchdog wrote off. */
+  abandon(turnToken?: string): void {
+    this.current().abandon?.(turnToken);
+  }
+
   compact(reason?: string): ReturnType<OperatorRuntime["compact"]> {
     return this.current().compact(reason);
   }
@@ -356,14 +361,32 @@ export class CodexCliOperatorRuntime implements OperatorRuntime {
       }
     } finally {
       clearTimeout(watchdog);
-      this.active = undefined;
-      this.activeTurnToken = undefined;
+      // Package 1.5: only if we still own it. An abandoned turn's generator can
+      // settle long after the next turn took the slot, and clearing it then
+      // would let a THIRD turn spawn beside the live one.
+      if (this.active === child) {
+        this.active = undefined;
+        this.activeTurnToken = undefined;
+      }
     }
   }
 
   async interrupt(turnToken?: string): Promise<void> {
     if (turnToken !== undefined && turnToken !== this.activeTurnToken) return;
     interruptChild(this.active, this.options.interruptGraceMs, this.options.logger);
+  }
+
+  abandon(turnToken?: string): void {
+    if (turnToken !== undefined && turnToken !== this.activeTurnToken) return;
+    const child = this.active;
+    // Free the slot FIRST: the whole point is that the next turn may start now.
+    this.active = undefined;
+    this.activeTurnToken = undefined;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    // No SIGINT grace here — this process has already had its interrupt and
+    // ignored it; a polite second ask would just keep the CPU and the session.
+    this.options.logger?.warn({ pid: child.pid }, "Abandoning a wedged Codex turn; killing it");
+    child.kill("SIGKILL");
   }
 
   async compact(reason = "scheduled compaction"): Promise<{ sessionId: string; summary?: string }> {
@@ -582,8 +605,11 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       }
     } finally {
       clearTimeout(watchdog);
-      this.active = undefined;
-      this.activeTurnToken = undefined;
+      // Package 1.5: only if we still own it — see the Codex runtime.
+      if (this.active === child) {
+        this.active = undefined;
+        this.activeTurnToken = undefined;
+      }
       if (mcpConfigPath) await unlink(mcpConfigPath).catch(() => undefined);
     }
   }
@@ -591,6 +617,27 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   async interrupt(turnToken?: string): Promise<void> {
     if (turnToken !== undefined && turnToken !== this.activeTurnToken) return;
     interruptChild(this.active, this.options.interruptGraceMs, this.options.logger);
+  }
+
+  /**
+   * Package 1.5 — release the single turn slot for a turn that was written off.
+   *
+   * `sendTurn` refuses to start while `active` is set, so the daemon's watchdog
+   * cannot simply walk away from a wedged call: the next turn would hit
+   * "Operator runtime already has an active turn" and the owner would get an
+   * apology instead of an answer until the zombie died. Dropping the slot and
+   * killing the child outright is what makes the abandonment real.
+   */
+  abandon(turnToken?: string): void {
+    if (turnToken !== undefined && turnToken !== this.activeTurnToken) return;
+    const child = this.active;
+    this.active = undefined;
+    this.activeTurnToken = undefined;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    // Immediate SIGKILL, not the SIGINT grace: this child was already asked
+    // politely (the watchdog interrupts before it abandons) and did not go.
+    this.options.logger?.warn({ pid: child.pid }, "Abandoning a wedged Claude turn; killing it");
+    child.kill("SIGKILL");
   }
 
   /**

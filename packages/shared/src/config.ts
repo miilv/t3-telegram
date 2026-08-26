@@ -180,7 +180,21 @@ const envSchema = z.object({
   CONNECTOR_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
   DASHBOARD_ENABLED: z.enum(["true", "false"]).default("true"),
   DASHBOARD_PORT: z.coerce.number().int().min(0).max(65_535).default(0),
-});
+})
+  /**
+   * Package 1.5: the zombie grace must outlast the runtime's own SIGINT→SIGKILL
+   * escalation. Otherwise the watchdog declares a turn wedged while it is still
+   * being killed politely, and every ordinary preemption produces a zombie
+   * notice the owner did not need.
+   */
+  .superRefine((value, ctx) => {
+    if (value.WATCHDOG_GRACE_SECONDS * 1_000 > value.OPERATOR_INTERRUPT_GRACE_MS) return;
+    ctx.addIssue({
+      code: "custom",
+      path: ["WATCHDOG_GRACE_SECONDS"],
+      message: `WATCHDOG_GRACE_SECONDS (${value.WATCHDOG_GRACE_SECONDS}s) must exceed OPERATOR_INTERRUPT_GRACE_MS (${value.OPERATOR_INTERRUPT_GRACE_MS}ms): the interrupted turn has to be given time to die before it is written off as a zombie`,
+    });
+  });
 
 /**
  * Credential families a provider subprocess legitimately authenticates with:

@@ -402,6 +402,16 @@ export interface OperatorRuntime {
    * hatch (the cancel word), unchanged.
    */
   interrupt(turnToken?: string): Promise<void>;
+  /**
+   * Package 1.5 — write this turn off and release the single turn slot NOW.
+   *
+   * `sendTurn` refuses to start while a turn is active, so a watchdog that only
+   * stops awaiting a wedged call would hand the next turn an error instead of
+   * an answer. Implementations must drop their active-turn bookkeeping and kill
+   * the process outright (the interrupt was already tried and ignored).
+   * Optional: an in-memory runtime has no slot to release.
+   */
+  abandon?(turnToken?: string): void;
   compact(reason?: string): Promise<{
     sessionId: string;
     summary?: string;

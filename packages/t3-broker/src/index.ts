@@ -789,6 +789,8 @@ class ThreadSubscriptionProjection {
   private startedEmitted = false;
   private turnObserved = false;
   private lastTurnId: string | undefined;
+  /** Package 1.5: the command id of the last turn this projection announced. */
+  private lastCommandId: string | undefined;
 
   constructor(
     private readonly threadId: string,
@@ -860,22 +862,21 @@ class ThreadSubscriptionProjection {
       case "thread.turn-start-requested": {
         this.turnObserved = true;
         this.store.updateThreadStatus(this.threadId, "queued");
-        const requestedTurnId =
-          typeof payload.turnId === "string"
-            ? payload.turnId
-            : isRecord(payload.turn) && typeof payload.turn.turnId === "string"
-              ? payload.turn.turnId
-              : undefined;
-        // Package 1.5: if the server echoes the commandId we sent, ownership of
-        // this turn is a fact rather than a guess. Best effort — absent on
-        // servers that do not echo it, and the daemon falls back to the counter.
+        // Package 1.5 — ownership by identity. `commandId` is a field of the
+        // EVENT ENVELOPE (`EventBaseFields` in the orchestration contract), not
+        // of the payload: the payload of `thread.turn-start-requested` carries
+        // `threadId` and `messageId` and no turn id at all. Reading it off the
+        // payload found nothing, which silently left every turn to the counter.
         const requestedCommandId =
-          typeof payload.commandId === "string"
-            ? payload.commandId
-            : isRecord(payload.turn) && typeof payload.turn.commandId === "string"
-              ? payload.turn.commandId
+          typeof event.commandId === "string"
+            ? event.commandId
+            : typeof event.correlationId === "string"
+              ? event.correlationId
               : undefined;
-        this.pushStarted(events, requestedTurnId, requestedCommandId);
+        // No turn id travels with this event; the daemon identifies the turn by
+        // the command id, and a snapshot supplies `latestTurn.turnId` when the
+        // server knows one.
+        this.pushStarted(events, undefined, requestedCommandId);
         break;
       }
       case "thread.message-sent":
@@ -1050,10 +1051,19 @@ class ThreadSubscriptionProjection {
     // A known, different turn id means a NEW turn began inside a live
     // subscription (e.g. someone continued the thread from the T3 UI); it must
     // surface even though this subscription already emitted a start.
-    const newTurn = Boolean(turnId && turnId !== this.lastTurnId);
+    //
+    // Package 1.5: a different COMMAND id means the same thing, and on the live
+    // stream it is the only thing that says it — `thread.turn-start-requested`
+    // carries no turn id. Without this the second turn of a thread never
+    // reached `observeTurnOwnership`, so ownership by identity could never fire
+    // in the case it exists for: our dispatch following someone else's turn.
+    const newTurn =
+      Boolean(turnId && turnId !== this.lastTurnId) ||
+      Boolean(commandId && commandId !== this.lastCommandId);
     if (this.startedEmitted && !newTurn) return;
     this.startedEmitted = true;
     if (turnId) this.lastTurnId = turnId;
+    if (commandId) this.lastCommandId = commandId;
     events.push({
       type: "started",
       threadId: this.threadId,

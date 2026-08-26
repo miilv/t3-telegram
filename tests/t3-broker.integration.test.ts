@@ -201,6 +201,59 @@ describe("HttpT3Broker", () => {
     expect(fixture.threadReadCount).toBe(1);
   });
 
+  it("carries the command id of a turn start from the event envelope (package 1.5)", async () => {
+    const liveClient = new FakeLiveClient();
+    const broker = new HttpT3Broker(
+      {
+        baseUrl: fixture.url,
+        providerInstanceId: "claude",
+        model: "claude-opus-4-1",
+        runtimeMode: "approval-required",
+        pollIntervalMs: 5,
+        liveClient,
+      },
+      store,
+      pino({ enabled: false }),
+    );
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: "/tmp/acme" });
+    const thread = await broker.createThread({ projectId: project.id, title: "Auth" });
+    await broker.sendTurn({ threadId: thread.id, text: "Fix auth", commandId: "cmd_ours" });
+    liveClient.threadItems = [
+      // The real shape: no turn id anywhere, `messageId` in the payload, and
+      // the command id on the envelope. Someone else's turn first…
+      t3Event(
+        4,
+        "thread.turn-start-requested",
+        { threadId: thread.id, messageId: "cmd_theirs:message" },
+        { commandId: "cmd_theirs" },
+      ),
+      // …then ours, which must surface as a SECOND start even though this
+      // subscription already emitted one — otherwise ownership by identity
+      // never gets a chance to correct the label.
+      t3Event(
+        5,
+        "thread.turn-start-requested",
+        { threadId: thread.id, messageId: "cmd_ours:message" },
+        { commandId: "cmd_ours" },
+      ),
+      t3Event(6, "thread.session-set", {
+        session: { status: "ready", activeTurnId: null, lastError: null },
+      }),
+    ];
+
+    const events = [];
+    for await (const event of broker.subscribeThread(thread.id)) events.push(event);
+
+    // The snapshot's own start (it carries a turn id and no command id), then
+    // one start per command id off the wire — identity intact in both.
+    const starts = events.filter((event) => event.type === "started");
+    expect(starts).toEqual([
+      { type: "started", threadId: thread.id, turnId: "turn_1" },
+      { type: "started", threadId: thread.id, commandId: "cmd_theirs" },
+      { type: "started", threadId: thread.id, commandId: "cmd_ours" },
+    ]);
+  });
+
   it("forwards intermediate agent narration but never the final answer twice", async () => {
     const liveClient = new FakeLiveClient();
     const broker = new HttpT3Broker(
@@ -520,8 +573,18 @@ class FakeLiveClient implements T3LiveClient {
   }
 }
 
-function t3Event(sequence: number, type: string, payload: Record<string, unknown>): unknown {
-  return { kind: "event", event: { sequence, type, payload } };
+function t3Event(
+  sequence: number,
+  type: string,
+  payload: Record<string, unknown>,
+  /**
+   * Package 1.5: envelope fields. `commandId` lives HERE in the orchestration
+   * contract (`EventBaseFields`), not in the payload — which is exactly the bug
+   * this shape pins: reading it off the payload found nothing, silently.
+   */
+  base: Record<string, unknown> = {},
+): unknown {
+  return { kind: "event", event: { sequence, type, payload, ...base } };
 }
 
 class T3Fixture {

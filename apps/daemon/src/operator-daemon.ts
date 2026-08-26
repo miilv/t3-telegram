@@ -297,6 +297,26 @@ const DELIVERY_ALERT_THROTTLE_MS = 60_000;
 const WATCHDOG_TICK_MS = 5_000;
 /** Package 1.5: the race token that means "this turn was abandoned as a zombie". */
 const ZOMBIE = Symbol("zombie-turn");
+/**
+ * Package 1.5: how a turn learns it was written off. `settled()` is the
+ * synchronous form — a turn abandoned while it QUEUED must not start at all,
+ * and a promise cannot express that without an await.
+ */
+interface AbandonHandle {
+  settled: () => boolean;
+  promise: Promise<unknown>;
+}
+/**
+ * Package 1.5: a wedged turn on a non-user lane (a digest interpretation) is
+ * given a longer budget than the owner's own message — nobody is watching a
+ * clock — but not an unlimited one: its terminal events sit under the
+ * `voice_relaying` marker, which holds the degraded fallback back for as long
+ * as the interpretation claims to be running, so a digest turn that never ends
+ * means nobody ever hears how the work finished.
+ */
+const NON_USER_STALL_FACTOR = 3;
+/** One zombie line per chat per this window: a cascade is not worth repeating. */
+const ZOMBIE_NOTICE_THROTTLE_MS = 60_000;
 
 /**
  * Package 1.1: an in-flight direct Operator turn, as seen from outside the
@@ -324,9 +344,20 @@ interface ActiveOperatorTurn {
    * afterwards is inert.
    */
   lastEventAt: number;
+  /**
+   * Package 1.5: `false` for a digest interpretation — the owner's message may
+   * not discard it (package 1.2), but the watchdog may still write it off.
+   */
+  preemptable?: boolean;
   interruptedAt?: number;
   zombie?: boolean;
   abandon?: () => void;
+  /**
+   * Package 1.5: the provider is done with this turn (it delivered, stayed
+   * deliberately silent, or is running its retry pause). The watchdog skips it
+   * — the queue slot it still holds is bookkeeping, not a freeze.
+   */
+  settled?: boolean;
   /**
    * Package 1.1: the superseded-message handoff this turn put in its envelope.
    * It stays in `chat_pending` until this turn actually delivers a final — a
@@ -388,13 +419,9 @@ export class OperatorDaemon {
   /** Recipients with an alert in flight, so a fire-and-forget send is never launched twice. */
   private readonly deliveryAlertsInFlight = new Set<number>();
   private readonly monitorTasks = new Set<Promise<void>>();
-  /**
-   * Package 1.5: last event seen per monitored thread. In memory by design — a
-   * restart resubscribes, and a thread whose subscription is fresh has not been
-   * silent for us yet, whatever it was doing while we were down.
-   */
-  private readonly threadEventClock = new Map<string, number>();
   private watchdogTimer: NodeJS.Timeout | undefined;
+  /** Package 1.5: last zombie line per chat, so a cascade is not a flood. */
+  private readonly zombieNoticeSentAt = new Map<number, number>();
   /** Package 1.2: the single voice over worker events (apps/daemon/src/voice.ts). */
   private readonly voice: ThreadVoice;
   private readonly shutdown = new AbortController();
@@ -816,7 +843,9 @@ export class OperatorDaemon {
     this.refreshStructuredThreadSummaries();
     await this.maintainStructuredMemory(this.buildOperatorMemorySnapshot());
     const snapshot = this.buildOperatorMemorySnapshot();
-    const result = await this.operatorRuntimeQueue.run(() => this.runtime.compact(reason));
+    const result = await this.operatorRuntimeQueue.run(() =>
+      this.withRuntimeDeadline("compaction", () => this.runtime.compact(reason)),
+    );
     this.operatorSessionId = result.sessionId;
     // Bug №29: only a confirmed compact turn (runtime.compact resolved) may
     // move the usage counters; a failed turn threw above and the old
@@ -1046,7 +1075,35 @@ export class OperatorDaemon {
     // none of them apply to text the daemon composed — and goes straight to the
     // turn that interprets it for the owner.
     if (update.threadEvents?.length) {
-      await this.answerDirect(update, this.store.getFocus(String(update.userId)), []);
+      // Package 1.5: a digest interpretation is a tracked turn too. It used to
+      // run outside `activeOperatorTurns` — which is what kept preemption off
+      // it (package 1.2: an owner message must not discard the story of a work
+      // that ended) but also put it beyond the watchdog's reach: a wedged
+      // digest froze the single voice with nothing able to notice. It is
+      // tracked and NOT preemptable: the watchdog may write it off, an owner
+      // message may not.
+      const digestTurn: ActiveOperatorTurn = {
+        chatId: update.chatId,
+        userId: update.userId,
+        conversationKey: this.conversationKey(update),
+        ingressJobId: telegramIngressJobId(update),
+        superseded: false,
+        preemptable: false,
+        lastEventAt: Date.now(),
+      };
+      this.activeOperatorTurns.add(digestTurn);
+      try {
+        await this.answerDirect(
+          update,
+          this.store.getFocus(String(update.userId)),
+          [],
+          undefined,
+          0,
+          digestTurn,
+        );
+      } finally {
+        this.activeOperatorTurns.delete(digestTurn);
+      }
       return;
     }
 
@@ -1448,7 +1505,11 @@ export class OperatorDaemon {
    * is their own. Worker threads are never in scope here.
    */
   private interruptibleTurns(chatId: number, userId: number): ActiveOperatorTurn[] {
-    const sameChatTurns = [...this.activeOperatorTurns].filter((turn) => turn.chatId === chatId);
+    const sameChatTurns = [...this.activeOperatorTurns].filter(
+      // Package 1.5: a digest interpretation is not the owner's turn to stop —
+      // they never started it, and a cancel word means "stop what I asked for".
+      (turn) => turn.chatId === chatId && turn.preemptable !== false,
+    );
     if (!sameChatTurns.length) return [];
     if (this.isAdministrator(userId)) return sameChatTurns;
     return sameChatTurns.filter((turn) => turn.userId === userId);
@@ -1522,7 +1583,10 @@ export class OperatorDaemon {
 
   private preemptOperatorTurn(conversationKey: string): void {
     const turns = [...this.activeOperatorTurns].filter(
-      (turn) => turn.conversationKey === conversationKey && !turn.superseded,
+      // Package 1.5: `preemptable === false` is the digest interpretation
+      // (package 1.2's rule, now expressed on the turn instead of by hiding it
+      // from the registry): a work that ended still owes the owner its story.
+      (turn) => turn.conversationKey === conversationKey && !turn.superseded && turn.preemptable !== false,
     );
     for (const turn of turns) {
       // A turn registers before `answerDirect` stamps its id. Interrupting on
@@ -1564,14 +1628,14 @@ export class OperatorDaemon {
    * waiting out real minutes; production runs it from a timer started in
    * `initialize()`.
    */
-  watchdogTick(): void {
+  watchdogTick(now = Date.now()): void {
     try {
-      this.sweepWedgedOperatorTurns();
+      this.sweepWedgedOperatorTurns(now);
     } catch (error) {
       this.logger.warn({ err: error }, "Operator-turn watchdog failed");
     }
     try {
-      this.sweepSilentThreads();
+      this.sweepSilentThreads(now);
     } catch (error) {
       this.logger.warn({ err: error }, "Thread watchdog failed");
     }
@@ -1580,10 +1644,14 @@ export class OperatorDaemon {
   /**
    * Package 1.5 — the wedged-turn watchdog, in two steps.
    *
-   * The precondition for both is that SOMEONE IS WAITING: the single voice can
-   * legitimately spend ten minutes on one hard question, and a long turn that
-   * nobody is queued behind is not a problem to solve. When the owner is in the
-   * queue, though, silence has a budget.
+   * The precondition for both is that SOMEONE IS WAITING — on ANY lane, not
+   * just the owner's. A long turn nobody is queued behind is not a problem to
+   * solve; but a queue of digest interpretations is a waiting party too, and a
+   * wedge in front of them is worse than it looks: their terminal events sit
+   * under the `voice_relaying` marker, which keeps the degraded fallback
+   * rolling for as long as an interpretation claims to be running, so nobody —
+   * not even the flat template — ever tells the owner how the work ended.
+   * Non-user lanes simply get a longer budget (`NON_USER_STALL_FACTOR`).
    *
    *  1. a turn that has produced no stream event for `watchdogStallMs` is
    *     interrupted — the same token-scoped interrupt preemption uses;
@@ -1597,16 +1665,21 @@ export class OperatorDaemon {
    * The concession is deliberate (grok-bot §watchdog): a single hung turn must
    * never freeze the system, even at the cost of leaving a process running.
    */
-  private sweepWedgedOperatorTurns(): void {
-    if (!this.operatorInputQueue.depth("user")) return;
-    const now = Date.now();
-    const stallMs = this.config.operator.watchdogStallMs;
+  private sweepWedgedOperatorTurns(now: number): void {
+    if (!this.operatorInputQueue.depth()) return;
+    const ownerWaiting = this.operatorInputQueue.depth("user") > 0;
+    const stallMs =
+      this.config.operator.watchdogStallMs * (ownerWaiting ? 1 : NON_USER_STALL_FACTOR);
     const graceMs = this.config.operator.watchdogGraceMs;
     for (const turn of this.activeOperatorTurns) {
-      if (turn.zombie) continue;
+      // A turn that has already delivered (or decided to say nothing) is done
+      // with the provider and is only finishing its bookkeeping — declaring it
+      // a zombie would invent a freeze that never happened and tell the owner
+      // their answer was lost right after they received it.
+      if (turn.zombie || turn.settled) continue;
       if (turn.interruptedAt !== undefined) {
         if (now - turn.interruptedAt < graceMs) continue;
-        this.declareZombieTurn(turn);
+        this.declareZombieTurn(turn, now);
         continue;
       }
       if (now - turn.lastEventAt < stallMs) continue;
@@ -1627,7 +1700,7 @@ export class OperatorDaemon {
   }
 
   /** Free the queue slot of a turn that ignored its interrupt (package 1.5). */
-  private declareZombieTurn(turn: ActiveOperatorTurn): void {
+  private declareZombieTurn(turn: ActiveOperatorTurn, now: number): void {
     // Nothing to abandon yet: the turn has not reached the provider call (it is
     // still downloading media, or waiting on the transcription). It will see
     // the supersession itself the moment it gets there and release the slot on
@@ -1641,15 +1714,23 @@ export class OperatorDaemon {
         ...(turn.operatorTurnId ? { operatorTurnId: turn.operatorTurnId } : {}),
         ingressJobId: turn.ingressJobId,
         graceMs: this.config.operator.watchdogGraceMs,
+        silentMs: now - turn.lastEventAt,
       },
     });
     this.logger.error(
       { operatorTurnId: turn.operatorTurnId, ingressJobId: turn.ingressJobId },
       "Operator turn ignored its interrupt; releasing the queue slot (zombie)",
     );
-    // One more interrupt on the way out: harmless if it lands, and the runtime's
-    // own SIGKILL grace may still reclaim the process.
-    if (turn.operatorTurnId) this.interruptQuietly(turn.operatorTurnId);
+    // THE step that makes the abandonment real. `sendTurn` refuses to start
+    // while the runtime holds an active turn, so releasing our two queues
+    // without this would hand the next turn "Operator runtime already has an
+    // active turn" — an apology instead of an answer, for as long as the zombie
+    // lives. `abandon` drops the runtime's slot and kills the child outright.
+    try {
+      this.runtime.abandon?.(turn.operatorTurnId);
+    } catch (error) {
+      this.logger.warn({ err: error }, "Operator runtime abandon failed");
+    }
     turn.abandon?.();
   }
 
@@ -1668,21 +1749,24 @@ export class OperatorDaemon {
    * never fires while the thread stays `running`, so this fact is the only
    * chance the Operator gets to notice a work that will never end by itself.
    */
-  private sweepSilentThreads(): void {
+  private sweepSilentThreads(now: number): void {
     const stallMs = this.config.operator.threadStallMs;
-    const now = Date.now();
     for (const [threadId, controller] of this.monitors) {
       if (controller.signal.aborted) continue;
       if (this.store.getThread(threadId)?.status !== "running") continue;
-      const lastEventAt = this.threadEventClock.get(threadId);
-      if (lastEventAt === undefined || now - lastEventAt < stallMs) continue;
+      const lastEventAt = Date.parse(
+        this.store.getRuntimeState(`thread_last_event_at:${threadId}`) ?? "",
+      );
+      if (!Number.isFinite(lastEventAt) || now - lastEventAt < stallMs) continue;
       const reportedAt = Date.parse(
         this.store.getRuntimeState(`thread_stall_reported_at:${threadId}`) ?? "",
       );
       if (Number.isFinite(reportedAt) && now - reportedAt < stallMs) continue;
       const route = this.monitorRoutes.get(threadId);
       if (!route) continue;
-      this.store.setRuntimeState(`thread_stall_reported_at:${threadId}`, nowIso());
+      // Stamped with the watchdog's own clock, so "once per window" means the
+      // same thing whatever clock the caller is using.
+      this.store.setRuntimeState(`thread_stall_reported_at:${threadId}`, new Date(now).toISOString());
       const minutes = Math.max(1, Math.round((now - lastEventAt) / 60_000));
       metrics.increment("worker_threads_stalled_total");
       this.store.appendEvent("worker.stalled", { threadId, payload: { silentMinutes: minutes } });
@@ -1842,6 +1926,14 @@ export class OperatorDaemon {
       correlationId,
       payload: { operatorTurnId },
     });
+    // Package 1.5: a replay after a transient provider failure is a NEW provider
+    // call on the same tracked turn — it is watched like any other, so the
+    // "done with the provider" flag set by the previous attempt is cleared and
+    // its silence budget starts over.
+    if (turn) {
+      turn.settled = false;
+      turn.lastEventAt = Date.now();
+    }
     for (const messageId of update.messageIds) {
       this.store.updateTelegramMessageBinding(update.chatId, messageId, { operatorTurnId });
     }
@@ -1989,17 +2081,25 @@ export class OperatorDaemon {
     let finalText: string;
     let messageType = "operator_answer";
     let retryDelayMs: number | undefined;
-    // Package 1.5 — the zombie escape hatch. The watchdog can resolve this, and
-    // both serial resources the turn holds (the lane queue through the await
-    // below, the runtime queue inside `askOperator`) are released at once.
+    // Package 1.5 — the zombie escape hatch. The watchdog resolves this, and
+    // every resource the turn holds is released at once: the lane queue (the
+    // await below), the runtime queue (`askOperator`) and the runtime's own
+    // turn slot (`runtime.abandon`, called by the watchdog itself).
+    //
+    // Only a tracked turn gets one: a call with no `turn` has no watchdog and
+    // would just leave a promise hanging on every turn forever.
     let abandoned = false;
-    const abandonment = new Promise<typeof ZOMBIE>((resolve) => {
-      if (!turn) return;
-      turn.abandon = () => {
-        abandoned = true;
-        resolve(ZOMBIE);
-      };
-    });
+    const abandonment = turn
+      ? new Promise<typeof ZOMBIE>((resolve) => {
+          turn.abandon = () => {
+            abandoned = true;
+            resolve(ZOMBIE);
+          };
+        })
+      : undefined;
+    const abandonHandle: AbandonHandle | undefined = abandonment
+      ? { settled: () => abandoned, promise: abandonment }
+      : undefined;
     const runTurn = async (): Promise<string> => {
       // Package 1.1: the preemption can land in the gap between the entry check
       // and the provider call — `startDraft` is a network round trip. The
@@ -2036,7 +2136,7 @@ export class OperatorDaemon {
           if (toolSteps === 1) writer?.reset("⏳ Работаю…");
         },
         operatorTurnId,
-        abandonment,
+        abandonHandle,
       );
     };
     try {
@@ -2044,7 +2144,9 @@ export class OperatorDaemon {
       // The detached promise must never surface as an unhandled rejection once
       // the race has been decided against it.
       void running.catch(() => undefined);
-      const raced = await Promise.race([running, abandonment]);
+      const raced = abandonment
+        ? await Promise.race([running, abandonment])
+        : await running;
       if (raced === ZOMBIE) {
         // Nothing is said from here: the turn is superseded, so the block below
         // records it, hands its dispatched work to the next turn through
@@ -2105,6 +2207,11 @@ export class OperatorDaemon {
         },
       });
     } finally {
+      // Package 1.5: the provider is out of the picture from here — whatever
+      // remains is delivery bookkeeping, and the watchdog must not mistake it
+      // for a freeze. (An abandoned turn stays UNSETTLED: it is a zombie, and
+      // the block below has to know that.)
+      if (turn && !abandoned) turn.settled = true;
       clearInterval(heartbeat);
       clearInterval(typing);
       await writer?.closePreview().catch((error) => {
@@ -2132,9 +2239,13 @@ export class OperatorDaemon {
       // not merely replaced but LOST — the turn hung and had to be abandoned.
       if (abandoned) await this.reportZombieTurn(update, operatorTurnId, correlationId);
       this.recordSupersededTurn(update, operatorTurnId, correlationId, attempt, turn);
-      // Package 1.5: an interpretation that never happened must not hold the
-      // degraded fallback back — the wait for this terminal restarts now.
-      if (isThreadEventTurn) this.voice.failRelay(threadEvents);
+      // Package 1.5: this interpretation never happened, and its job is
+      // completed — nothing will retry it. `reportLostDigest` covers both
+      // halves of that loss: the terminals stop holding the degraded fallback
+      // back (it calls `failRelay` itself), and the NON-terminal notes, which
+      // would otherwise vanish without a trace, are carried into the next
+      // digest as "N messages of this work were lost".
+      if (isThreadEventTurn) this.voice.reportLostDigest(threadEvents);
       await this.discardDraft(writer);
       return;
     }
@@ -2240,6 +2351,17 @@ export class OperatorDaemon {
     correlationId: string,
   ): Promise<void> {
     if (update.synthetic || update.threadEvents?.length) return;
+    // A cascade (a provider that wedges on every turn) is a stream of identical
+    // sentences; one per chat per minute says the same thing without the flood.
+    const lastNoticeAt = this.zombieNoticeSentAt.get(update.chatId) ?? 0;
+    if (Date.now() - lastNoticeAt < ZOMBIE_NOTICE_THROTTLE_MS) {
+      this.logger.warn(
+        { chatId: update.chatId, operatorTurnId },
+        "Zombie notice throttled; the owner was told about a wedged turn moments ago",
+      );
+      return;
+    }
+    this.zombieNoticeSentAt.set(update.chatId, Date.now());
     this.enqueueTelegramOutbox(
       `telegram:operator:${operatorTurnId}:zombie`,
       update.chatId,
@@ -2408,7 +2530,7 @@ export class OperatorDaemon {
     this.monitors.set(threadId, controller);
     this.store.setRuntimeState(`thread_monitor_started_at:${threadId}`, nowIso());
     // Package 1.5: silence is measured from the moment we started listening.
-    this.threadEventClock.set(threadId, Date.now());
+    this.store.setRuntimeState(`thread_last_event_at:${threadId}`, nowIso());
     this.store.setRuntimeState(`thread_stall_reported_at:${threadId}`, "");
     metrics.set("active_workers", this.monitors.size);
     const currentRoute = (): MonitorRoute =>
@@ -2426,8 +2548,9 @@ export class OperatorDaemon {
         for await (const event of this.broker.subscribeThread(threadId, controller.signal)) {
           resubscribeAttempt = 0;
           // Package 1.5: any event at all is a sign of life — including the
-          // ones this daemon deliberately keeps silent about.
-          this.threadEventClock.set(threadId, Date.now());
+          // ones this daemon deliberately keeps silent about. Durable, so the
+          // measurement survives the restart that resubscribes this monitor.
+          this.store.setRuntimeState(`thread_last_event_at:${threadId}`, nowIso());
           const route = currentRoute();
           // Bug №41: terminal events go to their own accumulator queue so a
           // burst of completions never occupies the interactive slots. This
@@ -2538,8 +2661,12 @@ export class OperatorDaemon {
         const route = currentRoute();
         this.monitors.delete(threadId);
         this.monitorRoutes.delete(threadId);
-        this.threadEventClock.delete(threadId);
+        this.store.setRuntimeState(`thread_last_event_at:${threadId}`, "");
         this.store.setRuntimeState(`thread_stall_reported_at:${threadId}`, "");
+        // Package 1.5: the turn identities we were expecting on this thread die
+        // with the subscription — keeping them would let a stale id claim
+        // ownership of somebody else's turn after a re-subscribe.
+        this.store.setRuntimeState(`thread_expected_turns:${threadId}`, "");
         metrics.set("active_workers", this.monitors.size);
         if (terminal) {
           const startedAt = Date.parse(this.store.getRuntimeState(`thread_monitor_started_at:${threadId}`) ?? "");
@@ -4476,7 +4603,9 @@ export class OperatorDaemon {
       await this.maintainStructuredMemory(this.buildOperatorMemorySnapshot());
       const snapshot = this.buildOperatorMemorySnapshot();
       const handoff = await this.operatorRuntimeQueue.run(() =>
-        this.runtime.compact(`provider switch ${current} -> ${providerId}`),
+        this.withRuntimeDeadline("provider-switch handoff", () =>
+          this.runtime.compact(`provider switch ${current} -> ${providerId}`),
+        ),
       );
       this.store.saveCompaction(
         handoff.sessionId,
@@ -5698,24 +5827,75 @@ export class OperatorDaemon {
      */
     turnToken?: string,
     /**
-     * Package 1.5: resolves when the caller's turn was declared a zombie. The
-     * single voice is TWO serial resources — the lane queue and this runtime
-     * queue — and freeing only the first would leave the next turn waiting on
-     * the wedged provider call anyway. When it fires, this call's queue slot is
-     * released and the provider call carries on detached and unheard.
-     *
-     * That the abandoned CLI may still be alive is accepted: it has been sent
-     * an interrupt, the runtime escalates SIGINT to SIGKILL after its own
-     * grace, and a hung turn must never freeze the system (grok-bot watchdog).
+     * Package 1.5: the caller's zombie handle. The single voice is TWO serial
+     * resources — the lane queue and this runtime queue — and freeing only the
+     * first would leave the next turn waiting on the wedged provider call
+     * anyway. The runtime's own slot is the third: `runtime.abandon()` (called
+     * by the watchdog) drops it and kills the child, so the next turn can spawn
+     * instead of hitting "runtime already has an active turn".
      */
-    abandoned?: Promise<unknown>,
+    abandon?: AbandonHandle,
   ): Promise<string> {
     return this.operatorRuntimeQueue.run(async () => {
-      const call = this.streamOperatorTurn(prompt, onDelta, toolAccess, onToolStarted, turnToken);
-      if (!abandoned) return call;
+      // Blocker: a turn abandoned WHILE IT WAITED on this queue (behind a
+      // compaction, mediation or maintenance call) must not start at all.
+      // Starting it would burn a provider turn for an answer nobody can
+      // receive, and — worse — leave a fresh active turn in the runtime that
+      // the watchdog cannot name, so every later turn would stall behind it.
+      if (abandon?.settled()) {
+        this.store.appendEvent("operator.turn.abandoned_before_start", {
+          correlationId: turnToken ?? "operator",
+          payload: { ...(turnToken ? { operatorTurnId: turnToken } : {}) },
+        });
+        return "";
+      }
+      const call = this.streamOperatorTurn(
+        prompt,
+        onDelta,
+        toolAccess,
+        onToolStarted,
+        turnToken,
+        abandon,
+      );
+      if (!abandon) return call;
       void call.catch(() => undefined);
-      return Promise.race([call, abandoned.then(() => "")]);
+      return Promise.race([call, abandon.promise.then(() => "")]);
     });
+  }
+
+  /**
+   * Package 1.5 — a deadline for the runtime users the watchdog cannot name.
+   *
+   * Compaction and the provider-switch handoff are not Operator TURNS: they
+   * hold the same serial runtime with no turn token, so a wedge in one of them
+   * is invisible to the watchdog and blocks every answer behind it. They get
+   * their own bound, and on expiry the RESOURCE is repaired (the runtime slot
+   * is released and the child killed) rather than the next victim punished.
+   */
+  private async withRuntimeDeadline<T>(label: string, run: () => Promise<T>): Promise<T> {
+    const budgetMs = this.config.operator.turnTimeoutMs;
+    let budget: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        run(),
+        new Promise<never>((_, reject) => {
+          budget = setTimeout(() => {
+            this.logger.error({ label, budgetMs }, "Operator runtime call exceeded its deadline");
+            // No token: inside this queue slot the wedged call IS the active
+            // turn, and it must not survive as one.
+            try {
+              this.runtime.abandon?.();
+            } catch (error) {
+              this.logger.warn({ err: error }, "Operator runtime abandon failed");
+            }
+            reject(new Error(`${label} exceeded its ${budgetMs}ms deadline`));
+          }, budgetMs);
+          budget.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(budget);
+    }
   }
 
   /** The provider call itself; `askOperator` owns the queueing around it. */
@@ -5725,6 +5905,7 @@ export class OperatorDaemon {
     toolAccess?: OperatorToolAccess,
     onToolStarted?: (tool: string) => void,
     turnToken?: string,
+    abandon?: AbandonHandle,
   ): Promise<string> {
     let streamed = "";
     let segment = "";
@@ -5762,6 +5943,10 @@ export class OperatorDaemon {
           segment = "";
           onToolStarted?.(event.tool);
         } else if (event.type === "result") {
+          // Package 1.5: an abandoned turn is INERT, not merely unheard. Its
+          // late result must not adopt a session id, book usage or otherwise
+          // write over the state of the turn that took its place.
+          if (abandon?.settled()) continue;
           result = event.text;
           this.recordOperatorUsage(event.usage);
           if (event.sessionId && event.sessionId !== this.operatorSessionId) {
@@ -5773,7 +5958,9 @@ export class OperatorDaemon {
       return finalAnswer();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (/session|resume|conversation.*not found/i.test(message)) {
+      // …and it must not create a session either: `createOperatorSession`
+      // rewrites `operator_session_id` for everyone.
+      if (/session|resume|conversation.*not found/i.test(message) && !abandon?.settled()) {
         await this.createOperatorSession();
         streamed = "";
         result = "";
@@ -5798,6 +5985,7 @@ export class OperatorDaemon {
             segment = "";
             onToolStarted?.(event.tool);
           } else if (event.type === "result") {
+            if (abandon?.settled()) continue;
             result = event.text;
             this.recordOperatorUsage(event.usage);
           }
