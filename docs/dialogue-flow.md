@@ -26,15 +26,7 @@ constant or the verbatim string, not the number.
 | 2 | Group/supergroup | `allowGroups` (default `false`) | yes |
 | 3 | Forum topic | `message_thread_id` | yes |
 | 4 | Direct-messages topic | `direct_messages_topic.topic_id` | yes |
-| 5 | Slash command | `text.startsWith("/")` | yes |
-
-Entry 5 is a *dispatch attempt*, not a separate fate: `handleCommand` is a chain
-of exact-match branches, and text that matches none of them falls through to the
-ordinary Operator turn. Since package 1.3 that is what `/stop`, `/cancel` and
-`/focus` do — they are deleted commands, so they reach the agent as plain text
-(and preempt the running turn like any other message). A semantic stop
-(«останови сборку») is the Operator's own job via `t3.interrupt_thread`; the
-deterministic hatch is the bare cancel word of §4.
+| 5 | Slash command | `dispatchableCommandName(part.text)` | yes |
 | 6 | Approval callback | `/^a:([A-Za-z0-9_-]+):(1\|s\|0)$/` | **no** — inline |
 | 7 | User-input callback | `/^ui:([^:]+):(\d+):(o\d+\|s\|c)$/` | **no** |
 | 8 | `ask_choices` callback | `/^route:([\w-]+):(\d+)$/` | **no**, but replays as a synthetic durable message |
@@ -52,6 +44,58 @@ deterministic hatch is the bare cancel word of §4.
 
 Entries 6–8, 9, 17 and 18 bypass the durable job table entirely — they are
 handled inline and are lost if the process dies mid-handling.
+
+### Entry 5 in detail
+
+A *dispatch attempt*, not a separate fate. Since package 4.3 the command
+surface has one source of truth — the table in `apps/daemon/src/commands.ts` —
+from which `setMyCommands`, `/help` and the viewer wall are all generated.
+
+```
+splitCommandBatch(update)
+├─ merged batch → the FIRST own (non-forwarded) part whose text is command-shaped
+│                 becomes its own update; every other part is re-queued through
+│                 enqueueBatchRemainder as the next turn
+├─ single message → itself, if command-shaped
+└─ nothing command-shaped → undefined; ordinary Operator turn
+```
+
+A *command-shaped* text is `/name`, optionally `@bot`, ending at a space or the
+end of the message, with an ASCII name — so `/tmp/report.log`, a bare `/` and
+«/статус» are ordinary text and reach the agent unchanged. A command that is
+shaped but unknown (`/statis`) is answered locally with a Levenshtein
+suggestion within distance 2 plus a pointer to `/help`; it never costs a turn.
+
+`/stop`, `/cancel` and `/focus` are the one exception: package 1.3 deleted them
+*into ordinary text* deliberately, so `dispatchableCommandName` refuses to claim
+them. `/focus clear` therefore reaches the agent (and preempts the running turn
+like any other message), while `/stop` and `/cancel` are caught one step later by
+the cancel hatch of §4 — which strips the leading slash since package 4.3, so a
+panic does not buy an LLM turn. A semantic stop («останови сборку») is still the
+Operator's own job via `t3.interrupt_thread`.
+
+Ordering matters for one role. The viewer wall (§1) runs long before this split,
+so it judges the COMMAND part of a burst rather than the glued text: otherwise a
+viewer's «спасибо» + «/status» met the wall and never ran the command at all —
+and a viewer has nothing but commands. The remainder is not waved through; it
+returns as its own ingress job with no command in it and meets the same wall on
+that pass.
+
+The remainder of a split batch carries `batchWatermarkId` — the newest message
+id of the batch it came from — so the package 1.1 staleness rule judges it by
+its batch and not by its own ids. Without it, a burst whose command arrived
+*last* would have its prose discarded the instant it was re-queued.
+`seedInboundWatermarkFromPendingJobs` reads the mark the same way, so a pending
+remainder cannot seed a lower mark than it answers to.
+
+It also carries `mediaContext` — the transcripts and file notes derived from the
+batch's attachments. Those cannot be attributed to a part (`attachments` is
+flat), so they follow the remainder, which is the turn actually going to the
+model. They ride the envelope rather than a call argument because a burst can be
+split more than once, and each split rebuilds `text` from the parts, which never
+held them. Two side effects worth naming: the reply path of bug №35 now carries
+media context too (it never passed any), and a remainder that a zombie turn left
+behind is retried by `retryAfterZombie` like any other ingress job.
 
 ---
 
@@ -94,8 +138,14 @@ if roleForUser === "viewer" && !isViewerSafeMessage(text)
    → return
 ```
 
-`isViewerSafeMessage` admits `/status`, `/projects`, `/work`, `/help` and
-`/start` (with args) only.
+Since package 4.3 both the predicate and the sentence are generated from the
+command table: `isViewerSafeMessage` admits exactly the rows whose `minRole` is
+`viewer` — `/status`, `/projects`, `/work`, `/help`, `/start` (with args) — and
+`viewerWallText()` lists the same set, so the wall can no longer promise
+something it refuses. The same table decides what `/help` prints for each role
+and what `setMyCommands` publishes: viewer-safe commands in the DEFAULT scope
+(strangers, groups), the role's full list in each configured user's private
+chat scope, republished when `/team set` changes a role.
 
 Consequence: a viewer never reaches `answerDirect`, therefore never receives an
 MCP tool lease. The in-command refusal `…не может управлять automations` is
@@ -443,7 +493,7 @@ because a rate limit or a dead provider must never cost the owner their stop.
 ```
 A. RUNTIME PREEMPTION — a bare cancel word
    isCancelIntent: ≤3 whitespace tokens, only the first is matched, NFKC-lowered,
-                   trailing punctuation stripped, against
+                   punctuation stripped from BOTH ends (package 4.3), against
                    {стоп, отмена, отмени, хватит, cancel, stop}
    guard mayInterruptOperatorTurn: an active turn in THIS chat, AND
                                    (isAdministrator OR the turn's own initiator)
@@ -455,11 +505,15 @@ B. BOUND-WORK CANCEL — replyContext.primaryThreadId ?? focus.primary.threadId
    !canEditThread→ "У вас нет прав на остановку этой работы."
    else          → interruptThread, mark runtime state, "Остановил **<title>**."
 
-(Package 1.3 deleted path C — `/stop` and `/cancel` as slash commands. Only the
-slash forms died: both word paths above are intact, and `cancelBoundWork` still
-backs path B. A stop expressed in ordinary language — «останови сборку» — is now
-the Operator's judgement call via `t3.interrupt_thread`, stated in the policy
-prompt.)
+(Package 1.3 deleted path C — `/stop` and `/cancel` as slash COMMANDS, and both
+word paths above are intact. Package 4.3 finished the thought: because the first
+token is now stripped of punctuation at both ends, «/stop» and «/cancel» are
+cancel WORDS and take paths A and B. Until then they were the one spelling of a
+panic that bought a full LLM turn — the worst possible outcome for the phrase a
+person types when something is wrong. «/focus clear» is not a cancel word and
+still reaches the agent as ordinary text. A stop expressed in ordinary language
+— «останови сборку» — remains the Operator's judgement call via
+`t3.interrupt_thread`, stated in the policy prompt.)
 ```
 
 **Mid-turn message:** batched within a 2 s quiet window, then queued on the

@@ -65,6 +65,17 @@ import {
   resolveProjectReference,
   updateFocus,
 } from "../../../packages/router/src/index.js";
+import {
+  commandArguments,
+  dispatchableCommandName,
+  isViewerSafeMessage,
+  paginateCommandList,
+  parseCommandPage,
+  renderHelp,
+  telegramCommandMenu,
+  unknownCommandReply,
+  viewerWallText,
+} from "./commands.js";
 import { ThreadVoice } from "./voice.js";
 import {
   SHUTDOWN_DEADLINE_MS,
@@ -316,6 +327,19 @@ const DELIVERY_ALERT_THROTTLE_MS = 60_000;
  * measured in tens of seconds at least, so this only bounds the slop.
  */
 const WATCHDOG_TICK_MS = 5_000;
+/**
+ * Package 4.3: which chat scopes carry a published command menu. A scope is
+ * invisible from the API side — Telegram will not list them — so the daemon has
+ * to remember, or a user removed from the allowlist keeps their old menu for
+ * good.
+ */
+const PUBLISHED_COMMAND_SCOPES_KEY = "telegram_command_scopes";
+/**
+ * Package 4.3: how many notes `/memory` pages over. The store reads one more
+ * than this, so the reply can say that older notes exist instead of passing a
+ * truncated list off as the whole memory.
+ */
+const MEMORY_LIST_CAP = 200;
 /** Package 1.5: the race token that means "this turn was abandoned as a zombie". */
 const ZOMBIE = Symbol("zombie-turn");
 /**
@@ -637,6 +661,14 @@ export class OperatorDaemon {
       },
       "Operator initialized",
     );
+    // Package 4.3 review, BLOCKER 3: publishing the menu is up to N+1 sequential
+    // Bot API calls, each of which the outbound queue may retry three times
+    // behind a flood wait. Awaiting it here put all of that in front of the
+    // durable outbox flush — a boot that owes the owner a crash notice must not
+    // wait on a cosmetic menu. Fire and forget, like the /team set republish.
+    void this.publishTelegramCommands().catch((error: unknown) => {
+      this.logger.warn({ err: error }, "Telegram command menu publication failed");
+    });
     await this.flushTelegramOutbox();
     await this.drainT3Dispatches();
     // Package 1.2: a crash mid-sentence must not leave a terminal marked "being
@@ -1207,9 +1239,24 @@ export class OperatorDaemon {
       return;
     }
 
-    if (this.roleForUser(update.userId) === "viewer" && !isViewerSafeMessage(update.text)) {
-      await this.commandReply(update, "Ваша роль `viewer` разрешает только `/status`, `/projects`, `/work` и `/help`.");
-      return;
+    if (this.roleForUser(update.userId) === "viewer") {
+      // Package 4.3 review, BLOCKER 1: the wall reads the COMMAND of a burst,
+      // not the glued text. It runs ~280 lines before the command split and
+      // returns, so a viewer's «спасибо» + «/status» used to hit the wall and
+      // never run the command at all — the head bug of this package, alive for
+      // exactly the role that has nothing but commands.
+      //
+      // The remainder is not waved through: it comes back as its own ingress
+      // job with no command in it, and meets this same wall on that pass. The
+      // wall cannot simply move below the split either — not every command
+      // carries an internal role check.
+      const commanded = splitCommandBatch(update)?.command.text ?? update.text;
+      if (!isViewerSafeMessage(commanded)) {
+        // The list the wall quotes comes from the same table as /help and
+        // setMyCommands, so they can no longer drift apart.
+        await this.commandReply(update, viewerWallText());
+        return;
+      }
     }
 
     if (!update.synthetic) {
@@ -1443,6 +1490,10 @@ export class OperatorDaemon {
       update = {
         ...update,
         text: [userText, ...mediaContext].filter(Boolean).join("\n\n"),
+        // Package 4.3 review: kept as its own field, not only folded into text,
+        // so a remainder that is split a SECOND time (two commands in one
+        // burst) can rebuild its text from the parts without losing it.
+        mediaContext: [...mediaContext],
       };
     }
     for (const messageId of update.messageIds) {
@@ -1479,9 +1530,27 @@ export class OperatorDaemon {
       return;
     }
 
-    if (update.text.startsWith("/")) {
-      const handled = await this.handleCommand(update);
-      if (handled) return;
+    // Package 4.3, finding «команды №2»: the 2 s window glues a burst into one
+    // envelope, and the command path used to read only the merged text's first
+    // token and return — so «/status» followed a second later by «и посмотри,
+    // что с оплатой» answered the command and dropped the question forever,
+    // while the reverse order buried the command inside prose and shipped it to
+    // the model as text. The command part is now dispatched on its own and the
+    // rest of the batch continues as its own turn, exactly like the reply path
+    // (bug №35). Forwarded parts are data, never commands.
+    const commandBatch = splitCommandBatch(update);
+    if (commandBatch) {
+      const handled = await this.handleCommand(commandBatch.command);
+      if (!handled) {
+        // Finding «команды №3»: a typo buys a cheap local answer with a
+        // suggestion, not a full LLM turn of improvisation.
+        await this.commandReply(
+          commandBatch.command,
+          unknownCommandReply(dispatchableCommandName(commandBatch.command.text)!, this.roleForUser(update.userId)),
+        );
+      }
+      if (commandBatch.remainder.length) this.enqueueBatchRemainder(update, commandBatch.remainder);
+      return;
     }
     if (await this.handleNaturalMemory(update)) return;
 
@@ -1573,6 +1642,13 @@ export class OperatorDaemon {
         forwarded.map((part) => part.text.trim()).filter(Boolean).join("\n\n"),
       );
     }
+    // Package 4.3 review: the batch's media context follows the remainder — the
+    // turn that is actually going to the model — instead of being dropped with
+    // the attachments it came from. Read off the envelope rather than passed
+    // in, so it survives a second split AND so the reply path (bug №35), which
+    // never passed it at all, carries it too.
+    const mediaContext = update.mediaContext ?? [];
+    sections.push(...mediaContext);
     // Package 1.4: the remainder keeps its own reply, if any of its parts had
     // one. Inheriting the batch-level fields would carry the ANSWERED card's
     // quote into a turn about different messages; dropping them wholesale
@@ -1588,6 +1664,11 @@ export class OperatorDaemon {
         : {}),
       messageId: remainder.at(-1)!.messageId,
       messageIds: remainder.map((part) => part.messageId),
+      // Package 4.3: whose watermark this remainder answers to. Without it a
+      // command at the END of a burst («почини оплату» → «/status») left prose
+      // that the package 1.1 staleness rule discarded on sight.
+      batchWatermarkId: Math.max(...update.messageIds, update.batchWatermarkId ?? 0),
+      ...(mediaContext.length ? { mediaContext } : {}),
       text: sections.join("\n\n"),
       ...(ownText ? { ownText } : {}),
       ...(forwarded.length ? { forwardedCount: forwarded.length } : {}),
@@ -1929,7 +2010,9 @@ export class OperatorDaemon {
     if (update.synthetic || update.edited) return false;
     const newest = this.inboundWatermark.get(this.conversationKey(update));
     if (newest === undefined) return false;
-    return newest > Math.max(...update.messageIds);
+    // Package 4.3: a batch remainder answers for its whole batch. Judging it by
+    // its own ids would call it stale because of a message it arrived WITH.
+    return newest > Math.max(...update.messageIds, update.batchWatermarkId ?? 0);
   }
 
   /**
@@ -1948,7 +2031,9 @@ export class OperatorDaemon {
         if (!update || update.type !== "message" || update.synthetic || update.edited) continue;
         if (!update.messageIds?.length) continue;
         const key = this.conversationKey(update);
-        const newest = Math.max(...update.messageIds);
+        // Package 4.3 review: read the mark the same way inboundSupersedes does,
+        // or a pending batch remainder seeds a lower mark than it answers to.
+        const newest = Math.max(...update.messageIds, update.batchWatermarkId ?? 0);
         if (newest > (this.inboundWatermark.get(key) ?? 0)) this.inboundWatermark.set(key, newest);
       }
     }
@@ -4697,11 +4782,123 @@ export class OperatorDaemon {
     };
   }
 
+  /**
+   * Package 4.3, finding «команды №6»: one shape for every list command.
+   *
+   * `/projects` had no limit at all — 200 projects became a wall of split
+   * messages — while `/work` cut at 20 and `/memory` at 12 without a word.
+   * Now every list shows one page and says so, and the next page is one more
+   * command away.
+   */
+  private renderCommandPage<T>(input: {
+    command: string;
+    argument: string;
+    items: readonly T[];
+    heading: string;
+    empty: string;
+    render: (item: T) => string;
+    /** Trailing lines that belong to a rendered list, not to a usage error. */
+    suffix?: string[];
+  }): string {
+    const page = parseCommandPage(input.argument);
+    if (page === undefined) return `Использование: \`${input.command} [страница]\`.`;
+    const suffix = input.suffix?.length ? ["", ...input.suffix] : [];
+    if (!input.items.length) return [input.empty, ...suffix].join("\n");
+    const view = paginateCommandList(input.items, page, input.command);
+    if (view.outOfRange) return view.outOfRange;
+    return [
+      input.heading,
+      "",
+      ...view.items.map(input.render),
+      ...(view.footer ? ["", view.footer] : []),
+      ...suffix,
+    ].join("\n");
+  }
+
+  /**
+   * Package 4.3, finding «команды №1»: publish the command menu, so Telegram
+   * offers autocomplete and a «Меню» button instead of the commands existing
+   * only inside the text of `/help`.
+   *
+   * Two scopes. The DEFAULT list is the viewer-safe subset: it is what a
+   * stranger, a group and anyone the daemon has no row for sees, and it must
+   * not advertise `/policy` or `/debug` to them. Every configured user then
+   * gets a chat-scoped list for their own private chat — in a private chat the
+   * chat id IS the user id — and Telegram prefers the more specific scope. A
+   * viewer's scope is published too rather than skipped, so a demotion
+   * replaces the old full menu instead of leaving it behind.
+   *
+   * Best effort throughout: someone who has never opened the chat has no chat
+   * for Telegram to scope to, and a menu is not worth failing a boot over.
+   */
+  private async publishTelegramCommands(): Promise<void> {
+    if (!this.telegram.setMyCommands) return;
+    try {
+      await this.telegram.setMyCommands(telegramCommandMenu("viewer"), { type: "default" });
+    } catch (error) {
+      this.logger.warn({ err: error }, "Could not publish the default Telegram command menu");
+    }
+    const configured = new Set<number>(
+      [
+        this.config.telegram.allowedUserId,
+        ...Object.keys(this.config.telegram.users).map(Number),
+      ].filter((userId) => Number.isFinite(userId)),
+    );
+    // Package 4.3 review: a chat scope outlives the user it was published for.
+    // Drop someone from TELEGRAM_ALLOWED_USERS and their client keeps the old
+    // owner-level autocomplete forever, because nothing ever revisits that
+    // scope. Remember which scopes exist and reset the ones that should not.
+    const stale = this.publishedCommandScopes().filter((userId) => !configured.has(userId));
+    const unresolved: number[] = [];
+    for (const userId of stale) {
+      // Back to what a stranger sees, which is what they now are. A scope we
+      // could not reset stays on the list so the next boot tries again.
+      if (!(await this.publishUserCommandMenu(userId, "viewer"))) unresolved.push(userId);
+    }
+    for (const userId of configured) await this.publishUserCommandMenu(userId);
+    this.store.setRuntimeState(
+      PUBLISHED_COMMAND_SCOPES_KEY,
+      [...configured, ...unresolved].join(","),
+    );
+  }
+
+  /** Chat scopes a previous boot published a menu into. */
+  private publishedCommandScopes(): number[] {
+    return (this.store.getRuntimeState(PUBLISHED_COMMAND_SCOPES_KEY) ?? "")
+      .split(",")
+      .map(Number)
+      .filter((userId) => Number.isFinite(userId) && userId !== 0);
+  }
+
+  /**
+   * One user's private-chat menu. `false` when Telegram would not take it —
+   * someone who never opened the chat has no chat to scope to, which is not an
+   * error worth more than this line.
+   */
+  private async publishUserCommandMenu(userId: number, role?: TeamRole): Promise<boolean> {
+    if (!this.telegram.setMyCommands) return false;
+    const scopeRole = role ?? this.roleForUser(userId);
+    try {
+      await this.telegram.setMyCommands(telegramCommandMenu(scopeRole), {
+        type: "chat",
+        chatId: userId,
+      });
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        { err: error, chat: hashChatId(userId), role: scopeRole },
+        "Could not publish a chat-scoped Telegram command menu",
+      );
+      return false;
+    }
+  }
+
   private async handleCommand(update: Extract<TelegramInbound, { type: "message" }>): Promise<boolean> {
-    const command = update.text
-      .split(/\s+/, 1)[0]!
-      .split("@", 1)[0]!
-      .toLocaleLowerCase();
+    // Package 4.3: the token is read by exactly the helper `splitCommandBatch`
+    // used to decide this IS a command. Parsing it twice by two rules is how a
+    // message with a leading space dispatched one way and was reported unknown
+    // the other. `false` here now means one thing only: the name is not live.
+    const command = `/${dispatchableCommandName(update.text) ?? ""}`;
     const visibleThreads = this.threadsVisibleToUser(update.userId, this.store.listThreads());
     const visibleThreadIds = new Set(visibleThreads.map((thread) => thread.id));
     if (command === "/status") {
@@ -4743,14 +4940,25 @@ export class OperatorDaemon {
         update.userId,
         await this.broker.listProjects().catch(() => this.store.listProjects()),
       );
-      await this.commandReply(update, projects.length ? `## Проекты\n\n${projects.map((project) => `- **${escapeMarkdownText(project.name)}**`).join("\n")}` : "Проектов пока нет.");
+      await this.commandReply(update, this.renderCommandPage({
+        command: "/projects",
+        argument: commandArguments(update.text),
+        items: projects,
+        heading: "## Проекты",
+        empty: "Проектов пока нет.",
+        render: (project) => `- **${escapeMarkdownText(project.name)}**`,
+      }));
       return true;
     }
     if (command === "/work") {
-      const threads = visibleThreads.slice(0, 20);
-      await this.commandReply(update, threads.length
-          ? `## Последние работы\n\n${threads.map((thread) => `- **${escapeMarkdownText(thread.title)}** — ${threadStatusRu(thread.status)}`).join("\n")}`
-          : "Рабочих тредов пока нет.");
+      await this.commandReply(update, this.renderCommandPage({
+        command: "/work",
+        argument: commandArguments(update.text),
+        items: visibleThreads,
+        heading: "## Последние работы",
+        empty: "Рабочих тредов пока нет.",
+        render: (thread) => `- **${escapeMarkdownText(thread.title)}** — ${threadStatusRu(thread.status)}`,
+      }));
       return true;
     }
     // Package 1.3: /focus is gone — focus is an internal binding, not a user
@@ -4793,23 +5001,11 @@ export class OperatorDaemon {
       return true;
     }
     if (command === "/help" || command === "/start") {
-      await this.commandReply(update, [
-          "## Operator",
-          "",
-          "Пишите обычным языком: короткие вопросы я отвечу сам, существенную работу возьму в долгую фоновую работу.",
-          "",
-          "- `/status` — активная и недавняя работа",
-          "- `/projects` — проекты",
-          "- `/work` — рабочие треды",
-          "- `/memory` — долговременные заметки; `remember`, `search`, `forget`, `restore`, `compact`",
-          "- `/team` — роли команды (владелец/админ)",
-          "- `/share <проект> <id-пользователя> <editor|viewer>` — доступ к проекту",
-          "- `/automation` — регулярные задачи по расписанию",
-          "- `/dashboard` и `/policy` — локальные настройки (владелец/админ)",
-          "- `/operator` — какой движок сейчас работает и переключение (владелец/админ)",
-          "- `/alias <проект> | <алиас>` — постоянный алиас проекта",
-          "- `/debug` — диагностика (только владелец)",
-        ].join("\n"));
+      // Package 4.3, finding «команды №13»: /help used to print the same 13
+      // lines to everyone, so a viewer read about `/memory` and `/automation`
+      // and then bounced off the wall on both. The list is now the same
+      // role-filtered table that feeds setMyCommands and the wall itself.
+      await this.commandReply(update, renderHelp(this.roleForUser(update.userId), update.userId));
       return true;
     }
     if (command === "/team") {
@@ -4867,7 +5063,7 @@ export class OperatorDaemon {
   private async handleProjectAliasCommand(
     update: Extract<TelegramInbound, { type: "message" }>,
   ): Promise<void> {
-    const [rawProject, rawAlias] = update.text.replace(/^\/alias(?:@\w+)?\s*/iu, "").split("|").map((value) => value.trim());
+    const [rawProject, rawAlias] = commandArguments(update.text).split("|").map((value) => value.trim());
     if (!rawProject || !rawAlias) {
       await this.commandReply(update, "Использование: `/alias <project-id-or-name> | <alias>`.");
       return;
@@ -4896,31 +5092,44 @@ export class OperatorDaemon {
       await this.commandReply(update, "Роль `viewer` не может управлять автоматизациями.");
       return;
     }
-    const input = update.text.replace(/^\/automations?(?:@\w+)?\s*/iu, "").trim();
+    const input = commandArguments(update.text);
     const [action = "list", id] = input.split(/\s+/, 2);
-    if (!input || action.toLocaleLowerCase() === "list") {
+    const verb = action.toLocaleLowerCase();
+    // `/automation 2` is the second page of the list, not an unknown verb.
+    const pageOnly = /^\d+$/.test(action);
+    if (!input || pageOnly || verb === "list") {
       const automations = this.isAdministrator(update.userId)
         ? this.store.listAutomations()
         : this.store.listAutomations(String(update.userId));
-      await this.commandReply(update, automations.length
-          ? `## Автоматизации\n\n${automations.map((automation) => [
-              `- **${escapeMarkdownText(automation.name)}** · \`${automation.id}\``,
-              `  ${automationScheduleLabel(automation.schedule)} · ${AUTOMATION_STATUS_RU[automation.status] ?? automation.status}${automation.nextRunAt ? ` · следующий запуск ${automation.nextRunAt}` : ""}`,
-            ].join("\n")).join("\n")}`
-          : "Автоматизаций пока нет. Создайте: `/automation add daily 09:00 Europe/Moscow | Утренний обзор | Проверь активные проекты и пришли краткий обзор`.");
+      await this.commandReply(update, this.renderCommandPage({
+        command: "/automation list",
+        argument: pageOnly ? action : (id ?? ""),
+        items: automations,
+        heading: "## Автоматизации",
+        empty: "Автоматизаций пока нет. Создайте: `/automation add daily 09:00 Europe/Moscow | Утренний обзор | Проверь активные проекты и пришли краткий обзор`.",
+        render: (automation) => [
+          `- **${escapeMarkdownText(automation.name)}** · \`${automation.id}\``,
+          `  ${automationScheduleLabel(automation.schedule)} · ${AUTOMATION_STATUS_RU[automation.status] ?? automation.status}${automation.nextRunAt ? ` · следующий запуск ${automation.nextRunAt}` : ""}`,
+        ].join("\n"),
+      }));
       return;
     }
-    if (["pause", "resume", "delete"].includes(action.toLocaleLowerCase())) {
-      const automation = id ? this.store.getAutomation(id) : undefined;
+    if (["pause", "resume", "delete"].includes(verb)) {
+      // Package 4.3: a missing id used to answer «не найдена», which reads as
+      // "your automation is gone" rather than "you left out the argument".
+      if (!id) {
+        await this.commandReply(
+          update,
+          `Использование: \`/automation ${verb} <id>\` — id показан рядом с названием в \`/automation\`.`,
+        );
+        return;
+      }
+      const automation = this.store.getAutomation(id);
       if (!automation || (!this.isAdministrator(update.userId) && automation.ownerId !== String(update.userId))) {
         await this.commandReply(update, "Автоматизация не найдена или недоступна.");
         return;
       }
-      const status = action.toLocaleLowerCase() === "pause"
-        ? "paused"
-        : action.toLocaleLowerCase() === "resume"
-          ? "active"
-          : "deleted";
+      const status = verb === "pause" ? "paused" : verb === "resume" ? "active" : "deleted";
       let resumeNote = "";
       if (status === "active") {
         // Resume recomputes interval/daily schedules from "now" so a stale
@@ -4943,8 +5152,8 @@ export class OperatorDaemon {
       await this.commandReply(update, `Автоматизация **${escapeMarkdownText(automation.name)}**: ${AUTOMATION_STATUS_RU[status] ?? status}.${resumeNote}`);
       return;
     }
-    if (action.toLocaleLowerCase() !== "add") {
-      await this.commandReply(update, "Использование: `/automation add <once ISO|every minutes|daily HH:MM TZ> | <name> | <prompt>`; также `list`, `pause`, `resume`, `delete`.");
+    if (verb !== "add") {
+      await this.commandReply(update, "Использование: `/automation add <once ISO|every minutes|daily HH:MM TZ> | <name> | <prompt>`; также `list [страница]`, `pause <id>`, `resume <id>`, `delete <id>`.");
       return;
     }
     const parts = input.replace(/^add\s+/iu, "").split("|").map((part) => part.trim());
@@ -4986,7 +5195,7 @@ export class OperatorDaemon {
       await this.commandReply(update, "Настройки доступны только владельцу и админам.");
       return;
     }
-    const input = update.text.replace(/^\/policy(?:@\w+)?\s*/iu, "").trim();
+    const input = commandArguments(update.text);
     if (!input) {
       const policy = this.getPolicy();
       await this.commandReply(update, `## Текущие настройки\n\n${Object.entries(policy).map(([key, value]) => `- **${escapeMarkdownText(key)}**: \`${Array.isArray(value) ? value.join(",") : value}\``).join("\n")}\n\nИзменить: \`/policy set <ключ> <значение>\`.`);
@@ -5022,7 +5231,7 @@ export class OperatorDaemon {
     }
     const current = this.runtime.currentProvider?.() ?? this.config.operator.provider;
     const available = this.runtime.availableProviders?.() ?? [current];
-    const input = update.text.replace(/^\/operator(?:@\w+)?\s*/iu, "").trim();
+    const input = commandArguments(update.text);
     if (!input || input.toLocaleLowerCase() === "status") {
       await this.commandReply(update, `## Движок\n\nСейчас работает: **${escapeMarkdownText(current)}**\nДоступны: ${available.map((provider) => `\`${escapeMarkdownText(provider)}\``).join(", ")}\n\nПереключить: \`/operator switch <движок>\`.`);
       return;
@@ -5099,7 +5308,7 @@ export class OperatorDaemon {
       await this.commandReply(update, "Команда доступна только владельцу и админам.");
       return;
     }
-    const args = update.text.trim().split(/\s+/).slice(1);
+    const args = commandArguments(update.text).split(/\s+/u).filter(Boolean);
     if (!args.length || args[0]?.toLocaleLowerCase() === "list") {
       const members = this.store.listTeamMembers();
       await this.commandReply(update, members.length
@@ -5131,24 +5340,47 @@ export class OperatorDaemon {
     this.store.appendEvent("team.role.updated", {
       payload: { actorUserId: String(update.userId), targetUserId: rawUserId, role: rawRole },
     });
+    // Package 4.3: the published menu is role-scoped, so a role change has to
+    // reach Telegram or the demoted user keeps an owner's autocomplete until
+    // the next boot. Only the target's scope changed, so only it is republished
+    // (review note). Best effort and off the reply path — the answer below must
+    // not wait on a menu call.
+    void this.publishUserCommandMenu(targetId, rawRole).catch(() => undefined);
     await this.commandReply(update, `Роль \`${rawUserId}\` обновлена: \`${escapeMarkdownText(rawRole)}\`.`);
   }
 
   private async handleShareCommand(
     update: Extract<TelegramInbound, { type: "message" }>,
   ): Promise<void> {
-    const [, rawProject, rawUserId, rawAccess] = update.text.trim().split(/\s+/, 4);
+    // Package 4.3, finding «команды №15»: `/share` split on whitespace and
+    // compared the third token to project ids and exact names, so a project
+    // whose name has a space was unreachable and an alias minted by `/alias`
+    // — which resolves the very same argument through resolveProjectReference
+    // — was not understood. Parse from the END instead: the last two tokens are
+    // the access role and the user id, and everything between the command and
+    // them is the project reference, spaces and all.
+    const tokens = commandArguments(update.text).split(/\s+/u).filter(Boolean);
+    const rawAccess = tokens.at(-1);
+    const rawUserId = tokens.at(-2);
+    const rawProject = tokens.slice(0, -2).join(" ");
     if (!rawProject || !rawUserId || !/^\d+$/.test(rawUserId) || !isProjectAccessRole(rawAccess)) {
-      await this.commandReply(update, "Использование: `/share <project-id-or-name> <telegram-user-id> <owner|editor|viewer>`");
+      await this.commandReply(update, [
+        "Использование: `/share <проект> <telegram-user-id> <owner|editor|viewer>`",
+        "",
+        "Проект — id, название (можно с пробелами) или алиас из `/alias`.",
+        "Пример: `/share Мобильное приложение 123456789 editor`.",
+      ].join("\n"));
       return;
     }
     const projects = this.projectsVisibleToUser(
       update.userId,
       await this.broker.listProjects().catch(() => this.store.listProjects()),
     );
-    const project = projects.find((candidate) =>
-      candidate.id === rawProject || candidate.name.toLocaleLowerCase() === rawProject.toLocaleLowerCase(),
-    );
+    // An exact id wins over a fuzzy name match: `resolveProjectReference` scans
+    // for names and aliases inside the text, so a project literally called
+    // «Проект» would otherwise hijack an argument that IS another project's id.
+    const project = projects.find((candidate) => candidate.id === rawProject)
+      ?? resolveProjectReference(rawProject, projects);
     if (!project) {
       await this.commandReply(update, "Проект не найден или недоступен.");
       return;
@@ -5179,7 +5411,7 @@ export class OperatorDaemon {
   private async handleMemoryCommand(
     update: Extract<TelegramInbound, { type: "message" }>,
   ): Promise<void> {
-    const input = update.text.replace(/^\/memory(?:@\w+)?\s*/iu, "").trim();
+    const input = commandArguments(update.text);
     const [action = "", ...rest] = input.split(/\s+/);
     const detail = rest.join(" ").trim();
     if (["remember", "запомни"].includes(action.toLocaleLowerCase())) {
@@ -5198,12 +5430,22 @@ export class OperatorDaemon {
       return;
     }
     if (["forget", "delete", "забудь"].includes(action.toLocaleLowerCase())) {
-      const removed = detail ? this.store.markOperatorNoteObsolete(detail) : false;
+      // Package 4.3: without an id this answered «не найдена», which reads as
+      // "the note is gone" instead of "you left out the argument".
+      if (!detail) {
+        await this.commandReply(update, "Использование: `/memory forget <id-заметки>` — id показан в списке `/memory`.");
+        return;
+      }
+      const removed = this.store.markOperatorNoteObsolete(detail);
       await this.commandReply(update, removed ? `Пометил **${escapeMarkdownText(detail)}** как устаревшую.` : "Активная заметка с таким ID не найдена.");
       return;
     }
     if (["restore", "восстанови"].includes(action.toLocaleLowerCase())) {
-      const restored = detail ? this.store.restoreOperatorNote(detail) : false;
+      if (!detail) {
+        await this.commandReply(update, "Использование: `/memory restore <id-заметки>` — id показан в списке `/memory`.");
+        return;
+      }
+      const restored = this.store.restoreOperatorNote(detail);
       if (restored) this.store.appendEvent("memory.note.restored", { payload: { noteId: detail } });
       await this.telegram.sendRich(
         update.chatId,
@@ -5226,17 +5468,41 @@ export class OperatorDaemon {
       await this.commandReply(update, "Контекст сжат: главный фокус, выжимки, незакрытые вопросы и долговременные заметки восстановлены.");
       return;
     }
-    const notes = this.store.listOperatorNotes({ status: "active", limit: 12 });
+    // Package 4.3, finding «команды №6»: the listing silently stopped at 12
+    // notes. It is now a page of the same shape as every other list command,
+    // bounded by the store's own cap on one read — and the review caught the
+    // pagination footer lying about that cap («Показано 1–20 из 200» on 250
+    // notes), so the cap is now stated rather than presented as the total.
+    const listPage = !action
+      ? ""
+      : /^\d+$/.test(action)
+        ? action
+        : ["list", "список"].includes(action.toLocaleLowerCase())
+          ? detail
+          : undefined;
+    if (listPage === undefined) {
+      await this.commandReply(update, "Использование: `/memory [страница]`; также `remember <текст>`, `search <запрос>`, `forget <id>`, `restore <id>`, `compact`.");
+      return;
+    }
+    const fetched = this.store.listOperatorNotes({ status: "active", limit: MEMORY_LIST_CAP + 1 });
+    const notes = fetched.slice(0, MEMORY_LIST_CAP);
     const compaction = this.store.listCompactions(1)[0];
-    await this.commandReply(update, [
-        "## Долговременная память",
-        "",
-        ...(notes.length ? notes.map(renderOperatorNote) : ["Активных заметок нет."]),
-        "",
+    await this.commandReply(update, this.renderCommandPage({
+      command: "/memory",
+      argument: listPage,
+      items: notes,
+      heading: "## Долговременная память",
+      empty: "## Долговременная память\n\nАктивных заметок нет.",
+      render: renderOperatorNote,
+      suffix: [
+        ...(fetched.length > MEMORY_LIST_CAP
+          ? [`Это ${MEMORY_LIST_CAP} самых свежих заметок — более старые ищите через \`/memory search <запрос>\`.`]
+          : []),
         compaction
           ? `Последнее сжатие: ${escapeMarkdownText(compaction.createdAt)} — ${escapeMarkdownText(compaction.reason)}`
           : "История сжатий пока пуста.",
-      ].join("\n"));
+      ],
+    }));
   }
 
   private async handleNaturalMemory(
@@ -6807,12 +7073,6 @@ export function syntheticNegativeMessageId(seed: string): number {
   return -Math.max(1, Number.parseInt(createHash("sha256").update(seed).digest("hex").slice(0, 12), 16));
 }
 
-function isViewerSafeMessage(text: string): boolean {
-  const normalized = text.trim();
-  // Package 1.3: /focus dropped from the wall with the command itself.
-  return /^\/(?:status|projects|work|help|start)(?:@\w+)?(?:\s|$)/iu.test(normalized);
-}
-
 function isTeamRole(value: string): value is TeamRole {
   return ["owner", "admin", "member", "viewer"].includes(value);
 }
@@ -7284,6 +7544,68 @@ export function answerPartUpdate(
     messageIds: [part.messageId],
     replyToMessageId: part.replyToMessageId!,
     ...(part.reply ? { reply: part.reply } : {}),
+    parts: [part],
+  };
+}
+
+/**
+ * Package 4.3: the one message of a merged batch that is a slash command,
+ * shaped as an update of its own, plus everything else in the batch.
+ *
+ * `undefined` when no part is command-shaped — the envelope is then an ordinary
+ * turn. A forwarded part is never a command: forwarded text is material to
+ * read, and letting it dispatch would make a forwarded «/debug» run one.
+ */
+export function splitCommandBatch(
+  update: Extract<TelegramInbound, { type: "message" }>,
+): { command: Extract<TelegramInbound, { type: "message" }>; remainder: TelegramInboundBatchPart[] } | undefined {
+  const parts = update.parts?.length ? update.parts : undefined;
+  if (!parts) {
+    // Package 4.3 review: the forwarded guard belongs on BOTH branches. With it
+    // only on the parts branch, a single forwarded «/debug» really did run one
+    // and hand back the chat hash, the SQLite state and the outbox counters.
+    return !update.forwardOrigin && dispatchableCommandName(update.text)
+      ? { command: update, remainder: [] }
+      : undefined;
+  }
+  const index = parts.findIndex((part) => !part.forwarded && dispatchableCommandName(part.text));
+  if (index === -1) return undefined;
+  return {
+    command: commandPartUpdate(update, parts[index]!),
+    remainder: parts.filter((_, position) => position !== index),
+  };
+}
+
+/**
+ * One part of a merged batch as a standalone command update. Batch-level reply
+ * and forwarding bookkeeping is dropped — it describes the whole envelope, not
+ * this message — and the attachments are already ingested and bound, so
+ * re-listing them here would download them a second time.
+ */
+function commandPartUpdate(
+  update: Extract<TelegramInbound, { type: "message" }>,
+  part: TelegramInboundBatchPart,
+): Extract<TelegramInbound, { type: "message" }> {
+  const {
+    reply: _mergedReply,
+    replyToMessageId: _mergedReplyToMessageId,
+    ownText: _mergedOwnText,
+    forwardedCount: _mergedForwardedCount,
+    ...base
+  } = update;
+  return {
+    ...base,
+    text: part.text,
+    ownText: part.text,
+    messageId: part.messageId,
+    messageIds: [part.messageId],
+    ...(part.replyToMessageId
+      ? {
+          replyToMessageId: part.replyToMessageId,
+          ...(part.reply ? { reply: part.reply } : {}),
+        }
+      : {}),
+    attachments: [],
     parts: [part],
   };
 }
