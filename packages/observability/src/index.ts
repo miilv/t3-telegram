@@ -226,19 +226,25 @@ export function createLogger(level = "info", destination?: DestinationStream): L
 }
 
 function sanitizeLogArgument(value: unknown): unknown {
-  return redactSecretsForOutputDeep(serializeLogErrors(value, new WeakMap<object, object>()));
+  return redactSecretsForOutputDeep(serializeDirectLogErrors(value));
 }
 
-function serializeLogErrors(value: unknown, seen: WeakMap<object, object>): unknown {
-  if (value instanceof Error) return serializeLogErrors(serializeSanitizedError(value), seen);
-  if (!value || typeof value !== "object" || value instanceof Date) return value;
-  const existing = seen.get(value);
-  if (existing) return existing;
-  const result: unknown[] | Record<string, unknown> = Array.isArray(value) ? [] : {};
-  seen.set(value, result);
-  for (const [key, item] of Object.entries(value)) {
-    if (Array.isArray(result)) result[Number(key)] = serializeLogErrors(item, seen);
-    else result[key] = serializeLogErrors(item, seen);
+function serializeDirectLogErrors(value: unknown): unknown {
+  if (value instanceof Error) return serializeSanitizedError(value);
+  if (!value || typeof value !== "object") return value;
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return value;
+  const errorEntries = Object.entries(Object.getOwnPropertyDescriptors(value))
+    .filter((entry): entry is [string, PropertyDescriptor & { value: Error }] =>
+      "value" in entry[1] && entry[1].value instanceof Error,
+    );
+  if (errorEntries.length === 0) return value;
+  const result: unknown[] | Record<string, unknown> = Array.isArray(value)
+    ? [...value]
+    : { ...(value as Record<string, unknown>) };
+  for (const [key, descriptor] of errorEntries) {
+    if (Array.isArray(result)) result[Number(key)] = serializeSanitizedError(descriptor.value);
+    else result[key] = serializeSanitizedError(descriptor.value);
   }
   return result;
 }
@@ -250,15 +256,16 @@ function serializeSanitizedError(error: unknown): unknown {
 }
 
 function sanitizeSerializedError(serialized: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...serialized };
   for (const key of ["message", "stack"]) {
-    if (typeof serialized[key] === "string") serialized[key] = redactSecretsForOutput(serialized[key]);
+    if (typeof result[key] === "string") result[key] = redactSecretsForOutput(result[key]);
   }
-  if (typeof serialized.cause === "string") {
-    serialized.cause = redactSecretsForOutput(serialized.cause);
-  } else if (serialized.cause && typeof serialized.cause === "object") {
-    serialized.cause = sanitizeSerializedError(serialized.cause as Record<string, unknown>);
+  if (typeof result.cause === "string") {
+    result.cause = redactSecretsForOutput(result.cause);
+  } else if (result.cause && typeof result.cause === "object") {
+    result.cause = sanitizeSerializedError(result.cause as Record<string, unknown>);
   }
-  return serialized;
+  return result;
 }
 
 const fallbackHashSalt = randomBytes(32);
