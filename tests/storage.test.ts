@@ -118,6 +118,58 @@ describe("OperatorStore", () => {
     ]);
   });
 
+  it("stores a typed local confirmation without inventing a worker thread", () => {
+    const store = tempStore();
+    const local = store.saveLocalApproval({
+      id: "approval_local",
+      requestKey: "delete:automation_1",
+      target: { kind: "automation_delete", automationId: "automation_1", actorUserId: "42" },
+      payload: { summary: "Delete it?" },
+      chatId: 7,
+    });
+    expect(local).toMatchObject({
+      kind: "local",
+      target: { kind: "automation_delete", automationId: "automation_1", actorUserId: "42" },
+      status: "pending",
+    });
+    expect(local).not.toHaveProperty("threadId");
+    expect(store.listPendingApprovalRequests(7).map((entry) => entry.id)).toEqual(["approval_local"]);
+    expect(store.db.prepare("SELECT count(*) AS count FROM pending_approvals").get()).toEqual({ count: 0 });
+    expect(store.db.prepare("SELECT target_kind,target_id FROM pending_local_approvals").get()).toEqual({
+      target_kind: "automation_delete",
+      target_id: "automation_1",
+    });
+    // Replaying the same request key returns the same confirmation row.
+    expect(store.saveLocalApproval({
+      id: "approval_other",
+      requestKey: "delete:automation_1",
+      target: { kind: "automation_delete", automationId: "automation_1", actorUserId: "42" },
+      payload: { summary: "Delete it?" },
+      chatId: 7,
+    }).id).toBe("approval_local");
+    expect(store.resolveLocalApproval("approval_local", "decline")).toBe(true);
+    expect(store.saveLocalApproval({
+      id: "approval_replayed_after_decline",
+      requestKey: "delete:automation_1",
+      target: { kind: "automation_delete", automationId: "automation_1", actorUserId: "42" },
+      payload: { summary: "Delete it?" },
+      chatId: 7,
+    })).toMatchObject({ id: "approval_local", status: "decline" });
+    const expired = store.saveLocalApproval({
+      id: "approval_expired",
+      requestKey: "delete:automation_2",
+      target: { kind: "automation_delete", automationId: "automation_2", actorUserId: "42" },
+      payload: { summary: "Delete that too?" },
+      chatId: 7,
+    });
+    store.resolveLocalApproval(expired.id, "expired");
+    expect(store.saveLocalApproval({ ...expired, id: "approval_expired_replay" })).toMatchObject({
+      id: "approval_expired",
+      status: "expired",
+    });
+    store.close();
+  });
+
   it("persists message mappings idempotently and restores reply context", () => {
     const store = tempStore();
     const createdAt = nowIso();
@@ -310,6 +362,44 @@ describe("OperatorStore", () => {
       lastErrorCode: "TELEGRAM_AMBIGUOUS",
     });
     expect(store.claimNextTelegramOutbox()).toBeUndefined();
+    store.close();
+  });
+
+  it("gives local approval cards a stable retry boundary without duplicate keyboards", () => {
+    const store = tempStore();
+    const approval = store.saveLocalApproval({
+      id: "approval_delete_1",
+      requestKey: "telegram-ingress:91:delete:1",
+      target: { kind: "automation_delete", automationId: "automation_1", actorUserId: "42" },
+      payload: { title: "Delete", risk: "destructive" },
+      chatId: 7,
+    });
+    const enqueue = () => store.enqueueTelegramOutbox({
+      dedupeKey: `telegram:approval:${approval.id}:request`,
+      chatId: 7,
+      operation: "approval",
+      payload: { approvalId: approval.id, text: "Confirm delete", localApproval: true },
+    });
+    const first = enqueue();
+    expect(enqueue().id).toBe(first.id);
+    expect(store.claimNextTelegramOutbox()?.id).toBe(first.id);
+    // A definite pre-send failure returns the same durable row to retry.
+    store.retryTelegramOutbox(first.id, "TELEGRAM_UNAVAILABLE", "definite failure", 0);
+    store.db.prepare("UPDATE telegram_outbox SET next_attempt_at=? WHERE id=?").run("2020-01-01", first.id);
+    expect(store.claimNextTelegramOutbox()?.id).toBe(first.id);
+    // If Telegram may have landed the keyboard before the process stopped, the
+    // non-idempotent send is parked as uncertain. Re-requesting by the stable
+    // approval id cannot create a second keyboard row.
+    expect(store.resetInterruptedTelegramOutbox()).toBe(1);
+    expect(store.getTelegramOutbox(first.id)).toMatchObject({
+      operation: "approval",
+      status: "uncertain",
+      lastErrorCode: "TELEGRAM_AMBIGUOUS",
+    });
+    expect(enqueue()).toMatchObject({ id: first.id, status: "uncertain" });
+    expect(store.db.prepare(
+      "SELECT count(*) AS count FROM telegram_outbox WHERE operation='approval'",
+    ).get()).toEqual({ count: 1 });
     store.close();
   });
 
@@ -783,9 +873,15 @@ describe("OperatorStore", () => {
     const expectedBackoffMinutes = [1, 2, 4, 8];
 
     for (const [index, backoff] of expectedBackoffMinutes.entries()) {
-      expect(store.claimDueAutomation(claimHorizon)?.id).toBe(automation.id);
-      const outcome = store.deferAutomationDispatch(automation.id, "T3_UNAVAILABLE", { now });
+      const claim = store.claimDueAutomation(claimHorizon)!;
+      expect(claim.id).toBe(automation.id);
+      const outcome = store.deferAutomationDispatch(automation.id, "T3_UNAVAILABLE", {
+        now,
+        expectedClaimToken: claim.claimToken!,
+        expectedScheduledFor: claim.nextRunAt!,
+      });
       expect(outcome).toEqual({
+        lostClaim: false,
         failures: index + 1,
         status: "active",
         nextRunAt: new Date(now.getTime() + backoff * 60_000).toISOString(),
@@ -793,12 +889,18 @@ describe("OperatorStore", () => {
       expect(store.getAutomation(automation.id)).toMatchObject({
         status: "active",
         consecutiveFailures: index + 1,
-        nextRunAt: outcome.nextRunAt,
+        nextRunAt: outcome.lostClaim ? undefined : outcome.nextRunAt,
       });
     }
 
-    expect(store.claimDueAutomation(claimHorizon)?.id).toBe(automation.id);
-    expect(store.deferAutomationDispatch(automation.id, "T3_UNAVAILABLE", { now })).toEqual({
+    const fifthClaim = store.claimDueAutomation(claimHorizon)!;
+    expect(fifthClaim.id).toBe(automation.id);
+    expect(store.deferAutomationDispatch(automation.id, "T3_UNAVAILABLE", {
+      now,
+      expectedClaimToken: fifthClaim.claimToken!,
+      expectedScheduledFor: fifthClaim.nextRunAt!,
+    })).toEqual({
+      lostClaim: false,
       failures: 5,
       status: "paused",
     });

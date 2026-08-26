@@ -148,6 +148,25 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
   updated_at TEXT NOT NULL
 );
 
+-- Daemon-owned confirmations are not worker approvals: they have a typed
+-- local target and deliberately carry no synthetic thread id.
+CREATE TABLE IF NOT EXISTS pending_local_approvals (
+  id TEXT PRIMARY KEY,
+  request_key TEXT NOT NULL UNIQUE,
+  target_kind TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  telegram_chat_id INTEGER,
+  telegram_message_id INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_local_approvals_message
+  ON pending_local_approvals(telegram_chat_id, telegram_message_id, status);
+
 CREATE TABLE IF NOT EXISTS pending_user_inputs (
   id TEXT PRIMARY KEY,
   t3_request_id TEXT NOT NULL,
@@ -322,6 +341,17 @@ CREATE TABLE IF NOT EXISTS automations (
   next_run_at TEXT,
   last_run_at TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  claim_token TEXT,
+  -- memory-design §3 (package 3.3) — reminders ride the automation machinery
+  -- instead of a second table: `kind` splits the PROMPT, not the scheduler.
+  -- `rrule` is an optional recurrence on top of a `daily` schedule (that
+  -- schedule supplies the time of day and the zone it is recomputed in, so a
+  -- DST shift moves the instant and never the wall clock). `escalate` marks a
+  -- fire that must be acknowledged: it opens a `waiting` now-item and earns
+  -- exactly one shorter repeat while that item stays open.
+  kind TEXT NOT NULL DEFAULT 'automation',
+  rrule TEXT,
+  escalate INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -381,6 +411,13 @@ CREATE TABLE IF NOT EXISTS now_items (
   status      TEXT NOT NULL DEFAULT 'open',
   journal_ref TEXT,
   valid_until TEXT,
+  -- Package 3.3: typed provenance for daemon-authored items that are not
+  -- thread projections. The columns stay separate so the close rule and the
+  -- escalation query do not infer semantics from a free-form string.
+  origin_kind TEXT,
+  origin_id   TEXT,
+  origin_run_at TEXT,
+  escalated_at TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );
@@ -426,6 +463,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_now_items_replay
   WHERE origin_job IS NOT NULL AND create_seq IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_now_items_thread
   ON now_items(thread_ref) WHERE source='daemon' AND thread_ref IS NOT NULL;
+-- Package 3.3: the escalation sweep asks "which unacknowledged fires are
+-- there", which is a scan of open items by origin, not by owner+updated_at.
+CREATE INDEX IF NOT EXISTS idx_now_items_origin
+  ON now_items(origin_kind, status, escalated_at, created_at) WHERE origin_kind IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_journal_entries_day
   ON journal_entries(day DESC, created_at DESC);
 

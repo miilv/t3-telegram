@@ -117,6 +117,7 @@ async function main(): Promise<void> {
     activeWorkers: () => daemon.workerOccupancy(),
     ownerTimeZone: () => config.owner.timezone,
     reconcileNowItems: () => daemon.reconcileNowState(),
+    onAutomationDeleteRequested: (input) => daemon.requestAutomationDeleteConfirmation(input),
     logger,
     onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
   });
@@ -128,6 +129,7 @@ async function main(): Promise<void> {
         getPolicy: () => daemon.getPolicy(),
         updatePolicy: (patch, updatedBy) => daemon.updatePolicy(patch, updatedBy),
         health: () => daemon.dashboardHealth(),
+        ownerTimeZone: () => config.owner.timezone,
       })
     : undefined;
   const scheduler = new DailyScheduler(() => daemon.maintain(), logger);

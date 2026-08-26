@@ -493,17 +493,84 @@ describe("OperatorDaemon product flow", () => {
     const run = daemon.run();
 
     await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
-    expect(runtime.prompts.filter((prompt) => prompt.includes("Scheduled automation"))).toHaveLength(1);
+    const appPrompts = runtime.prompts.filter((prompt) => prompt.includes("System input from automation app"));
+    expect(appPrompts).toHaveLength(1);
+    expect(appPrompts[0]).not.toContain("Handle the user's Telegram message");
+    expect(appPrompts[0]).not.toContain("<<<inbound:");
     expect(store.getAutomation(automation.id)?.status).toBe("completed");
     expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(1);
     expect(store.db.prepare("SELECT count(*) AS count FROM automation_runs").get()).toMatchObject({ count: 1 });
 
     await daemon.maintain("test replay");
-    expect(runtime.prompts.filter((prompt) => prompt.includes("Scheduled automation"))).toHaveLength(1);
+    expect(runtime.prompts.filter((prompt) => prompt.includes("System input from automation app"))).toHaveLength(1);
     telegram.finish();
     await run;
     await daemon.stop();
   });
+
+  it("replays a synthetic app turn after the message row was written but the runtime failed", async () => {
+    const home = tempDirectory("daemon-automation-retry-");
+    const store = tempStore();
+    class FailingOnceAppRuntime extends FakeRuntime {
+      appAttempts = 0;
+      override async *stream(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        this.prompts.push(input.prompt);
+        if (input.prompt.includes("System input from reminder app")) {
+          this.appAttempts += 1;
+          if (this.appAttempts === 1) throw new Error("fault after synthetic message persistence");
+          yield { type: "text_delta", text: "Напоминание доставлено." };
+          yield { type: "result", text: "Напоминание доставлено.", sessionId: input.sessionId };
+          return;
+        }
+        yield { type: "result", text: "ok", sessionId: input.sessionId };
+      }
+    }
+    const runtime = new FailingOnceAppRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const automation = createAutomation({
+      ownerId: "42",
+      name: "Retry me",
+      prompt: "Напомни после сбоя",
+      kind: "reminder",
+      schedule: { type: "once", runAt: "2020-01-01T00:00:00.000Z" },
+      chatId: 7,
+      now: new Date("2019-01-01T00:00:00.000Z"),
+    });
+    store.saveAutomation(automation);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    await waitFor(() => runtime.appAttempts >= 1, 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await daemon.maintain("fault-injection retry");
+    await waitFor(() => runtime.appAttempts >= 2, 10_000);
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Напоминание доставлено."), 10_000);
+    expect(runtime.appAttempts).toBe(2);
+    expect(telegram.sent.filter((entry) => entry.text === "Напоминание доставлено.")).toHaveLength(1);
+    expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
 
   it("backs off failing automation dispatches, pauses with an owner notice, and resumes without stale catch-up runs", async () => {
     const home = tempDirectory("daemon-automation-backoff-");
@@ -3247,6 +3314,13 @@ describe("OperatorDaemon product flow", () => {
       chatId: 7,
       payload: { summary: "Run deploy", risk: "network" },
     });
+    store.saveLocalApproval({
+      id: "approval_local_delete_1",
+      requestKey: "telegram-ingress:delete:1",
+      target: { kind: "automation_delete", automationId: "automation_missing", actorUserId: "42" },
+      payload: { title: "Delete automation", summary: "Delete it", risk: "destructive" },
+      chatId: 7,
+    });
     store.saveUserInput({
       id: "input_local_1",
       t3RequestId: "input_t3_1",
@@ -3280,9 +3354,12 @@ describe("OperatorDaemon product flow", () => {
     daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
 
     await daemon.initialize();
-    expect(telegram.approvals).toHaveLength(1);
+    expect(telegram.approvals).toHaveLength(2);
     expect(telegram.userInputs).toHaveLength(1);
     expect(store.getApproval("approval_local_1")?.messageId).toBeDefined();
+    expect(store.getLocalApproval("approval_local_delete_1")?.messageId).toBeDefined();
+    expect(store.listTelegramOutbox(["delivered"]).filter((item) => item.operation === "approval"))
+      .toHaveLength(1);
     expect(store.getUserInput("input_local_1")?.messageId).toBeDefined();
     await daemon.stop();
   });
@@ -7252,6 +7329,16 @@ describe("OperatorDaemon product flow", () => {
       "automation_paused",
       "user_input_submitted",
       "approval_decision_failed",
+      // A destructive local action needs the same explicit Telegram keyboard
+      // as a worker approval. The durable outbox authors only that consent UI;
+      // it never relays app/worker content or an automation result.
+      "approval",
+      // Package 3.3: the outcome of a confirmation the owner pressed on a
+      // daemon-authored approval card, written back INTO that card. Not about
+      // a work — it is the same plumbing as the keyboard cleanup beside it,
+      // and the alternative (a fresh message) would be the daemon speaking in
+      // the chat next to the Operator.
+      "approval_local_outcome",
       // Package 1.5: not about a work either — the one line that explains why
       // the answer the owner was waiting for will never arrive (zombie turn).
       // No Operator turn can author it: the turn IS the thing that hung.

@@ -613,6 +613,85 @@ describe("now.update / now.get over MCP (memory-design §2.2)", () => {
     });
   });
 
+  it("lets the agent close a daemon-authored reminder acknowledgement item", async () => {
+    await withTools(async ({ call, store }) => {
+      const reminderItem = store.createNowItem({
+        ownerId: OWNER,
+        section: "waiting",
+        content: "Reminder delivered — waiting for acknowledgement",
+        source: "daemon",
+        origin: {
+          kind: "reminder_acknowledgement",
+          automationId: "automation_medicine",
+          scheduledFor: "2026-08-26T09:00:00.000Z",
+        },
+      });
+      expect(await call("now.update", { id: reminderItem.id, status: "closed" })).toMatchObject({
+        ok: true,
+        item: { id: reminderItem.id, status: "closed" },
+      });
+      expect(store.getNowItem(reminderItem.id)?.status).toBe("closed");
+      expect(store.listJournalEntries()).toHaveLength(1);
+    });
+  });
+
+  it("lets a member close only their own typed reminder acknowledgement", async () => {
+    await withTools(async ({ server, store }) => {
+      const memberId = "11";
+      const reminderItem = store.createNowItem({
+        ownerId: memberId,
+        section: "waiting",
+        content: "Member reminder acknowledgement",
+        source: "daemon",
+        origin: {
+          kind: "reminder_acknowledgement",
+          automationId: "automation_member",
+          scheduledFor: "2026-08-26T09:00:00.000Z",
+        },
+      });
+      const ordinaryDaemonItem = store.createNowItem({
+        ownerId: memberId,
+        section: "active",
+        content: "Member work projection",
+        source: "daemon",
+        threadRef: "thread_member",
+      });
+      const lease = server.issue({
+        chatId: 777,
+        ownerId: memberId,
+        teamRole: "member",
+        originMessageId: 92,
+        operatorTurnId: "opturn_member_reminder",
+        ingressJobId: "job-member-reminder",
+      });
+      const client = new Client({ name: "member-reminder-test", version: "1.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(lease.access.url), {
+        requestInit: { headers: { Authorization: `Bearer ${lease.access.token}` } },
+      }));
+      try {
+        const reminderResult = await client.callTool({
+          name: "now.update",
+          arguments: { id: reminderItem.id, status: "closed" },
+        });
+        const reminderText = reminderResult.content.find((part) => part.type === "text") as
+          | { text?: string }
+          | undefined;
+        expect(reminderResult.isError).not.toBe(true);
+        expect(JSON.parse(reminderText?.text ?? "null")).toMatchObject({ ok: true });
+        const ordinaryResult = await client.callTool({
+          name: "now.update",
+          arguments: { id: ordinaryDaemonItem.id, status: "closed" },
+        });
+        expect(ordinaryResult.isError).toBe(true);
+      } finally {
+        lease.revoke();
+        await client.close().catch(() => undefined);
+      }
+      expect(store.getNowItem(reminderItem.id)?.status).toBe("closed");
+      expect(store.getNowItem(ordinaryDaemonItem.id)?.status).toBe("open");
+    });
+  });
+
   it("treats an already-archived item as gone rather than resurrecting it", async () => {
     await withTools(async ({ call, store }) => {
       const created = (await call("now.update", {

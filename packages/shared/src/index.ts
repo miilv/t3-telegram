@@ -10,7 +10,10 @@ export type {
   ThreadTerminalOutcome,
 } from "./thread-digest.js";
 export {
+  containsMachineTimestamp,
   DEFAULT_TIME_ZONE,
+  humanClock,
+  humanMoment,
   isValidTimeZone,
   isWithinLocalWindow,
   ownerLocalParts,
@@ -18,7 +21,7 @@ export {
   ownerLogicalDay,
   resolveTimeZone,
 } from "./time.js";
-export type { LocalTimeParts, OwnerLocalTimeOptions } from "./time.js";
+export type { HumanMomentOptions, LocalTimeParts, OwnerLocalTimeOptions } from "./time.js";
 
 export type Id = string;
 
@@ -29,12 +32,41 @@ export type AutomationSchedule =
   | { type: "interval"; intervalMinutes: number }
   | { type: "daily"; timeOfDay: string; timeZone: string };
 
+/**
+ * memory-design §3 — a reminder is an automation, not a second table.
+ *
+ * Revision 1 of the design gave reminders their own table and duplicated the
+ * whole firing machinery: once/interval/daily with zones, the
+ * `automation_runs UNIQUE(automation_id, scheduled_for)` exactly-once key, the
+ * dispatch backoff and the pause-after-five. Revision 2 makes the difference a
+ * `kind`, because the difference really is only in the PROMPT: an automation
+ * carries work, a reminder carries one sentence to say to the owner.
+ */
+export const AUTOMATION_KINDS = ["automation", "reminder"] as const;
+export type AutomationKind = (typeof AUTOMATION_KINDS)[number];
+
 export interface Automation {
   id: string;
   ownerId: string;
   name: string;
   prompt: string;
   schedule: AutomationSchedule;
+  /** §3: `reminder` fires a light turn ("at X, tell the owner about Y"). */
+  kind?: AutomationKind;
+  /**
+   * §3 — optional recurrence for repeats `interval`/`daily` cannot express
+   * ("every second Tuesday"). Layered ON TOP of a `daily` schedule, which
+   * supplies the time of day and the zone the recurrence is recomputed in, so
+   * a DST shift moves the instant and never the wall clock.
+   */
+  rrule?: string;
+  /**
+   * §3 — escalate an ignored fire BY ACKNOWLEDGEMENT: the fire opens a
+   * `waiting` now-item, and exactly one shorter repeat follows while that item
+   * is still open. Deliberately not "has the owner sent anything", which an
+   * answer about something else would falsely satisfy.
+   */
+  escalate?: boolean;
   chatId: number;
   messageThreadId?: number;
   directMessagesTopicId?: number;
@@ -44,8 +76,22 @@ export interface Automation {
   lastRunAt?: string;
   /** Consecutive dispatch failures; drives retry backoff and auto-pause. */
   consecutiveFailures?: number;
+  /** Ephemeral lease proving this exact scheduler claim is still current. */
+  claimToken?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Trusted provenance for a synthetic app turn. */
+export interface OperatorAppEvent {
+  app: AutomationKind;
+  name: string;
+  runId: string;
+  mode: "fire" | "escalation";
+  /** Durable instruction stored when the owner or Operator created the app. */
+  instruction: string;
+  projectId?: string;
+  acknowledgementItemId?: string;
 }
 
 export interface OperatorPolicySettings {
@@ -153,6 +199,10 @@ export interface NowItem {
   originJob?: string;
   /** Ordinal of the create WITHIN that turn — second half of the replay key. */
   createSeq?: number;
+  /** Typed provenance for daemon-created items that are not thread projections. */
+  origin?: NowItemOrigin;
+  /** Durable exactly-once marker for the one permitted reminder repeat. */
+  escalatedAt?: string;
   status: NowStatus;
   /** Slug (a name, not an id) of the journal entry this item was archived into. */
   journalRef?: string;
@@ -161,6 +211,17 @@ export interface NowItem {
   createdAt: string;
   updatedAt: string;
 }
+
+/**
+ * A reminder acknowledgement is daemon-authored but agent-closable. This
+ * discriminator keeps it distinct from a daemon thread projection, whose
+ * lifetime may only follow the underlying thread.
+ */
+export type NowItemOrigin = {
+  kind: "reminder_acknowledgement";
+  automationId: string;
+  scheduledFor: string;
+};
 
 /**
  * `runtime_state` key holding the operator turn whose `now.update` last LANDED

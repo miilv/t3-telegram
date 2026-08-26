@@ -210,3 +210,172 @@ export function isWithinLocalWindow(
   if (from === to) return false;
   return from < to ? minutesOfDay >= from && minutesOfDay < to : minutesOfDay >= from || minutesOfDay < to;
 }
+
+// ---------------------------------------------------------------------------
+// Human dates (memory-design §2.7 + §3, package 3.3)
+//
+// The owner never reads a machine timestamp. §3 makes that a TWO-LAYER rule:
+// the persona carries it as rule 11, and this module carries it as code — so a
+// compaction that costs the model its rules cannot cost the owner a readable
+// date. Every user-facing render of a moment goes through `humanMoment`.
+//
+// The relative-day label uses the LOGICAL day (§2.7, 03:00 boundary), not the
+// calendar day: a reminder at 02:00 belongs to the evening that set it, and
+// calling tonight "завтра" would be wrong twice over. Because that makes
+// "сегодня" reach past midnight, a moment before the boundary is additionally
+// marked "ночью" — "сегодня ночью в 2:00" is unambiguous where a bare
+// "сегодня в 2:00" said at 10:00 would read as the past.
+// ---------------------------------------------------------------------------
+
+/** Prepositional weekday phrases, indexed Sunday = 0 ("во вторник" is not "в"). */
+const WEEKDAY_PREPOSITIONAL_RU = [
+  "в воскресенье",
+  "в понедельник",
+  "во вторник",
+  "в среду",
+  "в четверг",
+  "в пятницу",
+  "в субботу",
+] as const;
+
+const MONTH_GENITIVE_RU = [
+  "января",
+  "февраля",
+  "марта",
+  "апреля",
+  "мая",
+  "июня",
+  "июля",
+  "августа",
+  "сентября",
+  "октября",
+  "ноября",
+  "декабря",
+] as const;
+
+// Local copy rather than an import from ./index.js: index.ts already imports
+// this module, and a cycle here would be paid by every consumer of either.
+function pluralRuLocal(count: number, one: string, few: string, many: string): string {
+  const abs = Math.abs(Math.trunc(count));
+  const lastTwo = abs % 100;
+  const last = abs % 10;
+  if (lastTwo >= 11 && lastTwo <= 14) return `${count} ${many}`;
+  if (last === 1) return `${count} ${one}`;
+  if (last >= 2 && last <= 4) return `${count} ${few}`;
+  return `${count} ${many}`;
+}
+
+/** Midnight UTC of a `YYYY-MM-DD` day string, as a calendar anchor. */
+function logicalDayAnchor(day: string): Date {
+  const [year, month, date] = day.split("-").map(Number) as [number, number, number];
+  const utc = new Date(0);
+  // setUTCFullYear, not Date.UTC: the latter maps two-digit years into the 1900s.
+  utc.setUTCFullYear(year, month - 1, date);
+  utc.setUTCHours(0, 0, 0, 0);
+  return utc;
+}
+
+/** `9:00`, `14:30` — human, unpadded hour, never a machine timestamp. */
+export function humanClock(date: Date, timeZone?: string): string {
+  const parts = ownerLocalParts(date, resolveTimeZone(timeZone, DEFAULT_TIME_ZONE));
+  return `${parts.hour}:${pad(parts.minute)}`;
+}
+
+export interface HumanMomentOptions {
+  /** Reference instant; defaults to now. */
+  now?: Date;
+  /** Logical-day boundary hour (§2.7). */
+  boundaryHour?: number;
+  /** Render only the day ("завтра", "3 сентября"), no clock. */
+  dateOnly?: boolean;
+}
+
+/**
+ * A moment as the owner would say it, in the owner's zone.
+ *
+ * "через 20 минут", "сегодня в 9:00", "завтра ночью в 2:00", "в пятницу в
+ * 18:00", "3 сентября в 10:00", "3 сентября 2027 г. в 10:00". Never an ISO
+ * string, never a UTC offset — that is the whole point of the function.
+ *
+ * The zone is resolved with a fallback rather than asserted: a stored schedule
+ * may carry a zone this runtime's Intl does not know, and a list of reminders
+ * must not fail to render over one bad row.
+ */
+export function humanMoment(
+  date: Date,
+  timeZone?: string,
+  options: HumanMomentOptions = {},
+): string {
+  if (!Number.isFinite(date.getTime())) throw new Error("humanMoment requires a valid Date");
+  const now = options.now ?? new Date();
+  const boundaryHour = options.boundaryHour ?? 3;
+  const zone = resolveTimeZone(timeZone, DEFAULT_TIME_ZONE);
+  const parts = ownerLocalParts(date, zone);
+  const deltaMs = date.getTime() - now.getTime();
+  const absMinutes = Math.round(Math.abs(deltaMs) / 60_000);
+
+  if (!options.dateOnly) {
+    // Sub-hour distances are said as distances; nobody answers "when" with a
+    // wall clock for something eight minutes away.
+    if (absMinutes < 1) return "прямо сейчас";
+    if (absMinutes < 60) {
+      const spelled = pluralRuLocal(absMinutes, "минуту", "минуты", "минут");
+      return deltaMs >= 0 ? `через ${spelled}` : `${spelled} назад`;
+    }
+  }
+
+  const today = ownerLogicalDay(now, zone, boundaryHour);
+  const day = ownerLogicalDay(date, zone, boundaryHour);
+  const delta = Math.round(
+    (logicalDayAnchor(day).getTime() - logicalDayAnchor(today).getTime()) / 86_400_000,
+  );
+  // A moment before the boundary belongs to the PREVIOUS logical day, so the
+  // day label alone would place it half a day off; say which half it is in.
+  const night = parts.hour < boundaryHour ? " ночью" : "";
+  const suffix = options.dateOnly ? "" : ` в ${parts.hour}:${pad(parts.minute)}`;
+
+  const relative =
+    delta === 0
+      ? "сегодня"
+      : delta === 1
+        ? "завтра"
+        : delta === 2
+          ? "послезавтра"
+          : delta === -1
+            ? "вчера"
+            : delta === -2
+              ? "позавчера"
+              : undefined;
+  if (relative) return `${relative}${night}${suffix}`;
+  if (delta > 2 && delta <= 6) {
+    return `${WEEKDAY_PREPOSITIONAL_RU[logicalDayAnchor(day).getUTCDay()]}${night}${suffix}`;
+  }
+
+  // Far enough out that the calendar date is the only useful answer. The day
+  // shown is the CALENDAR day of the moment, not its logical day: "2 сентября
+  // ночью" for a 02:00 event on the 3rd would send the owner to the wrong page
+  // of a paper calendar.
+  const monthName = MONTH_GENITIVE_RU[parts.month - 1] ?? String(parts.month);
+  const year = parts.year === ownerLocalParts(now, zone).year ? "" : ` ${parts.year} г.`;
+  return `${parts.day} ${monthName}${year}${night}${suffix}`;
+}
+
+/**
+ * Machine-timestamp shapes that must never reach a message to the owner (§3):
+ * `2026-08-26T06:30:00.000Z`, `2026-08-26 06:30`, a bare `2026-08-26`, and the
+ * `06:30 UTC`/`+03:00` offset forms a half-fixed render tends to leave behind.
+ */
+const MACHINE_TIMESTAMP_PATTERNS: readonly RegExp[] = [
+  /\d{4}-\d{2}-\d{2}/,
+  /\d{1,2}:\d{2}\s*(?:UTC|GMT|Z)\b/i,
+  /\d{1,2}:\d{2}\s*[+-]\d{2}:?\d{2}\b/,
+];
+
+/**
+ * Guard for user-facing renders: true when the text still carries a machine
+ * timestamp. This is the half of the two-layer rule that a compaction cannot
+ * erase — the guardian test walks every automation/reminder string through it.
+ */
+export function containsMachineTimestamp(text: string): boolean {
+  return MACHINE_TIMESTAMP_PATTERNS.some((pattern) => pattern.test(text));
+}

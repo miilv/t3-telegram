@@ -1703,18 +1703,39 @@ graceful stop, a second forces the marker write and exits, a third is inert.
 ```
 once     → runs at the ISO moment; nextRun undefined ⇒ status "completed"
 interval → advances past missed fires (while next <= now: next += interval) — NO catch-up
-daily    → next occurrence strictly after now, DST-converged by up to 3 iterations
-resume   → once keeps its moment; interval/daily recompute from NOW
+daily    → owner-zone civil time; DST gap uses the first valid wall minute,
+           DST fold uses the earlier instant
+rrule    → strict DAILY/WEEKLY/MONTHLY subset; UNTIL is an explicit instant;
+           sparse rules search a complete Gregorian cycle, not a fixed horizon
+pause    → active/running only; resume → paused only; terminal one-shots stay terminal
 ```
 
-Exactly-once is enforced by `automation_runs UNIQUE(automation_id, scheduled_for)`
-plus the ingress dedupe key. A still-`running` automation is never re-claimed;
-a crash leaves it `running` until the next boot resets it.
+`AutomationRepository` owns the scheduler transaction boundary. A due claim has
+a token; fire commits the claim CAS, next scheduler state, stable
+`automation_runs(automation_id, scheduled_for)`, durable `telegram_ingress`, and
+the optional reminder acknowledgement item together. A stale claim cannot fire
+or back off a newer claim. Ingress completion commits the background job and
+linked run together. A crash leaves a `running` row for startup recovery; replay
+reuses the same fire identity and processes an already-recorded synthetic
+message.
+
+Reminders extend this engine (`kind='reminder'`); there is no second scheduler.
+Their typed `appEvent` is a trusted system/app envelope outside the untrusted
+owner-message fence and gets a normal Operator turn with tools but no full
+now/memory push. It never masquerades as owner speech or advances the owner's
+pause baseline. An escalating reminder creates a typed daemon `waiting` item in
+the fire transaction. Its owner may narrowly close that item; ordinary daemon
+thread projections remain unclosable. At most one repeat is reserved durably,
+only after 15 minutes, post-fire authorised-human activity, completion of the
+original app turn, and no active turn for that human. The repeat uses the
+original run snapshot, so later prompt/kind edits cannot change its work.
+
+Every mutation from MCP and `/automation` uses a stable ingress+ordinal replay
+key. Delete uses a typed local approval target and a durable approval outbox
+card; accepted, declined, expired and superseded replays remain distinct.
 
 Failure backoff: `min(2^(failures-1), 60)` minutes, paused at 5 consecutive
-failures. The pause notice goes out via `telegram.sendRich` **directly, not the
-durable outbox** — if that send fails, the owner never learns the automation
-stopped.
+failures. The owner notice uses the normal durable Telegram outbox.
 
 ---
 
@@ -1723,10 +1744,12 @@ stopped.
 60 s interval, coalescing (an overlapping tick returns the same promise), and
 any failure is `logger.error("Scheduled maintenance failed")` and nothing more.
 
-Twelve steps: dispatch due automations, flush outbox, drain T3 dispatches,
-expire notes, stop idle Docling, clean expired artifacts, prune local Bot API
-files, refresh thread summaries, the compaction gate, the journal-retention gate,
-`recoverWorkers` (unless startup), and the completion event.
+The front of the tick dispatches due automations, reserves eligible reminder
+escalations, expires approvals, then flushes the outbox. It continues with T3
+dispatches, note/artifact/media cleanup, structured summaries, compaction and
+journal-retention gates, worker recovery (unless startup), and one completion
+event. App-turn failures throw back to durable ingress retry instead of being
+converted into an ordinary owner-turn error and consuming the scheduled run.
 
 ---
 
@@ -1763,11 +1786,13 @@ files, refresh thread summaries, the compaction gate, the journal-retention gate
 - **The agent can never read an email body** — `searchEmail` fetches
   `format=metadata` and returns only a 2 000-char `snippet`; there is no
   get-message call anywhere.
-- **One malformed calendar event kills the whole listing** — the response is
-  parsed with `z.array(calendarEventSchema)`, which requires `start` and `end`
-  on every item.
-- **Calendar creation validates after the write** — a differently-shaped
-  response throws *after* the event exists, and a retry duplicates it.
+- Calendar pages parse their envelope strictly and isolate malformed rows;
+  `skipped` reports omissions, including missing start/end boundary values.
+- Calendar creation validates the complete request before fetching. A stable
+  Google event id makes retry and ambiguous 2xx/JSON failures idempotent; 409
+  is read back as the earlier success. Two intentional identical creates in one
+  live turn use different ordinals. Event plus companion reminder is a
+  replay-safe saga, so a replay reuses both identities.
 
 ---
 

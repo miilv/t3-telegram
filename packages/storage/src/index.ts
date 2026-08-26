@@ -4,15 +4,25 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
+import {
+  LocalApprovalRepository,
+  type LocalApprovalTarget,
+  type PendingLocalApproval,
+} from "./local-approval-repository.js";
+import {
+  AutomationRepository,
+  type AutomationNowItemInput,
+} from "./automation-repository.js";
+export type { LocalApprovalTarget, PendingLocalApproval } from "./local-approval-repository.js";
 import type {
   Artifact,
   Automation,
-  AutomationSchedule,
   ConversationCompaction,
   FocusState,
   InteractionMediation,
   JournalEntry,
   NowItem,
+  NowItemOrigin,
   NowSection,
   NowSource,
   NowStatus,
@@ -58,6 +68,20 @@ export interface PendingUserInput {
   /** Cached mediation result so recovery/redraw never re-run the LLM pass. */
   mediation?: InteractionMediation;
 }
+
+export interface PendingWorkerApproval {
+  kind: "worker";
+  id: string;
+  t3ApprovalId: string;
+  threadId: string;
+  status: string;
+  payload: unknown;
+  createdAt: string;
+  chatId?: number;
+  messageId?: number;
+}
+
+export type PendingApprovalRequest = PendingWorkerApproval | PendingLocalApproval;
 
 export interface BackgroundJob<T = unknown> {
   id: string;
@@ -109,10 +133,22 @@ function resolveMigrationPath(): string {
 
 export class OperatorStore {
   readonly db: DatabaseSync;
+  private readonly localApprovals: LocalApprovalRepository;
+  private readonly automations: AutomationRepository;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
+    this.localApprovals = new LocalApprovalRepository(this.db, (work) => this.transaction(work));
+    this.automations = new AutomationRepository(
+      this.db,
+      (work) => this.transaction(work),
+      {
+        putNowItem: (input, at) => this.putNowItem(input, at),
+        getNowItem: (id) => this.getNowItem(id),
+        appendEvent: (eventType, input) => this.appendEvent(eventType, input),
+      },
+    );
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
   }
 
@@ -134,6 +170,31 @@ export class OperatorStore {
         this.db.exec("ALTER TABLE operator_notes ADD COLUMN expires_at TEXT");
       }
     }
+    // --- package 3.3 (memory-design §3): reminders, recurrence, escalation ---
+    // Kept as one self-contained block so it merges cleanly alongside the
+    // other in-flight phase-3 packages, which guard columns on other tables.
+    //
+    // It runs BEFORE the DDL file, like the operator_notes block above and for
+    // the same reason: the file ends with statements that NAME these columns
+    // (`idx_now_items_origin` on `now_items(origin, …)`), and on a database
+    // upgraded in place those would fail with "no such column" before any
+    // post-exec ALTER could add it.
+    //
+    // `kind`/`escalate` carry NOT NULL defaults, so every existing row reads
+    // back as the plain, non-escalating automation it already was.
+    this.addColumns("automations", [
+      ["kind", "TEXT NOT NULL DEFAULT 'automation'"],
+      ["rrule", "TEXT"],
+      ["escalate", "INTEGER NOT NULL DEFAULT 0"],
+      ["claim_token", "TEXT"],
+    ]);
+    this.addColumns("now_items", [
+      ["origin_kind", "TEXT"],
+      ["origin_id", "TEXT"],
+      ["origin_run_at", "TEXT"],
+      ["escalated_at", "TEXT"],
+    ]);
+    // --- end package 3.3 ---
     const sql = readFileSync(resolveMigrationPath(), "utf8");
     this.db.exec(sql);
     const threadColumns = this.db.prepare("PRAGMA table_info(threads)").all() as Row[];
@@ -175,6 +236,28 @@ export class OperatorStore {
     this.db
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)")
       .run(nowIso());
+  }
+
+  /**
+   * Guarded `ADD COLUMN` for a table that may not exist yet (package 3.3).
+   *
+   * SQLite has no `ADD COLUMN IF NOT EXISTS`, so the repo's pattern is a
+   * `PRAGMA table_info` check per column; this collapses the repetition and
+   * makes the "table is absent — the DDL will create it with the column
+   * already in place" case explicit rather than incidental.
+   */
+  private addColumns(table: string, columns: ReadonlyArray<readonly [string, string]>): void {
+    const exists = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+      .get(table);
+    if (!exists) return;
+    const present = new Set(
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map((row) => String(row.name)),
+    );
+    for (const [name, definition] of columns) {
+      if (present.has(name)) continue;
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+    }
   }
 
   close(): void {
@@ -320,120 +403,63 @@ export class OperatorStore {
   }
 
   saveAutomation(automation: Automation): void {
-    this.db
-      .prepare(`
-        INSERT INTO automations(
-          id,owner_id,name,prompt,schedule_json,chat_id,message_thread_id,
-          direct_messages_topic_id,project_id,status,next_run_at,last_run_at,
-          consecutive_failures,created_at,updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET
-          name=excluded.name,prompt=excluded.prompt,schedule_json=excluded.schedule_json,
-          chat_id=excluded.chat_id,message_thread_id=excluded.message_thread_id,
-          direct_messages_topic_id=excluded.direct_messages_topic_id,
-          project_id=excluded.project_id,status=excluded.status,
-          next_run_at=excluded.next_run_at,last_run_at=excluded.last_run_at,
-          consecutive_failures=excluded.consecutive_failures,
-          updated_at=excluded.updated_at
-      `)
-      .run(
-        automation.id,
-        automation.ownerId,
-        automation.name,
-        automation.prompt,
-        JSON.stringify(automation.schedule),
-        automation.chatId,
-        automation.messageThreadId ?? null,
-        automation.directMessagesTopicId ?? null,
-        automation.projectId ?? null,
-        automation.status,
-        automation.nextRunAt ?? null,
-        automation.lastRunAt ?? null,
-        automation.consecutiveFailures ?? 0,
-        automation.createdAt,
-        automation.updatedAt,
-      );
+    this.automations.save(automation);
+  }
+
+  /**
+   * Persist a scheduler mutation once per durable turn/ordinal.
+   *
+   * The processed-event claim and the automation write share one transaction:
+   * a crash can expose either neither or both. This matters for interval
+   * updates, whose next run is computed from "now" and would drift forward on
+   * every replay if an already-applied patch ran again.
+   */
+  saveAutomationOnce(
+    automation: Automation,
+    dedupeKey: string | undefined,
+  ): { automation: Automation; applied: boolean } {
+    return this.automations.saveOnce(automation, dedupeKey);
+  }
+
+  /** Read-check-mutate-write as one replay-idempotent transaction. */
+  updateAutomationOnce(
+    automationId: string,
+    dedupeKey: string,
+    update: (automation: Automation) => Automation,
+  ): { automation: Automation; applied: boolean } {
+    return this.automations.updateOnce(automationId, dedupeKey, update);
   }
 
   getAutomation(id: string): Automation | undefined {
-    const row = this.db.prepare("SELECT * FROM automations WHERE id=?").get(id) as Row | undefined;
-    return row ? rowToAutomation(row) : undefined;
+    return this.automations.get(id);
   }
 
   listAutomations(ownerId?: string, includeDeleted = false): Automation[] {
-    const statusClause = includeDeleted ? "" : " AND status!='deleted'";
-    const rows = ownerId
-      ? this.db.prepare(`SELECT * FROM automations WHERE owner_id=?${statusClause} ORDER BY created_at DESC`).all(ownerId)
-      : this.db.prepare(`SELECT * FROM automations WHERE 1=1${statusClause} ORDER BY created_at DESC`).all();
-    return (rows as Row[]).map(rowToAutomation);
+    return this.automations.list(ownerId, includeDeleted);
   }
 
   updateAutomationStatus(id: string, status: Automation["status"]): boolean {
-    const result = this.db
-      .prepare("UPDATE automations SET status=?,updated_at=? WHERE id=? AND status!='deleted'")
-      .run(status, nowIso(), id);
-    return Number(result.changes) > 0;
+    return this.automations.updateStatus(id, status);
   }
 
   resetRunningAutomations(): number {
-    const result = this.db
-      .prepare("UPDATE automations SET status='active',updated_at=? WHERE status='running'")
-      .run(nowIso());
-    return Number(result.changes);
+    return this.automations.resetRunning();
   }
 
   claimDueAutomation(at = nowIso()): Automation | undefined {
-    return this.transaction(() => {
-      const row = this.db
-        .prepare(`
-          SELECT * FROM automations
-          WHERE status='active' AND next_run_at IS NOT NULL AND next_run_at<=?
-          ORDER BY next_run_at,id LIMIT 1
-        `)
-        .get(at) as Row | undefined;
-      if (!row) return undefined;
-      const automation = rowToAutomation(row);
-      const result = this.db
-        .prepare("UPDATE automations SET status='running',updated_at=? WHERE id=? AND status='active'")
-        .run(nowIso(), automation.id);
-      return Number(result.changes) === 1 ? automation : undefined;
-    });
+    return this.automations.claimDue(at);
   }
 
   dispatchAutomationRun<T>(input: {
     automation: Automation;
     scheduledFor: string;
     nextRunAt?: string;
-    ingressPayload: T;
-  }): { runId: string; jobId: string; inserted: boolean } {
-    return this.transaction(() => {
-      const runId = stableAutomationRunId(input.automation.id, input.scheduledFor);
-      const jobId = `automation-ingress:${runId}`;
-      const createdAt = nowIso();
-      const inserted = this.db
-        .prepare(`
-          INSERT OR IGNORE INTO automation_runs(
-            id,automation_id,scheduled_for,status,background_job_id,created_at
-          ) VALUES (?,?,?,'dispatched',?,?)
-        `)
-        .run(runId, input.automation.id, input.scheduledFor, jobId, createdAt);
-      if (Number(inserted.changes) === 1) {
-        this.db
-          .prepare(`
-            INSERT OR IGNORE INTO background_jobs(
-              id,dedupe_key,kind,payload_json,status,run_after,attempts,last_error,created_at,updated_at
-            ) VALUES (?,?, 'telegram_ingress',?,'pending',NULL,0,NULL,?,?)
-          `)
-          .run(jobId, `automation:${input.automation.id}:${input.scheduledFor}`, JSON.stringify(input.ingressPayload), createdAt, createdAt);
-      }
-      this.db
-        .prepare(`
-          UPDATE automations SET status=?,last_run_at=?,next_run_at=?,consecutive_failures=0,updated_at=?
-          WHERE id=?
-        `)
-        .run(input.nextRunAt ? "active" : "completed", input.scheduledFor, input.nextRunAt ?? null, createdAt, input.automation.id);
-      return { runId, jobId, inserted: Number(inserted.changes) === 1 };
-    });
+    ingressPayload:
+      | T
+      | ((identity: { runId: string; jobId: string; acknowledgementItemId?: string }) => T);
+    acknowledgement?: { ownerId: string; content: string };
+  }): { runId: string; jobId: string; inserted: boolean; acknowledgementItem?: NowItem } {
+    return this.automations.dispatchRun(input);
   }
 
   /**
@@ -444,41 +470,61 @@ export class OperatorStore {
   deferAutomationDispatch(
     id: string,
     errorCode: string,
-    input: { now?: Date; maxConsecutiveFailures?: number; maxBackoffMinutes?: number } = {},
-  ): { failures: number; status: "active" | "paused"; nextRunAt?: string } {
-    const now = input.now ?? new Date();
-    const maxFailures = input.maxConsecutiveFailures ?? 5;
-    const maxBackoffMinutes = input.maxBackoffMinutes ?? 60;
-    return this.transaction(() => {
-      const row = this.db.prepare("SELECT consecutive_failures FROM automations WHERE id=?").get(id) as
-        | Row
-        | undefined;
-      const failures = Number(row?.consecutive_failures ?? 0) + 1;
-      const paused = failures >= maxFailures;
-      const backoffMinutes = Math.min(2 ** (failures - 1), maxBackoffMinutes);
-      const nextRunAt = new Date(now.getTime() + backoffMinutes * 60_000).toISOString();
-      this.db
-        .prepare(`
-          UPDATE automations SET status=?,next_run_at=?,consecutive_failures=?,updated_at=?
-          WHERE id=? AND status='running'
-        `)
-        .run(paused ? "paused" : "active", paused ? null : nextRunAt, failures, nowIso(), id);
-      this.appendEvent("automation.dispatch.failed", {
-        payload: {
-          automationId: id,
-          errorCode,
-          failures,
-          ...(paused ? { paused: true } : { nextRunAt }),
-        },
-      });
-      return { failures, status: paused ? "paused" : "active", ...(paused ? {} : { nextRunAt }) };
-    });
+    input: {
+      expectedClaimToken: string;
+      expectedScheduledFor: string;
+      now?: Date;
+      maxConsecutiveFailures?: number;
+      maxBackoffMinutes?: number;
+    },
+  ): { lostClaim: true } | { lostClaim: false; failures: number; status: "active" | "paused"; nextRunAt?: string } {
+    return this.automations.deferDispatch(id, errorCode, input);
+  }
+
+  /**
+   * The one shorter repeat an unacknowledged escalating fire earns (§3).
+   *
+   * Deliberately NOT `dispatchAutomationRun`: that one also advances the
+   * schedule (`last_run_at`, `next_run_at`, status), and an escalation is a
+   * second delivery of a run that already happened — it must leave the
+   * automation's own clock alone.
+   *
+   * "Exactly one repeat, ever" is not tracked in a flag anywhere; it falls out
+   * of `automation_runs UNIQUE(automation_id, scheduled_for)`, the same key
+   * that already makes a firing exactly-once. The escalation books the derived
+   * slot `<scheduledFor>#escalation`, so a second attempt — a retry, a replay,
+   * a daemon that restarted mid-sweep — inserts nothing and reports it.
+   */
+  dispatchAutomationEscalation<T>(input: {
+    nowItemId: string;
+    automationId: string;
+    scheduledFor: string;
+    ingressPayload: T | ((identity: { runId: string; jobId: string }) => T);
+  }): { runId: string; jobId: string; inserted: boolean } {
+    return this.automations.dispatchEscalation(input);
+  }
+
+  /**
+   * Open now-items opened by something other than a chat turn (§3) — the
+   * escalation sweep's input. Closed items are excluded in SQL: a closed item
+   * IS the acknowledgement, and re-reading it every minute is the scan this
+   * index exists to avoid.
+   */
+  listOpenReminderAcknowledgements(): NowItem[] {
+    return this.automations.listOpenAcknowledgements();
   }
 
   completeAutomationRunByJob(jobId: string): void {
-    this.db
-      .prepare("UPDATE automation_runs SET status='completed',completed_at=? WHERE background_job_id=?")
-      .run(nowIso(), jobId);
+    this.automations.completeRunByJob(jobId);
+  }
+
+  /** One terminal commit for an ingress job and the automation run it carries. */
+  completeTelegramIngressJob(jobId: string): void {
+    this.automations.completeIngressJob(jobId);
+  }
+
+  isAutomationRunCompleted(automationId: string, scheduledFor: string): boolean {
+    return this.automations.isRunCompleted(automationId, scheduledFor);
   }
 
   getPolicySetting<T>(key: string): T | undefined {
@@ -1083,6 +1129,7 @@ export class OperatorStore {
    * create of the replay land on the row the first attempt already wrote.
    */
   createNowItem(input: {
+    id?: string;
     ownerId: string;
     section: NowSection;
     content: string;
@@ -1090,6 +1137,8 @@ export class OperatorStore {
     threadRef?: string;
     originJob?: string;
     createSeq?: number;
+    /** What opened the item when no chat turn did (§3). */
+    origin?: NowItemOrigin;
     status?: NowStatus;
     validUntil?: string;
     createdAt?: string;
@@ -1097,7 +1146,13 @@ export class OperatorStore {
     const content = redactSecrets(input.content).trim();
     if (!content) throw new Error("Now item cannot be empty");
     const now = nowIso();
-    return this.transaction(() => {
+    return this.transaction(() => this.putNowItem({ ...input, content }, now));
+  }
+
+  /** Unwrapped now insert/upsert for callers already holding a transaction. */
+  private putNowItem(input: AutomationNowItemInput, now: string): NowItem {
+      const content = redactSecrets(input.content).trim();
+      if (!content) throw new Error("Now item cannot be empty");
       const replayable = Boolean(input.originJob) && input.createSeq !== undefined;
       if (replayable) {
         const existing = this.db
@@ -1125,13 +1180,14 @@ export class OperatorStore {
           );
         }
       }
-      const id = newId("now");
+      const id = input.id ?? newId("now");
       this.db
         .prepare(`
           INSERT INTO now_items(
             id,owner_id,section,content,source,thread_ref,origin_job,create_seq,
-            status,journal_ref,valid_until,created_at,updated_at
-          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            origin_kind,origin_id,origin_run_at,status,journal_ref,valid_until,created_at,updated_at
+            ,escalated_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         `)
         .run(
           id,
@@ -1142,14 +1198,17 @@ export class OperatorStore {
           input.threadRef ?? null,
           input.originJob ?? null,
           input.createSeq ?? null,
+          input.origin?.kind ?? null,
+          input.origin?.automationId ?? null,
+          input.origin?.scheduledFor ?? null,
           input.status ?? "open",
           null,
           input.validUntil ?? null,
           input.createdAt ?? now,
           now,
+          null,
         );
       return rowToNowItem(this.db.prepare("SELECT * FROM now_items WHERE id=?").get(id) as Row);
-    });
   }
 
   /**
@@ -1546,21 +1605,11 @@ export class OperatorStore {
       .run(chatId, messageId, nowIso(), id);
   }
 
-  getApproval(id: string):
-    | {
-        id: string;
-        t3ApprovalId: string;
-        threadId: string;
-        status: string;
-        payload: unknown;
-        createdAt: string;
-        chatId?: number;
-        messageId?: number;
-      }
-    | undefined {
+  getApproval(id: string): PendingWorkerApproval | undefined {
     const row = this.db.prepare("SELECT * FROM pending_approvals WHERE id=?").get(id) as Row | undefined;
     if (!row) return undefined;
     return {
+      kind: "worker",
       id: String(row.id),
       t3ApprovalId: String(row.t3_approval_id),
       threadId: String(row.thread_id),
@@ -1574,6 +1623,48 @@ export class OperatorStore {
         ? { messageId: Number(row.telegram_message_id) }
         : {}),
     };
+  }
+
+  saveLocalApproval(input: {
+    id: string;
+    requestKey: string;
+    target: LocalApprovalTarget;
+    payload: unknown;
+    chatId?: number;
+    messageId?: number;
+    createdAt?: string;
+  }): PendingLocalApproval {
+    return this.localApprovals.save(input);
+  }
+
+  getLocalApproval(id: string): PendingLocalApproval | undefined {
+    return this.localApprovals.get(id);
+  }
+
+  resolveLocalApproval(id: string, status: string, expected: string | readonly string[] = "pending"): boolean {
+    return this.localApprovals.resolve(id, status, expected);
+  }
+
+  updateLocalApprovalMessage(id: string, chatId: number, messageId: number): void {
+    this.localApprovals.updateMessage(id, chatId, messageId);
+  }
+
+  listPendingLocalApprovals(chatId?: number): PendingLocalApproval[] {
+    return this.localApprovals.listPending(chatId);
+  }
+
+  listPendingApprovalRequests(chatId?: number): PendingApprovalRequest[] {
+    return [...this.listPendingApprovals(chatId), ...this.listPendingLocalApprovals(chatId)]
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  }
+
+  listStaleLocalApprovalClaims(claimedBefore: string): PendingLocalApproval[] {
+    return this.localApprovals.listStaleClaims(claimedBefore);
+  }
+
+  listStaleApprovalRequestClaims(claimedBefore: string): PendingApprovalRequest[] {
+    return [...this.listStaleApprovalClaims(claimedBefore), ...this.listStaleLocalApprovalClaims(claimedBefore)]
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
   }
 
   findPendingApprovalByT3(threadId: string, t3ApprovalId: string) {
@@ -2350,36 +2441,6 @@ function rowToProject(row: Row): Project {
   };
 }
 
-function rowToAutomation(row: Row): Automation {
-  return {
-    id: String(row.id),
-    ownerId: String(row.owner_id),
-    name: String(row.name),
-    prompt: String(row.prompt),
-    schedule: JSON.parse(String(row.schedule_json)) as AutomationSchedule,
-    chatId: Number(row.chat_id),
-    status: String(row.status) as Automation["status"],
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    ...(row.message_thread_id !== null && row.message_thread_id !== undefined
-      ? { messageThreadId: Number(row.message_thread_id) }
-      : {}),
-    ...(row.direct_messages_topic_id !== null && row.direct_messages_topic_id !== undefined
-      ? { directMessagesTopicId: Number(row.direct_messages_topic_id) }
-      : {}),
-    ...(row.project_id ? { projectId: String(row.project_id) } : {}),
-    ...(row.next_run_at ? { nextRunAt: String(row.next_run_at) } : {}),
-    ...(row.last_run_at ? { lastRunAt: String(row.last_run_at) } : {}),
-    ...(Number(row.consecutive_failures ?? 0) > 0
-      ? { consecutiveFailures: Number(row.consecutive_failures) }
-      : {}),
-  };
-}
-
-function stableAutomationRunId(automationId: string, scheduledFor: string): string {
-  return `autorun_${createHash("sha256").update(automationId).update("\0").update(scheduledFor).digest("hex").slice(0, 32)}`;
-}
-
 function rowToThread(row: Row): WorkThread {
   return {
     id: String(row.id),
@@ -2474,9 +2535,19 @@ function rowToNowItem(row: Row): NowItem {
     ...(row.thread_ref ? { threadRef: String(row.thread_ref) } : {}),
     ...(row.origin_job ? { originJob: String(row.origin_job) } : {}),
     ...(createSeq === null || createSeq === undefined ? {} : { createSeq: Number(createSeq) }),
+    ...(row.origin_kind === "reminder_acknowledgement" && row.origin_id && row.origin_run_at
+      ? {
+          origin: {
+            kind: "reminder_acknowledgement" as const,
+            automationId: String(row.origin_id),
+            scheduledFor: String(row.origin_run_at),
+          },
+        }
+      : {}),
     status: (NOW_STATUSES as readonly string[]).includes(status) ? (status as NowStatus) : "open",
     ...(row.journal_ref ? { journalRef: String(row.journal_ref) } : {}),
     ...(row.valid_until ? { validUntil: String(row.valid_until) } : {}),
+    ...(row.escalated_at ? { escalatedAt: String(row.escalated_at) } : {}),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };

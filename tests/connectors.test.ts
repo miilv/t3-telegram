@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { GoogleWorkspaceConnectors } from "../packages/connectors/src/index.js";
+import {
+  GoogleWorkspaceConnectors,
+  GoogleWorkspaceHttpError,
+} from "../packages/connectors/src/index.js";
 
 describe("GoogleWorkspaceConnectors", () => {
   it("uses the official bounded Calendar and Gmail REST contracts", async () => {
@@ -44,7 +47,10 @@ describe("GoogleWorkspaceConnectors", () => {
       },
     });
 
-    expect(await connector.listCalendarEvents({ timeMin: "2026-08-21T00:00:00Z" })).toMatchObject([{ id: "event_1", title: "Review" }]);
+    expect(await connector.listCalendarEvents({ timeMin: "2026-08-21T00:00:00Z" })).toMatchObject({
+      events: [{ id: "event_1", title: "Review" }],
+      skipped: 0,
+    });
     expect(await connector.createCalendarEvent({
       title: "Review",
       start: "2026-08-21T10:00:00Z",
@@ -68,5 +74,129 @@ describe("GoogleWorkspaceConnectors", () => {
       fetchImpl: async () => Response.json({}),
     });
     await expect(enabled.sendEmail({ to: ["x@example.com\nBcc:evil@example.com"], subject: "x", text: "x" })).rejects.toThrow("newline");
+  });
+
+  it("validates calendar ranges before issuing a request", async () => {
+    let requests = 0;
+    const connector = new GoogleWorkspaceConnectors({
+      accessToken: "token",
+      calendarId: "primary",
+      fetchImpl: async () => {
+        requests += 1;
+        return Response.json({ items: [] });
+      },
+    });
+    await expect(connector.listCalendarEvents({
+      timeMin: "not-a-date",
+      timeMax: "2026-08-21T10:00:00Z",
+    })).rejects.toThrow(/timeMin/);
+    await expect(connector.listCalendarEvents({
+      timeMin: "2026-08-21T11:00:00Z",
+      timeMax: "2026-08-21T10:00:00Z",
+    })).rejects.toThrow(/after timeMin/);
+    await expect(connector.createCalendarEvent({
+      title: "Bad order",
+      start: "2026-08-21T11:00:00Z",
+      end: "2026-08-21T10:00:00Z",
+    })).rejects.toThrow(/after its start/);
+    expect(requests).toBe(0);
+  });
+
+  it("isolates malformed calendar rows and reports how many were skipped", async () => {
+    const connector = new GoogleWorkspaceConnectors({
+      accessToken: "token",
+      calendarId: "primary",
+      fetchImpl: async () => Response.json({ items: [
+        {
+          id: "good",
+          summary: "Review",
+          start: { dateTime: "2026-08-21T10:00:00Z" },
+          end: { dateTime: "2026-08-21T10:30:00Z" },
+        },
+        { id: "cancelled", status: "cancelled" },
+        {
+          id: "bad-link",
+          htmlLink: "not a URL",
+          start: { dateTime: "2026-08-21T11:00:00Z" },
+          end: { dateTime: "2026-08-21T11:30:00Z" },
+        },
+        { id: "missing-boundaries", start: {}, end: {} },
+      ] }),
+    });
+    expect(await connector.listCalendarEvents({ timeMin: "2026-08-21T00:00:00Z" })).toEqual({
+      events: [{
+        id: "good",
+        title: "Review",
+        start: "2026-08-21T10:00:00Z",
+        end: "2026-08-21T10:30:00Z",
+      }],
+      skipped: 3,
+    });
+  });
+
+  it("reuses the caller operation key after an ambiguous create failure", async () => {
+    const postedIds: string[] = [];
+    let attempt = 0;
+    const connector = new GoogleWorkspaceConnectors({
+      accessToken: "token",
+      calendarId: "primary",
+      fetchImpl: async (_input, init) => {
+        if (init?.method === "POST") {
+          postedIds.push((JSON.parse(String(init.body)) as { id: string }).id);
+          attempt += 1;
+          if (attempt === 1) return Response.json({}, { status: 500 });
+          return Response.json({}, { status: 409 });
+        }
+        return Response.json({
+          id: postedIds[0],
+          summary: "Review",
+          start: { dateTime: "2026-08-21T10:00:00.000Z" },
+          end: { dateTime: "2026-08-21T10:30:00.000Z" },
+        });
+      },
+    });
+    const input = {
+      title: "Review",
+      start: "2026-08-21T10:00:00Z",
+      end: "2026-08-21T10:30:00Z",
+      idempotencyKey: "ingress-42:create:1",
+    };
+    await expect(connector.createCalendarEvent(input)).rejects.toBeInstanceOf(GoogleWorkspaceHttpError);
+    expect(await connector.createCalendarEvent(input)).toMatchObject({ duplicate: true, id: postedIds[0] });
+    expect(postedIds).toHaveLength(2);
+    expect(new Set(postedIds).size).toBe(1);
+  });
+
+  it("reuses the same event id after a successful POST returned malformed JSON", async () => {
+    const postedIds: string[] = [];
+    let attempt = 0;
+    const connector = new GoogleWorkspaceConnectors({
+      accessToken: "token",
+      calendarId: "primary",
+      fetchImpl: async (_input, init) => {
+        if (init?.method === "POST") {
+          postedIds.push((JSON.parse(String(init.body)) as { id: string }).id);
+          attempt += 1;
+          return attempt === 1
+            ? new Response("accepted but not json", { status: 201 })
+            : Response.json({}, { status: 409 });
+        }
+        return Response.json({
+          id: postedIds[0],
+          summary: "Review",
+          start: { dateTime: "2026-08-21T10:00:00.000Z" },
+          end: { dateTime: "2026-08-21T10:30:00.000Z" },
+        });
+      },
+    });
+    const input = {
+      title: "Review",
+      start: "2026-08-21T10:00:00Z",
+      end: "2026-08-21T10:30:00Z",
+      idempotencyKey: "ingress-42:create:malformed-response",
+    };
+    await expect(connector.createCalendarEvent(input)).rejects.toBeInstanceOf(SyntaxError);
+    expect(await connector.createCalendarEvent(input)).toMatchObject({ duplicate: true, id: postedIds[0] });
+    expect(new Set(postedIds).size).toBe(1);
   });
 });

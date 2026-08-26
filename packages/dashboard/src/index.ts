@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Logger } from "pino";
 import type { OperatorPolicySettings } from "../../shared/src/index.js";
+import { humanMoment } from "../../shared/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 
 export interface DashboardServerOptions {
@@ -11,6 +12,8 @@ export interface DashboardServerOptions {
   getPolicy: () => OperatorPolicySettings;
   updatePolicy: (patch: Partial<OperatorPolicySettings>, updatedBy: string) => OperatorPolicySettings;
   health: () => Promise<Record<string, unknown>>;
+  /** Owner's IANA zone — the dashboard shows automation times in it (§3). */
+  ownerTimeZone?: () => string | undefined;
 }
 
 export class DashboardServer {
@@ -19,6 +22,13 @@ export class DashboardServer {
   private baseUrl: string | undefined;
 
   constructor(private readonly options: DashboardServerOptions) {}
+
+  private humanInstant(value: string | undefined): string | undefined {
+    if (!value) return undefined;
+    const instant = new Date(value);
+    if (!Number.isFinite(instant.getTime())) return undefined;
+    return humanMoment(instant, this.options.ownerTimeZone?.());
+  }
 
   async start(): Promise<void> {
     if (this.server) return;
@@ -112,12 +122,17 @@ export class DashboardServer {
         outboxPending: outbox.pending + outbox.sending,
       },
       policy: this.options.getPolicy(),
+      // Package 3.3: the dashboard is a second place the owner reads an
+      // automation's clock, so it gets the same treatment as the chat — the
+      // human form in the owner's zone, computed here rather than left to the
+      // browser's locale (which is the machine's accident, not the owner's).
       automations: automations.slice(0, 20).map((item) => ({
         id: item.id,
         name: item.name,
+        kind: item.kind ?? "automation",
         status: item.status,
-        nextRunAt: item.nextRunAt,
-        lastRunAt: item.lastRunAt,
+        nextRun: this.humanInstant(item.nextRunAt),
+        lastRun: this.humanInstant(item.lastRunAt),
       })),
       providers: this.options.store.listProviderPerformance(),
       recentEvents: recentEvents.map((event) => ({ type: event.event_type, at: event.created_at })),
@@ -190,7 +205,7 @@ const token=new URLSearchParams(location.hash.slice(1)).get('token')||'';const h
 const esc=v=>String(v??'');const row=(title,meta,badge='')=>{const d=document.createElement('div');d.className='row';const a=document.createElement('div');const s=document.createElement('strong');s.textContent=title;const m=document.createElement('div');m.className='meta';m.textContent=meta;a.append(s,m);const b=document.createElement('div');b.className='badge';b.textContent=badge;d.append(a,b);return d};
 async function load(){try{const r=await fetch('/api/state',{headers});if(!r.ok)throw new Error('Capability rejected. Open the full dashboard link from /dashboard.');state=await r.json();render()}catch(e){document.querySelector('#health').innerHTML='<span class="error"></span>';document.querySelector('#health span').textContent=e.message}}
 function render(){const h=document.querySelector('#health');h.querySelector('span').textContent=Object.values(state.health).every(v=>v!==false)?'Relay is responding':'One or more adapters need attention';const counts=document.querySelector('#counts');counts.replaceChildren();for(const [k,v] of Object.entries(state.counts)){const d=document.createElement('div');d.className='count';const b=document.createElement('b');b.textContent=v;const s=document.createElement('span');s.textContent=k.replace(/([A-Z])/g,' $1');d.append(b,s);counts.append(d)}
-const autos=document.querySelector('#automations');autos.replaceChildren(...(state.automations.length?state.automations.map(a=>row(a.name,a.nextRunAt?'Next '+a.nextRunAt:(a.lastRunAt?'Last '+a.lastRunAt:'No run recorded'),a.status)):[row('No automations','Create one with /automation or the scheduler tool')]));
+const autos=document.querySelector('#automations');autos.replaceChildren(...(state.automations.length?state.automations.map(a=>row(a.name,a.nextRun?'Next '+a.nextRun:(a.lastRun?'Last '+a.lastRun:'No run recorded'),a.status)):[row('No automations','Create one with /automation or the scheduler tool')]));
 const providers=document.querySelector('#providers');providers.replaceChildren(...(state.providers.length?state.providers.map(p=>row(p.providerInstanceId+' / '+p.model,Math.round(p.averageLatencyMs)+' ms average · '+p.successes+'/'+p.samples+' successful','$'+Number(p.estimatedCostUsd).toFixed(3))):[row('No observed runs','Provider scoring starts after worker completions')]));
 const events=document.querySelector('#events');events.replaceChildren(...state.recentEvents.slice(0,8).map(e=>row(e.type,e.at)));
 for(const [k,v] of Object.entries(state.policy)){const el=document.querySelector('[name="'+k+'"]');if(!el)continue;if(el.type==='checkbox')el.checked=Boolean(v);else el.value=Array.isArray(v)?v.join(', '):v}}

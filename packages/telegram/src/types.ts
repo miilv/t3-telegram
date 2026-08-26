@@ -1,3 +1,5 @@
+import type { OperatorAppEvent } from "../../shared/src/index.js";
+
 export type TelegramChatType = "private" | "group" | "supergroup" | "channel";
 
 export type TelegramAccessRole = "owner" | "admin" | "member" | "viewer";
@@ -156,6 +158,8 @@ export interface TelegramMessageInbound extends TelegramDestination {
   /** Daemon-created proactive ingress; never passed through Telegram normalization. */
   synthetic?: boolean;
   automationRunId?: string;
+  /** Trusted app provenance; handled by its own turn-envelope branch. */
+  appEvent?: OperatorAppEvent;
   /**
    * Package 1.2: this synthetic update carries digested worker events instead
    * of words from a human. `text` is the ready envelope (already fenced); the
