@@ -46,6 +46,8 @@ import type {
   SentMessage,
   InboundMessageSignal,
   StreamDraft,
+  TelegramBotCommand,
+  TelegramCommandScope,
   TelegramDestination,
   TelegramInbound,
   TelegramTransport,
@@ -9506,6 +9508,27 @@ class FakeTelegram implements TelegramTransport {
   async sendChatAction(_chatId: number, action: string): Promise<void> {
     this.chatActions.push({ action, at: Date.now() });
   }
+  /** Package 4.3: what the daemon published to Telegram's command menu. */
+  readonly publishedCommands: Array<{
+    scope: TelegramCommandScope;
+    commands: TelegramBotCommand[];
+  }> = [];
+  async setMyCommands(
+    commands: TelegramBotCommand[],
+    scope: TelegramCommandScope = { type: "default" },
+  ): Promise<void> {
+    this.publishedCommands.push({ scope, commands });
+  }
+  /** The names published for a scope, or `undefined` when nothing was. */
+  menuFor(scope: TelegramCommandScope): string[] | undefined {
+    const entry = this.publishedCommands.findLast(
+      (published) =>
+        published.scope.type === scope.type &&
+        (scope.type !== "chat" ||
+          (published.scope.type === "chat" && published.scope.chatId === scope.chatId)),
+    );
+    return entry?.commands.map((command) => command.command);
+  }
   async health(): Promise<{ healthy: boolean; username: string }> {
     return { healthy: true, username: "operator_test_bot" };
   }
@@ -10005,3 +10028,352 @@ class RecoveringBroker extends FakeBroker {
     });
   }
 }
+
+/**
+ * Package 4.3: the command surface. Findings «команды №1, 2, 3, 6, 13, 15» plus
+ * the usage-hint minor — everything a user meets before the Operator ever sees
+ * their message.
+ */
+describe("Operator commands (package 4.3)", () => {
+  /** One daemon with the fakes every command test needs. */
+  function commandHarness(
+    prefix: string,
+    users: Config["telegram"]["users"] = { 42: "owner" },
+  ) {
+    const home = tempDirectory(prefix);
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const base = config(home);
+    const daemonConfig: Config = { ...base, telegram: { ...base.telegram, users } };
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(daemonConfig, store, runtime, broker, telegram, artifacts, scheduler, logger);
+    return { home, store, runtime, broker, telegram, artifacts, daemon };
+  }
+
+  function seedProjects(
+    harness: { store: OperatorStore; broker: FakeBroker; home: string },
+    count: number,
+    name: (index: number) => string = (index) => `Проект ${index + 1}`,
+  ): Project[] {
+    const timestamp = nowIso();
+    return Array.from({ length: count }, (_, index) => {
+      const project: Project = {
+        id: `prj_${index + 1}`,
+        t3ProjectId: `prj_${index + 1}`,
+        name: name(index),
+        workspaceRoot: `${harness.home}/p${index + 1}`,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      harness.broker.projects.push(project);
+      harness.store.upsertProject(project);
+      return project;
+    });
+  }
+
+  /** The reply the daemon last sent, once it has sent more than `before`. */
+  async function lastReplyAfter(telegram: FakeTelegram, before: number): Promise<string> {
+    await waitFor(() => telegram.sent.length > before, 5_000);
+    return telegram.sent.at(-1)!.text;
+  }
+
+  it("publishes a role-scoped command menu at startup (finding «команды №1»)", async () => {
+    const harness = commandHarness("daemon-menu-", { 42: "owner", 11: "viewer", 7: "member" });
+    const { telegram, daemon } = harness;
+    await daemon.initialize();
+
+    // The DEFAULT scope is what a stranger and any group sees: viewer-safe only.
+    expect(telegram.menuFor({ type: "default" })?.toSorted()).toEqual([
+      "help",
+      "projects",
+      "start",
+      "status",
+      "work",
+    ]);
+
+    // The owner's own private chat (chat id === user id) gets everything.
+    const ownerMenu = telegram.menuFor({ type: "chat", chatId: 42 });
+    for (const live of [
+      "status", "projects", "work", "memory", "automation", "automations",
+      "dashboard", "policy", "operator", "alias", "help", "start", "team", "share", "debug",
+    ]) {
+      expect(ownerMenu).toContain(live);
+    }
+
+    // A member sees automations but not the owner's settings; a viewer neither.
+    const memberMenu = telegram.menuFor({ type: "chat", chatId: 7 });
+    expect(memberMenu).toContain("automation");
+    expect(memberMenu).not.toContain("policy");
+    expect(telegram.menuFor({ type: "chat", chatId: 11 })).not.toContain("memory");
+
+    // Nothing package 1.3 deleted may be advertised anywhere.
+    for (const published of telegram.publishedCommands) {
+      const names = published.commands.map((entry) => entry.command);
+      for (const dead of ["stop", "cancel", "focus"]) expect(names).not.toContain(dead);
+    }
+
+    await daemon.stop();
+  });
+
+  it("answers a command inside a batch and still routes the rest of the burst (finding «команды №2»)", async () => {
+    const harness = commandHarness("daemon-batch-command-");
+    const { telegram, runtime, daemon } = harness;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // Command first, then a second message a second later. The second message
+    // used to disappear forever.
+    telegram.push(mergeInboundBatch([message(1, "/status"), message(2, "и посмотри, что с оплатой")]));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Работа")));
+    await waitFor(
+      () => runtime.prompts.some((prompt) => prompt.includes("и посмотри, что с оплатой")),
+      5_000,
+    );
+
+    // Prose first, command second: the command used to be buried in the merged
+    // text and shipped to the model as prose.
+    telegram.push(mergeInboundBatch([message(3, "а ещё почини оплату"), message(4, "/status")]));
+    await waitFor(
+      () => telegram.sent.filter((entry) => entry.text.startsWith("## Работа")).length === 2,
+      5_000,
+    );
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("а ещё почини оплату")), 5_000);
+
+    // The command itself never costs a turn in either order.
+    expect(runtime.prompts.every((prompt) => !prompt.includes("/status"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("answers an unknown command locally with a suggestion (finding «команды №3»)", async () => {
+    const harness = commandHarness("daemon-unknown-command-");
+    const { telegram, runtime, daemon } = harness;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "/statis"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Не знаю команду")));
+    const reply = telegram.sent.findLast((entry) => entry.text.includes("Не знаю команду"))!.text;
+    expect(reply).toContain("`/statis`");
+    expect(reply).toContain("Похоже на `/status`?");
+    expect(reply).toContain("`/help`");
+    // And it cost no turn at all.
+    expect(runtime.prompts.every((prompt) => !prompt.includes("/statis"))).toBe(true);
+
+    // A typo glued to real text still answers the text as its own turn.
+    telegram.push(mergeInboundBatch([message(2, "/statis"), message(3, "столица Франции?")]));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 5_000);
+
+    // Text that merely starts with a slash is not a command and is not claimed.
+    telegram.push(message(4, "/tmp/report.log посмотри, пожалуйста"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("/tmp/report.log")), 5_000);
+    expect(telegram.sent.filter((entry) => entry.text.includes("Не знаю команду"))).toHaveLength(2);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("pages long lists instead of truncating them in silence (finding «команды №6»)", async () => {
+    const harness = commandHarness("daemon-pagination-");
+    const { telegram, store, daemon } = harness;
+    seedProjects(harness, 47);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    let before = telegram.sent.length;
+    telegram.push(message(1, "/projects"));
+    const first = await lastReplyAfter(telegram, before);
+    expect(first).toContain("Проект 1");
+    expect(first).toContain("Проект 20");
+    expect(first).not.toContain("Проект 21");
+    expect(first).toContain("Показано 1–20 из 47 — `/projects 2` для следующей страницы.");
+
+    before = telegram.sent.length;
+    telegram.push(message(2, "/projects 2"));
+    const second = await lastReplyAfter(telegram, before);
+    expect(second).toContain("Проект 21");
+    expect(second).toContain("Проект 40");
+    expect(second).not.toContain("Проект 41");
+    expect(second).toContain("Показано 21–40 из 47");
+
+    before = telegram.sent.length;
+    telegram.push(message(3, "/projects 3"));
+    const last = await lastReplyAfter(telegram, before);
+    expect(last).toContain("Проект 47");
+    expect(last).toContain("это последняя страница");
+
+    before = telegram.sent.length;
+    telegram.push(message(4, "/projects 9"));
+    expect(await lastReplyAfter(telegram, before)).toContain("Страницы 9 нет — всего 3");
+
+    before = telegram.sent.length;
+    telegram.push(message(5, "/projects две"));
+    expect(await lastReplyAfter(telegram, before)).toContain("Использование: `/projects [страница]`");
+
+    // /work used to cut at 20 without a word about the rest.
+    const timestamp = nowIso();
+    for (let index = 0; index < 25; index += 1) {
+      store.upsertThread({
+        id: `th_${index}`,
+        t3ThreadId: `th_${index}`,
+        projectId: "prj_1",
+        title: `Работа ${index + 1}`,
+        shortSummary: "",
+        keywords: [],
+        status: "completed",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        lastActivityAt: timestamp,
+        relatedArtifacts: [],
+      });
+    }
+    before = telegram.sent.length;
+    telegram.push(message(6, "/work"));
+    expect(await lastReplyAfter(telegram, before)).toContain("Показано 1–20 из 25 — `/work 2`");
+
+    // /memory used to stop at 12 notes, also without a word.
+    for (let index = 0; index < 23; index += 1) {
+      store.rememberOperatorNote({ category: "user", content: `Заметка ${index + 1}`, source: "manual" });
+    }
+    before = telegram.sent.length;
+    telegram.push(message(7, "/memory"));
+    const memory = await lastReplyAfter(telegram, before);
+    expect(memory).toContain("Показано 1–20 из 23 — `/memory 2`");
+    expect(memory).toContain("История сжатий пока пуста.");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  it("tailors /help to the sender's role (finding «команды №13»)", async () => {
+    const harness = commandHarness("daemon-help-role-", { 42: "owner", 11: "viewer" });
+    const { telegram, daemon } = harness;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    let before = telegram.sent.length;
+    telegram.push(message(1, "/help"));
+    const ownerHelp = await lastReplyAfter(telegram, before);
+    for (const live of ["/status", "/memory", "/automation", "/policy", "/debug", "/share"]) {
+      expect(ownerHelp).toContain(live);
+    }
+
+    before = telegram.sent.length;
+    telegram.push(messageAs(2, "/help", 11));
+    const viewerHelp = await lastReplyAfter(telegram, before);
+    expect(viewerHelp).toContain("/status");
+    expect(viewerHelp).toContain("/projects");
+    // No command the wall would refuse, and a footnote saying why.
+    for (const walled of ["/memory", "/policy", "/debug", "/team", "/automation"]) {
+      expect(viewerHelp).not.toContain(walled);
+    }
+    expect(viewerHelp).toContain("\\*");
+    expect(viewerHelp).toContain("11");
+
+    // The wall itself quotes the same table.
+    before = telegram.sent.length;
+    telegram.push(messageAs(3, "что там по оплате?", 11));
+    expect(await lastReplyAfter(telegram, before)).toContain("Ваша роль `viewer` разрешает только");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("shares a project by alias and by a name with spaces (finding «команды №15»)", async () => {
+    const harness = commandHarness("daemon-share-", { 42: "owner", 11: "member" });
+    const { telegram, store, daemon } = harness;
+    const [project] = seedProjects(harness, 1, () => "Мобильное приложение");
+    store.upsertTeamMember("11", "member");
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // A name with spaces: the old whitespace split made it unreachable.
+    let before = telegram.sent.length;
+    telegram.push(message(1, "/share Мобильное приложение 11 editor"));
+    expect(await lastReplyAfter(telegram, before)).toContain("Доступ к **Мобильное приложение**");
+    expect(store.getProjectAccess(project!.id, "11")).toBe("editor");
+
+    // An alias minted by /alias — which always understood the same argument.
+    before = telegram.sent.length;
+    telegram.push(message(2, "/alias Мобильное приложение | мобилка"));
+    expect(await lastReplyAfter(telegram, before)).toContain("Алиас **мобилка**");
+
+    before = telegram.sent.length;
+    telegram.push(message(3, "/share мобилка 11 viewer"));
+    expect(await lastReplyAfter(telegram, before)).toContain("Доступ к **Мобильное приложение**");
+    expect(store.getProjectAccess(project!.id, "11")).toBe("viewer");
+
+    // And the usage now explains both, instead of implying one bare token.
+    before = telegram.sent.length;
+    telegram.push(message(4, "/share"));
+    const usage = await lastReplyAfter(telegram, before);
+    expect(usage).toContain("Использование: `/share <проект> <telegram-user-id> <owner|editor|viewer>`");
+    expect(usage).toContain("алиас");
+    expect(usage).toContain("Пример:");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("answers a missing argument with the format, not with «не найдено»", async () => {
+    const harness = commandHarness("daemon-usage-");
+    const { telegram, daemon } = harness;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    for (const [messageId, text, expected] of [
+      [1, "/automation pause", "Использование: `/automation pause <id>`"],
+      [2, "/automation delete", "Использование: `/automation delete <id>`"],
+      [3, "/memory forget", "Использование: `/memory forget <id-заметки>`"],
+      [4, "/memory restore", "Использование: `/memory restore <id-заметки>`"],
+      [5, "/memory ерунда", "Использование: `/memory [страница]`"],
+    ] as const) {
+      const before = telegram.sent.length;
+      telegram.push(message(messageId, text));
+      const reply = await lastReplyAfter(telegram, before);
+      expect(reply).toContain(expected);
+      expect(reply).not.toContain("не найден");
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("keeps every published command in step with a real handler", async () => {
+    const harness = commandHarness("daemon-menu-sync-");
+    const { telegram, runtime, daemon } = harness;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const published = telegram.menuFor({ type: "chat", chatId: 42 })!;
+    expect(published.length).toBeGreaterThanOrEqual(15);
+    let messageId = 1;
+    for (const command of published) {
+      const before = telegram.sent.length;
+      telegram.push(message((messageId += 1), `/${command}`));
+      const reply = await lastReplyAfter(telegram, before);
+      // A published command that fell through the branch chain would answer
+      // «Не знаю команду», and one that reached the model would answer
+      // «Париж.» — both mean the menu advertises something not wired up.
+      expect(`/${command}: ${reply}`).not.toContain("Не знаю команду");
+      expect(`/${command}: ${reply}`).not.toContain("Париж.");
+    }
+    expect(runtime.prompts.every((prompt) => !prompt.includes("User message:"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+});
