@@ -1476,7 +1476,9 @@ retelling instead of `PROVIDER_FAILED`.
 
 ## 15. Storage and retention
 
-26 tables plus 2 FTS5 indexes, WAL, `foreign_keys = ON`, `busy_timeout = 5000`.
+31 tables plus 2 FTS5 indexes, WAL, `foreign_keys = ON`, `busy_timeout = 5000`.
+(The count was stale at 26 — `now_items` and `journal_entries` arrived with
+packages 2.2 and 3.1 and nobody re-counted.)
 
 **Every boot re-runs the whole schema file and re-embeds every active note.**
 `migrate()` has no version gate — `schema_migrations` is written with
@@ -1598,10 +1600,51 @@ stopped.
 60 s interval, coalescing (an overlapping tick returns the same promise), and
 any failure is `logger.error("Scheduled maintenance failed")` and nothing more.
 
-Twelve steps: dispatch due automations, flush outbox, drain T3 dispatches,
+Thirteen steps: dispatch due automations, flush outbox, drain T3 dispatches,
 expire notes, stop idle Docling, clean expired artifacts, prune local Bot API
 files, refresh thread summaries, the compaction gate, the journal-retention gate,
-`recoverWorkers` (unless startup), and the completion event.
+`recoverWorkers` (unless startup), **the night secretary**, and the completion
+event.
+
+### The night secretary (package 3.1, memory-design §5)
+
+Last in the tick, because it is the only step that can take minutes and worker
+recovery has no business waiting behind hygiene. Delivery is unaffected either
+way — the reliability pump owns the outbox on its own one-second loop.
+
+It runs 02:00–04:00 in the owner's zone, **once per logical day**. The window
+straddles the 03:00 boundary of §2.7, so the day it files under is pinned to the
+one that has ENDED: the 02:30 tick and the 03:30 tick of one night produce the
+same summary rather than two, one of them about a day half an hour old. One
+ATTEMPT per night, succeed or skip — the per-minute tick would otherwise re-enter
+a failing run a hundred times before dawn.
+
+Before any of it, a deterministic `has_work()`: the delta of work events,
+correspondence, expired deadlines, ledger changes, undescribed notes, and whether
+a month owes a rollup. The event half reads an ALLOW list of types, because the
+tick's own `maintenance.completed` lands every sixty seconds and would otherwise
+report a busy night on a machine nobody touched. A quiet night makes zero LLM
+calls and still moves the cursor.
+
+Then the deterministic half — the projection is reconciled, items past
+`valid_until` are closed and archived, and work the event log shows finishing
+with no entry anywhere is written up and marked «(восстановлено по event-логу)».
+Then the model half on the **Claude branch**, whatever the main session is
+running: the day's summary, the previous month's rollup, and a small batch of
+missing note descriptions.
+
+**The summary is built against the ledger, not by retelling the journal.** A
+reopened item clears its `journal_ref` while the archive of its earlier close
+stays, so an archive the ledger no longer confirms reaches the prompt labelled as
+reopened, never as done — otherwise the daily summary announces "закрыто" about
+work that is running right now.
+
+A skipped night leaves a journal mark, the cursor stays put so the next night's
+48-hour window still covers it, and after **three** consecutive skips the owner
+hears about it once. Both owner-facing outputs — that alert and the monthly
+proposal batch — are enqueued as synthetic background-lane turns, so the words
+are the Operator's. The daemon gains no new path to the chat, and the untrusted
+lists inside those prompts are fenced like any worker output.
 
 ---
 
