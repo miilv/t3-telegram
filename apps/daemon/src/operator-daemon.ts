@@ -6481,12 +6481,21 @@ export class OperatorDaemon {
   }
 
   private async maintainStructuredMemory(snapshot: Record<string, unknown>): Promise<void> {
+    // Package 2.1: `obsoleteNoteIds` is a decision about notes, and the snapshot
+    // JSON no longer lists them — the memory index does, and every one of its
+    // lines ends in the id this call has to name. This is the one-shot's own
+    // DATA, not a state push: it carries no push handle, so it neither moves
+    // the diff baseline nor counts as a turn of the epoch (§4).
+    const layers = this.buildStateLayers();
     const response = await this.askOperator(
       [
         "Prepare durable memory maintenance before context compaction.",
         "Use the current Operator conversation plus the bounded authoritative state below.",
         "Return ONLY JSON with notes (array of {category,content,expiresAt?}) and obsoleteNoteIds (string[]).",
         "Keep only stable preferences, decisions, open loops, and cross-session facts. Never store credentials, secrets, raw transcripts, or temporary chatter. Merge duplicates conceptually and return no more than 20 notes.",
+        "Existing notes are listed below as `trigger → id`; an id from that list is the only thing obsoleteNoteIds may contain.",
+        layers.index,
+        layers.now,
         `State JSON:\n${serializeBoundedJson(snapshot, 20_000)}`,
       ].join("\n\n"),
     ).catch(() => "");
