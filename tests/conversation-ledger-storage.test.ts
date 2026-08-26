@@ -9,11 +9,11 @@ describe("logical conversation ledger storage", () => {
     try {
       const coverage = store.conversation.coverageStartedAt();
       expect(Date.parse(coverage)).not.toBeNaN();
-      expect(store.conversation.cursor("distiller")).toBe(0);
+      expect(store.conversation.cursor("distiller", "42")).toBe(0);
 
       // A cursor may never leap over sequence values that future delivered
       // rows will receive.
-      expect(store.conversation.advanceCursor("distiller", 0, 12)).toBe(false);
+      expect(store.conversation.advanceCursor("distiller", "42", 0, 12)).toBe(false);
       const ready = store.conversation.appendOwnerIngress({
         ownerId: "42",
         conversationKey: "7:42:0:0",
@@ -22,12 +22,121 @@ describe("logical conversation ledger storage", () => {
         sourceKey: "telegram-ingress:7:1",
         ingressJobId: "telegram-ingress:7:1",
       });
-      expect(store.conversation.advanceCursor("distiller", 0, ready.seq!)).toBe(true);
-      expect(store.conversation.advanceCursor("distiller", 0, 4)).toBe(false);
-      expect(store.conversation.cursor("distiller")).toBe(ready.seq);
+      expect(store.conversation.advanceCursor("distiller", "42", 0, ready.seq!)).toBe(true);
+      expect(store.conversation.advanceCursor("distiller", "42", 0, 4)).toBe(false);
+      expect(store.conversation.cursor("distiller", "42")).toBe(ready.seq);
     } finally {
       store.close();
     }
+  });
+
+  it("partitions cursor compare-and-swap and high-water validation by owner", () => {
+    const store = tempStore();
+    try {
+      const ownerA = store.conversation.appendOwnerIngress({
+        ownerId: "owner-a",
+        conversationKey: "7:owner-a:0:0",
+        text: "owner A first",
+        evidenceText: "owner A first",
+        sourceKey: "owner-a-1",
+        ingressJobId: "owner-a-1",
+      });
+      const ownerB = store.conversation.appendOwnerIngress({
+        ownerId: "owner-b",
+        conversationKey: "7:owner-b:0:0",
+        text: "owner B first",
+        evidenceText: "owner B first",
+        sourceKey: "owner-b-1",
+        ingressJobId: "owner-b-1",
+      });
+
+      expect(ownerB.seq).toBeGreaterThan(ownerA.seq!);
+      expect(store.conversation.cursor("distiller", "owner-a")).toBe(0);
+      expect(store.conversation.cursor("distiller", "owner-b")).toBe(0);
+      // B's interleaved global sequence is not a valid A high-water.
+      expect(store.conversation.advanceCursor("distiller", "owner-a", 0, ownerB.seq!)).toBe(false);
+      expect(store.conversation.selectBatch({ ownerId: "owner-a", afterSeq: 0 }).entries)
+        .toMatchObject([{ seq: ownerA.seq, text: "owner A first" }]);
+      expect(store.conversation.selectBatch({ ownerId: "owner-b", afterSeq: 0 }).entries)
+        .toMatchObject([{ seq: ownerB.seq, text: "owner B first" }]);
+      expect(store.conversation.advanceCursor("distiller", "owner-a", 0, ownerA.seq!)).toBe(true);
+      expect(store.conversation.cursor("distiller", "owner-a")).toBe(ownerA.seq);
+      expect(store.conversation.cursor("distiller", "owner-b")).toBe(0);
+
+      const ownerANext = store.conversation.appendOwnerIngress({
+        ownerId: "owner-a",
+        conversationKey: "7:owner-a:0:0",
+        text: "owner A second",
+        evidenceText: "owner A second",
+        sourceKey: "owner-a-2",
+        ingressJobId: "owner-a-2",
+      });
+      const ownerAPage = store.conversation.selectBatch({
+        ownerId: "owner-a",
+        afterSeq: store.conversation.cursor("distiller", "owner-a"),
+      });
+      expect(ownerAPage.entries).toMatchObject([{ seq: ownerANext.seq, text: "owner A second" }]);
+      expect(store.conversation.advanceCursor(
+        "distiller",
+        "owner-a",
+        ownerA.seq!,
+        ownerAPage.throughSeq,
+      )).toBe(true);
+      expect(store.conversation.advanceCursor("distiller", "owner-b", 0, ownerB.seq!)).toBe(true);
+      expect(store.conversation.cursor("distiller", "owner-b")).toBe(ownerB.seq);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("migrates a legacy global cursor into bounded owner partitions idempotently", () => {
+    const path = join(tempDirectory("conversation-ledger-cursor-migration-"), "operator.db");
+    let store = new OperatorStore(path);
+    store.migrate();
+    const ownerA = store.conversation.appendOwnerIngress({
+      ownerId: "owner-a",
+      conversationKey: "7:owner-a:0:0",
+      text: "owner A first",
+      evidenceText: "owner A first",
+      sourceKey: "migration-owner-a",
+      ingressJobId: "migration-owner-a",
+    });
+    const ownerB = store.conversation.appendOwnerIngress({
+      ownerId: "owner-b",
+      conversationKey: "7:owner-b:0:0",
+      text: "owner B first",
+      evidenceText: "owner B first",
+      sourceKey: "migration-owner-b",
+      ingressJobId: "migration-owner-b",
+    });
+    store.db.exec(`
+      DROP TABLE conversation_ledger_cursors;
+      CREATE TABLE conversation_ledger_cursors (
+        consumer TEXT PRIMARY KEY,
+        last_seq INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
+        updated_at TEXT NOT NULL
+      );
+    `);
+    store.db.prepare(`
+      INSERT INTO conversation_ledger_cursors(consumer,last_seq,updated_at)
+      VALUES ('distiller',?,'2026-08-26T00:00:00.000Z')
+    `).run(ownerB.seq!);
+    store.close();
+
+    store = new OperatorStore(path);
+    store.migrate();
+    expect(store.conversation.cursor("distiller", "owner-a")).toBe(ownerA.seq);
+    expect(store.conversation.cursor("distiller", "owner-b")).toBe(ownerB.seq);
+    expect((store.db.prepare("PRAGMA table_info(conversation_ledger_cursors)").all() as Array<{
+      name: string;
+    }>).map((column) => column.name)).toContain("owner_id");
+    store.close();
+
+    store = new OperatorStore(path);
+    store.migrate();
+    expect(store.conversation.cursor("distiller", "owner-a")).toBe(ownerA.seq);
+    expect(store.conversation.cursor("distiller", "owner-b")).toBe(ownerB.seq);
+    store.close();
   });
 
   it("rejects contradictory actor/evidence provenance at the schema boundary", () => {
@@ -277,6 +386,15 @@ describe("logical conversation ledger storage", () => {
       expect(first.hasMore).toBe(true);
       expect(first.throughSeq).toBe(first.entries[1]!.seq);
 
+      store.conversation.appendOwnerIngress({
+        ownerId: "42",
+        conversationKey: "7:42:0:0",
+        text: "message-5",
+        evidenceText: "message-5",
+        sourceKey: "ingress-5",
+        ingressJobId: "ingress-5",
+      });
+
       const second = store.conversation.selectBatch({
         ownerId: "42",
         afterSeq: first.throughSeq,
@@ -286,6 +404,21 @@ describe("logical conversation ledger storage", () => {
       });
       expect(second.entries.map((entry) => entry.text)).toEqual(["message-3"]);
       expect(second.hasMore).toBe(true);
+      expect(second.highWaterSeq).toBe(first.highWaterSeq);
+
+      const third = store.conversation.selectBatch({
+        ownerId: "42",
+        afterSeq: second.throughSeq,
+        throughSeq: first.highWaterSeq,
+      });
+      expect(third.entries.map((entry) => entry.text)).toEqual(["message-4"]);
+      expect(third.hasMore).toBe(false);
+
+      const nextCycle = store.conversation.selectBatch({
+        ownerId: "42",
+        afterSeq: third.throughSeq,
+      });
+      expect(nextCycle.entries.map((entry) => entry.text)).toEqual(["message-5"]);
     } finally {
       store.close();
     }
@@ -319,7 +452,12 @@ describe("logical conversation ledger storage", () => {
 
       const beforeRestart = store.conversation.selectBatch({ ownerId: "42", afterSeq: 0 });
       expect(beforeRestart.entries.map((entry) => entry.text)).toEqual(["потом новый вопрос"]);
-      expect(store.conversation.advanceCursor("distiller", 0, beforeRestart.throughSeq)).toBe(true);
+      expect(store.conversation.advanceCursor(
+        "distiller",
+        "42",
+        0,
+        beforeRestart.throughSeq,
+      )).toBe(true);
 
       store.close();
       store = new OperatorStore(path);
@@ -333,6 +471,7 @@ describe("logical conversation ledger storage", () => {
       expect(replay.entries.map((entry) => entry.text)).toEqual(["сначала этот ответ"]);
       expect(store.conversation.advanceCursor(
         "distiller",
+        "42",
         beforeRestart.throughSeq,
         replay.throughSeq,
       )).toBe(true);

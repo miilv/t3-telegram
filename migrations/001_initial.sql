@@ -295,9 +295,11 @@ BEGIN
 END;
 
 CREATE TABLE IF NOT EXISTS conversation_ledger_cursors (
-  consumer   TEXT PRIMARY KEY,
+  consumer   TEXT NOT NULL,
+  owner_id   TEXT NOT NULL,
   last_seq   INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (consumer, owner_id)
 );
 
 -- Existing installations cannot be backfilled: telegram_messages never stored

@@ -194,7 +194,10 @@ export class OperatorStore {
       },
     );
     this.journal = new JournalRepository(this.db, (fn) => this.transaction(fn));
-    this.conversation = new ConversationLedgerRepository(this.db);
+    this.conversation = new ConversationLedgerRepository(
+      this.db,
+      (work) => this.transaction(work),
+    );
   }
 
   migrate(): void {
@@ -302,6 +305,7 @@ export class OperatorStore {
     // --- end package 3.3 ---
     const sql = readFileSync(resolveMigrationPath(), "utf8");
     this.db.exec(sql);
+    this.conversation.migrateCursorPartition();
     this.db.prepare(
       "INSERT OR IGNORE INTO conversation_ledger_meta(key,value) VALUES ('coverage_started_at',?)",
     ).run(nowIso());

@@ -58,7 +58,40 @@ export interface ConversationBatch {
 
 /** Storage boundary for logical correspondence and its monotonic consumers. */
 export class ConversationLedgerRepository {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly transaction: <T>(work: () => T) => T,
+  ) {}
+
+  /** Upgrade the pre-owner-partition cursor without inventing consumed rows. */
+  migrateCursorPartition(): void {
+    const columns = this.db.prepare("PRAGMA table_info(conversation_ledger_cursors)").all() as Row[];
+    if (!columns.length || columns.some((column) => column.name === "owner_id")) return;
+    this.transaction(() => {
+      this.db.exec(`
+        ALTER TABLE conversation_ledger_cursors
+          RENAME TO conversation_ledger_cursors_legacy_v1;
+        CREATE TABLE conversation_ledger_cursors (
+          consumer TEXT NOT NULL,
+          owner_id TEXT NOT NULL,
+          last_seq INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (consumer, owner_id)
+        );
+        INSERT INTO conversation_ledger_cursors(consumer,owner_id,last_seq,updated_at)
+        SELECT legacy.consumer, ready.owner_id,
+          MIN(legacy.last_seq,ready.high_water_seq), legacy.updated_at
+        FROM conversation_ledger_cursors_legacy_v1 legacy
+        CROSS JOIN (
+          SELECT ledger.owner_id,MAX(stream.seq) AS high_water_seq
+          FROM conversation_ledger_stream stream
+          JOIN conversation_ledger ledger ON ledger.id=stream.ledger_id
+          GROUP BY ledger.owner_id
+        ) ready;
+        DROP TABLE conversation_ledger_cursors_legacy_v1;
+      `);
+    });
+  }
 
   coverageStartedAt(): string {
     const row = this.db
@@ -228,32 +261,43 @@ export class ConversationLedgerRepository {
     return { entries, highWaterSeq, throughSeq, hasMore };
   }
 
-  cursor(consumer: string): number {
+  cursor(consumer: string, ownerId: string): number {
     const row = this.db
-      .prepare("SELECT last_seq FROM conversation_ledger_cursors WHERE consumer=?")
-      .get(consumer) as Row | undefined;
+      .prepare(`
+        SELECT last_seq FROM conversation_ledger_cursors
+        WHERE consumer=? AND owner_id=?
+      `)
+      .get(consumer, ownerId) as Row | undefined;
     return Number(row?.last_seq ?? 0);
   }
 
-  advanceCursor(consumer: string, expectedSeq: number, throughSeq: number): boolean {
+  advanceCursor(
+    consumer: string,
+    ownerId: string,
+    expectedSeq: number,
+    throughSeq: number,
+  ): boolean {
     const expected = boundedSequence(expectedSeq);
     const through = boundedSequence(throughSeq);
     if (through < expected) return false;
-    const latest = this.db.prepare(
-      "SELECT MAX(seq) AS seq FROM conversation_ledger_stream",
-    ).get() as Row;
+    const latest = this.db.prepare(`
+      SELECT MAX(stream.seq) AS seq
+      FROM conversation_ledger_stream stream
+      JOIN conversation_ledger ledger ON ledger.id=stream.ledger_id
+      WHERE ledger.owner_id=?
+    `).get(ownerId) as Row;
     if (through > Number(latest.seq ?? 0)) return false;
     if (expected === 0) {
       const inserted = this.db.prepare(`
-        INSERT INTO conversation_ledger_cursors(consumer,last_seq,updated_at)
-        VALUES (?,?,?) ON CONFLICT(consumer) DO NOTHING
-      `).run(consumer, through, nowIso());
+        INSERT INTO conversation_ledger_cursors(consumer,owner_id,last_seq,updated_at)
+        VALUES (?,?,?,?) ON CONFLICT(consumer,owner_id) DO NOTHING
+      `).run(consumer, ownerId, through, nowIso());
       if (inserted.changes > 0) return true;
     }
     return this.db.prepare(`
       UPDATE conversation_ledger_cursors SET last_seq=?,updated_at=?
-      WHERE consumer=? AND last_seq=? AND last_seq<=?
-    `).run(through, nowIso(), consumer, expected, through).changes > 0;
+      WHERE consumer=? AND owner_id=? AND last_seq=? AND last_seq<=?
+    `).run(through, nowIso(), consumer, ownerId, expected, through).changes > 0;
   }
 
   private requireBySource(sourceKind: string, sourceKey: string): ConversationLedgerRow {
