@@ -154,6 +154,101 @@ describe("grammY Telegram transport", () => {
     expect(ambiguousCalls.map((call) => call.method)).toEqual(["sendRichMessage"]);
   });
 
+  it("degrades a spoiler in two steps and only latches on a retry that works (review M2/M3)", async () => {
+    const calls: ApiCall[] = [];
+    // A chat that rejects `<blockquote expandable>` and accepts everything else.
+    const rejectExpandable = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const call = parseApiCall(input, init);
+      calls.push(call);
+      if (call.method === "getMe") return telegramResponse(getMeResult());
+      if (call.method === "sendRichMessage") {
+        return telegramResponse({ ok: false, error_code: 400, description: "Bad Request: can't parse rich message" }, 400);
+      }
+      if (String(call.body.text ?? "").includes("blockquote expandable")) {
+        return telegramResponse({ ok: false, error_code: 400, description: "Bad Request: can't parse entities" }, 400);
+      }
+      return telegramResponse(messageResult(101));
+    });
+    vi.stubGlobal("fetch", rejectExpandable);
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const spoiler = "<details><summary>Итог</summary>\n\nтело\n\n</details>";
+
+    await transport.sendRich(7, spoiler);
+    const first = calls.filter((call) => call.method === "sendMessage");
+    expect(first).toHaveLength(2);
+    // The retry keeps HTML — only the spoiler shape is given up, not the markup.
+    expect(first[1]?.body.parse_mode).toBe("HTML");
+    expect(String(first[1]?.body.text)).toContain("<b>Итог</b>");
+    expect(String(first[1]?.body.text)).not.toContain("expandable");
+    await expect(transport.health()).resolves.toMatchObject({
+      capabilities: { expandableQuote: "unavailable" },
+    });
+
+    // Latched: the next spoiler goes out flat on the first attempt.
+    calls.length = 0;
+    await transport.sendRich(7, spoiler);
+    const second = calls.filter((call) => call.method === "sendMessage");
+    expect(second).toHaveLength(1);
+    expect(String(second[0]?.body.text)).not.toContain("expandable");
+  });
+
+  it("keeps the spoiler capability unknown when the flat retry fails too (review M2)", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        if (call.method === "getMe") return telegramResponse(getMeResult());
+        if (call.method === "sendRichMessage") {
+          return telegramResponse({ ok: false, error_code: 400, description: "Bad Request: can't parse rich message" }, 400);
+        }
+        // Every HTML payload is refused; only the plain one survives.
+        if (call.body.parse_mode === "HTML") {
+          return telegramResponse({ ok: false, error_code: 400, description: "Bad Request: can't parse entities" }, 400);
+        }
+        return telegramResponse(messageResult(102));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    await transport.sendRich(7, "<details><summary>Итог</summary>\n\nтело\n\n</details>");
+
+    const attempts = calls.filter((call) => call.method === "sendMessage");
+    expect(attempts).toHaveLength(3);
+    expect(attempts.at(-1)?.body.parse_mode).toBeUndefined();
+    // The flat retry failed as well, so the spoiler was never proven guilty.
+    await expect(transport.health()).resolves.toMatchObject({
+      capabilities: { expandableQuote: "unknown" },
+    });
+  });
+
+  it("gives an edited message the same two-step degradation as a fresh send (review M3)", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const call = parseApiCall(input, init);
+        calls.push(call);
+        if (call.method !== "editMessageText") return telegramResponse(messageResult(103));
+        if (call.body.rich_message) {
+          return telegramResponse({ ok: false, error_code: 400, description: "Bad Request: can't parse rich message" }, 400);
+        }
+        if (String(call.body.text ?? "").includes("blockquote expandable")) {
+          return telegramResponse({ ok: false, error_code: 400, description: "Bad Request: can't parse entities" }, 400);
+        }
+        return telegramResponse(messageResult(103));
+      }),
+    );
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    await transport.editRich(7, 103, "<details><summary>Итог</summary>\n\nтело\n\n</details>");
+
+    const edits = calls.filter((call) => call.method === "editMessageText");
+    expect(edits).toHaveLength(3);
+    // The edit keeps its formatting instead of collapsing straight to plain text.
+    expect(edits.at(-1)?.body.parse_mode).toBe("HTML");
+    expect(String(edits.at(-1)?.body.text)).toContain("<b>Итог</b>");
+  });
+
   it("renders persistent structured user-input buttons and clears them after submission", async () => {
     const calls: ApiCall[] = [];
     vi.stubGlobal("fetch", successfulTelegramFetch(calls));

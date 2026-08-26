@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DraftWriter,
   markdownToTelegramHtml,
+  renderStreamPhase,
   splitRichText,
   truncateRichPreview,
 } from "../packages/telegram/src/index.js";
@@ -82,6 +83,87 @@ describe("Telegram rich rendering", () => {
     expect(html).not.toContain("attachment://");
     expect(html).not.toContain("![");
     expect(markdownToTelegramHtml("![](attachment://x.png)")).toBe("изображение");
+  });
+
+  it("accepts every GFM delimiter row, not just three dashes (review B1)", () => {
+    const variants = [
+      "| Имя | Итог |\n|:-:|:-:|\n| a | b |",
+      "| Имя | Итог |\n|-|-|\n| a | b |",
+      "| Имя | Итог |\n|:--|--:|\n| a | b |",
+    ];
+    for (const table of variants) {
+      const html = markdownToTelegramHtml(table);
+      expect(html).toContain("<pre>");
+      expect(html).not.toContain("|-");
+      expect(html).not.toContain("| Имя | Итог |");
+    }
+    // Centering actually centers, right alignment actually right-aligns.
+    const centered = /<pre>([\s\S]*?)<\/pre>/u.exec(markdownToTelegramHtml(variants[0]!))![1]!;
+    // «Имя» is 3 wide and «Итог» 4, so a centred single character sits in the middle of both.
+    expect(centered.split("\n")[2]).toBe(" a  |  b  ");
+  });
+
+  it("cannot have its own token markers forged from the user's text (review B2)", () => {
+    for (const forged of ["@@CODEBLOCK0@@", "@@TG00000000_0@@", "@@TGdeadbeef_1@@"]) {
+      const html = markdownToTelegramHtml(`${forged}\n\n\`\`\`\nсекрет фенса\n\`\`\`\n\n| a | b |\n|-|-|\n| ${forged} | y |`);
+      // The literal survives as itself; it never picks up the fence's content.
+      expect(html).toContain(forged.replaceAll("_", "_"));
+      expect(html.split("секрет фенса").length - 1).toBe(1);
+      // And no <pre> ever ends up nested inside the table box.
+      expect(html).not.toMatch(/<pre>[^<]*<pre>/u);
+    }
+  });
+
+  it("keeps replacement patterns in code literal (review T1)", () => {
+    const html = markdownToTelegramHtml("```sh\necho \"$& $' $` $$ $1\"\n```\n\nи `$&` в строке");
+    expect(html).toContain("echo &quot;$&amp; $' $` $$ $1&quot;");
+    expect(html).toContain("<code>$&amp;</code>");
+  });
+
+  it("converts a table inside a spoiler, the way tool output arrives (review M1)", () => {
+    const html = markdownToTelegramHtml(
+      renderStreamPhase("tools", "| Шаг | Итог |\n|-|-|\n| build | ок |"),
+    );
+    expect(html).toContain("<blockquote expandable><b>Работа инструментов</b>");
+    expect(html).toContain("<pre>");
+    expect(html).not.toContain("|-|-|");
+    // <pre> inside the expandable quote is the only nesting Telegram allows here.
+    expect(html).not.toContain("<blockquote expandable><blockquote");
+  });
+
+  it("keeps a pipe inside inline code from breaking the columns (review M5)", () => {
+    const html = markdownToTelegramHtml("| Команда | Итог |\n|-|-|\n| `a \\| b` | ок |\n| x | y |");
+    const rows = /<pre>([\s\S]*?)<\/pre>/u.exec(html)![1]!.split("\n");
+    expect(rows).toHaveLength(4);
+    expect(rows[2]).toContain("a \\| b");
+    // No entity is nested inside the monospaced box.
+    expect(rows[2]).not.toContain("<code>");
+  });
+
+  it("flattens a quoted spoiler instead of nesting quotes (review M4)", () => {
+    const html = markdownToTelegramHtml("> <details><summary>Итог</summary>\n> тело\n> </details>");
+    expect(html).toContain("<blockquote expandable><b>Итог</b>");
+    expect(html).not.toMatch(/<blockquote>\s*<blockquote/u);
+    expect(html).not.toContain("&gt;");
+    expect(html).toContain("тело");
+  });
+
+  it("leaves no stray tags when spoilers are nested", () => {
+    const html = markdownToTelegramHtml(
+      "<details><summary>Внешний</summary>\n\n<details><summary>Внутренний</summary>\n\nтело\n\n</details>\n\n</details>",
+    );
+    expect(html).not.toContain("&lt;/details&gt;");
+    expect(html).not.toContain("&lt;details");
+    expect(html).toContain("<b>Внешний</b>");
+    expect(html).toContain("<b>Внутренний</b>");
+  });
+
+  it("trims wide cells and ragged rows in the monospaced box", () => {
+    const html = markdownToTelegramHtml(`| Имя | Итог |\n|-|-|\n| ${"я".repeat(60)} | ок |\n| одна |`);
+    const rows = /<pre>([\s\S]*?)<\/pre>/u.exec(html)![1]!.split("\n");
+    expect(rows[2]).toContain("…");
+    expect(rows.every((row) => row.length <= 40)).toBe(true);
+    expect(rows.every((row) => !/[\s|]$/u.test(row))).toBe(true);
   });
 
   it("never exceeds a limit smaller than the truncation marker", () => {

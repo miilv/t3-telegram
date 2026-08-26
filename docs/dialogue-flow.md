@@ -881,9 +881,17 @@ Package 4.2 — the legacy converter no longer leaks markup: `<details>` becomes
 `<blockquote expandable>` with the summary in bold (quotes inside it are
 flattened, since same-kind entities cannot nest), Markdown tables become an
 aligned `<pre>` box, single `*`/`_` become `<i>`, and `![alt](url)` becomes a
-link — or bare alt text for `attachment://`. `expandableBlockquote` is a
-fourth latched capability: one HTML formatting error on a chunk containing a
-spoiler retries the flat «заголовок + текст» shape before the plain fallback.
+link — or bare alt text for `attachment://`. Token markers carry a per-call
+random nonce, so nothing the user types can be swapped for another fragment's
+content, and expansion uses `split/join` so a literal `$&` in a code block
+stays literal.
+
+`expandableQuote` is a fourth latched capability, reported by `health()`.
+Every legacy send **and edit** goes through one degradation path —
+HTML → flat spoiler → plain — so an edit no longer loses all its markup at
+the first formatting error. The latch only turns `false` when the flat retry
+actually succeeds: a flat retry that fails too proves the spoiler was
+innocent, and the capability returns to `unknown`.
 
 **Anchored edits** resolve at delivery time and are discarded if the anchor's
 chat differs. `"message is not modified"` counts as delivered. On a

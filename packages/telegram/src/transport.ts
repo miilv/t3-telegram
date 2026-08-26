@@ -755,6 +755,7 @@ export class TelegramBotTransport implements TelegramTransport {
           richFinal: capabilityState(this.richFinalAvailable),
           richDraft: capabilityState(this.richDraftAvailable),
           plainDraft: capabilityState(this.draftAvailable),
+          expandableQuote: capabilityState(this.expandableQuoteAvailable),
         },
       };
     } catch (error) {
@@ -1006,19 +1007,15 @@ export class TelegramBotTransport implements TelegramTransport {
     const sent: SentMessage[] = [];
     for (const [index, chunk] of splitRichText(text, 4000).entries()) {
       const chunkOptions = index === 0 ? options : withoutReply(options);
-      let message;
-      try {
-        message = await this.outbound(chatId, () =>
-          this.bot.api.sendMessage(chatId, this.legacyHtml(chunk), {
+      const message = await this.deliverFormatted(chunk, (payload, html) =>
+        this.outbound(chatId, () =>
+          this.bot.api.sendMessage(chatId, payload, {
             ...messageOptions(chunkOptions),
-            parse_mode: "HTML",
+            ...(html ? { parse_mode: "HTML" as const } : {}),
             link_preview_options: { is_disabled: true },
           }),
-        );
-      } catch (error) {
-        if (!isFormattingError(error)) throw error;
-        message = await this.sendLegacyDegraded(chatId, chunk, chunkOptions);
-      }
+        ),
+      );
       sent.push(sentMessage(chatId, message.message_id, chunkOptions));
     }
     return sent;
@@ -1029,32 +1026,41 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   /**
-   * A rejected HTML chunk gets one more chance before losing its formatting
-   * entirely: `<blockquote expandable>` is the newest tag we emit, so a chat
-   * that refuses it is retried with the flat spoiler shape, and the capability
-   * is latched off for the rest of this life.
+   * The one place formatting degrades: HTML → flat spoiler → plain text. Every
+   * legacy send and edit goes through it, so an edit no longer drops straight
+   * to plain and the latch learns from both paths alike (review M3).
+   *
+   * `<blockquote expandable>` is the newest tag we emit, so it is the first
+   * suspect when a chunk carrying a spoiler is rejected — but only a flat
+   * retry that actually succeeds proves it. A flat retry that fails too says
+   * the spoiler was innocent, and the capability goes back to unknown rather
+   * than costing every later message its spoilers (review M2).
    */
-  private async sendLegacyDegraded(chatId: number, chunk: string, options: TelegramSendOptions) {
-    if (this.expandableQuoteAvailable !== false && /<details/iu.test(chunk)) {
-      this.expandableQuoteAvailable = false;
-      try {
-        return await this.outbound(chatId, () =>
-          this.bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk, { expandableBlockquote: false }), {
-            ...messageOptions(options),
-            parse_mode: "HTML",
-            link_preview_options: { is_disabled: true },
-          }),
-        );
-      } catch (error) {
-        if (!isFormattingError(error)) throw error;
+  private async deliverFormatted<T>(
+    text: string,
+    deliver: (payload: string, html: boolean) => Promise<T>,
+  ): Promise<T> {
+    const hasSpoiler = /<details/iu.test(text);
+    try {
+      const result = await deliver(this.legacyHtml(text), true);
+      if (hasSpoiler && this.expandableQuoteAvailable === undefined) this.expandableQuoteAvailable = true;
+      return result;
+    } catch (error) {
+      if (!isFormattingError(error)) throw error;
+      metrics.increment("rich_fallback_total", { reason: "formatting" });
+      if (hasSpoiler && this.expandableQuoteAvailable !== false) {
+        const previous = this.expandableQuoteAvailable;
+        try {
+          const result = await deliver(markdownToTelegramHtml(text, { expandableBlockquote: false }), true);
+          this.expandableQuoteAvailable = false;
+          return result;
+        } catch (retryError) {
+          if (!isFormattingError(retryError)) throw retryError;
+          this.expandableQuoteAvailable = previous;
+        }
       }
+      return deliver(text, false);
     }
-    return this.outbound(chatId, () =>
-      this.bot.api.sendMessage(chatId, chunk, {
-        ...messageOptions(options),
-        link_preview_options: { is_disabled: true },
-      }),
-    );
   }
 
   private async editRichSingle(
@@ -1084,21 +1090,17 @@ export class TelegramBotTransport implements TelegramTransport {
     }
     const chunks = splitRichText(text, 4000);
     try {
-      await this.outbound(chatId, () =>
-        this.bot.api.editMessageText(chatId, messageId, this.legacyHtml(chunks[0] ?? "…"), {
-          parse_mode: "HTML",
-          link_preview_options: { is_disabled: true },
-        }),
+      await this.deliverFormatted(chunks[0] ?? "…", (payload, html) =>
+        this.outbound(chatId, () =>
+          this.bot.api.editMessageText(chatId, messageId, payload, {
+            ...(html ? { parse_mode: "HTML" as const } : {}),
+            link_preview_options: { is_disabled: true },
+          }),
+        ),
       );
     } catch (error) {
       if (isMessageNotModified(error)) return [sentMessage(chatId, messageId, options)];
-      if (!isFormattingError(error)) throw error;
-      metrics.increment("rich_fallback_total", { reason: "formatting" });
-      await this.outbound(chatId, () =>
-        this.bot.api.editMessageText(chatId, messageId, chunks[0] ?? "…", {
-          link_preview_options: { is_disabled: true },
-        }),
-      );
+      throw error;
     }
     const sent = [sentMessage(chatId, messageId, options)];
     for (const chunk of chunks.slice(1)) {

@@ -211,6 +211,7 @@ export interface TelegramHealth {
     richFinal: "available" | "unavailable" | "unknown";
     richDraft: "available" | "unavailable" | "unknown";
     plainDraft: "available" | "unavailable" | "unknown";
+    expandableQuote: "available" | "unavailable" | "unknown";
   };
 }
 
