@@ -115,6 +115,7 @@ async function main(): Promise<void> {
     getPolicy: () => daemon.getPolicy(),
     updatePolicy: (patch, updatedBy) => daemon.updatePolicy(patch, updatedBy),
     activeWorkers: () => daemon.workerOccupancy(),
+    ownerTimeZone: () => config.owner.timezone,
     logger,
     onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
   });
