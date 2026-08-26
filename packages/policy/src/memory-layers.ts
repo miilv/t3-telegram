@@ -16,6 +16,8 @@
  */
 
 import { createHash } from "node:crypto";
+import { openFence } from "../../shared/src/index.js";
+import type { Fence } from "../../shared/src/index.js";
 
 /** memory-design §2.2 — now-state render budget. */
 export const NOW_STATE_BUDGET_CHARS = 3_000;
@@ -75,10 +77,16 @@ export interface MemoryIndexNote {
 }
 
 export interface RenderOptions {
-  /** Character budget for the whole section, header and tail included. */
+  /** Character budget for the whole section, header, fence and tail included. */
   budget?: number;
   /** Tool named in the overflow tail. */
   overflowTool?: string;
+  /**
+   * The shared `worker` fence for this snapshot. `renderStateLayers` opens ONE
+   * and hands it to every layer, so the whole state block speaks a single fence
+   * vocabulary; a renderer called on its own opens its own.
+   */
+  fence?: Fence;
 }
 
 function clean(value: string, limit: number): string {
@@ -93,11 +101,17 @@ function byRecencyDesc(a: { updatedAt: string }, b: { updatedAt: string }): numb
 }
 
 /**
- * Greedy fit: take the ranked prefix that still renders inside the budget.
+ * Take the LARGEST ranked prefix that still renders inside the budget.
  *
  * Recomputing the whole render per step is O(n²) on a list capped in the
- * hundreds, and it is the only way to account for the section headers and the
- * tail line that appear and disappear as the selection changes.
+ * hundreds, and it is the only way to account for the section headers, the
+ * fence and the tail line that appear and disappear as the selection changes.
+ *
+ * The loop runs to the end rather than stopping at the first overflow, because
+ * length is NOT monotonic in the count: the last item to be added removes the
+ * tail line entirely (`(+1 items — …)` → nothing), which can shrink the render
+ * by more than the item added to it. Breaking early would drop a list that fits
+ * whole and print a "(+1 items)" tail nobody needed.
  */
 function fitToBudget<T>(
   ranked: readonly T[],
@@ -107,10 +121,28 @@ function fitToBudget<T>(
   let best = render([], ranked.length);
   for (let count = 1; count <= ranked.length; count += 1) {
     const candidate = render(ranked.slice(0, count), ranked.length - count);
-    if (candidate.length > budget) break;
-    best = candidate;
+    if (candidate.length <= budget) best = candidate;
   }
   return best;
+}
+
+/**
+ * The blocker of the 2.1 review: a layer body is written by MODELS and WORKERS
+ * — thread titles come from the agent's own routing call, note bodies from
+ * whatever it once decided to remember — and it sits in the trusted head of the
+ * envelope, directly above an instruction. Persona rule 12 says only the
+ * owner's own words may direct the agent; that promise is only kept if the
+ * state block is visibly DATA.
+ *
+ * One marker pair wraps the whole body (~40 characters against a 3000-character
+ * budget), so the cost argument against fencing never applied: what is
+ * expensive is a fence per line, not a fence per layer. Our own words — the
+ * layer header, the placeholders, the overflow tail, the lead line — stay
+ * OUTSIDE it: a claim the daemon makes must not read as content the daemon
+ * quotes.
+ */
+function fenceBody(body: string, fence: Fence | undefined): string {
+  return (fence ?? openFence("worker"))(body);
 }
 
 /**
@@ -139,14 +171,16 @@ export function renderNowState(
       // where to read it — instead of a placeholder that would be a lie.
       if (omitted === 0) lines.push(NOW_STATE_EMPTY);
     } else {
+      const body: string[] = [];
       for (const section of SECTION_ORDER) {
         const inSection = selected.filter((item) => item.section === section);
         if (inSection.length === 0) continue;
-        lines.push(section.toUpperCase());
+        body.push(section.toUpperCase());
         for (const item of inSection) {
-          lines.push(`- ${clean(item.content, NOW_ITEM_CONTENT_CHARS)}`);
+          body.push(`- ${clean(item.content, NOW_ITEM_CONTENT_CHARS)}`);
         }
       }
+      lines.push(fenceBody(body.join("\n"), options.fence));
     }
     if (omitted > 0) {
       lines.push(`(+${omitted} items — call ${overflowTool} for the full list)`);
@@ -172,7 +206,10 @@ export function renderMemoryIndex(
   if (notes.length === 0) return `${MEMORY_INDEX_HEADER}\n${MEMORY_INDEX_EMPTY}`;
   const ranked = [...notes].sort(byRecencyDesc);
   return fitToBudget(ranked, budget, (selected, omitted) => {
-    const lines = [MEMORY_INDEX_HEADER, ...selected.map(indexLine)];
+    const lines = [MEMORY_INDEX_HEADER];
+    if (selected.length > 0) {
+      lines.push(fenceBody(selected.map(indexLine).join("\n"), options.fence));
+    }
     if (omitted > 0) lines.push(`(+${omitted} notes — ${overflowTool})`);
     return lines.join("\n");
   });
@@ -200,7 +237,10 @@ export function renderAntiRediscovery(
   if (notes.length === 0) return `${ANTI_REDISCOVERY_HEADER}\n${ANTI_REDISCOVERY_EMPTY}`;
   const ranked = [...notes].sort(byRecencyDesc);
   return fitToBudget(ranked, budget, (selected, omitted) => {
-    const lines = [ANTI_REDISCOVERY_HEADER, ...selected.map(indexLine)];
+    const lines = [ANTI_REDISCOVERY_HEADER];
+    if (selected.length > 0) {
+      lines.push(fenceBody(selected.map(indexLine).join("\n"), options.fence));
+    }
     if (omitted > 0) lines.push(`(+${omitted} entries — ${overflowTool})`);
     return lines.join("\n");
   });
@@ -239,8 +279,11 @@ export function fingerprintNowItems(items: readonly NowStateItem[]): NowItemFing
   const fingerprints: NowItemFingerprints = {};
   for (const item of items.slice(0, 100)) {
     fingerprints[item.id] = {
-      h: hashText(`${item.section} ${clean(item.content, NOW_ITEM_CONTENT_CHARS)}`),
-      l: clean(item.content, 80),
+      h: hashText(`${item.section} ${clean(item.content, NOW_ITEM_CONTENT_CHARS)}`),
+      // The label only has to NAME a vanished item in one diff line, and this
+      // row is persisted for every item on every accepted turn — 40 characters
+      // is a title, not a payload.
+      l: clean(item.content, 40),
     };
   }
   return fingerprints;
@@ -248,22 +291,35 @@ export function fingerprintNowItems(items: readonly NowStateItem[]): NowItemFing
 
 /** Render all three layers plus everything the push state machine needs. */
 export function renderStateLayers(input: StateLayerInput): RenderedStateLayers {
+  // ONE fence for the whole snapshot: three layers, three bodies, one marker
+  // vocabulary the model can recognise at a glance.
+  const fence = openFence("worker");
   const now = renderNowState(input.now, {
+    fence,
     ...(input.nowOverflowTool ? { overflowTool: input.nowOverflowTool } : {}),
   });
-  const index = renderMemoryIndex(input.notes);
-  const antiRediscovery = renderAntiRediscovery(input.antiRediscovery);
+  const index = renderMemoryIndex(input.notes, { fence });
+  const antiRediscovery = renderAntiRediscovery(input.antiRediscovery, { fence });
   const snapshot = [SNAPSHOT_LEAD, now, index, antiRediscovery].join("\n\n");
+  // The fence nonce is drawn fresh for every render — hashing the text as-is
+  // would make every layer look changed on every turn, which would quietly turn
+  // "full snapshot only when something moved" into "full snapshot always" and
+  // the diff baseline into noise. The nonce is replaced by a constant of the
+  // same length first, so the hash tracks CONTENT and nothing else.
+  const canonical = (text: string): string => text.replaceAll(fence.nonce, CANONICAL_NONCE);
   return {
     now,
     index,
     antiRediscovery,
     snapshot,
-    nowHash: hashText(now),
-    snapshotHash: hashText(snapshot),
+    nowHash: hashText(canonical(now)),
+    snapshotHash: hashText(canonical(snapshot)),
     items: fingerprintNowItems(input.now),
   };
 }
+
+/** Same length as a real nonce, so canonicalization cannot change a render's shape. */
+const CANONICAL_NONCE = "00000000";
 
 export interface NowDiffEntry {
   kind: "added" | "changed" | "closed";
@@ -300,14 +356,21 @@ const DIFF_VERB: Record<NowDiffEntry["kind"], string> = {
   closed: "no longer open",
 };
 
-/** `undefined` when nothing moved — the caller then emits no section at all. */
-export function renderNowDiff(entries: readonly NowDiffEntry[], limit = 12): string | undefined {
+/**
+ * `undefined` when nothing moved — the caller then emits no section at all.
+ *
+ * The labels are the same worker-written titles the now layer carries, so the
+ * body is fenced for the same reason (review blocker №1): a diff line sits in
+ * the trusted head of the envelope too.
+ */
+export function renderNowDiff(
+  entries: readonly NowDiffEntry[],
+  options: { limit?: number; fence?: Fence } = {},
+): string | undefined {
   if (entries.length === 0) return undefined;
-  const shown = entries.slice(0, limit);
-  const lines = [
-    NOW_DIFF_HEADER,
-    ...shown.map((entry) => `- ${DIFF_VERB[entry.kind]}: ${entry.label}`),
-  ];
+  const shown = entries.slice(0, options.limit ?? 12);
+  const body = shown.map((entry) => `- ${DIFF_VERB[entry.kind]}: ${entry.label}`).join("\n");
+  const lines = [NOW_DIFF_HEADER, fenceBody(body, options.fence)];
   if (entries.length > shown.length) {
     lines.push(`(+${entries.length - shown.length} more changes)`);
   }

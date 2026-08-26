@@ -97,6 +97,8 @@ import {
   mayAutoApprove,
   parsePushBaseline,
   readOperatorPolicy,
+  renderGapLine,
+  renderMemoryIndex,
   renderNowDiff,
   renderPersonaDigest,
   renderStateLayers,
@@ -336,6 +338,38 @@ interface OperatorPushHandle {
   rebuild: () => string;
   /** The provider accepted the prompt: the pushed state is now history. */
   accepted: () => void;
+}
+/**
+ * Everything an Operator turn may carry besides its prompt. It grew to six
+ * optional arguments across packages 1.1–2.1, and the calls that want only the
+ * last one were passing five `undefined`s to reach it — a shape where inserting
+ * an argument silently rebinds every such call.
+ */
+interface OperatorTurnOptions {
+  onDelta?: (delta: string) => void;
+  toolAccess?: OperatorToolAccess;
+  onToolStarted?: (tool: string) => void;
+  /**
+   * Package 1.1: names this turn inside the runtime, so a preemption that
+   * arrives after the turn released the slot cannot kill the maintenance,
+   * mediation or memory call that took it next.
+   */
+  turnToken?: string;
+  /**
+   * Package 1.5: the caller's zombie handle. The single voice is TWO serial
+   * resources — the lane queue and the runtime queue — and freeing only the
+   * first would leave the next turn waiting on the wedged provider call anyway.
+   * The runtime's own slot is the third: `runtime.abandon()` (called by the
+   * watchdog) drops it and kills the child, so the next turn can spawn instead
+   * of hitting "runtime already has an active turn".
+   */
+  abandon?: AbandonHandle;
+  /**
+   * Package 2.1: the push side of this turn (memory-design §1). Absent for the
+   * service one-shots that carry no state layer at all — failure recovery and
+   * memory maintenance (§4: "нормализация/failure-recovery/фоновые — НЕТ").
+   */
+  push?: OperatorPushHandle;
 }
 /**
  * Package 2.1: the instant of the owner's LAST message, persisted so the pause
@@ -933,15 +967,7 @@ export class OperatorDaemon {
         "Reply exactly CONTEXT_RESTORED.",
       ].join("\n\n"),
     );
-    await this.askOperator(
-      restore.prompt,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      restore.push,
-    );
+    await this.askOperator(restore.prompt, { push: restore.push });
   }
 
   /**
@@ -2173,9 +2199,13 @@ export class OperatorDaemon {
     // per-viewer baseline, and package 2.1 does not buy that for a filtered
     // subset nobody is asking for. A non-admin turn simply carries no state.
     const mayReadState = this.isAdministrator(update.userId);
+    // Whose turn is this? A thread-event digest and a synthetic automation turn
+    // are the daemon addressing itself; only the owner's own message earns the
+    // pause-driven snapshot and the gap line (§2.7).
+    const ownerTurn = !isThreadEventTurn && !update.synthetic;
     const composePrompt = (force: boolean): { text: string; commit: () => void } => {
       const push = mayReadState
-        ? this.buildPushSections({ ...(force ? { force: true } : {}), at: pushAt })
+        ? this.buildPushSections({ ...(force ? { force: true } : {}), at: pushAt, ownerTurn })
         : { sections: [] as string[], commit: (): void => undefined };
       return {
         text: [...push.sections, ...turnInstruction]
@@ -2196,7 +2226,7 @@ export class OperatorDaemon {
     // AFTER this turn's pause was classified against the previous message, and
     // only when the owner really spoke — a synthetic automation turn or a
     // thread-event digest is the daemon talking to itself.
-    if (!isThreadEventTurn && !update.synthetic && this.roleForUser(update.userId) === "owner") {
+    if (ownerTurn && this.roleForUser(update.userId) === "owner") {
       this.store.setRuntimeState(OWNER_LAST_MESSAGE_KEY, nowIso());
     }
     const operatorStartedAt = Date.now();
@@ -2253,9 +2283,8 @@ export class OperatorDaemon {
       // would run to completion only to be dropped, with the owner's new turn
       // waiting behind it. Spend no provider turn on an undeliverable answer.
       if (turn?.superseded) return "";
-      return this.askOperator(
-        composed.text,
-        (delta) => {
+      return this.askOperator(composed.text, {
+        onDelta: (delta) => {
           // Package 1.5: a zombie turn is inert. Its late tokens must not
           // reappear in a draft that belongs to the next turn now.
           if (turn?.zombie) return;
@@ -2267,8 +2296,8 @@ export class OperatorDaemon {
           previewTouched = true;
           writer?.append(delta);
         },
-        toolLease?.access,
-        () => {
+        ...(toolLease?.access ? { toolAccess: toolLease.access } : {}),
+        onToolStarted: () => {
           if (turn?.zombie) return;
           // Package 1.5: a tool step is a sign of life too — a turn that thinks
           // for ten minutes between two tool calls is working, not wedged.
@@ -2281,10 +2310,10 @@ export class OperatorDaemon {
           // which is what the T3 thread shows too.
           if (toolSteps === 1) writer?.reset("⏳ Работаю…");
         },
-        operatorTurnId,
-        abandonHandle,
-        pushHandle,
-      );
+        turnToken: operatorTurnId,
+        ...(abandonHandle ? { abandon: abandonHandle } : {}),
+        push: pushHandle,
+      });
     };
     try {
       const running = runTurn();
@@ -4480,7 +4509,15 @@ export class OperatorDaemon {
    * sent still put the state into the session history, while a provider error
    * before acceptance leaves the session knowing nothing and must not move it.
    */
-  private commitPushBaseline(layers: RenderedStateLayers, reason: string): void {
+  private commitPushBaseline(
+    layers: RenderedStateLayers,
+    reason: string,
+    ownerTurn: boolean,
+  ): void {
+    // Only the owner's own turn advances what the OWNER has seen. A background
+    // stretch of thread-event digests keeps the diff baseline honest about the
+    // session's history while leaving their re-orientation intact (review №3).
+    const previous = parsePushBaseline(this.store.getRuntimeState(PUSH_BASELINE_KEY));
     this.store.setRuntimeState(
       PUSH_BASELINE_KEY,
       serializePushBaseline({
@@ -4488,12 +4525,15 @@ export class OperatorDaemon {
         epoch: this.pushEpoch(),
         nowHash: layers.nowHash,
         snapshotHash: layers.snapshotHash,
+        ownerSnapshotHash: ownerTurn
+          ? layers.snapshotHash
+          : (previous?.ownerSnapshotHash ?? layers.snapshotHash),
         items: layers.items,
         sentAt: nowIso(),
       }),
     );
     this.store.appendEvent("memory.pushed", {
-      payload: { reason, chars: layers.snapshot.length },
+      payload: { reason, ownerTurn, chars: layers.snapshot.length },
     });
   }
 
@@ -4508,13 +4548,19 @@ export class OperatorDaemon {
    * snapshot, whose empty layers render explicit placeholders, is the whole
    * economy of the model.
    */
-  private buildPushSections(options: { force?: boolean; at?: Date } = {}): {
+  private buildPushSections(
+    options: { force?: boolean; at?: Date; ownerTurn: boolean },
+  ): {
     sections: string[];
     commit: () => void;
     reason: string;
   } {
     const nowItems = this.currentNowItems();
-    const layers = this.buildStateLayers(nowItems);
+    // The layers are built LAZILY. Rendering them reads every durable note and
+    // resolves a project per live thread, and the common turn — inside an
+    // episode, with a valid baseline and nothing moved — needs none of it.
+    let layers: RenderedStateLayers | undefined;
+    const stateLayers = (): RenderedStateLayers => (layers ??= this.buildStateLayers(nowItems));
     const previousRaw = this.store.getRuntimeState(OWNER_LAST_MESSAGE_KEY);
     const pause = classifyPause({
       previousAt: previousRaw ? new Date(previousRaw) : undefined,
@@ -4527,22 +4573,35 @@ export class OperatorDaemon {
       sessionId: this.operatorSessionId,
       epoch: this.pushEpoch(),
       pause,
-      snapshotHash: layers.snapshotHash,
+      snapshotHash: () => stateLayers().snapshotHash,
+      ownerTurn: options.ownerTurn,
       ...(options.force ? { force: true } : {}),
     });
     const sections: string[] = [];
+    let commit = (): void => undefined;
     if (decision.mode === "full") {
-      sections.push(layers.snapshot);
+      const rendered = stateLayers();
+      sections.push(rendered.snapshot);
+      commit = () => this.commitPushBaseline(rendered, decision.reason, options.ownerTurn);
     } else {
       const diff = renderNowDiff(diffNowItems(baseline?.items ?? {}, nowItems));
-      if (diff) sections.push(diff);
+      if (diff) {
+        sections.push(diff);
+        // Only a turn that actually pushed something moves the baseline. An
+        // empty diff pushed nothing, so leaving the baseline untouched is not
+        // an omission — it keeps the last FULL push as the reference a later
+        // significant pause compares against.
+        const rendered = stateLayers();
+        commit = () => this.commitPushBaseline(rendered, decision.reason, options.ownerTurn);
+      }
     }
-    if (pause.gapLine) sections.push(pause.gapLine);
-    return {
-      sections,
-      commit: () => this.commitPushBaseline(layers, decision.reason),
-      reason: decision.reason,
-    };
+    // The gap line belongs to the owner's own turn (§2.7 measures THEIR
+    // silence), and its wording depends on whether any state precedes it.
+    if (options.ownerTurn) {
+      const gapLine = renderGapLine(pause, { stateAbove: sections.length > 0 });
+      if (gapLine) sections.push(gapLine);
+    }
+    return { sections, commit, reason: decision.reason };
   }
 
   /**
@@ -4558,7 +4617,10 @@ export class OperatorDaemon {
     let commit = (): void => undefined;
     const build = (): string => {
       const layers = this.buildStateLayers();
-      commit = () => this.commitPushBaseline(layers, "forced");
+      // A compaction recovery or a provider handoff re-seeds the epoch for
+      // everyone, the owner included: it IS the state they will next reason
+      // from, so it advances their baseline too.
+      commit = () => this.commitPushBaseline(layers, "forced", true);
       return compose(layers.snapshot);
     };
     const prompt = build();
@@ -5007,15 +5069,7 @@ export class OperatorDaemon {
           "Reply exactly PROVIDER_CONTEXT_RESTORED.",
         ].join("\n\n"),
       );
-      const restored = await this.askOperator(
-        restore.prompt,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        restore.push,
-      );
+      const restored = await this.askOperator(restore.prompt, { push: restore.push });
       this.store.appendEvent("operator.provider.switched", {
         payload: {
           from: current,
@@ -6239,34 +6293,8 @@ export class OperatorDaemon {
     }
   }
 
-  private async askOperator(
-    prompt: string,
-    onDelta?: (delta: string) => void,
-    toolAccess?: OperatorToolAccess,
-    onToolStarted?: (tool: string) => void,
-    /**
-     * Package 1.1: names this turn inside the runtime, so a preemption that
-     * arrives after the turn released the slot cannot kill the maintenance,
-     * mediation or memory call that took it next.
-     */
-    turnToken?: string,
-    /**
-     * Package 1.5: the caller's zombie handle. The single voice is TWO serial
-     * resources — the lane queue and this runtime queue — and freeing only the
-     * first would leave the next turn waiting on the wedged provider call
-     * anyway. The runtime's own slot is the third: `runtime.abandon()` (called
-     * by the watchdog) drops it and kills the child, so the next turn can spawn
-     * instead of hitting "runtime already has an active turn".
-     */
-    abandon?: AbandonHandle,
-    /**
-     * Package 2.1: the push side of this turn (memory-design §1). Absent for
-     * the service one-shots that carry no state layer at all — failure
-     * recovery and memory maintenance (§4: "нормализация/failure-recovery/
-     * фоновые — НЕТ").
-     */
-    push?: OperatorPushHandle,
-  ): Promise<string> {
+  private async askOperator(prompt: string, options: OperatorTurnOptions = {}): Promise<string> {
+    const { onDelta, toolAccess, onToolStarted, turnToken, abandon, push } = options;
     return this.operatorRuntimeQueue.run(async () => {
       // Blocker: a turn abandoned WHILE IT WAITED on this queue (behind a
       // compaction, mediation or maintenance call) must not start at all.
@@ -6486,7 +6514,17 @@ export class OperatorDaemon {
     // lines ends in the id this call has to name. This is the one-shot's own
     // DATA, not a state push: it carries no push handle, so it neither moves
     // the diff baseline nor counts as a turn of the epoch (§4).
-    const layers = this.buildStateLayers();
+    //
+    // Two differences from the pushed index, both deliberate: anti-rediscovery
+    // notes are folded back IN (they are excluded from the pushed index because
+    // they have their own block — excluding them here would make them the one
+    // category this mechanism could never retire), and the budget is the
+    // one-shot's own 20 000, not the envelope's 3 000. A maintenance pass that
+    // sees a third of the notes would obsolete from a third of the picture.
+    const notes = this.currentMemoryNotes();
+    const maintenanceIndex = renderMemoryIndex([...notes.index, ...notes.antiRediscovery], {
+      budget: 20_000,
+    });
     const response = await this.askOperator(
       [
         "Prepare durable memory maintenance before context compaction.",
@@ -6494,8 +6532,8 @@ export class OperatorDaemon {
         "Return ONLY JSON with notes (array of {category,content,expiresAt?}) and obsoleteNoteIds (string[]).",
         "Keep only stable preferences, decisions, open loops, and cross-session facts. Never store credentials, secrets, raw transcripts, or temporary chatter. Merge duplicates conceptually and return no more than 20 notes.",
         "Existing notes are listed below as `trigger → id`; an id from that list is the only thing obsoleteNoteIds may contain.",
-        layers.index,
-        layers.now,
+        maintenanceIndex,
+        `Live work (context only — these are not notes and their ids are NOT note ids):\n${this.buildStateLayers().now}`,
         `State JSON:\n${serializeBoundedJson(snapshot, 20_000)}`,
       ].join("\n\n"),
     ).catch(() => "");

@@ -5109,16 +5109,15 @@ describe("OperatorDaemon product flow", () => {
       daemon as unknown as {
         askOperator: (
           prompt: string,
-          onDelta?: (delta: string) => void,
-          toolAccess?: unknown,
-          onToolStarted?: (tool: string) => void,
-          turnToken?: string,
-          abandon?: { settled: () => boolean; promise: Promise<unknown> },
+          options?: {
+            turnToken?: string;
+            abandon?: { settled: () => boolean; promise: Promise<unknown> };
+          },
         ) => Promise<string>;
       }
-    ).askOperator("вопрос", undefined, undefined, undefined, "opturn_x", {
-      settled: () => true,
-      promise: new Promise(() => undefined),
+    ).askOperator("вопрос", {
+      turnToken: "opturn_x",
+      abandon: { settled: () => true, promise: new Promise(() => undefined) },
     });
 
     expect(answer).toBe("");
@@ -7953,6 +7952,24 @@ describe("Operator push envelope (package 2.1)", () => {
   const directEnvelopes = (runtime: FakeRuntime): string[] =>
     runtime.prompts.filter((prompt) => prompt.includes("User message:"));
 
+  /**
+   * A `significant` pause is anything from 2 to 12 hours WITHIN one logical day
+   * (03:00 boundary, memory-design §2.7) — so a fixed "four hours ago" is not a
+   * fixed pause class: run the suite at 06:00 owner-local and those four hours
+   * cross the boundary into a cold resume, which is a different push. Pinning
+   * the owner to a zone where it is currently midday makes the backdate below
+   * mean the same thing whenever the suite runs.
+   */
+  function ownerConfigAtLocalNoon(home: string): Config {
+    const offset = 12 - new Date().getUTCHours(); // -11..+12
+    const zone = offset === 0 ? "Etc/GMT" : `Etc/GMT${offset > 0 ? "-" : "+"}${Math.abs(offset)}`;
+    const base = config(home);
+    return { ...base, owner: { ...base.owner, timezone: zone } };
+  }
+
+  const hoursAgo = (hours: number): string =>
+    new Date(Date.now() - hours * 60 * 60_000).toISOString();
+
   it("pushes a full snapshot once, then diffs inside the episode, then re-pushes after a cold gap", async () => {
     const home = tempDirectory("daemon-push-snapshot-");
     const store = tempStore();
@@ -8017,6 +8034,101 @@ describe("Operator push envelope (package 2.1)", () => {
     expect(third).toContain("Operator state snapshot");
     expect(third).toContain("[gap:");
     expect(third).toContain("cold-resume");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("does not let a thread-event digest spend the owner's re-orientation (review №3)", async () => {
+    const home = tempDirectory("daemon-push-digest-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    // The work stays RUNNING: a live thread is a now-state item, so the state
+    // the owner comes back to is genuinely different from the one they left.
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "progress", threadId: "th_1", summary: "Читаю логи…" },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(ownerConfigAtLocalNoon(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь логирование"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Запустил работу")), 10_000);
+    // The owner goes quiet for three hours; the worker keeps reporting.
+    store.setRuntimeState("owner_last_message_at", hoursAgo(3));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("Читаю логи…")), 10_000);
+
+    const digest = runtime.prompts.find((prompt) => prompt.includes("Читаю логи…"))!;
+    // The daemon talking to itself neither claims the owner's snapshot…
+    expect(digest).not.toContain("Operator state snapshot");
+    // …nor is told the OWNER has been silent for three hours.
+    expect(digest).not.toContain("[gap:");
+
+    // …and the owner, arriving after it, still gets the full re-orientation:
+    // the digest did not move the baseline out from under them.
+    telegram.push(message(2, "ну что там?"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("ну что там?")), 10_000);
+    const ownerEnvelope = runtime.prompts.find((prompt) => prompt.includes("ну что там?"))!;
+    expect(ownerEnvelope).toContain("Operator state snapshot");
+    expect(ownerEnvelope).toContain("[gap:");
+    expect(ownerEnvelope).toContain("significant");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  it("spends nothing but a gap line on a significant pause where nothing moved", async () => {
+    const home = tempDirectory("daemon-push-quiet-gap-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(ownerConfigAtLocalNoon(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length >= 1);
+    store.setRuntimeState("owner_last_message_at", hoursAgo(3));
+    telegram.push(message(2, "а столица Италии?"));
+    await waitFor(() => directEnvelopes(runtime).length >= 2);
+    const second = directEnvelopes(runtime).at(-1)!;
+    // Nothing changed in four hours, so the re-push would be six kilobytes of
+    // the same thing — the agent gets the gap line and nothing else…
+    expect(second).not.toContain("Operator state snapshot");
+    expect(second).toContain("[gap:");
+    // …and that line must not send it looking for state that is not there.
+    expect(second).not.toContain("state above");
+    expect(second).toContain("Nothing in the tracked state has changed");
 
     telegram.finish();
     await run;

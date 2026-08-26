@@ -221,8 +221,26 @@ measures the **owner's** silence — `owner_last_message_at` in `runtime_state`,
 which synthetic automation turns and thread-event digests deliberately do not
 move — and the 03:00 logical-day boundary is read in `owner.timezone`.
 
+Both the gap line and the pause-driven snapshot belong to the **owner's own
+turn**. A thread-event digest and a synthetic automation turn are the daemon
+addressing itself: telling one that "the owner has been silent for three hours"
+says nothing about what IT should do, and letting one consume the
+re-orientation would leave the owner — arriving ten minutes later — with a gap
+line above nothing. Structural full pushes (no baseline, a new session, a new
+epoch) still apply to every turn: a session that has seen no state is blind
+whoever is speaking.
+
+The gap line's wording follows what the envelope actually contains: after a
+`significant` pause where nothing moved there is no state section above it, so
+it says so instead of pointing at state that is not there.
+
 The diff baseline is persistent: `memory_push_baseline` in `runtime_state` holds
-`(sessionId, epoch, nowHash, snapshotHash, per-item fingerprints)`. It moves
+`(sessionId, epoch, nowHash, snapshotHash, ownerSnapshotHash, per-item
+fingerprints)`. The two hashes answer two different questions: `snapshotHash` is
+what the SESSION last had pushed into it (background digests move it, and they
+must — the diff is computed against it), while `ownerSnapshotHash` is what the
+OWNER last saw, and only their own turn advances it. "Did anything change while
+they were away" can only be measured against the second one. It moves
 when the provider **accepts** the prompt (the first event of the stream), not
 when the answer is delivered — a turn preempted after its prompt was sent still
 put the state into the session's history, while a provider error before
@@ -320,7 +338,7 @@ without being explained to the model.
 | daemon thread-event turn (`enqueueThreadEventTurn`) | every digested worker event — progress, the worker's notes, and the final report of a finished work — under ONE marker for the whole turn | `worker` |
 | daemon `mediateUserInput` / `mediateApproval` | the worker's questions, approval request, and thread context — its intermediate words on the way into the operator LLM (the Telegram delivery path is untouched) | `worker` |
 | daemon `buildOperatorMemorySnapshot` | project names, short summaries, and every prose field of the structured summaries, under one marker for the whole snapshot | `worker` |
-| daemon push head (package 2.1) | **defanged, not fenced**: thread titles and note bodies are worker- and model-written, but a fence per line would eat the character budget and read as noise, so the daemon defangs every marker-shaped sequence instead. The lines are state the daemon vouches for, and each one is capped at 200 characters | — |
+| daemon push head (package 2.1) | the BODY of each layer — thread titles, note excerpts, diff labels — under ONE marker for the whole snapshot. The layer headers, the placeholders (`No current work items.`) and the overflow tails stay outside it: those are the daemon's own claims, not content it quotes. The fence costs ~40 characters against a 3000-character budget, and its nonce is canonicalized away before the layer hashes are taken | `worker` |
 | `t3.get_thread_status` / `get_thread_summary` / `get_thread` / `search_threads` / `memory.search` | worker-written titles and summary prose | `worker` |
 | `utility.web_search` | each result's `title` and `snippet` (`url` stays raw) | `tool` |
 | `email.search` | `subject`, `snippet`, and the display names; the connector splits a bare validated `fromAddress`/`toAddress` out of each header and normalizes `date` to ISO, so those stay raw and reusable | `tool` |

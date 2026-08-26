@@ -28,8 +28,21 @@ export interface PushBaseline {
   epoch: string;
   /** Hash of the rendered now layer of the last ACCEPTED prompt (§1). */
   nowHash: string;
-  /** Hash of the whole snapshot; answers "did anything change" for a significant pause. */
+  /** Hash of the whole snapshot as of the last accepted push, whoever it was for. */
   snapshotHash: string;
+  /**
+   * Hash of the whole snapshot as of the last accepted push ON THE OWNER'S OWN
+   * TURN — the state THEY last saw.
+   *
+   * Review №3, second half. "Has anything changed" during the owner's absence
+   * can only be measured from what the owner last saw, not from the last push
+   * of any kind: while they were away, thread-event digests kept running and
+   * kept pushing diffs, and each of those would otherwise have consumed the
+   * change the owner came back to be told about. The two hashes diverge exactly
+   * for the duration of a background stretch, which is exactly the window this
+   * question is asked in.
+   */
+  ownerSnapshotHash: string;
   /** Per-item fingerprints, so the diff needs no second source of truth. */
   items: NowItemFingerprints;
   sentAt: string;
@@ -51,7 +64,21 @@ export interface PushDecisionInput {
   sessionId: string;
   epoch: string;
   pause: PauseAssessment;
-  snapshotHash: string;
+  /**
+   * Lazily computed: rendering the whole snapshot to hash it costs a read of
+   * every active thread and every durable note, and the common turn — inside an
+   * episode, with a valid baseline — never needs it.
+   */
+  snapshotHash: () => string;
+  /**
+   * Is this the OWNER speaking? A thread-event digest and a synthetic
+   * automation turn are the daemon talking to itself: the pause since the
+   * owner's last message says nothing about what THEY need to be re-oriented
+   * about, and letting a digest consume the pause-driven snapshot would leave
+   * the owner — arriving ten minutes later, with the baseline already moved —
+   * holding a gap line above no state at all.
+   */
+  ownerTurn: boolean;
   /** Compaction recovery, provider switch and fresh-session replay set this. */
   force?: boolean;
 }
@@ -70,11 +97,15 @@ export function decidePushMode(input: PushDecisionInput): PushDecision {
     return { mode: "full", reason: "session_changed" };
   }
   if (input.baseline.epoch !== input.epoch) return { mode: "full", reason: "epoch_changed" };
-  if (input.pause.wantsFullSnapshot) {
+  // The structural reasons above hold for ANY turn — a session that never saw
+  // the state is blind whoever is speaking. The pause-driven one below is the
+  // owner's alone.
+  if (input.pause.wantsFullSnapshot && input.ownerTurn) {
     if (!input.pause.onlyWhenChanged) return { mode: "full", reason: "cold_resume" };
     // A `significant` pause where nothing moved does not deserve 6 KB: the
-    // agent gets the gap line and, if anything did move, the diff.
-    if (input.baseline.snapshotHash !== input.snapshotHash) {
+    // agent gets the gap line and, if anything did move, the diff. "Moved" is
+    // measured against what the OWNER last saw (see `ownerSnapshotHash`).
+    if (input.baseline.ownerSnapshotHash !== input.snapshotHash()) {
       return { mode: "full", reason: "significant_change" };
     }
   }
@@ -103,6 +134,12 @@ export function parsePushBaseline(raw: string | undefined): PushBaseline | undef
       epoch: parsed.epoch,
       nowHash: parsed.nowHash,
       snapshotHash: parsed.snapshotHash,
+      // A baseline written before this field existed saw no background stretch
+      // worth distinguishing: the last push was the owner's, as far as it knew.
+      ownerSnapshotHash:
+        typeof parsed.ownerSnapshotHash === "string"
+          ? parsed.ownerSnapshotHash
+          : parsed.snapshotHash,
       items: (parsed.items ?? {}) as NowItemFingerprints,
       sentAt: typeof parsed.sentAt === "string" ? parsed.sentAt : "",
     };

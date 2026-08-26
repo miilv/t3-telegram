@@ -34,8 +34,8 @@ export interface PauseAssessment {
   pauseClass: PauseClass;
   /** Milliseconds since the owner's last message; `undefined` when unknown. */
   gapMs?: number;
-  /** The `[gap: …]` envelope line, or `undefined` when this class carries none. */
-  gapLine?: string;
+  /** Whether this class earns a `[gap: …]` line; render it with `renderGapLine`. */
+  carriesGapLine: boolean;
   /** This class asks for a full snapshot… */
   wantsFullSnapshot: boolean;
   /** …but `significant` only gets one if the state actually moved (§1). */
@@ -56,14 +56,31 @@ export function classifyPause(input: PauseInput): PauseAssessment {
     // Nothing to measure against: treat it as a cold resume (the safe side —
     // a full snapshot), but say nothing about a gap whose length we do not
     // know. A fabricated "[gap: …]" line is worse than none.
-    return { pauseClass: "cold-resume", wantsFullSnapshot: true, onlyWhenChanged: false };
+    return {
+      pauseClass: "cold-resume",
+      carriesGapLine: false,
+      wantsFullSnapshot: true,
+      onlyWhenChanged: false,
+    };
   }
   const gapMs = Math.max(0, now.getTime() - previousAt.getTime());
   if (gapMs < PAUSE_LIGHT_AFTER_MS) {
-    return { pauseClass: "same-episode", gapMs, wantsFullSnapshot: false, onlyWhenChanged: false };
+    return {
+      pauseClass: "same-episode",
+      gapMs,
+      carriesGapLine: false,
+      wantsFullSnapshot: false,
+      onlyWhenChanged: false,
+    };
   }
   if (gapMs < PAUSE_SIGNIFICANT_AFTER_MS) {
-    return { pauseClass: "light", gapMs, wantsFullSnapshot: false, onlyWhenChanged: false };
+    return {
+      pauseClass: "light",
+      gapMs,
+      carriesGapLine: false,
+      wantsFullSnapshot: false,
+      onlyWhenChanged: false,
+    };
   }
   const crossedDay =
     ownerLogicalDay(previousAt, timeZone, LOGICAL_DAY_BOUNDARY_HOUR) !==
@@ -73,18 +90,34 @@ export function classifyPause(input: PauseInput): PauseAssessment {
   return {
     pauseClass,
     gapMs,
-    gapLine: gapLineFor(pauseClass, gapMs),
+    carriesGapLine: true,
     wantsFullSnapshot: true,
     onlyWhenChanged: pauseClass === "significant",
   };
 }
 
-function gapLineFor(pauseClass: PauseClass, gapMs: number): string {
-  const advice =
-    pauseClass === "cold-resume"
+/**
+ * The `[gap: …]` line.
+ *
+ * `stateAbove` is not decoration: a `significant` pause where nothing moved
+ * produces a gap line with NO state section above it (the diff was empty), and
+ * a line telling the agent to "read the state above" would then point at the
+ * turn instruction. The wording follows what the envelope actually contains.
+ */
+export function renderGapLine(
+  pause: PauseAssessment,
+  options: { stateAbove: boolean },
+): string | undefined {
+  if (!pause.carriesGapLine || pause.gapMs === undefined) return undefined;
+  const resumption = pause.pauseClass === "cold-resume";
+  const advice = options.stateAbove
+    ? resumption
       ? "This is a resumption, not a continuation: read the state above before you answer, and do not refer to the previous exchange as if it had just happened."
-      : "Check the state above before continuing — do not assume the episode ran on uninterrupted.";
-  return `[gap: ${humanGap(gapMs)} since the owner's last message (${pauseClass}). ${advice}]`;
+      : "Check the state above before continuing — do not assume the episode ran on uninterrupted."
+    : resumption
+      ? "This is a resumption, not a continuation. Nothing in the tracked state has changed since your last turn, but do not refer to the previous exchange as if it had just happened."
+      : "Nothing in the tracked state has changed since your last turn — but do not assume the episode ran on uninterrupted.";
+  return `[gap: ${humanGap(pause.gapMs)} since the owner's last message (${pause.pauseClass}). ${advice}]`;
 }
 
 /** Deliberately coarse: the agent needs the ORDER of the pause, not its arithmetic. */
