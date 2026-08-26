@@ -4,8 +4,8 @@ import { operatorNoteInputHash, type OperatorNoteRepository } from "./operator-n
 
 /** Operator-supplied local ONNX model; weights are deliberately not in git. */
 export const MINILM_NOTE_EMBEDDING_MODEL = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
-/** Current 384d fallback. `local-hash-v2` remains the distinct legacy 128d model. */
-export const HASH_NOTE_EMBEDDING_MODEL = "local-hash-v3";
+/** Current locality-sensitive 384d fallback. Earlier hash models stay distinct. */
+export const HASH_NOTE_EMBEDDING_MODEL = "local-hash-v4";
 export const NOTE_EMBEDDING_DIMENSIONS = 384;
 
 type RuntimeEnvironment = {
@@ -82,7 +82,7 @@ export class LocalNoteEmbeddingService {
       return {
         model: HASH_NOTE_EMBEDDING_MODEL,
         dimensions: NOTE_EMBEDDING_DIMENSIONS,
-        values: hashVector(text),
+        values: featureHashVector(text),
       };
     }
     try {
@@ -96,7 +96,7 @@ export class LocalNoteEmbeddingService {
       return {
         model: HASH_NOTE_EMBEDDING_MODEL,
         dimensions: NOTE_EMBEDDING_DIMENSIONS,
-        values: hashVector(text),
+        values: featureHashVector(text),
       };
     }
   }
@@ -158,13 +158,30 @@ function vectorFromRuntimeResult(result: unknown): number[] {
   return normalize(values as number[]);
 }
 
-function hashVector(text: string): number[] {
+/**
+ * Feature hashing preserves token overlap (and short word stems) between a
+ * stored fact and a query. It is deliberately a retriever only, never a
+ * semantic-dedupe encoder.
+ */
+function featureHashVector(text: string): number[] {
   const values = new Array<number>(NOTE_EMBEDDING_DIMENSIONS).fill(0);
-  for (let index = 0; index < NOTE_EMBEDDING_DIMENSIONS; index += 1) {
-    const bytes = createHash("sha256").update(`${index}\u0000${text}`).digest();
-    values[index] = (bytes.readUInt16BE(0) / 32_767.5) - 1;
+  const tokens = text.normalize("NFKC").toLocaleLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? [];
+  for (const token of tokens) {
+    addFeature(values, `token:${token}`, 1);
+    for (let width = 3; width <= Math.min(6, token.length); width += 1) {
+      addFeature(values, `prefix:${token.slice(0, width)}`, 0.55);
+    }
   }
+  if (!tokens.length) addFeature(values, "empty", 1);
   return normalize(values);
+}
+
+function addFeature(values: number[], feature: string, weight: number): void {
+  const digest = createHash("sha256").update(feature).digest();
+  const first = digest.readUInt16BE(0) % NOTE_EMBEDDING_DIMENSIONS;
+  const second = digest.readUInt16BE(2) % NOTE_EMBEDDING_DIMENSIONS;
+  values[first] = (values[first] ?? 0) + weight;
+  values[second] = (values[second] ?? 0) + weight * 0.5;
 }
 
 function normalize(values: number[]): number[] {

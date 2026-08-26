@@ -27,6 +27,8 @@ export interface OperatorNoteWriteResult {
   note: OperatorNote;
   applied: boolean;
   supersededId?: string;
+  /** A distilled write was refused by the transaction's curated-key guard. */
+  curatedCollision?: boolean;
 }
 
 export interface StoredNoteVector {
@@ -58,6 +60,12 @@ export class OperatorNoteRepository {
       const current = this.db
         .prepare("SELECT * FROM operator_notes WHERE key=? AND status='active'")
         .get(input.key) as Row | undefined;
+      // This guard lives at the transaction boundary, after replay resolution
+      // and the current-row read. A writer may await local embedding while a
+      // curator writes the same key, so a stale preflight cannot enforce it.
+      if (current && input.source === "distilled" && String(current.source) !== "distilled") {
+        return { note: rowToOperatorNote(current), applied: false, curatedCollision: true };
+      }
       if (current && samePayload(current, input)) {
         this.recordOperation(input.operationKey, String(current.id));
         return { note: rowToOperatorNote(current), applied: false };

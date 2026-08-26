@@ -99,29 +99,13 @@ export class OperatorNoteWriter {
       category: validated.category,
       content: validated.content,
     };
-    const current = this.repository.getActive(input.key);
-    // A distilled fact may never overwrite a curator's keyed fact, regardless
-    // of whether the local semantic model is presently available.
-    if (current?.source === "manual" && draft.source === "distilled") {
-      return { ok: true, kind: "merge-proposal", mergeProposal: { note: current, score: 1 } };
-    }
+    const exactKeyAtStart = Boolean(this.repository.getActive(input.key));
     const vector = await this.embeddings.embed(input);
     // Exact-key writes are authorized version changes. Semantic dedupe is only
     // for cross-key matches, never a way to block the key's current editor.
-    if (current) {
-      const write = this.repository.writeVersion({
-        ...input,
-        source: draft.source,
-        ...(draft.verifiedAt ? { verifiedAt: draft.verifiedAt } : {}),
-        ...(draft.validUntil ? { validUntil: draft.validUntil } : {}),
-        operationKey: draft.operationKey,
-        vectors: [vector],
-      });
-      return { ok: true, kind: "written", write, crossLinks: [] };
-    }
     const semantic = this.embeddings.isSemanticDedupeAvailable() &&
       vector.model === MINILM_NOTE_EMBEDDING_MODEL &&
-      vector.dimensions === NOTE_EMBEDDING_DIMENSIONS;
+      vector.dimensions === NOTE_EMBEDDING_DIMENSIONS && !exactKeyAtStart;
     const matches = semantic ? this.findSemanticMatches(vector, input.key) : [];
     const mergeProposal = matches.find((match) => match.score >= MINILM_MERGE_PROPOSAL_THRESHOLD);
     // Curated notes (and every other source) are never silently merged.
@@ -135,6 +119,9 @@ export class OperatorNoteWriter {
       operationKey: draft.operationKey,
       vectors: [vector],
     });
+    if (write.curatedCollision) {
+      return { ok: true, kind: "merge-proposal", mergeProposal: { note: write.note, score: 1 } };
+    }
     return {
       ok: true,
       kind: "written",

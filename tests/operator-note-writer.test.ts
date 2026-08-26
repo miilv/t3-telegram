@@ -208,4 +208,82 @@ describe("OperatorNoteWriter", () => {
     expect(store.notes.getActive(curated.key)?.content).toBe(curated.content);
     store.close();
   });
+
+  it("keeps a curator's interleaved keyed write when a distilled embedding resolves later", async () => {
+    const store = tempStore();
+    let release!: () => void;
+    let started!: () => void;
+    const embeddingStarted = new Promise<void>((resolve) => { started = resolve; });
+    const releaseEmbedding = new Promise<void>((resolve) => { release = resolve; });
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => false,
+      embed: async (draft) => {
+        started();
+        await releaseEmbedding;
+        return {
+          model: "local-hash-v3",
+          dimensions: NOTE_EMBEDDING_DIMENSIONS,
+          inputHash: operatorNoteInputHash(draft),
+          values: unit(1, 0),
+        };
+      },
+    });
+    const candidate = {
+      key: "warehouse-contact",
+      category: "people",
+      description: "when warehouse contact matters → use Dan",
+      content: "Distilled answer",
+      source: "distilled" as const,
+      operationKey: "distilled:late",
+    };
+    const pending = writer.write(candidate);
+    await embeddingStarted;
+    store.notes.writeVersion({
+      ...candidate,
+      content: "Manual answer",
+      source: "manual",
+      operationKey: "manual:interleaved",
+    });
+    release();
+
+    await expect(pending).resolves.toMatchObject({
+      ok: true,
+      kind: "merge-proposal",
+      mergeProposal: { note: { content: "Manual answer", source: "manual" } },
+    });
+    expect(store.notes.getActive(candidate.key)?.content).toBe("Manual answer");
+    store.close();
+  });
+
+  it.each(["manual", "maintenance", "system"] as const)(
+    "treats an existing %s keyed fact as curated against a distilled collision",
+    async (source) => {
+      const store = tempStore();
+      const base = {
+        key: `curated-${source}`,
+        category: "people",
+        description: "when warehouse contact matters → use Dan",
+        content: `${source} answer`,
+      };
+      store.notes.writeVersion({ ...base, source, operationKey: `seed:${source}` });
+      const writer = new OperatorNoteWriter(store.notes, {
+        isSemanticDedupeAvailable: () => false,
+        embed: async (draft) => ({
+          model: "local-hash-v3",
+          dimensions: NOTE_EMBEDDING_DIMENSIONS,
+          inputHash: operatorNoteInputHash(draft),
+          values: unit(1, 0),
+        }),
+      });
+
+      await expect(writer.write({
+        ...base,
+        content: "distilled replacement",
+        source: "distilled",
+        operationKey: `distilled:${source}`,
+      })).resolves.toMatchObject({ ok: true, kind: "merge-proposal", mergeProposal: { note: { source } } });
+      expect(store.notes.getActive(base.key)?.content).toBe(base.content);
+      store.close();
+    },
+  );
 });

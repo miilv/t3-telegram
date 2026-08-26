@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { operatorNoteInputHash } from "../packages/storage/src/index.js";
 import {
   HASH_NOTE_EMBEDDING_MODEL,
+  LocalNoteEmbeddingService,
   MINILM_NOTE_EMBEDDING_MODEL,
   NOTE_EMBEDDING_DIMENSIONS,
 } from "../packages/storage/src/note-embeddings.js";
@@ -56,6 +57,46 @@ describe("embedded note retrieval", () => {
       dimensions: NOTE_EMBEDDING_DIMENSIONS,
       values: unit(1, 0),
     }))).resolves.toMatchObject([{ key: "fallback-nearest" }]);
+    store.close();
+  });
+
+  it("retrieves token-related facts with the real offline fallback and excludes unrelated text", async () => {
+    const store = tempStore();
+    const service = new LocalNoteEmbeddingService({
+      loadRuntime: async () => { throw new Error("operator has not supplied MiniLM weights"); },
+    });
+    const warehouse = {
+      key: "warehouse-inventory-owner",
+      category: "operations",
+      description: "when warehouse inventory ownership matters → read this fact",
+      content: "Mira owns the warehouse inventory reconciliation.",
+    };
+    const astronomy = {
+      key: "astronomy-observatory",
+      category: "research",
+      description: "when telescope observations matter → read this fact",
+      content: "The observatory tracks nebula measurements.",
+    };
+    store.notes.writeVersion({
+      ...warehouse,
+      source: "manual",
+      operationKey: "seed:warehouse",
+      vectors: [await service.embed(warehouse)],
+    });
+    store.notes.writeVersion({
+      ...astronomy,
+      source: "manual",
+      operationKey: "seed:astronomy",
+      vectors: [await service.embed(astronomy)],
+    });
+    // This is an embedding regression, not an FTS regression: lexical search
+    // must not be able to make the old random fallback appear to work.
+    store.db.prepare("DELETE FROM operator_note_search").run();
+
+    await expect(store.searchOperatorNotesEmbedded("warehouse inventory owner", service.embedQuery.bind(service)))
+      .resolves.toMatchObject([{ key: "warehouse-inventory-owner" }]);
+    await expect(store.searchOperatorNotesEmbedded("volcanic magma geology", service.embedQuery.bind(service)))
+      .resolves.toEqual([]);
     store.close();
   });
 });
