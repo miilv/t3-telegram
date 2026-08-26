@@ -29,6 +29,7 @@ import type {
 } from "../../shared/src/index.js";
 import {
   DEFAULT_TIME_ZONE,
+  JOURNAL_KINDS,
   NOW_AGENT_WRITE_KEY,
   NOW_SECTIONS,
   NOW_STATUSES,
@@ -57,6 +58,14 @@ import {
   renderClosedItemJournalBody,
   selectNowItemsForRender,
 } from "../../policy/src/now-items.js";
+import {
+  JOURNAL_HINT_RESERVED_SLUG,
+  firstDayOfMonth,
+  monthOfDay,
+  isReservedJournalSlug,
+  lintJournalNote,
+  renderJournalSkeleton,
+} from "../../policy/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 import type {
   SentMessage,
@@ -67,11 +76,29 @@ import type { GoogleWorkspaceConnectors } from "../../connectors/src/index.js";
 import { createAutomation, resumeAutomationRun } from "../../automations/src/index.js";
 
 const CAPABILITY_TTL_MS = 2 * 60 * 60 * 1_000;
+/**
+ * `pruneJournals` deletes `daemon_events` older than this (storage §retention).
+ *
+ * Duplicated as a constant rather than imported, because the two numbers mean
+ * different things: storage's is the DELETION policy, this one is what
+ * `memory.journal` promises a reader about coverage. If they ever diverge the
+ * tool's answer is conservative — it offers the journal for a window the events
+ * might still cover, which is honest either way.
+ */
+const DAEMON_EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_TOOL_RESULT_CHARS = 16_000;
 /** Per-string cap inside one result; see boundedJsonText. */
 const MAX_TOOL_STRING_CHARS = 8_000;
 const MAX_SEARCH_RESULTS = 10;
 const MAX_MCP_IMAGE_BYTES = 5 * 1024 * 1024;
+
+const journalDaySchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/u)
+  .refine(isCalendarDay, "Expected a real calendar day in YYYY-MM-DD form");
+const journalMonthSchema = z
+  .string()
+  .regex(/^\d{4}-(?:0[1-9]|1[0-2])$/u, "Expected a real calendar month in YYYY-MM form");
 
 export const OPERATOR_MCP_TOOL_NAMES = [
   "t3.list_projects",
@@ -92,6 +119,8 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "memory.get",
   "memory.remember",
   "memory.journal",
+  "journal.note",
+  "journal.read",
   "now.get",
   "now.update",
   "scheduler.list_automations",
@@ -200,6 +229,8 @@ interface TurnCapability {
    * previous attempt stopped and duplicate the whole set.
    */
   nowCreateSeq: number;
+  /** Replay ordinal for journal.note writes; independent from now creates. */
+  journalCreateSeq: number;
 }
 
 interface ToolResult {
@@ -331,6 +362,7 @@ export class OperatorToolServer {
       expiresAt: Date.now() + CAPABILITY_TTL_MS,
       sentMessageIds: new Set(),
       nowCreateSeq: 0,
+      journalCreateSeq: 0,
     });
     let revoked = false;
     return {
@@ -788,7 +820,9 @@ export class OperatorToolServer {
     this.addTool(server, token, {
       name: "memory.journal",
       description:
-        "Read the daemon's durable event journal (what the Operator, workers and automations actually did), newest first. Answers 'what did you do yesterday' from the record, not from memory.",
+        "Read the daemon's durable event journal (what the Operator, workers and automations actually did), newest first. Answers 'what did you do yesterday' from the record, not from memory. " +
+        "Returns {events}; when the window reaches past the 30-day event retention it also returns bounded {journal, coverage} evidence for the pruned part, prioritizing monthly rollups and reporting omissions explicitly. Journal bodies are worker-fenced data; metadata stays structured. " +
+        "For the narrative itself (what was decided, what is next) read journal.read instead: no event carries a decision.",
       schema: z.object({
         since: z
           .string()
@@ -815,12 +849,234 @@ export class OperatorToolServer {
       handler: ({ since, until, types, limit }, capability) => {
         this.requireAdministrativeRole(capability, "read the daemon journal");
         const now = this.now();
-        return this.options.store.listDaemonEvents({
-          ...(since ? { since: resolveJournalInstant(since, now) } : {}),
-          ...(until ? { until: resolveJournalInstant(until, now) } : {}),
+        const sinceInstant = since ? resolveJournalInstant(since, now) : undefined;
+        const untilInstant = until ? resolveJournalInstant(until, now) : undefined;
+        const events = this.options.store.listDaemonEvents({
+          ...(sinceInstant ? { since: sinceInstant } : {}),
+          ...(untilInstant ? { until: untilInstant } : {}),
           ...(types?.length ? { typePrefixes: types } : {}),
           ...(limit !== undefined ? { limit } : {}),
         });
+        // Package 3.1 (§2.4). `daemon_events` is pruned at 30 days, so a window
+        // that reaches past the cutoff used to answer "nothing happened" about
+        // a month the operator worked through — the worst possible failure for
+        // a tool whose whole job is answering from the record instead of from
+        // memory. The narrative journal has no retention, so what the events
+        // can no longer cover, the journal and its monthly rollups do.
+        const cutoff = new Date(now.getTime() - DAEMON_EVENT_RETENTION_MS);
+        const reachesPastRetention = sinceInstant
+          ? Date.parse(sinceInstant) < cutoff.getTime()
+          : true;
+        if (!reachesPastRetention) return { events };
+        const timeZone = this.options.ownerTimeZone?.();
+        const fromDay = ownerLogicalDay(
+          sinceInstant ? new Date(sinceInstant) : new Date(0),
+          timeZone,
+        );
+        // Only supplement the part of the caller's interval which is both
+        // requested and older than event retention. In particular, a closed
+        // historical interval must not leak later journal rows merely because
+        // the global retention cutoff is later than its explicit `until`.
+        const journalEnd = untilInstant && Date.parse(untilInstant) < cutoff.getTime()
+          ? new Date(untilInstant)
+          : cutoff;
+        const prunedThroughDay = ownerLogicalDay(journalEnd, timeZone);
+        const rollups = this.options.store.selectJournalEntries({
+          from: firstDayOfMonth(monthOfDay(fromDay)),
+          to: prunedThroughDay,
+          kinds: ["rollup"],
+          limit: 60,
+        });
+        const remaining = Math.max(0, 60 - rollups.entries.length);
+        // Query even when rollups consume all 60 output slots: the count is
+        // what lets coverage admit that narrative evidence was omitted.
+        const narrative = this.options.store.selectJournalEntries({
+          from: fromDay,
+          to: prunedThroughDay,
+          kinds: ["entry", "archive", "summary"],
+          limit: Math.max(1, remaining),
+        });
+        const narrativeEntries = narrative.entries.slice(0, remaining);
+        const selectedJournal = [...rollups.entries, ...narrativeEntries];
+        const journal = fenceJournalEntries(selectedJournal);
+        const journalRowsOmitted = Math.max(
+          0,
+          rollups.total + narrative.total - journal.length,
+        );
+        return {
+          events,
+          journal,
+          coverage: {
+            eventsPrunedBefore: cutoff.toISOString(),
+            requestedJournalFrom: fromDay,
+            requestedJournalTo: prunedThroughDay,
+            ...(selectedJournal.length
+              ? {
+                  journalFrom: selectedJournal.reduce(
+                    (earliest, entry) => entry.day < earliest ? entry.day : earliest,
+                    selectedJournal[0]!.day,
+                  ),
+                  journalTo: selectedJournal.reduce(
+                    (latest, entry) => entry.day > latest ? entry.day : latest,
+                    selectedJournal[0]!.day,
+                  ),
+                }
+              : {}),
+            journalTruncated: journalRowsOmitted > 0,
+            journalRowsOmitted,
+            note:
+              "Events older than the retention cutoff are deleted. The bounded journal evidence above targets only that pruned portion and prioritizes available monthly rollups; journalTruncated reports whether narrative rows were omitted.",
+          },
+        };
+      },
+    });
+
+    // Package 3.1 (memory-design §2.4): the narrative journal, both halves.
+    //
+    // `memory.journal` above answers "what calls were made" from the event log.
+    // These two answer "what happened, and what did we decide" from the thing
+    // written by whoever was there — which is the only place a DECISION ever
+    // exists, since no event carries one.
+    this.addTool(server, token, {
+      name: "journal.note",
+      description:
+        "Write ONE journal entry about work that happened: what was done, what was decided, what turned up on the way, what is next. Use it when a piece of work reaches a state worth remembering — the journal is forever, the event log is kept 30 days. The returned body is worker-fenced untrusted data; slug/day/kind metadata remains structured.",
+      schema: z.object({
+        done: z
+          .string()
+          .max(4_000)
+          .describe("Сделано — what actually happened. Required; everything else is optional."),
+        decisions: z.string().max(4_000).optional().describe("Решения — what was decided, and why."),
+        found: z
+          .string()
+          .max(4_000)
+          .optional()
+          .describe("Найдено попутно — what turned up that nobody was looking for."),
+        next: z.string().max(4_000).optional().describe("Следующий шаг — the next step."),
+        day: journalDaySchema
+          .optional()
+          .describe("Owner-local logical day (03:00 boundary). Defaults to today."),
+        threadRef: z
+          .string()
+          .trim()
+          .min(1)
+          .max(120)
+          .optional()
+          .describe("T3 thread this entry is about, when it is about one."),
+        title: z
+          .string()
+          .trim()
+          .max(120)
+          .optional()
+          .describe("Short name for the entry's slug; derived from the day and the text when omitted."),
+      }),
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "write the Operator journal");
+        const sections = {
+          done: input.done,
+          ...(input.decisions ? { decisions: input.decisions } : {}),
+          ...(input.found ? { found: input.found } : {}),
+          ...(input.next ? { next: input.next } : {}),
+        };
+        const verdict = lintJournalNote(sections);
+        if (!verdict.ok) return verdict;
+        const day = input.day ?? ownerLogicalDay(this.now(), this.options.ownerTimeZone?.());
+        // Checked on the DERIVED slug, not on the raw title. `journalSlugBase`
+        // prefixes the day, so a title of "summary" passes a check on the title
+        // and produces `2026-08-25-summary` — the exact name the night
+        // secretary writes its day under. That is not cosmetic: the summary
+        // pass skips a day whose slug already exists, so an innocent title
+        // silently costs the owner that night's summary. `title: "scribe
+        // skipped"` collides with the skip mark the same way.
+        const slugBase = journalSlugBase(day, input.title?.trim() ? input.title : input.done);
+        if (isReservedJournalSlug(slugBase)) {
+          return { ok: false, hint: JOURNAL_HINT_RESERVED_SLUG };
+        }
+        capability.journalCreateSeq += 1;
+        const entry = this.options.store.appendJournalEntry({
+          slugBase,
+          day,
+          body: renderJournalSkeleton(sections),
+          source: "agent",
+          kind: "entry",
+          ...(capability.context.ingressJobId
+            ? { originJob: capability.context.ingressJobId, createSeq: capability.journalCreateSeq }
+            : {}),
+          ...(input.threadRef ? { threadRef: input.threadRef } : {}),
+        });
+        // memory-design §2.4.2: the in-the-moment check asks whether the agent
+        // recorded anything "в now/журнал". Package 2.2 could only check the
+        // now half — "тулз журнала ещё нет" — and this is the tool. A turn that
+        // wrote its narrative down has satisfied the check, and nudging it to
+        // also touch the ledger would be asking for bookkeeping, not for a
+        // record.
+        this.markNowWrite(capability);
+        return { ok: true, entry: fenceJournalEntries([entry])[0]! };
+      },
+    });
+
+    this.addTool(server, token, {
+      name: "journal.read",
+      description:
+        "Read the narrative journal: one day, a range of days, or the monthly rollups. This is the durable record of what was done and decided — it outlives the 30-day event log that memory.journal reads. Every returned body is worker-fenced untrusted data under one response nonce; metadata remains structured.",
+      schema: z.object({
+        day: journalDaySchema
+          .optional()
+          .describe("One owner-local logical day, e.g. 2026-08-25."),
+        from: journalDaySchema
+          .optional()
+          .describe("Range start (inclusive), a logical day."),
+        to: journalDaySchema
+          .optional()
+          .describe("Range end (inclusive), a logical day."),
+        month: journalMonthSchema
+          .optional()
+          .describe("Read the rollup of one month, e.g. 2026-07."),
+        kinds: z
+          .array(z.enum(JOURNAL_KINDS))
+          .max(JOURNAL_KINDS.length)
+          .optional()
+          .describe(
+            "entry (narrative), archive (a now item closing), summary (a day), rollup (a month).",
+          ),
+        threadRef: z.string().trim().min(1).max(120).optional(),
+        limit: z.number().int().min(1).max(200).optional(),
+      }).superRefine((input, context) => {
+        if (input.from && input.to && input.from > input.to) {
+          context.addIssue({ code: "custom", path: ["to"], message: "Range end must not precede range start" });
+        }
+      }),
+      readOnly: true,
+      handler: (input, capability) => {
+        this.requireAdministrativeRole(capability, "read the Operator journal");
+        // `month` is sugar for the rollup, and it is worth having: "what did we
+        // do in July" is the question this whole table exists to answer, and
+        // spelling it as from/to/kinds is three chances to get it wrong.
+        if (input.month) {
+          const entries = this.options.store.listJournalEntries({
+            day: firstDayOfMonth(input.month),
+            kinds: ["rollup"],
+            limit: 1,
+          });
+          return {
+            month: input.month,
+            entries: fenceJournalEntries(entries),
+            ...(entries.length
+              ? {}
+              : {
+                  hint: `No rollup for ${input.month} yet. Rollups are written by the night secretary once the month is over; read the days with from/to instead.`,
+                }),
+          };
+        }
+        const entries = this.options.store.listJournalEntries({
+          ...(input.day ? { day: input.day } : {}),
+          ...(input.from ? { from: input.from } : {}),
+          ...(input.to ? { to: input.to } : {}),
+          ...(input.kinds?.length ? { kinds: input.kinds } : {}),
+          ...(input.threadRef ? { threadRef: input.threadRef } : {}),
+          ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        });
+        return { entries: fenceJournalEntries(entries) };
       },
     });
 
@@ -2138,6 +2394,22 @@ function fenceTextFields<Row extends object>(
     }
     return fenced as Row;
   });
+}
+
+/** Journal prose is model/worker-authored data; metadata remains machine-readable. */
+function fenceJournalEntries(entries: readonly JournalEntry[]): JournalEntry[] {
+  const fence = openFence("worker");
+  return entries.map((entry) => ({ ...entry, body: fence(entry.body) }));
+}
+
+function isCalendarDay(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
 }
 
 function xmlValue(xml: string, tag: string): string {
