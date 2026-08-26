@@ -3,13 +3,14 @@ import { createLogger } from "../../../packages/observability/src/index.js";
 import {
   ClaudeCliOperatorRuntime,
   CodexCliOperatorRuntime,
+  privacyGuardOperatorRuntime,
   SwitchableOperatorRuntime,
 } from "../../../packages/operator-runtime/src/index.js";
 import type { OperatorRuntime } from "../../../packages/shared/src/index.js";
 import { DailyScheduler } from "../../../packages/scheduler/src/index.js";
 import { loadConfig } from "../../../packages/shared/src/config.js";
 import { OperatorStore } from "../../../packages/storage/src/index.js";
-import { HttpT3Broker } from "../../../packages/t3-broker/src/index.js";
+import { HttpT3Broker, privacyGuardT3Broker } from "../../../packages/t3-broker/src/index.js";
 import { TelegramBotTransport } from "../../../packages/telegram/src/index.js";
 import { OperatorToolServer } from "../../../packages/operator-tools/src/index.js";
 import { MediaProcessor } from "../../../packages/media/src/index.js";
@@ -67,18 +68,22 @@ async function main(): Promise<void> {
       "Configured Operator provider is not enabled; starting on the fallback",
     );
   }
-  const runtime = new SwitchableOperatorRuntime(providers, defaultProvider);
-  const broker = new HttpT3Broker(
-    {
-      baseUrl: config.t3.baseUrl,
-      ...(config.t3.bearerToken ? { bearerToken: config.t3.bearerToken } : {}),
-      providerInstanceId: config.t3.providerInstanceId,
-      model: config.t3.model,
-      runtimeMode: config.t3.runtimeMode,
-      pollIntervalMs: config.t3.pollIntervalMs,
-    },
-    store,
-    logger,
+  const runtime = privacyGuardOperatorRuntime(
+    new SwitchableOperatorRuntime(providers, defaultProvider),
+  );
+  const broker = privacyGuardT3Broker(
+    new HttpT3Broker(
+      {
+        baseUrl: config.t3.baseUrl,
+        ...(config.t3.bearerToken ? { bearerToken: config.t3.bearerToken } : {}),
+        providerInstanceId: config.t3.providerInstanceId,
+        model: config.t3.model,
+        runtimeMode: config.t3.runtimeMode,
+        pollIntervalMs: config.t3.pollIntervalMs,
+      },
+      store,
+      logger,
+    ),
   );
   const telegram = new TelegramBotTransport(
     config.telegram.token,

@@ -1,6 +1,10 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import pino, { type DestinationStream, type Logger } from "pino";
-import { redactSecrets } from "../../shared/src/index.js";
+import {
+  redactSecretsForOutput,
+  redactSecretsForOutputDeep,
+  SECRET_REDACTION_PATHS,
+} from "../../shared/src/index.js";
 
 export type MetricName =
   | "telegram_update_latency_ms"
@@ -186,20 +190,20 @@ export function createLogger(level = "info", destination?: DestinationStream): L
     {
       level,
       base: { service: "t3-telegram-operator" },
-      // TODO: third independent copy of the secret-key list. The canonical one
-      // is SECRET_KEY_PATTERN in packages/shared/src/index.ts (used by
-      // redactSecretsDeep); these pino paths should be generated from it so a
-      // new secret-shaped key cannot be covered in storage but leak in logs.
+      hooks: {
+        logMethod(inputArgs, method) {
+          for (let index = 0; index < inputArgs.length; index += 1) {
+            inputArgs[index] = sanitizeLogArgument(inputArgs[index]);
+          }
+          method.apply(this, inputArgs);
+        },
+      },
       redact: {
         paths: [
-          "token",
+          ...SECRET_REDACTION_PATHS,
           "telegram.token",
           "t3.bearerToken",
-          "authorization",
           "headers.authorization",
-          "*.token",
-          "*.apiKey",
-          "apiKey",
           "prompt",
           "transcript",
           "providerResponse",
@@ -221,22 +225,47 @@ export function createLogger(level = "info", destination?: DestinationStream): L
   );
 }
 
+function sanitizeLogArgument(value: unknown): unknown {
+  return redactSecretsForOutputDeep(serializeDirectLogErrors(value));
+}
+
+function serializeDirectLogErrors(value: unknown): unknown {
+  if (value instanceof Error) return serializeSanitizedError(value);
+  if (!value || typeof value !== "object") return value;
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return value;
+  const errorEntries = Object.entries(Object.getOwnPropertyDescriptors(value))
+    .filter((entry): entry is [string, PropertyDescriptor & { value: Error }] =>
+      "value" in entry[1] && entry[1].value instanceof Error,
+    );
+  if (errorEntries.length === 0) return value;
+  const result: unknown[] | Record<string, unknown> = Array.isArray(value)
+    ? [...value]
+    : { ...(value as Record<string, unknown>) };
+  for (const [key, descriptor] of errorEntries) {
+    if (Array.isArray(result)) result[Number(key)] = serializeSanitizedError(descriptor.value);
+    else result[key] = serializeSanitizedError(descriptor.value);
+  }
+  return result;
+}
+
 function serializeSanitizedError(error: unknown): unknown {
-  if (typeof error === "string") return redactSecrets(error);
+  if (typeof error === "string") return redactSecretsForOutput(error);
   if (!(error instanceof Error)) return error;
   return sanitizeSerializedError(pino.stdSerializers.errWithCause(error) as Record<string, unknown>);
 }
 
 function sanitizeSerializedError(serialized: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...serialized };
   for (const key of ["message", "stack"]) {
-    if (typeof serialized[key] === "string") serialized[key] = redactSecrets(serialized[key]);
+    if (typeof result[key] === "string") result[key] = redactSecretsForOutput(result[key]);
   }
-  if (typeof serialized.cause === "string") {
-    serialized.cause = redactSecrets(serialized.cause);
-  } else if (serialized.cause && typeof serialized.cause === "object") {
-    serialized.cause = sanitizeSerializedError(serialized.cause as Record<string, unknown>);
+  if (typeof result.cause === "string") {
+    result.cause = redactSecretsForOutput(result.cause);
+  } else if (result.cause && typeof result.cause === "object") {
+    result.cause = sanitizeSerializedError(result.cause as Record<string, unknown>);
   }
-  return serialized;
+  return result;
 }
 
 const fallbackHashSalt = randomBytes(32);

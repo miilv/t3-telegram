@@ -473,6 +473,37 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("redacts visible outbox prose before persistence without changing replay identifiers", () => {
+    const store = tempStore();
+    const queued = store.enqueueTelegramOutbox({
+      dedupeKey: "privacy:outbox",
+      chatId: 7,
+      operation: "approval",
+      payload: {
+        text: "Card api_key=outbox-text-secret",
+        caption: "Attachment token=outbox-caption-secret",
+        callbackData: "a:opaque_token_identifier:1",
+        approvalId: "approval_opaque_token_identifier",
+      },
+    });
+    expect(queued.payload).toEqual({
+      text: "Card api_key=[REDACTED]",
+      caption: "Attachment token=[REDACTED]",
+      callbackData: "a:opaque_token_identifier:1",
+      approvalId: "approval_opaque_token_identifier",
+    });
+
+    store.updateTelegramOutboxPayload(queued.id, {
+      ...queued.payload,
+      text: "Retry password=retry-outbox-secret",
+    });
+    expect(store.getTelegramOutbox(queued.id)?.payload).toMatchObject({
+      text: "Retry password=[REDACTED]",
+      callbackData: "a:opaque_token_identifier:1",
+    });
+    store.close();
+  });
+
   it("gives local approval cards a stable retry boundary without duplicate keyboards", () => {
     const store = tempStore();
     const approval = store.saveLocalApproval({
@@ -676,13 +707,14 @@ describe("OperatorStore", () => {
       purpose: "Fix refresh token concurrency",
       currentState: "Regression tests pass",
       importantDecisions: ["Use single-flight refresh"],
-      files: ["src/auth.ts"],
+      files: ["src/auth.ts", "/srv/api_key=release-path/report.txt"],
       openIssues: [],
       nextActions: ["Deploy canary"],
     });
     expect(store.getThreadSummary("thread_memory")).toMatchObject({
       currentState: "Regression tests pass",
       importantDecisions: ["Use single-flight refresh"],
+      files: ["src/auth.ts", "/srv/api_key=release-path/report.txt"],
     });
     expect(store.searchThreads("single flight refresh")[0]?.thread.id).toBe("thread_memory");
 
@@ -707,7 +739,7 @@ describe("OperatorStore", () => {
     const redacted = store.rememberOperatorNote({
       content: "authorization=sensitive-value-that-must-not-persist",
     });
-    expect(redacted.content).toBe("authorization=[REDACTED]");
+    expect(redacted.content).toBe("authorization=sensit…[37]");
     const hybrid = store.rememberOperatorNote({
       category: "decision",
       content: "Repair the authentication defect before release",
@@ -727,6 +759,7 @@ describe("OperatorStore", () => {
       payload: {
         tool: "t3.send_turn",
         opturn: "opturn_redaction",
+        checksum: "e".repeat(40),
         args: '{"prompt":"deploy with authorization: hunter2","apiKey":"sk-live_abcdefghijklmno"}',
         token: "ghp_abcdefghijklmnopqrst",
         nested: { note: "curl -H Bearer abcdefghij https://example.com", durationMs: 12 },
@@ -742,10 +775,20 @@ describe("OperatorStore", () => {
     expect(payload).toMatchObject({
       tool: "t3.send_turn",
       opturn: "opturn_redaction",
+      checksum: "e".repeat(40),
       token: "[REDACTED]",
       nested: { note: "curl -H Bearer [REDACTED] https://example.com", durationMs: 12 },
     });
     expect(payload.args).toContain("[REDACTED]");
+    store.close();
+  });
+
+  it("preserves legacy-redacted note markers so migration can classify them", () => {
+    const store = tempStore();
+    const note = store.rememberOperatorNote({
+      content: "Old deploy note authorization=[REDACTED] [REDACTED HEX]",
+    });
+    expect(note.content).toBe("Old deploy note authorization=[REDACTED] [REDACTED HEX]");
     store.close();
   });
 
@@ -784,9 +827,7 @@ describe("OperatorStore", () => {
     store.close();
   });
 
-  it("cannot recover a key rule once the payload has been serialised", () => {
-    // Why journalling redacts the structure first: the key rule needs keys, and
-    // a plain value under `token` has no secret-shaped substring to match.
+  it("redacts secret-shaped keys embedded in serialized event payloads", () => {
     const store = tempStore();
     store.appendEvent("operator.tool.completed", {
       correlationId: "opturn_order",
@@ -798,7 +839,8 @@ describe("OperatorStore", () => {
         .get() as { payload_json: string }).payload_json,
     ) as { structured: { token: string }; serialised: string };
     expect(payload.structured.token).toBe("[REDACTED]");
-    expect(payload.serialised).toContain("hunter2plain");
+    expect(payload.serialised).toBe('{"token":"[REDACTED]"}');
+    expect(payload.serialised).not.toContain("hunter2plain");
     store.close();
   });
 

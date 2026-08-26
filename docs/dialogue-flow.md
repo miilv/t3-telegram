@@ -1641,12 +1641,13 @@ and takes the **first** 50. Past that, later files are silently dropped from
 durable memory. Each entry is capped at 2 000 chars. Only the 200 most recently
 active threads ever get their summaries refreshed.
 
-**Secret redaction is destructive.** Notes, thread purpose/state/decisions/
-files/open issues/next actions, and project aliases all pass through
-`redactSecrets` **on write**. Its last two rules are
-`\b[a-f0-9]{40,}\b → [REDACTED HEX]` and
-`[A-Za-z0-9+]{48,} → [REDACTED BASE64]`. A remembered git SHA, checksum or any
-48-character identifier is destroyed permanently, not masked on display.
+**Secret handling distinguishes storage from output.** Notes, thread
+purpose/state/decisions/files/open issues/next actions, journal bodies and
+project aliases pass through `maskSecretsForStorage` **on write**, retaining a
+six-character diagnostic prefix plus the original length. Provider, MCP,
+Telegram, dashboard, TTS and event/log boundaries use fail-closed output
+redaction. Generic 40-character hex and long base64-like identifiers are no
+longer treated as credentials, so git SHAs, checksums and opaque ids survive.
 
 ---
 
@@ -1840,13 +1841,13 @@ take one finalization path: skip row + event + day stamp, without an outage miss
 - **`hashChatId` reads `OBSERVABILITY_HASH_SALT` straight from `process.env`** —
   it is not in the zod schema. Unset, the salt is per-process, so chat
   pseudonyms are not comparable across restarts.
-- **`daemon_events.payload_json` is redacted at write** (roadmap 0.2):
-  `appendEvent` runs the payload through `redactSecretsDeep`, and the operator
-  tool journal redacts the structure before serialising it. Outbound
-  Telegram text is still never redacted. Pino keeps its own third copy of the
-  secret-key list (TODO in `createLogger`) and redacts `prompt`, `transcript`,
-  `providerResponse`, `detail`, `payload.text`, `payload.prompt`, `*.token`,
-  `*.apiKey`, and runs error message/stack/cause through `redactSecrets`.
+- **Privacy boundaries share one vocabulary.** `appendEvent`, MCP results and
+  errors, dashboard JSON, provider prompts, T3 turns, Telegram text/captions/
+  button labels/callback notices, durable outbox prose and TTS input use the
+  canonical output redactor. It removes secret-shaped structured fields before
+  serialisation and fails closed on excessive depth or cycles. Pino derives
+  its structured paths from the same secret-field vocabulary; operational
+  content fields and error message/stack/cause remain separately covered.
 - **Google connectors die roughly an hour after the token was minted** —
   `GOOGLE_WORKSPACE_ACCESS_TOKEN` is a single static bearer with no refresh path,
   and `availability()` only checks the string is non-empty. After expiry every

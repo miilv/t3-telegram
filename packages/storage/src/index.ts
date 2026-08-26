@@ -48,8 +48,9 @@ import {
   NOW_STATUSES,
   newId,
   nowIso,
-  redactSecrets,
-  redactSecretsDeep,
+  maskSecretsForStorage,
+  redactSecretsForOutput,
+  redactSecretsForOutputDeep,
   truncateCodePoints,
 } from "../../shared/src/index.js";
 import {
@@ -447,7 +448,7 @@ export class OperatorStore {
   }
 
   addProjectAlias(projectId: string, alias: string, source = "manual"): string {
-    const normalized = redactSecrets(alias).normalize("NFKC").trim().replace(/\s+/g, " ").slice(0, 160);
+    const normalized = maskSecretsForStorage(alias).normalize("NFKC").trim().replace(/\s+/g, " ").slice(0, 160);
     if (normalized.length < 2) throw new Error("project alias is too short");
     if (!this.getProject(projectId)) throw new Error("project not found");
     this.db
@@ -911,10 +912,10 @@ export class OperatorStore {
     const updatedAt = nowIso();
     const summary: ThreadSummary = {
       threadId: input.threadId,
-      purpose: redactSecrets(input.purpose).trim().slice(0, 4_000),
-      currentState: redactSecrets(input.currentState).trim().slice(0, 4_000),
+      purpose: maskSecretsForStorage(input.purpose).trim().slice(0, 4_000),
+      currentState: maskSecretsForStorage(input.currentState).trim().slice(0, 4_000),
       importantDecisions: boundedStrings(input.importantDecisions),
-      files: boundedStrings(input.files),
+      files: boundedOperationalPaths(input.files),
       openIssues: boundedStrings(input.openIssues),
       nextActions: boundedStrings(input.nextActions),
       updatedAt,
@@ -1107,7 +1108,7 @@ export class OperatorStore {
     source?: OperatorNote["source"];
     expiresAt?: string;
   }): OperatorNote {
-    const content = redactSecrets(input.content).trim().slice(0, 8_000);
+    const content = maskSecretsForStorage(input.content).trim().slice(0, 8_000);
     if (!content) throw new Error("Operator note cannot be empty");
     const category = (input.category?.trim() || "general").slice(0, 80);
     const existing = this.db
@@ -1408,7 +1409,7 @@ export class OperatorStore {
     validUntil?: string;
     createdAt?: string;
   }): NowItem {
-    const content = redactSecrets(input.content).trim();
+    const content = maskSecretsForStorage(input.content).trim();
     if (!content) throw new Error("Now item cannot be empty");
     const now = nowIso();
     return this.transaction(() => this.putNowItem({ ...input, content }, now));
@@ -1416,7 +1417,7 @@ export class OperatorStore {
 
   /** Unwrapped now insert/upsert for callers already holding a transaction. */
   private putNowItem(input: AutomationNowItemInput, now: string): NowItem {
-      const content = redactSecrets(input.content).trim();
+      const content = maskSecretsForStorage(input.content).trim();
       if (!content) throw new Error("Now item cannot be empty");
       const replayable = Boolean(input.originJob) && input.createSeq !== undefined;
       if (replayable) {
@@ -1557,7 +1558,7 @@ export class OperatorStore {
       const existing = this.getNowItem(id);
       if (!existing) return undefined;
       const content =
-        patch.content === undefined ? existing.content : redactSecrets(patch.content).trim();
+        patch.content === undefined ? existing.content : maskSecretsForStorage(patch.content).trim();
       if (!content) throw new Error("Now item cannot be empty");
       this.db
         .prepare(
@@ -1594,7 +1595,7 @@ export class OperatorStore {
     return this.transaction(() => {
       const existing = this.getNowItem(id);
       if (!existing) return undefined;
-      const content = redactSecrets(patch.content).trim();
+      const content = maskSecretsForStorage(patch.content).trim();
       if (!content) throw new Error("Now item cannot be empty");
       this.db
         .prepare(
@@ -1861,7 +1862,7 @@ export class OperatorStore {
     // trigger, not a summary). A storage cap of its own would accept what the
     // linter is required to refuse, and the two numbers would drift apart in
     // exactly the direction that makes the render budget wrong.
-    const trimmed = truncateCodePoints(redactSecrets(description).trim(), NOTE_DESCRIPTION_CHARS);
+    const trimmed = truncateCodePoints(maskSecretsForStorage(description).trim(), NOTE_DESCRIPTION_CHARS);
     if (!trimmed) return false;
     return this.transaction(() => {
       const row = this.db
@@ -2504,6 +2505,7 @@ export class OperatorStore {
   }): TelegramOutboxItem<T> {
     const now = nowIso();
     const id = newId("outbox");
+    const safePayload = redactTelegramOutboxPayload(input.payload);
     return this.transaction(() => {
       this.db
         .prepare(`
@@ -2513,7 +2515,7 @@ export class OperatorStore {
           ) VALUES (?,?,?,?,?,'pending',0,NULL,'[]',NULL,NULL,?,?,NULL)
           ON CONFLICT(dedupe_key) DO NOTHING
         `)
-        .run(id, input.dedupeKey, input.chatId, input.operation, JSON.stringify(input.payload), now, now);
+        .run(id, input.dedupeKey, input.chatId, input.operation, JSON.stringify(safePayload), now, now);
       const row = this.db.prepare("SELECT * FROM telegram_outbox WHERE dedupe_key=?").get(input.dedupeKey) as Row;
       // A re-emitted event that lands on a dead row means the caller still
       // needs the delivery: revive it with the fresh payload for a new attempt
@@ -2528,7 +2530,7 @@ export class OperatorStore {
             UPDATE telegram_outbox SET status='pending',payload_json=?,attempts=0,next_attempt_at=NULL,
               last_error_code=NULL,last_error_detail=NULL,updated_at=? WHERE id=?
           `)
-          .run(JSON.stringify(input.payload), now, String(row.id));
+          .run(JSON.stringify(safePayload), now, String(row.id));
         const revived = this.db.prepare("SELECT * FROM telegram_outbox WHERE id=?").get(String(row.id)) as Row;
         return rowToTelegramOutbox<T>(revived);
       }
@@ -2545,7 +2547,7 @@ export class OperatorStore {
   updateTelegramOutboxPayload<T>(id: string, payload: T): void {
     this.db
       .prepare("UPDATE telegram_outbox SET payload_json=? WHERE id=?")
-      .run(JSON.stringify(payload), id);
+      .run(JSON.stringify(redactTelegramOutboxPayload(payload)), id);
   }
 
   getTelegramOutbox<T>(idOrDedupeKey: string): TelegramOutboxItem<T> | undefined {
@@ -2926,7 +2928,7 @@ export class OperatorStore {
         input.threadId ?? null,
         // Redaction-at-write: daemon_events is durable and read back by the
         // journal/secretary, so secrets never enter payload_json.
-        JSON.stringify(redactSecretsDeep(input.payload ?? {})),
+        JSON.stringify(redactSecretsForOutputDeep(input.payload ?? {})),
         nowIso(),
       );
     return id;
@@ -3235,6 +3237,25 @@ function rowToTelegramOutbox<T>(row: Row): TelegramOutboxItem<T> {
   };
 }
 
+/**
+ * The outbox is already outside durable private state: its prose is waiting to
+ * be delivered. Redact only visible fields, leaving callback ids, paths,
+ * anchors and other replay-critical transport data byte-for-byte stable.
+ */
+function redactTelegramOutboxPayload<T>(payload: T): T {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const value = payload as Record<string, unknown>;
+  return {
+    ...value,
+    ...(typeof value.text === "string"
+      ? { text: redactSecretsForOutput(value.text) }
+      : {}),
+    ...(typeof value.caption === "string"
+      ? { caption: redactSecretsForOutput(value.caption) }
+      : {}),
+  } as T;
+}
+
 function rowToTelegramMessage(row: Row): TelegramMessageRecord {
   return {
     chatId: Number(row.chat_id),
@@ -3254,7 +3275,18 @@ function boundedStrings(values: string[], limit = 50): string[] {
     ...new Set(
       values
         .filter((value): value is string => typeof value === "string")
-        .map((value) => redactSecrets(value).trim().slice(0, 2_000))
+        .map((value) => maskSecretsForStorage(value).trim().slice(0, 2_000))
+        .filter(Boolean),
+    ),
+  ].slice(0, limit);
+}
+
+function boundedOperationalPaths(values: string[], limit = 50): string[] {
+  return [
+    ...new Set(
+      values
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim().slice(0, 2_000))
         .filter(Boolean),
     ),
   ].slice(0, limit);

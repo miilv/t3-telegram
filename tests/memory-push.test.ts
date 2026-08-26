@@ -91,6 +91,27 @@ function baseline(overrides: Partial<PushBaseline> = {}): PushBaseline {
   };
 }
 
+describe("privacy at the pushed memory boundary", () => {
+  it("redacts before snapshots, diffs, budgets and fingerprints while preserving ids", () => {
+    const item = nowItem("now_opaque_123", {
+      content: "Deploy with api_key=push-layer-secret",
+    });
+    const rendered = renderStateLayers({
+      now: [item],
+      notes: [note("note_opaque_456", { description: "token=index-layer-secret" })],
+      antiRediscovery: [],
+    });
+    const diff = renderNowDiff([{ kind: "closed", label: "password=old-baseline-secret" }]);
+
+    expect(rendered.snapshot).toContain("api_key=[REDACTED]");
+    expect(rendered.snapshot).toContain("token=[REDACTED]");
+    expect(rendered.snapshot).toContain("now_opaque_123");
+    expect(rendered.snapshot).toContain("note_opaque_456");
+    expect(JSON.stringify(rendered.items)).not.toContain("push-layer-secret");
+    expect(diff).toContain("password=[REDACTED]");
+  });
+});
+
 /**
  * memory-design §2.7 — the mapping table, row by row. These four classes decide
  * both halves of the envelope's head: whether a `[gap: …]` line appears at all,

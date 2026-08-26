@@ -9,6 +9,7 @@ import type {
   OperatorSession,
   OperatorToolAccess,
 } from "../../shared/src/index.js";
+import { redactSecretsForOutput } from "../../shared/src/index.js";
 import { DAEMON_SECRET_ENV_NAMES } from "../../shared/src/config.js";
 
 /** Package 1.1: default SIGINT→SIGKILL grace for an interrupted turn. */
@@ -88,6 +89,59 @@ export interface CodexCliRuntimeOptions extends EnvironmentFilterOptions {
  * grows a one-shot channel.
  */
 export const BACKGROUND_ONESHOT_PROVIDER = "claude";
+
+/**
+ * Last-mile decorator for every prompt crossing into an Operator provider.
+ * Tool capability tokens are transport credentials and intentionally remain
+ * intact; only provider-visible prose is transformed.
+ */
+export function privacyGuardOperatorRuntime(runtime: OperatorRuntime): OperatorRuntime {
+  return {
+    start: (input) => runtime.start({ systemPrompt: redactSecretsForOutput(input.systemPrompt) }),
+    sendTurn: (input) => runtime.sendTurn({
+      ...input,
+      prompt: redactSecretsForOutput(input.prompt),
+    }),
+    interrupt: (turnToken) => runtime.interrupt(turnToken),
+    ...(runtime.abandon ? { abandon: (turnToken?: string) => runtime.abandon?.(turnToken) } : {}),
+    compact: (reason) => runtime.compact(redactSecretsForOutput(reason ?? "") || undefined),
+    resume: (sessionId, providerId, options) => runtime.resume(
+      sessionId,
+      providerId,
+      options?.systemPrompt
+        ? { ...options, systemPrompt: redactSecretsForOutput(options.systemPrompt) }
+        : options,
+    ),
+    ...(runtime.oneShot
+      ? {
+          oneShot: (input: { prompt: string; timeoutMs?: number }) =>
+            runtime.oneShot!({ ...input, prompt: redactSecretsForOutput(input.prompt) }),
+        }
+      : {}),
+    ...(runtime.backgroundOneShot
+      ? {
+          backgroundOneShot: (input: { prompt: string; timeoutMs?: number }) =>
+            runtime.backgroundOneShot!({
+              ...input,
+              prompt: redactSecretsForOutput(input.prompt),
+            }),
+        }
+      : {}),
+    health: () => runtime.health(),
+    ...(runtime.currentProvider ? { currentProvider: () => runtime.currentProvider!() } : {}),
+    ...(runtime.availableProviders
+      ? { availableProviders: () => runtime.availableProviders!() }
+      : {}),
+    ...(runtime.switchProvider
+      ? {
+          switchProvider: (providerId: string, input: { systemPrompt: string }) =>
+            runtime.switchProvider!(providerId, {
+              systemPrompt: redactSecretsForOutput(input.systemPrompt),
+            }),
+        }
+      : {}),
+  };
+}
 
 export class SwitchableOperatorRuntime implements OperatorRuntime {
   private providerId: string;
