@@ -13,6 +13,11 @@ import {
   AutomationRepository,
   type AutomationNowItemInput,
 } from "./automation-repository.js";
+import {
+  ConversationLedgerRepository,
+  type OperatorConversationOutbound,
+  type OwnerConversationIngress,
+} from "./conversation-ledger.js";
 export type { LocalApprovalTarget, PendingLocalApproval } from "./local-approval-repository.js";
 import type {
   Artifact,
@@ -61,6 +66,17 @@ import {
 
 export { JournalRepository } from "./journal.js";
 export type { JournalEntryInput, JournalFilter, JournalSelection } from "./journal.js";
+export { ConversationLedgerRepository } from "./conversation-ledger.js";
+export type {
+  ConversationBatch,
+  ConversationActor,
+  ConversationDirection,
+  ConversationEvidenceRole,
+  ConversationLedgerRow,
+  ConversationSourceKind,
+  OperatorConversationOutbound,
+  OwnerConversationIngress,
+} from "./conversation-ledger.js";
 
 type Row = Record<string, unknown>;
 
@@ -161,6 +177,7 @@ export class OperatorStore {
   private readonly localApprovals: LocalApprovalRepository;
   private readonly automations: AutomationRepository;
   readonly journal: JournalRepository;
+  readonly conversation: ConversationLedgerRepository;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -177,6 +194,7 @@ export class OperatorStore {
       },
     );
     this.journal = new JournalRepository(this.db, (fn) => this.transaction(fn));
+    this.conversation = new ConversationLedgerRepository(this.db);
   }
 
   migrate(): void {
@@ -284,6 +302,9 @@ export class OperatorStore {
     // --- end package 3.3 ---
     const sql = readFileSync(resolveMigrationPath(), "utf8");
     this.db.exec(sql);
+    this.db.prepare(
+      "INSERT OR IGNORE INTO conversation_ledger_meta(key,value) VALUES ('coverage_started_at',?)",
+    ).run(nowIso());
     const threadColumns = this.db.prepare("PRAGMA table_info(threads)").all() as Row[];
     if (!threadColumns.some((column) => column.name === "model")) {
       this.db.exec("ALTER TABLE threads ADD COLUMN model TEXT");
@@ -2246,6 +2267,30 @@ export class OperatorStore {
     return id;
   }
 
+  /**
+   * The accepted owner utterance and the durable ingress job are one fact.
+   * Keeping their inserts in one transaction prevents either a lost transcript
+   * with a runnable job or a transcript for a job that never existed.
+   */
+  enqueueOwnerConversationIngressJob<T>(
+    payload: T,
+    conversation: OwnerConversationIngress,
+    input: { id: string; dedupeKey: string },
+    runAfter?: string,
+  ): string {
+    const now = nowIso();
+    return this.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO background_jobs(
+          id,dedupe_key,kind,payload_json,status,run_after,attempts,last_error,created_at,updated_at
+        ) VALUES (?,?,'telegram_ingress',?,'pending',?,0,NULL,?,?)
+        ON CONFLICT DO NOTHING
+      `).run(input.id, input.dedupeKey, JSON.stringify(payload), runAfter ?? null, now, now);
+      this.conversation.appendOwnerIngress(conversation);
+      return input.id;
+    });
+  }
+
   resetInterruptedBackgroundJobs(kind?: string): number {
     const result = kind
       ? this.db
@@ -2329,6 +2374,7 @@ export class OperatorStore {
     chatId: number;
     operation: string;
     payload: T;
+    conversation?: OperatorConversationOutbound;
   }): TelegramOutboxItem<T> {
     const now = nowIso();
     const id = newId("outbox");
@@ -2342,6 +2388,9 @@ export class OperatorStore {
           ON CONFLICT(dedupe_key) DO NOTHING
         `)
         .run(id, input.dedupeKey, input.chatId, input.operation, JSON.stringify(input.payload), now, now);
+      if (input.conversation) {
+        this.conversation.appendPendingOutbound("telegram_outbox", input.dedupeKey, input.conversation);
+      }
       const row = this.db.prepare("SELECT * FROM telegram_outbox WHERE dedupe_key=?").get(input.dedupeKey) as Row;
       // A re-emitted event that lands on a dead row means the caller still
       // needs the delivery: revive it with the fresh payload for a new attempt
@@ -2357,6 +2406,13 @@ export class OperatorStore {
               last_error_code=NULL,last_error_detail=NULL,updated_at=? WHERE id=?
           `)
           .run(JSON.stringify(input.payload), now, String(row.id));
+        if (input.conversation) {
+          this.conversation.replacePendingOutbound(
+            "telegram_outbox",
+            input.dedupeKey,
+            input.conversation,
+          );
+        }
         const revived = this.db.prepare("SELECT * FROM telegram_outbox WHERE id=?").get(String(row.id)) as Row;
         return rowToTelegramOutbox<T>(revived);
       }
@@ -2473,6 +2529,7 @@ export class OperatorStore {
   ): void {
     this.transaction(() => {
       const now = nowIso();
+      const outbox = this.db.prepare("SELECT dedupe_key FROM telegram_outbox WHERE id=?").get(id) as Row | undefined;
       this.db
         .prepare(`
           UPDATE telegram_outbox SET status='delivered',telegram_message_ids_json=?,
@@ -2480,6 +2537,9 @@ export class OperatorStore {
           WHERE id=?
         `)
         .run(JSON.stringify(messageIds), now, now, id);
+      if (outbox?.dedupe_key) {
+        this.conversation.markOutboundDelivered("telegram_outbox", String(outbox.dedupe_key), now);
+      }
       if (localApproval) {
         this.localApprovals.updateMessage(
           localApproval.approvalId,
