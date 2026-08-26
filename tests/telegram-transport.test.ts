@@ -657,6 +657,33 @@ describe("Telegram inbound normalization", () => {
     ).toMatchObject({ type: "message", userId: 42, chatType: "supergroup" });
   });
 
+  it("marks a quoted bot message as such (package 1.4)", () => {
+    const inbound = normalizeTelegramUpdate(
+      {
+        update_id: 11,
+        message: {
+          message_id: 60,
+          chat: { id: 7, type: "private" },
+          from: { id: 42, first_name: "M" },
+          date: 1_700_000_000,
+          text: "и что дальше?",
+          reply_to_message: {
+            message_id: 59,
+            chat: { id: 7, type: "private" },
+            from: { id: 999, is_bot: true, first_name: "Operator", username: "operator_bot" },
+            date: 1_699_999_999,
+            text: "Запустил работу.",
+          },
+        },
+      } as never,
+      { users: { 42: "owner" }, allowGroups: false },
+    );
+
+    expect(inbound).toMatchObject({
+      reply: { messageId: 59, fromBot: true, username: "operator_bot", text: "Запустил работу." },
+    });
+  });
+
   it("preserves voice, reply, forward and forum-topic context", () => {
     const inbound = normalizeTelegramUpdate(
       {
@@ -1092,6 +1119,27 @@ describe("inbound batch merging", () => {
     edited: false,
     chatType: "private" as const,
   };
+  it("keeps every part's own quote when a reply is not the first message of the batch", () => {
+    const quote = { messageId: 500, fromBot: true, text: "Какой вариант?", attachments: [] };
+    const merged = mergeInboundBatch([
+      { ...base, updateId: 1, messageId: 21, messageIds: [21], text: "мысль вслух" },
+      {
+        ...base,
+        updateId: 2,
+        messageId: 22,
+        messageIds: [22],
+        text: "второй",
+        replyToMessageId: 500,
+        reply: quote,
+      },
+    ]);
+    // The merged envelope still reports the FIRST message at the top level…
+    expect(merged.replyToMessageId).toBeUndefined();
+    expect(merged.reply).toBeUndefined();
+    // …so the parts breakdown is the only place the reply can survive.
+    expect(merged.parts?.[1]).toMatchObject({ messageId: 22, replyToMessageId: 500, reply: quote });
+  });
+
   it("merges a burst of forwarded messages into one attributed update", () => {
     const merged = mergeInboundBatch([
       {

@@ -830,12 +830,39 @@ export class OperatorStore {
     );
   }
 
+  /**
+   * Package 1.4: a link never loses information on rewrite. A question card
+   * that is re-linked as `primary` by a later delivery pass used to forget it
+   * ever was a `user_input` card, and with it the envelope clause that tells
+   * the agent the owner is answering a worker's question. The more specific
+   * relation wins; equal specificity still rewrites (idempotent).
+   */
   linkMessageThread(chatId: number, messageId: number, threadId: string, relation = "primary"): void {
+    const existing = this.db
+      .prepare("SELECT relation FROM message_thread_links WHERE chat_id=? AND message_id=? AND thread_id=?")
+      .get(chatId, messageId, threadId) as Row | undefined;
+    if (existing && relationSpecificity(String(existing.relation)) > relationSpecificity(relation)) return;
     this.db
       .prepare(
         "INSERT OR REPLACE INTO message_thread_links(chat_id,message_id,thread_id,relation) VALUES (?,?,?,?)",
       )
       .run(chatId, messageId, threadId, relation);
+  }
+
+  /**
+   * Package 1.4: every thread link of one message WITH its relation, readable
+   * even when `telegram_messages` has no row for it (a worker question card is
+   * linked but never saved as a message row, so `getReplyContext` alone made a
+   * reply to an already-answered question resolve to nothing).
+   */
+  getMessageThreadLinks(chatId: number, messageId: number): Array<{ threadId: string; relation: string }> {
+    return (
+      this.db
+        .prepare(
+          "SELECT thread_id, relation FROM message_thread_links WHERE chat_id=? AND message_id=? ORDER BY relation",
+        )
+        .all(chatId, messageId) as Row[]
+    ).map((link) => ({ threadId: String(link.thread_id), relation: String(link.relation) }));
   }
 
   getReplyContext(chatId: number, messageId: number): ReplyContext | undefined {
@@ -2047,6 +2074,28 @@ function rowToThread(row: Row): WorkThread {
     ...(row.last_result_summary ? { lastResultSummary: String(row.last_result_summary) } : {}),
     relatedArtifacts: JSON.parse(String(row.related_artifacts_json ?? "[]")) as string[],
   };
+}
+
+/**
+ * How much a message→thread relation says about WHY the two are linked
+ * (package 1.4). The card relations describe an exchange the agent must know
+ * about; `primary`/`operator_output` only state ownership; `related` is the
+ * weakest claim there is.
+ */
+function relationSpecificity(relation: string): number {
+  switch (relation) {
+    case "user_input":
+    case "user_input_answer":
+    case "approval":
+    case "recovery":
+      return 3;
+    case "primary":
+      return 2;
+    case "operator_output":
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 function rowToThreadSummary(row: Row): ThreadSummary {

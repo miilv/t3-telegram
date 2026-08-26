@@ -44,6 +44,8 @@ export interface TelegramReplyContext {
   messageId: number;
   userId?: number;
   username?: string;
+  /** Package 1.4: the quoted message was written by a bot — usually us. */
+  fromBot?: boolean;
   text?: string;
   attachments: TelegramAttachment[];
   forwardOrigin?: TelegramForwardOrigin;
@@ -65,6 +67,12 @@ export interface TelegramInboundBatchPart {
   messageId: number;
   text: string;
   replyToMessageId?: number;
+  /**
+   * Package 1.4: the quoted message of THIS part. The merged envelope keeps
+   * only the first message's reply at the top level, so without this a reply
+   * glued behind an ordinary message loses both its quote and its thread.
+   */
+  reply?: TelegramReplyContext;
   forwarded?: boolean;
 }
 

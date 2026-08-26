@@ -9,6 +9,7 @@ import {
   ingressClaims,
   ingressLane,
   OperatorDaemon,
+  answerPartUpdate,
   operatorHeartbeatText,
   syntheticNegativeMessageId,
 } from "../apps/daemon/src/operator-daemon.js";
@@ -806,6 +807,781 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  // Package 1.4 — reply context. Four holes closed at once: the quote reached
+  // nothing, operator finals carried no thread, tool messages carried none
+  // either, and an answered worker question lost its thread with the pending
+  // state. Each test below owns one of them.
+  it("carries the quoted message into the envelope as fenced, truncated data without inventing a thread", async () => {
+    const home = tempDirectory("daemon-reply-quote-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(async () => "Ок.");
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const longQuote = `начало цитаты ${"ы".repeat(3_000)} конец цитаты`;
+    telegram.push({
+      ...message(1, "и что с этим делать?"),
+      replyToMessageId: 900,
+      reply: { messageId: 900, userId: 42, text: longQuote, attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.length === 1);
+    const ownQuoteEnvelope = runtime.prompts.at(-1)!;
+    expect(ownQuoteEnvelope).toContain(
+      "The owner replies to this quoted message (the owner's own earlier message)",
+    );
+    expect(ownQuoteEnvelope).toContain("начало цитаты");
+    // Fenced under its own `quote` label — never `inbound`, which is the label
+    // that says "the owner's own words" — and bounded: the quote may not drag a
+    // 3000-character wall into the envelope, nor lose its terminator to the cut.
+    const quoteFence = /<<<quote:(\w+)>>>\n([\s\S]*?)\n<<<end:\1>>>/gu;
+    const fencedBlocks = [...ownQuoteEnvelope.matchAll(quoteFence)].map((match) => match[2]!);
+    const fencedQuote = fencedBlocks.find((block) => block.includes("начало цитаты"));
+    expect(fencedQuote).toBeDefined();
+    expect(userText(ownQuoteEnvelope)).not.toContain("начало цитаты");
+    expect(fencedQuote!.length).toBeLessThanOrEqual(700);
+    expect(fencedQuote).toContain("…");
+    expect(fencedQuote).not.toContain("конец цитаты");
+    // No mapping exists for message 900, so no thread may be invented.
+    expect(ownQuoteEnvelope).not.toContain("replies to work thread");
+    expect(envelopeThreadId(ownQuoteEnvelope)).toBeUndefined();
+
+    telegram.push({
+      ...message(2, "поясни"),
+      replyToMessageId: 901,
+      reply: { messageId: 901, userId: 999, fromBot: true, text: "Париж.", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.length === 2);
+    const botQuoteEnvelope = runtime.prompts.at(-1)!;
+    expect(botQuoteEnvelope).toContain(
+      "The owner replies to this quoted message (your earlier message)",
+    );
+    expect(botQuoteEnvelope).toContain("Париж.");
+    expect(botQuoteEnvelope).not.toContain("replies to work thread");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("binds the final answer to the work the turn started, so a reply to it continues that work", async () => {
+    const home = tempDirectory("daemon-reply-final-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /исправь/u, title: "Auth race fix" }),
+    );
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь гонку в авторизации"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Запустил работу")));
+    const dispatched = broker.threads.at(-1)!;
+    const answer = telegram.sent.find((sent) => sent.text.includes("Запустил работу"))!;
+    expect(store.getReplyContext(7, answer.messageId)?.primaryThreadId).toBe(dispatched.id);
+
+    telegram.push({
+      ...message(2, "а как там дела?"),
+      replyToMessageId: answer.messageId,
+      reply: {
+        messageId: answer.messageId,
+        fromBot: true,
+        text: "Запустил работу Auth race fix.",
+        attachments: [],
+      },
+    });
+    // The worker finishes on its own in this fake, so a thread-event turn may
+    // interleave; the envelope under test is the one carrying the owner's reply.
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("а как там дела?")));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("а как там дела?"))!;
+    expect(envelope).toContain('replies to work thread "Auth race fix"');
+    expect(envelope).toContain(
+      "The owner replies to this quoted message (your earlier message)",
+    );
+    expect(envelopeThreadId(envelope)).toBe(dispatched.id);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("routes a reply to an agent message that named its thread, and leaves an unnamed one unbound", async () => {
+    const home = tempDirectory("daemon-reply-tool-");
+    const store = tempStore();
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_tool_reply",
+      t3ProjectId: "prj_tool_reply",
+      name: "Tool Reply Project",
+      workspaceRoot: `${home}/tool-reply`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    mkdirSync(project.workspaceRoot!, { recursive: true });
+    const thread: WorkThread = {
+      id: "th_tool_bound",
+      t3ThreadId: "th_tool_bound",
+      projectId: project.id,
+      title: "Index rebuild",
+      shortSummary: "Rebuilding the search index",
+      keywords: ["index"],
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      if (userText(envelope).includes("что там")) return "Всё идёт.";
+      await call("telegram.send_message", {
+        text: "Смотрю, как идёт перестроение индекса.",
+        threadId: thread.id,
+      });
+      await call("telegram.send_message", { text: "Кстати, кофе закончился." });
+      return "Готово.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    broker.projects.push(project);
+    broker.threads.push(thread);
+    store.upsertProject(project);
+    store.upsertThread(thread);
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "проверь индекс"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("кофе")));
+    const bound = telegram.sent.find((sent) => sent.text.includes("перестроение индекса"))!;
+    const unbound = telegram.sent.find((sent) => sent.text.includes("кофе"))!;
+
+    telegram.push({
+      ...message(2, "что там у него?"),
+      replyToMessageId: bound.messageId,
+      reply: {
+        messageId: bound.messageId,
+        fromBot: true,
+        text: "Смотрю, как идёт перестроение индекса.",
+        attachments: [],
+      },
+    });
+    await waitFor(() => runtime.prompts.length === 2);
+    const boundEnvelope = runtime.prompts.at(-1)!;
+    expect(boundEnvelope).toContain('replies to work thread "Index rebuild"');
+    expect(envelopeThreadId(boundEnvelope)).toBe(thread.id);
+
+    telegram.push({
+      ...message(3, "что там за кофе?"),
+      replyToMessageId: unbound.messageId,
+      reply: {
+        messageId: unbound.messageId,
+        fromBot: true,
+        text: "Кстати, кофе закончился.",
+        attachments: [],
+      },
+    });
+    await waitFor(() => runtime.prompts.length === 3);
+    const unboundEnvelope = runtime.prompts.at(-1)!;
+    expect(unboundEnvelope).toContain("The owner replies to this quoted message");
+    expect(unboundEnvelope).not.toContain("replies to work thread");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("keeps the quote and the thread of a reply glued behind another message in one batch", async () => {
+    const home = tempDirectory("daemon-reply-batch-");
+    const store = tempStore();
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_batch_reply",
+      t3ProjectId: "prj_batch_reply",
+      name: "Batch Reply Project",
+      workspaceRoot: `${home}/batch-reply`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    mkdirSync(project.workspaceRoot!, { recursive: true });
+    const thread: WorkThread = {
+      id: "th_batch_card",
+      t3ThreadId: "th_batch_card",
+      projectId: project.id,
+      title: "Billing export",
+      shortSummary: "Exporting billing data",
+      keywords: ["billing"],
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    const runtime = new DelegatingRuntime(async () => "Принял.");
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    broker.projects.push(project);
+    broker.threads.push(thread);
+    store.upsertProject(project);
+    store.upsertThread(thread);
+    store.linkMessageThread(7, 444, thread.id, "user_input");
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // Exactly what the 2 s batching produces: an ordinary thought first, the
+    // reply second. The merged envelope carries the FIRST message's (absent)
+    // reply at the top level, so everything must come from the parts.
+    const quote = { messageId: 444, fromBot: true, text: "Какой формат выгрузки?", attachments: [] };
+    telegram.push({
+      ...message(11, "сначала мысль вслух\n\nдавай csv"),
+      messageIds: [11, 12],
+      parts: [
+        { messageId: 11, text: "сначала мысль вслух" },
+        { messageId: 12, text: "давай csv", replyToMessageId: 444, reply: quote },
+      ],
+    });
+    await waitFor(() => runtime.prompts.length === 1);
+    const envelope = runtime.prompts.at(-1)!;
+    expect(envelope).toContain('replies to work thread "Billing export"');
+    expect(envelope).toContain("worker question to the owner");
+    expect(envelope).toContain("Какой формат выгрузки?");
+    expect(envelopeThreadId(envelope)).toBe(thread.id);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("sends a reply on a recovered thread's origin message into the LIVE thread, not the dead one", async () => {
+    const home = tempDirectory("daemon-reply-recovery-");
+    const store = tempStore();
+    const runtime = new RecoveryDecidingRuntime(
+      delegatingScript({ workPattern: /implement/u, title: "Auth recovery" }),
+      { action: "new_thread", reason: "context limit corruption" },
+    );
+    const broker = new RecoveringBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "implement auth recovery and run tests"));
+    // The recovery creates a second thread and links it to the SAME origin
+    // message, whose primary column still points at the thread that died.
+    await waitFor(() => store.getMessageThreadLinks(7, 1).some((link) => link.relation === "recovery"), 10_000);
+    const recovered = store.getMessageThreadLinks(7, 1).find((link) => link.relation === "recovery")!.threadId;
+    expect(store.getReplyContext(7, 1)?.primaryThreadId).toBe("th_1");
+    expect(["completed", "failed", "cancelled"]).toContain(store.getThread("th_1")!.status);
+
+    telegram.push({
+      ...message(20, "а тесты не забудь"),
+      replyToMessageId: 1,
+      reply: { messageId: 1, userId: 42, text: "implement auth recovery and run tests", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("а тесты не забудь")), 25_000);
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("а тесты не забудь"))!;
+    expect(envelopeThreadId(envelope)).toBe(recovered);
+    expect(envelope).toContain("recovery notice about that work");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
+  it("never routes a reply on a `related` link, and never lets the focus become a primary binding", async () => {
+    const home = tempDirectory("daemon-reply-related-");
+    const store = tempStore();
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_related",
+      t3ProjectId: "prj_related",
+      name: "Related Project",
+      workspaceRoot: `${home}/related`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    mkdirSync(project.workspaceRoot!, { recursive: true });
+    const thread: WorkThread = {
+      id: "th_focus_only",
+      t3ThreadId: "th_focus_only",
+      projectId: project.id,
+      title: "Nightly sync",
+      shortSummary: "Syncing nightly",
+      keywords: ["sync"],
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    const runtime = new DelegatingRuntime(async () => "Париж.");
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    broker.projects.push(project);
+    broker.threads.push(thread);
+    store.upsertProject(project);
+    store.upsertThread(thread);
+    store.grantProjectAccess(project.id, "42", "owner");
+    // A machine focus with no dispatch in the turn: the classic mis-routing
+    // this package removes. The answer may carry the id as a related hint and
+    // nothing more.
+    store.setFocus("42", {
+      primary: { projectId: project.id, threadId: thread.id, topic: "Nightly sync", confidence: 0.9, updatedAt: timestamp },
+      secondary: [],
+    });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Париж")));
+    const answer = telegram.sent.find((sent) => sent.text.includes("Париж"))!;
+    // The focus rode along as a related id — and as a `related` link only.
+    expect(store.getReplyContext(7, answer.messageId)?.primaryThreadId).toBeUndefined();
+    expect(store.getMessageThreadLinks(7, answer.messageId)).toEqual([
+      { threadId: thread.id, relation: "related" },
+    ]);
+
+    telegram.push({
+      ...message(2, "а подробнее?"),
+      replyToMessageId: answer.messageId,
+      reply: { messageId: answer.messageId, fromBot: true, text: "Париж.", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.length === 2);
+    const envelope = runtime.prompts.at(-1)!;
+    expect(envelope).toContain("The owner replies to this quoted message");
+    expect(envelope).not.toContain("replies to work thread");
+    expect(envelopeThreadId(envelope)).toBeUndefined();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("delivers an agent message even when the thread it names cannot be resolved", async () => {
+    const home = tempDirectory("daemon-binding-degrade-");
+    const store = tempStore();
+    const results: Array<Record<string, unknown>> = [];
+    const runtime = new DelegatingRuntime(async (_envelope, call) => {
+      results.push((await call("telegram.send_message", {
+        text: "Ща посмотрю, это займёт минуту.",
+        threadId: "th_down",
+      })) as Record<string, unknown>);
+      results.push((await call("telegram.send_message", {
+        text: "И ещё одна мысль.",
+        threadId: "th_ghost",
+      })) as Record<string, unknown>);
+      return "Готово.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // th_down: T3 itself is unreachable. th_ghost: the agent named a thread
+    // that does not exist. Neither may cost the owner the text — the heads-up
+    // is mandatory precisely when the backend is sick.
+    const realGetThread = broker.getThread.bind(broker);
+    broker.getThread = async (id: string) => {
+      if (id === "th_down") throw Object.assign(new Error("ECONNRESET"), { code: "ECONNRESET" });
+      return realGetThread(id);
+    };
+
+    telegram.push(message(1, "посмотри что там"));
+    await waitFor(() => results.length === 2);
+    expect(telegram.sent.some((sent) => sent.text.includes("Ща посмотрю"))).toBe(true);
+    expect(telegram.sent.some((sent) => sent.text.includes("И ещё одна мысль"))).toBe(true);
+    // …and the agent is told why each binding did not happen.
+    expect(results[0]).toMatchObject({ thread: { status: "dropped", reason: "unavailable" } });
+    expect(results[1]).toMatchObject({ thread: { status: "dropped", reason: "not_found" } });
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("binds «Остановил X» to X, so a reply to it continues that work", async () => {
+    const home = tempDirectory("daemon-cancel-binding-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(
+      delegatingScript({ workPattern: /исправь/u, title: "Race fix" }),
+    );
+    const broker = new FakeBroker();
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь гонку в авторизации"));
+    await waitFor(() => broker.turns.length === 1);
+    const dispatched = broker.threads.at(-1)!;
+    telegram.push(message(2, "стоп"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Остановил")));
+    const stopped = telegram.sent.find((sent) => sent.text.includes("Остановил"))!;
+    expect(store.getReplyContext(7, stopped.messageId)?.primaryThreadId).toBe(dispatched.id);
+
+    telegram.push({
+      ...message(3, "а почему остановилось?"),
+      replyToMessageId: stopped.messageId,
+      reply: { messageId: stopped.messageId, fromBot: true, text: "Остановил Race fix.", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("а почему остановилось?")));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("а почему остановилось?"))!;
+    expect(envelope).toContain('replies to work thread "Race fix"');
+    expect(envelopeThreadId(envelope)).toBe(dispatched.id);
+
+    broker.releaseTerminal();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("leaves a fan-out answer unbound rather than picking one of the threads it started", async () => {
+    const home = tempDirectory("daemon-fanout-binding-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      if (userText(envelope).includes("а что там")) return "Оба идут.";
+      const workspacesRoot =
+        /New project workspaces belong under (\S+)\./u.exec(envelope)?.[1] ?? "/tmp/workspaces";
+      const project = (await call("t3.create_project", {
+        name: "Fan Out",
+        workspaceRoot: `${workspacesRoot}/fan-out`,
+      })) as { id: string };
+      for (const title of ["Left half", "Right half"]) {
+        const thread = (await call("t3.create_thread", { projectId: project.id, title })) as { id: string };
+        await call("t3.send_turn", { threadId: thread.id, text: title });
+      }
+      return "Запустил обе работы.";
+    });
+    const broker = new FakeBroker();
+    broker.holdTerminal();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "раздели задачу надвое"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Запустил обе")));
+    const answer = telegram.sent.find((sent) => sent.text.includes("Запустил обе"))!;
+    // Two threads make any primary pick a guess. Both stay as related ids —
+    // the audit trail is complete, the routing claims nothing.
+    expect(store.getReplyContext(7, answer.messageId)?.primaryThreadId).toBeUndefined();
+    expect(store.getMessageThreadLinks(7, answer.messageId).map((link) => link.relation)).toEqual([
+      "related",
+      "related",
+    ]);
+
+    telegram.push({
+      ...message(2, "а что там с ними?"),
+      replyToMessageId: answer.messageId,
+      reply: { messageId: answer.messageId, fromBot: true, text: "Запустил обе работы.", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("а что там с ними?")));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("а что там с ними?"))!;
+    expect(envelope).not.toContain("replies to work thread");
+    expect(envelope).toContain("The owner replies to this quoted message");
+
+    broker.releaseTerminal();
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("gives no reply binding at all when the primary thread is closed to this user", async () => {
+    const home = tempDirectory("daemon-reply-acl-");
+    const store = tempStore();
+    const timestamp = nowIso();
+    const secret: Project = {
+      id: "prj_secret",
+      t3ProjectId: "prj_secret",
+      name: "Secret Project",
+      workspaceRoot: `${home}/secret`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const open: Project = {
+      id: "prj_open",
+      t3ProjectId: "prj_open",
+      name: "Open Project",
+      workspaceRoot: `${home}/open`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    for (const project of [secret, open]) mkdirSync(project.workspaceRoot!, { recursive: true });
+    const thread = (projectId: string, id: string, title: string): WorkThread => ({
+      id,
+      t3ThreadId: id,
+      projectId,
+      title,
+      shortSummary: "",
+      keywords: [],
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    });
+    const hidden = thread(secret.id, "th_hidden", "Hidden work");
+    const visible = thread(open.id, "th_visible", "Visible work");
+    const runtime = new DelegatingRuntime(async () => "Ок.");
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    for (const project of [secret, open]) {
+      broker.projects.push(project);
+      store.upsertProject(project);
+    }
+    for (const item of [hidden, visible]) {
+      broker.threads.push(item);
+      store.upsertThread(item);
+    }
+    // A team member (not an admin — admins read everything) who was given the
+    // open project and never the secret one.
+    store.grantProjectAccess(secret.id, "999", "owner");
+    store.grantProjectAccess(open.id, "43", "editor");
+    // The quoted message points primarily at work this user may not read, and
+    // carries a weaker link to work they may. The weak one must NOT be used.
+    store.saveTelegramMessage({
+      chatId: 7,
+      messageId: 800,
+      primaryThreadId: hidden.id,
+      relatedThreadIds: [hidden.id],
+      artifactIds: [],
+      messageType: "operator_answer",
+      createdAt: timestamp,
+    });
+    store.linkMessageThread(7, 800, hidden.id, "primary");
+    store.linkMessageThread(7, 800, visible.id, "operator_output");
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    const base = config(home);
+    daemon = new OperatorDaemon(
+      { ...base, telegram: { ...base.telegram, users: { 42: "owner", 43: "member" } } },
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push({
+      ...messageAs(1, "а тут что?", 43),
+      replyToMessageId: 800,
+      reply: { messageId: 800, fromBot: true, text: "Отчёт по работе.", attachments: [] },
+    });
+    await waitFor(() => runtime.prompts.length === 1);
+    const envelope = runtime.prompts.at(-1)!;
+    expect(envelope).not.toContain("replies to work thread");
+    expect(envelope).not.toContain("Hidden work");
+    expect(envelope).not.toContain("Visible work");
+    expect(envelopeThreadId(envelope)).toBeUndefined();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("routes a reply to an already-answered worker question back into the asking thread", async () => {
+    const home = tempDirectory("daemon-reply-question-");
+    const store = tempStore();
+    const timestamp = nowIso();
+    const project: Project = {
+      id: "prj_question_reply",
+      t3ProjectId: "prj_question_reply",
+      name: "Question Project",
+      workspaceRoot: `${home}/question-project`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    mkdirSync(project.workspaceRoot!, { recursive: true });
+    const thread: WorkThread = {
+      id: "th_question_owner",
+      t3ThreadId: "th_question_owner",
+      projectId: project.id,
+      title: "Migration rollout",
+      shortSummary: "Rolling out the migration",
+      keywords: ["migration"],
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastActivityAt: timestamp,
+      relatedArtifacts: [],
+    };
+    const runtime = new DelegatingRuntime(async () => "Понял.");
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    broker.projects.push(project);
+    broker.threads.push(thread);
+    store.upsertProject(project);
+    store.upsertThread(thread);
+    // The question card as the daemon leaves it behind: a thread link and no
+    // telegram_messages row at all. Its pending state is already closed.
+    store.linkMessageThread(7, 555, thread.id, "user_input");
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push({
+      ...message(1, "всё-таки давай второй вариант"),
+      replyToMessageId: 555,
+      reply: {
+        messageId: 555,
+        fromBot: true,
+        text: "Какой вариант миграции выбрать?",
+        attachments: [],
+      },
+    });
+    await waitFor(() => runtime.prompts.length === 1);
+    const envelope = runtime.prompts.at(-1)!;
+    expect(envelope).toContain('replies to work thread "Migration rollout"');
+    expect(envelope).toContain("worker question to the owner");
+    expect(envelopeThreadId(envelope)).toBe(thread.id);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("materializes an inbound Telegram document into the delegated worker workspace", async () => {
     const home = tempDirectory("daemon-document-in-");
     const store = tempStore();
@@ -1331,6 +2107,26 @@ describe("OperatorDaemon product flow", () => {
     expect(broker.userInputResponses[0]?.commandId).toMatch(/^user-input:/);
     expect(telegram.keyboardClears).toContain(prompt.messageId);
     expect(store.listPendingUserInputs()).toHaveLength(0);
+
+    // Package 1.4: the card outlives its pending state. A reply to it now that
+    // the question is answered still belongs to the thread that asked — and the
+    // `user_input` relation must have survived every later write to that link.
+    expect(store.getMessageThreadLinks(7, prompt.messageId)).toContainEqual({
+      threadId: "th_1",
+      relation: "user_input",
+    });
+    telegram.push({
+      ...message(6, "и ещё: не забудь про US-регион"),
+      replyToMessageId: prompt.messageId,
+      reply: { messageId: prompt.messageId, fromBot: true, text: "Any deployment note?", attachments: [] },
+    });
+    await waitFor(
+      () => runtime.prompts.some((entry) => entry.includes("не забудь про US-регион")),
+      10_000,
+    );
+    const replyEnvelope = runtime.prompts.find((entry) => entry.includes("не забудь про US-регион"))!;
+    expect(replyEnvelope).toContain("worker question to the owner");
+    expect(envelopeThreadId(replyEnvelope)).toBe("th_1");
 
     telegram.finish();
     await run;
@@ -6333,6 +7129,44 @@ describe("OperatorDaemon product flow", () => {
   }, 40_000);
 });
 
+describe("answerPartUpdate (package 1.4)", () => {
+  const merged = {
+    type: "message" as const,
+    updateId: 1,
+    edited: false,
+    chatId: 7,
+    chatType: "private" as const,
+    userId: 42,
+    messageId: 31,
+    messageIds: [30, 31],
+    date: 0,
+    text: "мысль\n\nда, первый вариант",
+    attachments: [],
+    // The merged envelope carries the FIRST message's reply — an unrelated
+    // quote as far as the worker's question is concerned.
+    replyToMessageId: 600,
+    reply: { messageId: 600, fromBot: true, text: "Отчёт по другой работе.", attachments: [] },
+    parts: [
+      { messageId: 30, text: "мысль", replyToMessageId: 600, reply: { messageId: 600, fromBot: true, text: "Отчёт по другой работе.", attachments: [] } },
+      { messageId: 31, text: "да, первый вариант", replyToMessageId: 700, reply: { messageId: 700, fromBot: true, text: "Какой вариант?", attachments: [] } },
+    ],
+  };
+
+  it("gives the answering part its own quote and never the batch's", () => {
+    const answer = answerPartUpdate(merged, merged.parts[1]!);
+    expect(answer.messageIds).toEqual([31]);
+    expect(answer.replyToMessageId).toBe(700);
+    expect(answer.reply).toMatchObject({ messageId: 700, text: "Какой вариант?" });
+    expect(answer.text).toBe("да, первый вариант");
+  });
+
+  it("carries no quote at all when the answering part had none", () => {
+    const bare = { messageId: 31, text: "да, первый вариант", replyToMessageId: 700 };
+    const answer = answerPartUpdate({ ...merged, parts: [merged.parts[0]!, bare] }, bare);
+    expect(answer.reply).toBeUndefined();
+  });
+});
+
 /** Just enough of a durable ingress payload for the digest assertions. */
 interface DurableIngressPeek {
   update: { text: string; messageThreadId?: number; threadEvents?: unknown[] };
@@ -6814,6 +7648,34 @@ class MediatingRuntime extends DelegatingRuntime {
   }
 }
 
+/**
+ * Package 1.4: failure recovery asks the Operator IN SESSION (askOperator →
+ * sendTurn), so a scripted decision has to live here rather than in oneShot.
+ */
+class RecoveryDecidingRuntime extends DelegatingRuntime {
+  constructor(
+    script: OperatorScript,
+    private readonly decision: Record<string, unknown>,
+  ) {
+    super(script);
+  }
+
+  override async *sendTurn(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (input.prompt.includes("Choose recovery for a failed T3 worker")) {
+      this.prompts.push(input.prompt);
+      const text = JSON.stringify(this.decision);
+      yield { type: "text_delta", text };
+      yield { type: "result", text, sessionId: input.sessionId };
+      return;
+    }
+    yield* super.sendTurn(input);
+  }
+}
+
 class BlockingRuntime extends FakeRuntime {
   turnStarted = false;
   turnReleased = false;
@@ -6999,8 +7861,15 @@ class FakeBroker implements T3Broker {
       .sort((left, right) => right.score - left.score)
       .slice(0, input.limit ?? 5);
   }
+  /**
+   * Package 1.4: an unknown id FAILS here, the way the real broker fails on a
+   * thread T3 does not have. Returning `undefined!` made every caller's
+   * not-found path show up as a TypeError somewhere else instead.
+   */
   async getThread(id: string): Promise<WorkThread> {
-    return this.threads.find((thread) => thread.id === id)!;
+    const thread = this.threads.find((candidate) => candidate.id === id);
+    if (!thread) throw Object.assign(new Error(`T3 thread not found: ${id}`), { status: 404 });
+    return thread;
   }
   async createThread(input: CreateThreadInput): Promise<WorkThread> {
     this.threadInputs.push(input);
@@ -7586,5 +8455,25 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void
   while (!predicate()) {
     if (Date.now() - started > timeoutMs) throw new Error("Timed out waiting for daemon state");
     await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/**
+ * Package 1.4: the first thread dies once; the thread recovery creates in its
+ * place keeps working. A shared `workerEvents` list cannot express that — it
+ * would replay th_1's failure into the recovery thread's monitor and resurrect
+ * the corpse the test is about.
+ */
+class RecoveringBroker extends FakeBroker {
+  override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+    this.subscriptions.push(threadId);
+    yield { type: "started", threadId };
+    if (threadId === "th_1") {
+      yield { type: "failed", threadId, error: "context window exhausted" };
+      return;
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 60_000).unref();
+    });
   }
 }

@@ -323,7 +323,7 @@ export class OperatorToolServer {
       {
         instructions: [
           "These tools are privileged and scoped to one Telegram Operator turn.",
-          "Use telegram.send_message only for extra agent-initiated messages; the daemon delivers the normal final answer.",
+          "Use telegram.send_message only for extra agent-initiated messages; the daemon delivers the normal final answer. Pass threadId when such a message is about a specific work, so the owner's reply to it continues that work.",
           "Telegram destination and reply target are fixed by the daemon. Tool results are intentionally compact.",
         ].join(" "),
       },
@@ -1098,30 +1098,56 @@ export class OperatorToolServer {
   }
 
   private addTelegramTools(server: McpServer, token: string): void {
-    const textSchema = z.object({ text: z.string().trim().min(1).max(64_000) });
+    // Package 1.4: an agent-initiated message can name the work it is about.
+    // The binding is what makes the owner's reply to that message continue the
+    // same work instead of landing on the machine focus.
+    const textSchema = z.object({
+      text: z.string().trim().min(1).max(64_000),
+      threadId: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("The work thread this message is about; the owner's reply to it continues that work."),
+    });
     this.addTool(server, token, {
       name: "telegram.send_message",
-      description: "Send an additional message to the current Telegram chat/topic. Do not use for the normal final answer.",
+      description:
+        "Send an additional message to the current Telegram chat/topic. Do not use for the normal final answer. Pass threadId when the message speaks about a specific work — the owner's reply to it then continues that work.",
       schema: textSchema,
-      handler: async ({ text }, capability) => {
+      handler: async ({ text, threadId }, capability) => {
         this.requireTeamMutation(capability, "send Telegram messages");
-        return this.recordSent(await this.options.telegram.sendRich(
+        // The message is the point, the binding is a bonus: send FIRST, then
+        // resolve. Nothing about naming a thread may cost the owner the text —
+        // least of all a T3 outage during a mandatory heads-up.
+        const sent = await this.options.telegram.sendRich(
           capability.context.chatId,
           text,
           destination(capability.context),
-        ), capability, "operator_tool_message");
+        );
+        const bound = await this.resolveOutgoingThread(capability, threadId);
+        return {
+          ...this.recordSent(sent, capability, "operator_tool_message", [], bound.threadId),
+          ...(bound.thread ? { thread: bound.thread } : {}),
+        };
       },
     });
     this.addTool(server, token, {
       name: "telegram.reply",
-      description: "Reply natively to the inbound Telegram message fixed by this turn's capability.",
+      description:
+        "Reply natively to the inbound Telegram message fixed by this turn's capability. Pass threadId when the reply speaks about a specific work.",
       schema: textSchema,
-      handler: async ({ text }, capability) => {
+      handler: async ({ text, threadId }, capability) => {
         this.requireTeamMutation(capability, "send Telegram replies");
-        return this.recordSent(await this.options.telegram.sendRich(capability.context.chatId, text, {
+        const sent = await this.options.telegram.sendRich(capability.context.chatId, text, {
           ...destination(capability.context),
           replyToMessageId: capability.context.originMessageId,
-        }), capability, "operator_tool_reply");
+        });
+        const bound = await this.resolveOutgoingThread(capability, threadId);
+        return {
+          ...this.recordSent(sent, capability, "operator_tool_reply", [], bound.threadId),
+          ...(bound.thread ? { thread: bound.thread } : {}),
+        };
       },
     });
     this.addTool(server, token, {
@@ -1435,11 +1461,61 @@ export class OperatorToolServer {
     return automation;
   }
 
+  /**
+   * Package 1.4: an agent-named thread must be real and readable by this owner
+   * before it becomes a routing binding. An unknown or forbidden id is dropped
+   * silently rather than failing the send: the message is the point, the
+   * binding is a bonus, and a thrown error here would cost the owner the text.
+   */
+  private async resolveOutgoingThread(
+    capability: TurnCapability,
+    threadId?: string,
+  ): Promise<{ threadId?: string; thread?: { status: "bound" | "dropped"; reason?: string } }> {
+    if (!threadId) return {};
+    const drop = (reason: string) => {
+      this.options.logger.warn(
+        { errorCode: "OPERATOR_THREAD_BINDING_DROPPED", reason, threadId },
+        "Telegram message sent without the thread binding the agent asked for",
+      );
+      return { thread: { status: "dropped" as const, reason } };
+    };
+    const local = this.options.store.getThread(threadId);
+    if (local) {
+      try {
+        this.requireProjectAccess(capability, local.projectId, false);
+      } catch {
+        return drop("access_denied");
+      }
+      return { threadId: local.id, thread: { status: "bound" as const } };
+    }
+    let remote;
+    try {
+      remote = await this.options.broker.getThread(threadId);
+    } catch (error) {
+      // Neither case may cost the owner the message (it is already sent by the
+      // time we get here), so both degrade to a dropped binding — but they are
+      // reported apart: `not_found` is the agent's own mistake and stays
+      // dropped, `unavailable` is a transient T3 fault the agent may retry.
+      return drop(isMissingThreadError(error) ? "not_found" : "unavailable");
+    }
+    if (!remote) return drop("not_found");
+    try {
+      this.requireProjectAccess(capability, remote.projectId, false);
+    } catch {
+      return drop("access_denied");
+    }
+    // The daemon's reply routing reads the LOCAL store, so a binding it does
+    // not know about would never route a thing. Persist what the broker knows.
+    this.options.store.upsertThread(remote);
+    return { threadId: remote.id, thread: { status: "bound" as const } };
+  }
+
   private recordSent(
     messages: SentMessage[],
     capability: TurnCapability,
     messageType: string,
     artifactIds: string[] = [],
+    threadId?: string,
   ): { sent: Array<{ chatId: number; messageId: number }> } {
     for (const message of messages) {
       capability.sentMessageIds.add(message.messageId);
@@ -1447,11 +1523,15 @@ export class OperatorToolServer {
         chatId: message.chatId,
         messageId: message.messageId,
         operatorTurnId: capability.context.operatorTurnId,
-        relatedThreadIds: [],
+        ...(threadId ? { primaryThreadId: threadId } : {}),
+        relatedThreadIds: threadId ? [threadId] : [],
         artifactIds,
         messageType,
         createdAt: nowIso(),
       });
+      if (threadId) {
+        this.options.store.linkMessageThread(message.chatId, message.messageId, threadId, "operator_output");
+      }
     }
     return { sent: messages.map(({ chatId, messageId }) => ({ chatId, messageId })) };
   }
@@ -1672,6 +1752,15 @@ function boundedJsonText(value: unknown, stringLimit: number): string {
 }
 
 /** Truncate to `limit` code units inclusive of the ellipsis marker. */
+/**
+ * Package 1.4: "this thread does not exist" versus "T3 is down right now".
+ * Only the first may cost the agent its thread binding silently.
+ */
+function isMissingThreadError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error ?? "")).toLowerCase();
+  return /not found|no such thread|unknown thread|does not exist|\b404\b/.test(message);
+}
+
 function boundedText(value: string, limit: number, json = false): string {
   if (value.length <= limit) return value;
   return `${safeSlice(value, limit - 1, json)}…`;

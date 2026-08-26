@@ -83,6 +83,7 @@ const ALLOWED_REACTIONS = new Set([
 
 interface RawUser {
   id: number;
+  is_bot?: boolean;
   username?: string;
   first_name: string;
   last_name?: string;
@@ -1302,6 +1303,9 @@ export function mergeInboundBatch(messages: TelegramMessageInbound[]): TelegramM
             messageId: message.messageId,
             text: message.text,
             ...(message.replyToMessageId ? { replyToMessageId: message.replyToMessageId } : {}),
+            // Package 1.4: the quote traveling with its own part, so a reply
+            // that is not the first message of the batch keeps its context.
+            ...(message.reply ? { reply: message.reply } : {}),
             ...(message.forwardOrigin ? { forwarded: true } : {}),
           })),
         }
@@ -1494,6 +1498,7 @@ function normalizeReply(message: RawMessage): TelegramReplyContext {
   return {
     messageId: message.message_id,
     ...(message.from?.id ? { userId: message.from.id } : {}),
+    ...(message.from?.is_bot ? { fromBot: true } : {}),
     ...(message.from?.username ? { username: message.from.username } : {}),
     ...(message.text || message.caption ? { text: sanitizeUserText(message.text ?? message.caption ?? "").slice(0, 4000) } : {}),
     attachments: normalizeAttachments(message),
