@@ -19,6 +19,10 @@ describe("proactive automations", () => {
       runAt: "2026-08-21T12:00:00.000Z",
     });
     expect(parseAutomationSchedule("every 15m")).toEqual({ type: "interval", intervalMinutes: 15 });
+    expect(parseAutomationSchedule("once 2026-08-21T15:00:00+03:00")).toEqual({
+      type: "once",
+      runAt: "2026-08-21T12:00:00.000Z",
+    });
     const daily = parseAutomationSchedule("daily 09:30 Europe/Moscow");
     expect(firstAutomationRun(daily, new Date("2026-08-21T05:00:00Z"))).toBe("2026-08-21T06:30:00.000Z");
     expect(nextAutomationRun(
@@ -26,6 +30,25 @@ describe("proactive automations", () => {
       "2026-08-21T09:00:00.000Z",
       new Date("2026-08-21T09:31:00.000Z"),
     )).toBe("2026-08-21T09:40:00.000Z");
+  });
+
+  it.each([
+    "once 2026-02-31T09:00:00Z",
+    "once 2026-01-01",
+    "once 2026-01-01T09:00:00",
+    "once 2026-01-01 09:00Z",
+  ])("rejects a once schedule that is not a valid explicit instant: %s", (schedule) => {
+    expect(() => parseAutomationSchedule(schedule)).toThrow(/explicit UTC or offset instant/);
+  });
+
+  it("rejects an impossible direct one-shot schedule before it can be stored", () => {
+    expect(() => createAutomation({
+      ownerId: "42",
+      name: "Impossible",
+      prompt: "never normalize this",
+      schedule: { type: "once", runAt: "2026-02-31T09:00:00Z" },
+      chatId: 7,
+    })).toThrow(/explicit UTC or offset instant/);
   });
 
   it("defaults a zone-less daily schedule to UTC rather than the host clock", () => {
@@ -80,6 +103,9 @@ describe("proactive automations", () => {
     ["FREQ=DAILY;UNTIL=20260825T090000", /UNTIL/],
     ["FREQ=DAILY;UNTIL=2026-08-25T09:00:00", /UNTIL/],
     ["FREQ=DAILY;UNTIL=2026-08-25", /UNTIL/],
+    ["FREQ=DAILY;", /must look/i],
+    ["FREQ=DAILY;;INTERVAL=2", /must look/i],
+    [";FREQ=DAILY", /must look/i],
   ])("rejects a partly malformed rule: %s", (rrule, message) => {
     expect(() => parseRrule(rrule)).toThrow(message);
   });
@@ -150,6 +176,31 @@ describe("proactive automations", () => {
       schedule: { type: "daily", timeOfDay: "25:00", timeZone: "UTC" },
       chatId: 7,
     })).toThrow(/HH:MM/);
+    expect(() => createAutomation({
+      ownerId: "42",
+      name: "too sparse",
+      prompt: "never run",
+      schedule: { type: "interval", intervalMinutes: 525_601 },
+      chatId: 7,
+    })).toThrow(/1\.\.525600/);
+    expect(() => createAutomation({
+      ownerId: "42",
+      name: "   ",
+      prompt: "never run",
+      schedule: { type: "interval", intervalMinutes: 5 },
+      chatId: 7,
+    })).toThrow(/name cannot be empty/);
+    const valid = createAutomation({
+      ownerId: "42",
+      name: "valid",
+      prompt: "prompt",
+      schedule: { type: "interval", intervalMinutes: 5 },
+      chatId: 7,
+    });
+    expect(() => updateAutomation(valid, { prompt: "  " })).toThrow(/prompt cannot be empty/);
+    expect(() => updateAutomation(valid, {
+      schedule: { type: "interval", intervalMinutes: 525_601 },
+    })).toThrow(/1\.\.525600/);
   });
 
   it("rejects escalation on non-reminder automations", () => {

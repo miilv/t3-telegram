@@ -1723,9 +1723,20 @@ message.
 
 Reminders extend this engine (`kind='reminder'`); there is no second scheduler.
 Their typed `appEvent` is a trusted system/app envelope outside the untrusted
-owner-message fence and gets a normal Operator turn with tools but no full
-now/memory push. It never masquerades as owner speech or advances the owner's
-pause baseline. An escalating reminder creates a typed daemon `waiting` item in
+owner-message fence and gets a normal Operator turn with a short prompt context
+and no full now/memory push. Because an owner message can preempt this turn, its
+capability fails closed to a replay-safe surface: reads plus durable
+`journal.note`, `now.update`, `scheduler.*`, and `calendar.create_event`
+mutations. Remote email/Telegram sends, T3 dispatch/mutation, policy/global
+memory writes, and file materialization are unavailable: none has a crash-safe
+remote idempotency boundary, so exposing them would duplicate side effects when
+the durable app ingress replays. The app envelope tells the Operator to report
+that limitation when a stored instruction asks for one of those actions.
+
+The app turn never masquerades as owner speech or advances the owner's pause
+baseline. A newer owner message preempts it and is served first; the app ingress
+is requeued and eventually produces one final rather than being marked
+complete. An escalating reminder creates a typed daemon `waiting` item in
 the fire transaction. Its owner may narrowly close that item; ordinary daemon
 thread projections remain unclosable. At most one repeat is reserved durably,
 only after 15 minutes, post-fire authorised-human activity, completion of the
@@ -1737,7 +1748,12 @@ key. Delete uses a typed local approval target and a durable approval outbox
 card; accepted, declined, expired and superseded replays remain distinct.
 
 Failure backoff: `min(2^(failures-1), 60)` minutes, paused at 5 consecutive
-failures. The owner notice uses the normal durable Telegram outbox.
+failures. The owner notice uses the normal durable Telegram outbox. Provider or
+app-runtime failure requeues the same ingress. On the eighth failed attempt the
+background job and linked automation run become `failed`, an open reminder
+acknowledgement is retired, `automation.delivery.failed` is recorded, and one
+stable non-reply owner notice is enqueued; the occurrence is never labelled
+delivered.
 
 ---
 

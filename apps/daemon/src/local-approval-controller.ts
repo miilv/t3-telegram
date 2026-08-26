@@ -95,11 +95,7 @@ export class LocalApprovalController {
     }
     this.options.store.setRuntimeState(`approval_requested_at:${id}`, nowIso());
     if (mayAutoApprove(risk, this.options.approvalAutoAllow())) {
-      await this.apply(approval.target);
-      this.options.store.resolveLocalApproval(id, "auto-accepted");
-      this.options.store.appendEvent("approval.resolved", {
-        payload: { approvalId: id, decision: "accept", automatic: true, risk, local: true },
-      });
+      await this.decide(id, "auto-accepted");
       return { applied: true, outcome: "accepted" };
     }
     const evicted = await this.options.enforcePendingCap(input.chatId, id);
@@ -127,18 +123,14 @@ export class LocalApprovalController {
     return { applied: false, outcome: "pending" };
   }
 
-  async apply(target: LocalApprovalTarget): Promise<string> {
-    const automation = this.options.store.getAutomation(target.automationId);
-    if (!automation || automation.status === "deleted") return "Автоматизация уже удалена.";
-    this.options.store.updateAutomationStatus(target.automationId, "deleted");
-    this.options.store.appendEvent("automation.status.updated", {
-      payload: {
-        automationId: target.automationId,
-        status: "deleted",
-        actorUserId: target.actorUserId,
-        confirmed: true,
-      },
-    });
+  async decide(
+    approvalId: string,
+    decision: "accept" | "acceptForSession" | "auto-accepted" | "decline",
+  ): Promise<string> {
+    const result = this.options.store.finalizeLocalAutomationDelete(approvalId, decision);
+    if (!result.applied) return "Отменено.";
+    const automation = result.automation;
+    if (!automation) return "Автоматизация уже удалена.";
     return `${kindWord(automation)} **${escapeMarkdown(automation.name)}**: удалена.`;
   }
 }

@@ -21,8 +21,13 @@ describe("automation app service", () => {
       "Дата 2026-08-26T06:30",
       "Дата 2026-08-26 06:30 +03:00",
       "Дата 2026-08-26 06:30 GMT",
+      "Дата 2026-08-26T06:30:00.123456Z",
+      "Дата 2026-08-26T06:30:00.123456789+03:00",
+      "Дата 20260826T063000Z",
     ]) {
-      expect(containsMachineTimestamp(guardAutomationAppOutput(machine, "Europe/Moscow"))).toBe(false);
+      const guarded = guardAutomationAppOutput(machine, "Europe/Moscow");
+      expect(containsMachineTimestamp(guarded)).toBe(false);
+      expect(guarded).not.toMatch(/\.\d{4,9}(?:Z|[+-]\d{2}:?\d{2})/u);
     }
     const kiritimati = guardAutomationAppOutput("Дата 2026-08-26", "Pacific/Kiritimati");
     expect(containsMachineTimestamp(kiritimati)).toBe(false);
@@ -93,13 +98,34 @@ describe("automation app service", () => {
     // backed off: its repeat must not overtake the first delivery.
     expect(service.escalateUnacknowledged()).toBe(0);
     const originalJob = store.listBackgroundJobs("telegram_ingress")[0]!;
-    store.completeAutomationRunByJob(originalJob.id);
+    store.completeTelegramIngressJob(originalJob.id);
+    const completedAck = store.listOpenReminderAcknowledgements()[0]!;
+    expect(completedAck.origin).toMatchObject({
+      completedAt: expect.any(String),
+      snapshot: { appEvent: { instruction: "Take medicine", mode: "fire" } },
+    });
+    // The acknowledgement outlives both journal retention windows. Its repeat
+    // must still use the immutable fire snapshot, not the automation's edited
+    // prompt or a prunable background job/run row.
+    store.db.prepare("UPDATE background_jobs SET updated_at=? WHERE id=?")
+      .run(completedAck.createdAt, originalJob.id);
+    store.db.prepare("UPDATE automation_runs SET created_at=? WHERE background_job_id=?")
+      .run(completedAck.createdAt, originalJob.id);
+    const live = store.getAutomation(automation.id)!;
+    store.saveAutomation({ ...live, prompt: "Changed after the original fire" });
+    now = new Date(firedAt + 100 * 24 * 60 * 60_000);
+    store.setRuntimeState("human_last_message_at:42", new Date(now.getTime() - 60_000).toISOString());
+    const pruned = store.pruneJournals(now);
+    expect(pruned.backgroundJobs).toBe(1);
+    expect(pruned.automationRuns).toBe(1);
     expect(service.escalateUnacknowledged()).toBe(1);
-    store.db.prepare("DELETE FROM automation_runs").run();
     expect(service.escalateUnacknowledged()).toBe(0);
     const jobs = store.listBackgroundJobs<{ update: { appEvent?: { mode?: string } } }>("telegram_ingress");
-    expect(jobs).toHaveLength(2);
-    expect(jobs.find((job) => job.payload.update.appEvent?.mode === "escalation")).toBeDefined();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.payload.update.appEvent).toMatchObject({
+      mode: "escalation",
+      instruction: "Take medicine",
+    });
     store.close();
   });
 });

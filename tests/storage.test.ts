@@ -170,6 +170,114 @@ describe("OperatorStore", () => {
     store.close();
   });
 
+  it("atomically finalizes a local delete with its approval and audit, and heals the legacy crash cut", () => {
+    const store = tempStore();
+    const automation = createAutomation({
+      id: "automation_atomic_delete",
+      ownerId: "42",
+      name: "Atomic delete",
+      prompt: "prompt",
+      schedule: { type: "interval", intervalMinutes: 5 },
+      chatId: 7,
+    });
+    store.saveAutomation(automation);
+    const approval = store.saveLocalApproval({
+      id: "approval_atomic_delete",
+      requestKey: "delete:atomic",
+      target: { kind: "automation_delete", automationId: automation.id, actorUserId: "42" },
+      payload: { title: automation.name, summary: "Delete?" },
+      chatId: 7,
+      messageId: 100,
+    });
+    store.resolveLocalApproval(approval.id, "deciding");
+    store.db.exec(`
+      CREATE TEMP TRIGGER abort_local_finalize
+      BEFORE UPDATE OF status ON pending_local_approvals
+      WHEN NEW.id='approval_atomic_delete' AND NEW.status='accept'
+      BEGIN SELECT RAISE(ABORT, 'simulated crash'); END
+    `);
+    expect(() => store.finalizeLocalAutomationDelete(approval.id, "accept")).toThrow(/simulated crash/);
+    expect(store.getAutomation(automation.id)?.status).toBe("active");
+    expect(store.getLocalApproval(approval.id)?.status).toBe("deciding");
+    expect(store.listDaemonEvents({ typePrefixes: ["automation.status.updated", "approval.resolved"] }))
+      .toHaveLength(0);
+    store.db.exec("DROP TRIGGER abort_local_finalize");
+
+    expect(store.finalizeLocalAutomationDelete(approval.id, "accept")).toMatchObject({ applied: true });
+    expect(store.getAutomation(automation.id)?.status).toBe("deleted");
+    expect(store.getLocalApproval(approval.id)?.status).toBe("accept");
+    expect(store.listDaemonEvents({ typePrefixes: ["automation.status.updated"] })).toHaveLength(1);
+    expect(store.listDaemonEvents({ typePrefixes: ["approval.resolved"] })).toHaveLength(1);
+
+    const legacy = createAutomation({
+      id: "automation_legacy_delete_cut",
+      ownerId: "42",
+      name: "Legacy cut",
+      prompt: "prompt",
+      schedule: { type: "interval", intervalMinutes: 5 },
+      chatId: 7,
+    });
+    store.saveAutomation(legacy);
+    const legacyApproval = store.saveLocalApproval({
+      id: "approval_legacy_delete_cut",
+      requestKey: "delete:legacy-cut",
+      target: { kind: "automation_delete", automationId: legacy.id, actorUserId: "42" },
+      payload: { title: legacy.name, summary: "Delete?" },
+      chatId: 7,
+      messageId: 101,
+    });
+    store.resolveLocalApproval(legacyApproval.id, "deciding");
+    // Exact old crash state: the action landed, but approval/audit did not.
+    store.updateAutomationStatus(legacy.id, "deleted");
+    expect(store.finalizeLocalAutomationDelete(legacyApproval.id, "accept")).toMatchObject({ applied: true });
+    expect(store.getLocalApproval(legacyApproval.id)?.status).toBe("accept");
+    expect(store.listDaemonEvents({ typePrefixes: ["automation.status.updated"] })).toHaveLength(2);
+
+    const expiredApproval = store.saveLocalApproval({
+      id: "approval_retire_atomic",
+      requestKey: "delete:retire-atomic",
+      target: { kind: "automation_delete", automationId: legacy.id, actorUserId: "42" },
+      payload: { title: "Retire", summary: "Expire?" },
+      chatId: 7,
+      messageId: 102,
+    });
+    store.resolveLocalApproval(expiredApproval.id, "expiring");
+    store.db.exec(`
+      CREATE TEMP TRIGGER abort_local_retirement
+      BEFORE INSERT ON daemon_events
+      WHEN NEW.event_type='approval.resolved' AND NEW.payload_json LIKE '%approval_retire_atomic%'
+      BEGIN SELECT RAISE(ABORT, 'simulated retirement crash'); END
+    `);
+    expect(() => store.finalizeLocalApprovalRetirement(expiredApproval.id, "expired"))
+      .toThrow(/simulated retirement crash/);
+    expect(store.getLocalApproval(expiredApproval.id)?.status).toBe("expiring");
+    store.db.exec("DROP TRIGGER abort_local_retirement");
+    expect(store.finalizeLocalApprovalRetirement(expiredApproval.id, "expired")).toMatchObject({
+      applied: true,
+      approval: { status: "expired" },
+    });
+
+    const supersededApproval = store.saveLocalApproval({
+      id: "approval_retire_legacy_cut",
+      requestKey: "delete:retire-legacy",
+      target: { kind: "automation_delete", automationId: legacy.id, actorUserId: "42" },
+      payload: { title: "Retire", summary: "Supersede?" },
+      chatId: 7,
+      messageId: 103,
+    });
+    store.resolveLocalApproval(supersededApproval.id, "expiring");
+    // Exact historical cut: status committed, audit/outcome did not.
+    store.resolveLocalApproval(supersededApproval.id, "superseded", "expiring");
+    expect(store.finalizeLocalApprovalRetirement(supersededApproval.id, "superseded")).toMatchObject({
+      applied: true,
+      approval: { status: "superseded" },
+    });
+    const retirementEvents = store.listDaemonEvents({ typePrefixes: ["approval.resolved"] })
+      .filter((event) => [expiredApproval.id, supersededApproval.id].includes(String(event.payload.approvalId)));
+    expect(retirementEvents).toHaveLength(2);
+    store.close();
+  });
+
   it("persists message mappings idempotently and restores reply context", () => {
     const store = tempStore();
     const createdAt = nowIso();

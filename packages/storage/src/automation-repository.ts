@@ -9,7 +9,8 @@ import type {
   NowSource,
   NowStatus,
 } from "../../shared/src/index.js";
-import { NOW_SECTIONS, NOW_STATUSES, newId, nowIso } from "../../shared/src/index.js";
+import type { ReminderAcknowledgementSnapshot } from "../../shared/src/index.js";
+import { newId, nowIso } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
 
@@ -203,7 +204,11 @@ export class AutomationRepository {
     ingressPayload:
       | T
       | ((identity: { runId: string; jobId: string; acknowledgementItemId?: string }) => T);
-    acknowledgement?: { ownerId: string; content: string };
+    acknowledgement?: {
+      ownerId: string;
+      content: string;
+      snapshot?: ReminderAcknowledgementSnapshot | ((payload: T) => ReminderAcknowledgementSnapshot);
+    };
   }): { runId: string; jobId: string; inserted: boolean; acknowledgementItem?: NowItem } {
     return this.transaction(() => {
       const runId = stableAutomationRunId(input.automation.id, input.scheduledFor);
@@ -250,6 +255,9 @@ export class AutomationRepository {
             : input.ingressPayload;
         this.insertIngressJob(jobId, input.automation.id, input.scheduledFor, ingressPayload, createdAt);
         if (input.acknowledgement && acknowledgementItemId) {
+          const snapshot = typeof input.acknowledgement.snapshot === "function"
+            ? input.acknowledgement.snapshot(ingressPayload)
+            : input.acknowledgement.snapshot;
           this.hooks.putNowItem(
             {
               id: acknowledgementItemId,
@@ -263,6 +271,7 @@ export class AutomationRepository {
                 kind: "reminder_acknowledgement",
                 automationId: input.automation.id,
                 scheduledFor: input.scheduledFor,
+                ...(snapshot ? { snapshot } : {}),
               },
             },
             createdAt,
@@ -372,12 +381,15 @@ export class AutomationRepository {
   listOpenAcknowledgements(): NowItem[] {
     const rows = this.db
       .prepare(`
-        SELECT * FROM now_items
+        SELECT id FROM now_items
         WHERE origin_kind='reminder_acknowledgement' AND status!='closed' AND escalated_at IS NULL
         ORDER BY created_at ASC
       `)
       .all() as Row[];
-    return rows.map(rowToNowItem);
+    return rows.flatMap((row) => {
+      const item = this.hooks.getNowItem(String(row.id));
+      return item ? [item] : [];
+    });
   }
 
   completeRunByJob(jobId: string): void {
@@ -393,6 +405,62 @@ export class AutomationRepository {
       this.db
         .prepare("UPDATE automation_runs SET status='completed',completed_at=? WHERE background_job_id=?")
         .run(at, jobId);
+      this.db
+        .prepare(`
+          UPDATE now_items SET origin_completed_at=?,updated_at=?
+          WHERE origin_kind='reminder_acknowledgement' AND origin_job=?
+        `)
+        .run(at, at, jobId);
+    });
+  }
+
+  /**
+   * Retry a synthetic app ingress as one linked unit. On the terminal attempt
+   * the occurrence is explicitly failed and its acknowledgement is retired;
+   * it is never mislabeled completed/delivered.
+   */
+  retryIngressJob(jobId: string, error: string, maxAttempts = 8): boolean {
+    return this.transaction(() => {
+      const job = this.db.prepare("SELECT attempts FROM background_jobs WHERE id=?").get(jobId) as Row | undefined;
+      const attempts = Number(job?.attempts ?? 0) + 1;
+      const at = nowIso();
+      if (attempts < maxAttempts) {
+        const delayMs = Math.min(60_000, 1_000 * 2 ** Math.min(attempts - 1, 6));
+        this.db.prepare(`
+          UPDATE background_jobs SET status='pending',attempts=?,last_error=?,run_after=?,updated_at=?
+          WHERE id=?
+        `).run(
+          attempts,
+          error.slice(0, 1_000),
+          new Date(Date.now() + delayMs).toISOString(),
+          at,
+          jobId,
+        );
+        return false;
+      }
+      this.db.prepare(`
+        UPDATE background_jobs SET status='failed',attempts=?,last_error=?,updated_at=? WHERE id=?
+      `).run(attempts, error.slice(0, 1_000), at, jobId);
+      const run = this.db.prepare(`
+        SELECT automation_id,scheduled_for FROM automation_runs WHERE background_job_id=?
+      `).get(jobId) as Row | undefined;
+      this.db.prepare(`
+        UPDATE automation_runs SET status='failed',completed_at=? WHERE background_job_id=?
+      `).run(at, jobId);
+      this.db.prepare(`
+        UPDATE now_items SET status='closed',updated_at=?
+        WHERE origin_kind='reminder_acknowledgement' AND origin_job=? AND status!='closed'
+      `).run(at, jobId);
+      this.hooks.appendEvent("automation.delivery.failed", {
+        correlationId: run ? stableAutomationRunId(String(run.automation_id), String(run.scheduled_for)) : jobId,
+        payload: {
+          jobId,
+          attempts,
+          errorCode: error.slice(0, 1_000),
+          ...(run ? { automationId: String(run.automation_id), scheduledFor: String(run.scheduled_for) } : {}),
+        },
+      });
+      return true;
     });
   }
 
@@ -462,36 +530,6 @@ function rowToAutomation(row: Row): Automation {
       ? { consecutiveFailures: Number(row.consecutive_failures) }
       : {}),
     ...(row.claim_token ? { claimToken: String(row.claim_token) } : {}),
-  };
-}
-
-function rowToNowItem(row: Row): NowItem {
-  const section = String(row.section);
-  const status = String(row.status ?? "open");
-  return {
-    id: String(row.id),
-    ownerId: String(row.owner_id),
-    section: (NOW_SECTIONS as readonly string[]).includes(section) ? (section as NowSection) : "next",
-    content: String(row.content),
-    source: String(row.source) === "daemon" ? "daemon" : "agent",
-    ...(row.thread_ref ? { threadRef: String(row.thread_ref) } : {}),
-    ...(row.origin_job ? { originJob: String(row.origin_job) } : {}),
-    ...(row.create_seq === null || row.create_seq === undefined ? {} : { createSeq: Number(row.create_seq) }),
-    ...(row.origin_kind === "reminder_acknowledgement" && row.origin_id && row.origin_run_at
-      ? {
-          origin: {
-            kind: "reminder_acknowledgement" as const,
-            automationId: String(row.origin_id),
-            scheduledFor: String(row.origin_run_at),
-          },
-        }
-      : {}),
-    status: (NOW_STATUSES as readonly string[]).includes(status) ? (status as NowStatus) : "open",
-    ...(row.journal_ref ? { journalRef: String(row.journal_ref) } : {}),
-    ...(row.valid_until ? { validUntil: String(row.valid_until) } : {}),
-    ...(row.escalated_at ? { escalatedAt: String(row.escalated_at) } : {}),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
   };
 }
 

@@ -51,8 +51,9 @@ export function parseRrule(input: string): ParsedRrule {
   const text = input.trim().replace(/^RRULE:/i, "");
   if (!text) throw new Error(RRULE_SYNTAX_HELP);
   const parts = new Map<string, string>();
-  for (const chunk of text.split(";")) {
-    if (!chunk.trim()) continue;
+  const chunks = text.split(";");
+  if (chunks.some((chunk) => !chunk.trim())) throw new Error(RRULE_SYNTAX_HELP);
+  for (const chunk of chunks) {
     const separator = chunk.indexOf("=");
     if (separator < 0) throw new Error(RRULE_SYNTAX_HELP);
     const key = chunk.slice(0, separator).trim().toUpperCase();

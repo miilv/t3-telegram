@@ -118,6 +118,14 @@ export class LocalApprovalRepository {
     });
   }
 
+  listAll(): PendingLocalApproval[] {
+    return (this.db.prepare("SELECT id FROM pending_local_approvals ORDER BY created_at,id").all() as Row[])
+      .flatMap((row) => {
+        const approval = this.get(String(row.id));
+        return approval ? [approval] : [];
+      });
+  }
+
   listStaleClaims(claimedBefore: string): PendingLocalApproval[] {
     return (this.db.prepare(
       "SELECT id FROM pending_local_approvals WHERE status IN ('expiring','deciding') AND updated_at < ? ORDER BY created_at,id",

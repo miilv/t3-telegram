@@ -30,6 +30,7 @@ import type {
   OperatorNote,
   Project,
   ProviderPerformance,
+  ReminderAcknowledgementSnapshot,
   ReplyContext,
   TeamRole,
   TelegramMessageRecord,
@@ -276,6 +277,8 @@ export class OperatorStore {
       ["origin_kind", "TEXT"],
       ["origin_id", "TEXT"],
       ["origin_run_at", "TEXT"],
+      ["origin_snapshot_json", "TEXT"],
+      ["origin_completed_at", "TEXT"],
       ["escalated_at", "TEXT"],
     ]);
     // --- end package 3.3 ---
@@ -541,7 +544,11 @@ export class OperatorStore {
     ingressPayload:
       | T
       | ((identity: { runId: string; jobId: string; acknowledgementItemId?: string }) => T);
-    acknowledgement?: { ownerId: string; content: string };
+    acknowledgement?: {
+      ownerId: string;
+      content: string;
+      snapshot?: ReminderAcknowledgementSnapshot | ((payload: T) => ReminderAcknowledgementSnapshot);
+    };
   }): { runId: string; jobId: string; inserted: boolean; acknowledgementItem?: NowItem } {
     return this.automations.dispatchRun(input);
   }
@@ -605,6 +612,10 @@ export class OperatorStore {
   /** One terminal commit for an ingress job and the automation run it carries. */
   completeTelegramIngressJob(jobId: string): void {
     this.automations.completeIngressJob(jobId);
+  }
+
+  retryAutomationIngressJob(jobId: string, error: string, maxAttempts = 8): boolean {
+    return this.automations.retryIngressJob(jobId, error, maxAttempts);
   }
 
   isAutomationRunCompleted(automationId: string, scheduledFor: string): boolean {
@@ -1274,9 +1285,9 @@ export class OperatorStore {
         .prepare(`
           INSERT INTO now_items(
             id,owner_id,section,content,source,thread_ref,origin_job,create_seq,
-            origin_kind,origin_id,origin_run_at,status,journal_ref,valid_until,created_at,updated_at
-            ,escalated_at
-          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            origin_kind,origin_id,origin_run_at,origin_snapshot_json,origin_completed_at,
+            status,journal_ref,valid_until,created_at,updated_at,escalated_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         `)
         .run(
           id,
@@ -1290,6 +1301,8 @@ export class OperatorStore {
           input.origin?.kind ?? null,
           input.origin?.automationId ?? null,
           input.origin?.scheduledFor ?? null,
+          input.origin?.snapshot ? JSON.stringify(input.origin.snapshot) : null,
+          input.origin?.completedAt ?? null,
           input.status ?? "open",
           null,
           input.validUntil ?? null,
@@ -1955,6 +1968,106 @@ export class OperatorStore {
     return this.localApprovals.listPending(chatId);
   }
 
+  listLocalApprovals(): PendingLocalApproval[] {
+    return this.localApprovals.listAll();
+  }
+
+  /**
+   * One commit for a confirmed daemon-owned delete: action, approval terminal
+   * state and both audit facts. The processed marker also heals the legacy
+   * crash state where the automation was deleted before its audit was written.
+   */
+  finalizeLocalAutomationDelete(
+    approvalId: string,
+    decision: "accept" | "acceptForSession" | "auto-accepted" | "decline",
+  ): { approval: PendingLocalApproval; automation?: Automation; applied: boolean } {
+    return this.transaction(() => {
+      const approval = this.localApprovals.get(approvalId);
+      if (!approval) throw new Error("local approval not found");
+      const terminal = !["pending", "deciding", "expiring"].includes(approval.status);
+      if (terminal) {
+        return {
+          approval,
+          ...(this.automations.get(approval.target.automationId)
+            ? { automation: this.automations.get(approval.target.automationId)! }
+            : {}),
+          applied: ["accept", "acceptForSession", "auto-accepted"].includes(approval.status),
+        };
+      }
+      if (approval.status === "expiring") throw new Error("local approval is expiring");
+      const accepted = decision !== "decline";
+      const automation = this.automations.get(approval.target.automationId);
+      const mutationKey = `local-approval-finalize:${approval.id}`;
+      const firstFinalization = this.claimEvent(mutationKey);
+      if (accepted && automation) {
+        this.automations.updateStatus(automation.id, "deleted");
+      }
+      if (!this.localApprovals.resolve(approval.id, decision, ["pending", "deciding"])) {
+        throw new Error("local approval lost its decision claim");
+      }
+      if (firstFinalization) {
+        if (accepted && automation) {
+          this.appendEvent("automation.status.updated", {
+            ...(automation.projectId ? { projectId: automation.projectId } : {}),
+            payload: {
+              automationId: automation.id,
+              status: "deleted",
+              actorUserId: approval.target.actorUserId,
+              confirmed: true,
+            },
+          });
+        }
+        this.appendEvent("approval.resolved", {
+          payload: {
+            approvalId: approval.id,
+            decision: accepted ? "accept" : "decline",
+            local: true,
+            ...(decision === "auto-accepted" ? { automatic: true } : {}),
+          },
+        });
+      }
+      return {
+        approval: this.localApprovals.get(approval.id)!,
+        ...(automation ? { automation: this.automations.get(automation.id) ?? automation } : {}),
+        applied: accepted,
+      };
+    });
+  }
+
+  /**
+   * Retire an unanswered daemon-owned confirmation together with its audit.
+   * Accepting the already-terminal cause heals the historical crash cut where
+   * the status committed before `approval.resolved`; the stable processed
+   * marker prevents a restart from duplicating that event.
+   */
+  finalizeLocalApprovalRetirement(
+    approvalId: string,
+    cause: "expired" | "superseded",
+  ): { approval: PendingLocalApproval; applied: boolean } {
+    return this.transaction(() => {
+      const approval = this.localApprovals.get(approvalId);
+      if (!approval) throw new Error("local approval not found");
+      if (!["expiring", cause].includes(approval.status)) {
+        return { approval, applied: false };
+      }
+      if (approval.status === "expiring" && !this.localApprovals.resolve(approval.id, cause, "expiring")) {
+        throw new Error("local approval lost its retirement claim");
+      }
+      if (this.claimEvent(`local-approval-retire:${approval.id}:${cause}`)) {
+        this.appendEvent("approval.resolved", {
+          payload: {
+            approvalId: approval.id,
+            decision: "decline",
+            automatic: true,
+            reason: cause === "expired" ? "approval expired" : "approval superseded",
+            local: true,
+          },
+        });
+      }
+      return { approval: this.localApprovals.get(approval.id)!, applied: true };
+    });
+  }
+
   listPendingApprovalRequests(chatId?: number): PendingApprovalRequest[] {
     return [...this.listPendingApprovals(chatId), ...this.listPendingLocalApprovals(chatId)]
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
@@ -2353,15 +2466,28 @@ export class OperatorStore {
     ).map((row) => rowToTelegramOutbox<T>(row));
   }
 
-  markTelegramOutboxDelivered(id: string, messageIds: number[]): void {
-    const now = nowIso();
-    this.db
-      .prepare(`
-        UPDATE telegram_outbox SET status='delivered',telegram_message_ids_json=?,
-          last_error_code=NULL,last_error_detail=NULL,updated_at=?,delivered_at=?
-        WHERE id=?
-      `)
-      .run(JSON.stringify(messageIds), now, now, id);
+  markTelegramOutboxDelivered(
+    id: string,
+    messageIds: number[],
+    localApproval?: { approvalId: string; chatId: number; messageId: number },
+  ): void {
+    this.transaction(() => {
+      const now = nowIso();
+      this.db
+        .prepare(`
+          UPDATE telegram_outbox SET status='delivered',telegram_message_ids_json=?,
+            last_error_code=NULL,last_error_detail=NULL,updated_at=?,delivered_at=?
+          WHERE id=?
+        `)
+        .run(JSON.stringify(messageIds), now, now, id);
+      if (localApproval) {
+        this.localApprovals.updateMessage(
+          localApproval.approvalId,
+          localApproval.chatId,
+          localApproval.messageId,
+        );
+      }
+    });
   }
 
   retryTelegramOutbox(id: string, errorCode: string, detail: string, retryAfterMs?: number): void {
@@ -2844,6 +2970,10 @@ function rowToNowItem(row: Row): NowItem {
             kind: "reminder_acknowledgement" as const,
             automationId: String(row.origin_id),
             scheduledFor: String(row.origin_run_at),
+            ...(row.origin_snapshot_json
+              ? { snapshot: JSON.parse(String(row.origin_snapshot_json)) as ReminderAcknowledgementSnapshot }
+              : {}),
+            ...(row.origin_completed_at ? { completedAt: String(row.origin_completed_at) } : {}),
           },
         }
       : {}),

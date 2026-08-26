@@ -1,8 +1,16 @@
 import type { Logger } from "pino";
 import { nextAutomationRun } from "../../../packages/automations/src/index.js";
 import { classifyOperationalError } from "../../../packages/observability/src/index.js";
-import type { Automation, OperatorAppEvent } from "../../../packages/shared/src/index.js";
-import { containsMachineTimestamp, humanMoment } from "../../../packages/shared/src/index.js";
+import type {
+  Automation,
+  OperatorAppEvent,
+  ReminderAcknowledgementSnapshot,
+} from "../../../packages/shared/src/index.js";
+import {
+  containsMachineTimestamp,
+  humanMoment,
+  parseExplicitInstant,
+} from "../../../packages/shared/src/index.js";
 import type { OperatorStore } from "../../../packages/storage/src/index.js";
 import type { TelegramInbound } from "../../../packages/telegram/src/index.js";
 
@@ -38,6 +46,7 @@ export function buildAutomationAppEnvelope(event: OperatorAppEvent, ownerLanguag
     event.projectId
       ? `Target project: ${event.projectId}.`
       : "No project is forced; use the normal routing policy.",
+    "This app turn is crash/preemption replayable. Its capability exposes reads plus replay-safe journal, now-state, scheduler, and calendar mutations only. It cannot send email, send/edit/react in Telegram, dispatch or mutate T3 work, change policy/memory, or materialize files. Do not attempt those unavailable side effects; report that limitation in your own voice when the stored instruction requires one.",
     `Stored app instruction:\n${event.instruction}`,
     "Render every time and date for the owner in their configured timezone and in human form — never expose ISO or UTC.",
     event.acknowledgementItemId
@@ -54,27 +63,45 @@ export function buildAutomationAppEnvelope(event: OperatorAppEvent, ownerLanguag
  */
 export function guardAutomationAppOutput(text: string, ownerTimeZone?: string): string {
   let guarded = text.replace(
-    /\b(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?)\s*(Z|UTC|GMT|[+-]\d{2}:?\d{2})?)?\b/gi,
+    /\b(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?)\s*(Z|UTC|GMT|[+-]\d{2}:?\d{2})?)?\b/gi,
     (_value, date: string, clock?: string, rawZone?: string) => {
       const zone = rawZone
-        ? /^(?:Z|UTC|GMT)$/i.test(rawZone) ? "Z" : rawZone
+        ? /^(?:Z|UTC|GMT)$/i.test(rawZone)
+          ? "Z"
+          : rawZone.replace(/^([+-]\d{2})(\d{2})$/u, "$1:$2")
         : "Z";
       if (!clock) return "в указанную дату";
-      const instant = new Date(`${date}T${clock}${zone}`);
-      if (!Number.isFinite(instant.getTime())) return "в указанное время";
-      return humanMoment(instant, ownerTimeZone);
+      try {
+        return humanMoment(parseExplicitInstant(`${date}T${clock}${zone}`), ownerTimeZone);
+      } catch {
+        return "в указанное время";
+      }
     },
   );
   guarded = guarded.replace(
-    /\b\d{1,2}:\d{2}\s*(?:UTC|GMT|Z|[+-]\d{2}:?\d{2})\b/gi,
+    /\b(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})\b/gi,
+    (_value, year: string, month: string, day: string, hour: string, minute: string,
+      second: string, fraction?: string, rawZone?: string) => {
+      const zone = (rawZone ?? "Z").replace(/^([+-]\d{2})(\d{2})$/u, "$1:$2");
+      const instant = `${year}-${month}-${day}T${hour}:${minute}:${second}${fraction ? `.${fraction}` : ""}${zone}`;
+      try {
+        return humanMoment(parseExplicitInstant(instant), ownerTimeZone);
+      } catch {
+        return "в указанное время";
+      }
+    },
+  );
+  guarded = guarded.replace(
+    /\b\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?\s*(?:UTC|GMT|Z|[+-]\d{2}:?\d{2})\b/gi,
     "по местному времени",
   );
   // Explicit postcondition: a future detector expansion fails closed instead
   // of letting a newly recognised machine form leak into Telegram.
   if (containsMachineTimestamp(guarded)) {
     guarded = guarded
+      .replace(/\b\d{8}T\d{6}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})\b/gi, "в указанное время")
       .replace(/\b\d{4}-\d{2}-\d{2}\b/g, "в указанную дату")
-      .replace(/\b\d{1,2}:\d{2}\s*(?:UTC|GMT|Z|[+-]\d{2}:?\d{2})\b/gi, "по местному времени");
+      .replace(/\b\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?\s*(?:UTC|GMT|Z|[+-]\d{2}:?\d{2})\b/gi, "по местному времени");
   }
   return guarded;
 }
@@ -126,6 +153,8 @@ export class AutomationAppService {
                 acknowledgement: {
                   ownerId: automation.ownerId,
                   content: `Reminder "${automation.name}" delivered — waiting for acknowledgement`,
+                  snapshot: (payload: AutomationIngressPayload) =>
+                    reminderSnapshot(payload.update),
                 },
               }
             : {}),
@@ -195,16 +224,14 @@ export class AutomationAppService {
       if (!Number.isFinite(lastHumanActivity) || lastHumanActivity <= createdAt) continue;
       // The acknowledgement is reserved atomically with the ingress job, but
       // it is not eligible for a repeat until that original app turn has
-      // completed. A backed-off first delivery must never be overtaken by its
-      // escalation.
-      if (!this.options.store.isAutomationRunCompleted(origin.automationId, origin.scheduledFor)) continue;
+      // completed. This marker and the immutable fire snapshot live on the
+      // acknowledgement itself because queue/run journals are pruned while an
+      // open acknowledgement may wait indefinitely for the owner's return.
+      if (!origin.completedAt || !origin.snapshot) continue;
       const automation = this.options.store.getAutomation(origin.automationId);
       if (!automation || automation.status === "deleted" || automation.status === "paused") continue;
       if (this.options.humanTurnActive?.(item.ownerId, automation.chatId)) continue;
-      const originalJob = item.originJob
-        ? this.options.store.getBackgroundJob<AutomationIngressPayload>(item.originJob)
-        : undefined;
-      const originalEvent = originalJob?.payload.update.appEvent;
+      const originalEvent = origin.snapshot.appEvent;
       if (!originalEvent || originalEvent.app !== "reminder" || originalEvent.mode !== "fire") continue;
       const dispatch = this.options.store.dispatchAutomationEscalation<AutomationIngressPayload>({
         nowItemId: item.id,
@@ -212,9 +239,24 @@ export class AutomationAppService {
         scheduledFor: origin.scheduledFor,
         ingressPayload: ({ runId }) => ({
           update: {
-            ...originalJob.payload.update,
+            type: "message",
+            updateId: this.options.syntheticMessageId(runId),
+            edited: false,
+            synthetic: true,
+            chatId: origin.snapshot!.chatId,
+            chatType: "private",
+            userId: origin.snapshot!.userId,
+            messageId: this.options.syntheticMessageId(runId),
             messageIds: [this.options.syntheticMessageId(runId)],
             date: Math.floor(now.getTime() / 1_000),
+            text: "(synthetic reminder app event)",
+            attachments: [],
+            ...(origin.snapshot!.messageThreadId
+              ? { messageThreadId: origin.snapshot!.messageThreadId }
+              : {}),
+            ...(origin.snapshot!.directMessagesTopicId
+              ? { directMessagesTopicId: origin.snapshot!.directMessagesTopicId }
+              : {}),
             automationRunId: runId,
             appEvent: {
               ...originalEvent,
@@ -279,4 +321,21 @@ export class AutomationAppService {
         : {}),
     };
   }
+}
+
+function reminderSnapshot(
+  update: Extract<TelegramInbound, { type: "message" }>,
+): ReminderAcknowledgementSnapshot {
+  if (!update.appEvent || update.appEvent.app !== "reminder" || update.appEvent.mode !== "fire") {
+    throw new Error("reminder acknowledgement requires an original reminder fire");
+  }
+  return {
+    appEvent: update.appEvent,
+    chatId: update.chatId,
+    userId: update.userId,
+    ...(update.messageThreadId ? { messageThreadId: update.messageThreadId } : {}),
+    ...(update.directMessagesTopicId
+      ? { directMessagesTopicId: update.directMessagesTopicId }
+      : {}),
+  };
 }

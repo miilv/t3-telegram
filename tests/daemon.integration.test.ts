@@ -461,6 +461,59 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("lets a member confirm their own local delete but rejects another member", async () => {
+    const home = tempDirectory("daemon-local-approval-member-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const automation = createAutomation({
+      id: "automation_member_delete",
+      ownerId: "43",
+      name: "Member reminder",
+      prompt: "prompt",
+      kind: "reminder",
+      schedule: { type: "interval", intervalMinutes: 30 },
+      chatId: 7,
+    });
+    store.saveAutomation(automation);
+    const approval = store.saveLocalApproval({
+      id: "approval_member_delete",
+      requestKey: "member-delete",
+      target: { kind: "automation_delete", automationId: automation.id, actorUserId: "43" },
+      payload: { title: automation.name, summary: "Delete it?", risk: "destructive" },
+      chatId: 7,
+      messageId: 777,
+    });
+    const base = config(home);
+    const teamConfig: Config = {
+      ...base,
+      telegram: { ...base.telegram, users: { 42: "owner", 43: "member", 44: "member" } },
+    };
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(teamConfig, store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(callbackAs(1, "cb_other_member", 777, `a:${compactCallbackToken(approval.id)}:1`, 44));
+    await waitFor(() => telegram.callbackAnswers.some((text) => text.includes("только его автор")));
+    expect(store.getAutomation(automation.id)?.status).toBe("active");
+    expect(store.getLocalApproval(approval.id)?.status).toBe("pending");
+
+    telegram.push(callbackAs(2, "cb_own_member", 777, `a:${compactCallbackToken(approval.id)}:1`, 43));
+    await waitFor(() => store.getAutomation(automation.id)?.status === "deleted");
+    await waitFor(() => telegram.keyboardClears.includes(777));
+    expect(store.getLocalApproval(approval.id)?.status).toBe("accept");
+    expect(telegram.sent.some((entry) => entry.text.includes("Member reminder"))).toBe(true);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("executes due proactive work from durable ingress exactly once", async () => {
     const home = tempDirectory("daemon-automation-");
     const store = tempStore();
@@ -566,6 +619,211 @@ describe("OperatorDaemon product flow", () => {
     expect(runtime.appAttempts).toBe(2);
     expect(telegram.sent.filter((entry) => entry.text === "Напоминание доставлено.")).toHaveLength(1);
     expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  it("fails an app occurrence honestly on its eighth attempt and sends a stable non-reply notice", async () => {
+    const home = tempDirectory("daemon-app-give-up-");
+    const store = tempStore();
+    class AlwaysFailAppRuntime extends FakeRuntime {
+      appAttempts = 0;
+      override async *stream(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        this.prompts.push(input.prompt);
+        if (input.prompt.includes("System input from reminder app")) {
+          this.appAttempts += 1;
+          throw new Error("provider remains unavailable");
+        }
+        yield { type: "result", text: "ok", sessionId: input.sessionId };
+      }
+    }
+    const runtime = new AlwaysFailAppRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const automation = createAutomation({
+      ownerId: "42",
+      name: "Undeliverable",
+      prompt: "This reminder cannot reach the provider",
+      kind: "reminder",
+      escalate: true,
+      schedule: { type: "once", runAt: "2020-01-01T00:00:00.000Z" },
+      chatId: 7,
+      now: new Date("2019-01-01T00:00:00.000Z"),
+    });
+    store.saveAutomation(automation);
+    const claimed = store.claimDueAutomation("2020-01-01T00:00:00.000Z")!;
+    const dispatched = store.dispatchAutomationRun({
+      automation: claimed,
+      scheduledFor: claimed.nextRunAt!,
+      ingressPayload: ({ runId, acknowledgementItemId }) => {
+        const messageId = syntheticNegativeMessageId(runId);
+        return {
+          update: {
+            type: "message" as const,
+            updateId: messageId,
+            edited: false,
+            synthetic: true,
+            automationRunId: runId,
+            appEvent: {
+              app: "reminder" as const,
+              name: automation.name,
+              runId,
+              mode: "fire" as const,
+              instruction: automation.prompt,
+              ...(acknowledgementItemId ? { acknowledgementItemId } : {}),
+            },
+            chatId: 7,
+            chatType: "private" as const,
+            userId: 42,
+            messageId,
+            messageIds: [messageId],
+            date: 1_598_000_000,
+            text: "(synthetic reminder app event)",
+            attachments: [],
+          },
+          processExisting: true,
+          lane: "background" as const,
+          enqueuedAt: "2020-01-01T00:00:00.000Z",
+        };
+      },
+      acknowledgement: {
+        ownerId: "42",
+        content: "Waiting for delivery acknowledgement",
+        snapshot: (payload) => ({
+          appEvent: payload.update.appEvent!,
+          chatId: payload.update.chatId,
+          userId: payload.update.userId,
+        }),
+      },
+    });
+    store.db.prepare("UPDATE background_jobs SET attempts=7 WHERE id=?").run(dispatched.jobId);
+
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    await waitFor(() => store.getBackgroundJob(dispatched.jobId)?.status === "failed", 10_000);
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Undeliverable")), 10_000);
+    expect(runtime.appAttempts).toBe(1);
+    expect(store.getBackgroundJob(dispatched.jobId)).toMatchObject({ status: "failed", attempts: 8 });
+    expect(store.db.prepare("SELECT status FROM automation_runs WHERE id=?").get(dispatched.runId))
+      .toEqual({ status: "failed" });
+    const failedAcknowledgement = store.getNowItem(dispatched.acknowledgementItem!.id)!;
+    expect(failedAcknowledgement.status).toBe("closed");
+    expect(failedAcknowledgement.origin?.completedAt).toBeUndefined();
+    expect(store.getAutomation(automation.id)?.status).toBe("completed");
+    const notice = store.getTelegramOutbox<{ options?: { replyToMessageId?: number } }>(
+      `telegram:automation:${dispatched.runId}:ingress-failed`,
+    );
+    expect(notice?.status).toBe("delivered");
+    expect(notice?.payload.options?.replyToMessageId).toBeUndefined();
+    expect(store.listDaemonEvents({ typePrefixes: ["automation.delivery.failed"] })).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  it("lets owner input preempt an app turn and retries the durable app after the owner reply", async () => {
+    const home = tempDirectory("daemon-app-preempt-");
+    const store = tempStore();
+    class PreemptibleAppRuntime extends FakeRuntime {
+      appAttempts = 0;
+      interrupts = 0;
+      private releaseApp: (() => void) | undefined;
+
+      override async interrupt(): Promise<void> {
+        this.interrupts += 1;
+        this.releaseApp?.();
+      }
+
+      override async *stream(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        this.prompts.push(input.prompt);
+        if (input.prompt.includes("System input from reminder app")) {
+          this.appAttempts += 1;
+          if (this.appAttempts === 1) {
+            yield { type: "text_delta", text: "Недописанное напоминание" };
+            await new Promise<void>((resolve) => { this.releaseApp = resolve; });
+            yield { type: "result", text: "Недописанное напоминание", sessionId: input.sessionId };
+            return;
+          }
+          yield { type: "result", text: "Итоговое напоминание.", sessionId: input.sessionId };
+          return;
+        }
+        if (input.prompt.includes("сначала ответь мне")) {
+          yield { type: "result", text: "Ответ владельцу.", sessionId: input.sessionId };
+          return;
+        }
+        yield { type: "result", text: "ok", sessionId: input.sessionId };
+      }
+    }
+    const runtime = new PreemptibleAppRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const automation = createAutomation({
+      ownerId: "42",
+      name: "Durable reminder",
+      prompt: "Напомни после ответа владельцу",
+      kind: "reminder",
+      schedule: { type: "once", runAt: "2020-01-01T00:00:00.000Z" },
+      chatId: 7,
+      now: new Date("2019-01-01T00:00:00.000Z"),
+    });
+    store.saveAutomation(automation);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    await waitFor(() => runtime.appAttempts === 1, 10_000);
+    telegram.push(message(1, "сначала ответь мне"));
+    await waitFor(() => runtime.interrupts === 1, 10_000);
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Ответ владельцу."), 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await daemon.maintain("retry preempted app");
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Итоговое напоминание."), 10_000);
+
+    const ownerIndex = telegram.sent.findIndex((entry) => entry.text === "Ответ владельцу.");
+    const appIndex = telegram.sent.findIndex((entry) => entry.text === "Итоговое напоминание.");
+    expect(ownerIndex).toBeGreaterThanOrEqual(0);
+    expect(appIndex).toBeGreaterThan(ownerIndex);
+    expect(runtime.appAttempts).toBe(2);
+    expect(telegram.sent.filter((entry) => entry.text === "Итоговое напоминание.")).toHaveLength(1);
+    expect(telegram.sent.some((entry) => entry.text === "Недописанное напоминание")).toBe(false);
+    expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(2);
 
     telegram.finish();
     await run;
@@ -3321,6 +3579,74 @@ describe("OperatorDaemon product flow", () => {
       payload: { title: "Delete automation", summary: "Delete it", risk: "destructive" },
       chatId: 7,
     });
+    store.saveLocalApproval({
+      id: "approval_local_crash_gap",
+      requestKey: "telegram-ingress:delete:crash-gap",
+      target: { kind: "automation_delete", automationId: "automation_missing_2", actorUserId: "42" },
+      payload: { title: "Delete second automation", summary: "Delete it", risk: "destructive" },
+      chatId: 7,
+    });
+    const crashGapOutbox = store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:approval:approval_local_crash_gap:request",
+      chatId: 7,
+      operation: "approval",
+      payload: {
+        text: "Confirm delete",
+        options: {},
+        messageType: "approval",
+        approvalId: "approval_local_crash_gap",
+        localApproval: true,
+      },
+    });
+    // Exact pre-fix crash state: Telegram landed message 444 and the outbox
+    // became terminal, but the process died before the local approval mapping.
+    store.markTelegramOutboxDelivered(crashGapOutbox.id, [444]);
+    const finalizedAutomation = createAutomation({
+      id: "automation_finalized_before_outcome",
+      ownerId: "42",
+      name: "Finalized before outcome",
+      prompt: "prompt",
+      schedule: { type: "interval", intervalMinutes: 10 },
+      chatId: 7,
+    });
+    store.saveAutomation(finalizedAutomation);
+    const finalizedApproval = store.saveLocalApproval({
+      id: "approval_finalized_before_outcome",
+      requestKey: "telegram-ingress:delete:finalized-before-outcome",
+      target: {
+        kind: "automation_delete",
+        automationId: finalizedAutomation.id,
+        actorUserId: "42",
+      },
+      payload: {
+        title: finalizedAutomation.name,
+        summary: "Delete after confirmation",
+        risk: "destructive",
+      },
+      chatId: 7,
+      messageId: 555,
+    });
+    // Exact second crash cut: action + terminal approval + audit committed,
+    // process died before the outcome edit and keyboard cleanup were enqueued.
+    store.finalizeLocalAutomationDelete(finalizedApproval.id, "accept");
+    const expiredLocal = store.saveLocalApproval({
+      id: "approval_expired_before_card",
+      requestKey: "telegram-ingress:delete:expired-before-card",
+      target: { kind: "automation_delete", automationId: "expired_target", actorUserId: "42" },
+      payload: { title: "Expired local action", summary: "Delete expired target", risk: "destructive" },
+      chatId: 7,
+      messageId: 556,
+    });
+    store.resolveLocalApproval(expiredLocal.id, "expired");
+    const supersededLocal = store.saveLocalApproval({
+      id: "approval_superseded_before_card",
+      requestKey: "telegram-ingress:delete:superseded-before-card",
+      target: { kind: "automation_delete", automationId: "superseded_target", actorUserId: "42" },
+      payload: { title: "Superseded local action", summary: "Delete superseded target", risk: "destructive" },
+      chatId: 7,
+      messageId: 557,
+    });
+    store.resolveLocalApproval(supersededLocal.id, "superseded");
     store.saveUserInput({
       id: "input_local_1",
       t3RequestId: "input_t3_1",
@@ -3358,8 +3684,28 @@ describe("OperatorDaemon product flow", () => {
     expect(telegram.userInputs).toHaveLength(1);
     expect(store.getApproval("approval_local_1")?.messageId).toBeDefined();
     expect(store.getLocalApproval("approval_local_delete_1")?.messageId).toBeDefined();
+    expect(store.getLocalApproval("approval_local_crash_gap")?.messageId).toBe(444);
+    expect(store.getAutomation(finalizedAutomation.id)?.status).toBe("deleted");
+    expect(store.getLocalApproval(finalizedApproval.id)?.status).toBe("accept");
     expect(store.listTelegramOutbox(["delivered"]).filter((item) => item.operation === "approval"))
-      .toHaveLength(1);
+      .toHaveLength(2);
+    expect(telegram.sent.some(
+      (entry) => entry.messageId === 555 && entry.text.includes("Finalized before outcome"),
+    )).toBe(true);
+    expect(telegram.keyboardClears).toContain(555);
+    expect(telegram.keyboardClears).toEqual(expect.arrayContaining([556, 557]));
+    expect(telegram.sent.some(
+      (entry) => entry.messageId === 556 && entry.text.includes("истёк без ответа"),
+    )).toBe(true);
+    expect(telegram.sent.some(
+      (entry) => entry.messageId === 557 && entry.text.includes("вытеснен новыми"),
+    )).toBe(true);
+    expect(store.getTelegramOutbox(`telegram:approval:${finalizedApproval.id}:local-outcome`)?.status)
+      .toBe("delivered");
+    expect(store.getTelegramOutbox(`telegram:approval:${expiredLocal.id}:expired`)?.status)
+      .toBe("delivered");
+    expect(store.getTelegramOutbox(`telegram:approval:${supersededLocal.id}:superseded`)?.status)
+      .toBe("delivered");
     expect(store.getUserInput("input_local_1")?.messageId).toBeDefined();
     await daemon.stop();
   });
@@ -5848,6 +6194,99 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   });
+
+  it("does not reserve reminder escalation while human ingress is still preprocessing", async () => {
+    const home = tempDirectory("daemon-reminder-preprocess-race-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const automation = createAutomation({
+      id: "automation_preprocess_guard",
+      ownerId: "42",
+      name: "Acknowledge me",
+      prompt: "Original reminder",
+      kind: "reminder",
+      escalate: true,
+      schedule: { type: "interval", intervalMinutes: 30 },
+      chatId: 7,
+    });
+    store.saveAutomation(automation);
+    const createdAt = new Date(Date.now() - 20 * 60_000).toISOString();
+    const acknowledgement = store.createNowItem({
+      ownerId: "42",
+      section: "waiting",
+      content: "Waiting for acknowledgement",
+      source: "daemon",
+      originJob: "automation-ingress:completed-origin",
+      createSeq: 0,
+      origin: {
+        kind: "reminder_acknowledgement",
+        automationId: automation.id,
+        scheduledFor: createdAt,
+        completedAt: createdAt,
+        snapshot: {
+          appEvent: {
+            app: "reminder",
+            name: automation.name,
+            runId: "original-run",
+            mode: "fire",
+            instruction: automation.prompt,
+          },
+          chatId: 7,
+          userId: 42,
+        },
+      },
+      createdAt,
+    });
+    let releaseMedia!: () => void;
+    const mediaGate = new Promise<void>((resolve) => { releaseMedia = resolve; });
+    let enrichCalls = 0;
+    const media = {
+      enrichInbound: async () => {
+        enrichCalls += 1;
+        await mediaGate;
+        return { transcript: "это ответ на напоминание", artifacts: [], transcriptionProvider: "openai" };
+      },
+    } as unknown as MediaProcessor;
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools, media);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(voiceMessage(1));
+    await waitFor(() => enrichCalls === 1);
+    await daemon.maintain("while owner media is preprocessing");
+    expect(store.getNowItem(acknowledgement.id)?.escalatedAt).toBeUndefined();
+    expect(store.db.prepare(
+      "SELECT count(*) AS count FROM automation_runs WHERE scheduled_for LIKE '%#escalation'",
+    ).get()).toEqual({ count: 0 });
+
+    releaseMedia();
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+    store.closeNowItem(acknowledgement.id, {
+      slugBase: "2026-08-26-reminder-acknowledged",
+      day: "2026-08-26",
+      body: "Owner acknowledged reminder",
+    });
+    await daemon.maintain("after owner turn closed acknowledgement");
+    expect(store.getNowItem(acknowledgement.id)?.escalatedAt).toBeUndefined();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
 
   it("tells the next turn that the previous message was superseded and its work continues (package 1.1)", async () => {
     const home = tempDirectory("daemon-preempt-note-");

@@ -40,7 +40,7 @@ export interface AutomationToolRegistration {
 export function registerAutomationAndCalendarTools(context: AutomationToolRegistration): void {
   const { register, options, now } = context;
   const scheduleSchema = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("once"), runAt: z.string().datetime() }),
+    z.object({ type: z.literal("once"), runAt: z.string().datetime({ offset: true }) }),
     z.object({ type: z.literal("interval"), intervalMinutes: z.number().int().min(1).max(525_600) }),
     z.object({
       type: z.literal("daily"),
@@ -120,13 +120,15 @@ export function registerAutomationAndCalendarTools(context: AutomationToolRegist
       rrule: z.string().trim().max(500).optional(),
       escalate: z.boolean().optional(),
       kind: z.enum(AUTOMATION_KINDS).optional(),
-      projectId: z.string().min(1).optional(),
+      projectId: z.string().min(1).nullable().optional(),
     }),
     handler: (input, capability) => {
       context.requireTeamMutation(capability, "update automations");
       const automation = requireAutomationAccess(capability, input.automationId, context);
       if (automation.status === "deleted") throw new Error("automation not found");
-      if (input.projectId) context.requireProjectAccess(capability, input.projectId, true);
+      if (typeof input.projectId === "string") {
+        context.requireProjectAccess(capability, input.projectId, true);
+      }
       const operationKey = capability.replayKeys.nextAutomationMutation(`update:${automation.id}`);
       const result = options.store.updateAutomationOnce(automation.id, operationKey, (current) =>
         updateAutomation(current, {
@@ -218,8 +220,8 @@ export function registerAutomationAndCalendarTools(context: AutomationToolRegist
     description:
       "List a bounded Google Calendar range. Event prose is fenced as untrusted invite data; malformed rows are isolated and counted.",
     schema: z.object({
-      timeMin: z.string().datetime(),
-      timeMax: z.string().datetime().optional(),
+      timeMin: z.string().datetime({ offset: true }),
+      timeMax: z.string().datetime({ offset: true }).optional(),
       query: z.string().max(500).optional(),
       limit: z.number().int().min(1).max(50).optional(),
     }),
@@ -242,8 +244,8 @@ export function registerAutomationAndCalendarTools(context: AutomationToolRegist
       "Create a retry-safe Google Calendar event. Pass remindMinutesBefore to attach a reminder; escalation requires that reminder.",
     schema: z.object({
       title: z.string().trim().min(1).max(500),
-      start: z.string().datetime(),
-      end: z.string().datetime(),
+      start: z.string().datetime({ offset: true }),
+      end: z.string().datetime({ offset: true }),
       timeZone: z.string().max(100).optional(),
       description: z.string().max(8_000).optional(),
       location: z.string().max(1_000).optional(),
@@ -403,7 +405,7 @@ function calendarCreateMayBeAmbiguous(error: unknown): boolean {
     return error.status === 408 || error.status === 429 || error.status >= 500;
   }
   return error instanceof TypeError || error instanceof SyntaxError ||
-    (error instanceof Error && error.name === "AbortError");
+    (error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name));
 }
 
 function destination(capability: TurnCapability): TelegramDestination {

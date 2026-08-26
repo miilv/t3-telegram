@@ -529,6 +529,50 @@ describe("OperatorToolServer", () => {
         await viewerClient.close().catch(() => undefined);
       }
 
+      const appLease = server.issue({
+        chatId: 777,
+        ownerId: "42",
+        teamRole: "owner",
+        originMessageId: -101,
+        operatorTurnId: "opturn_app",
+        ingressJobId: "job_app",
+        turnOrigin: "app",
+      });
+      expect(appLease.access.toolNames).toContain("calendar.create_event");
+      expect(appLease.access.toolNames).toContain("now.update");
+      expect(appLease.access.toolNames).not.toContain("email.send");
+      expect(appLease.access.toolNames).not.toContain("telegram.send_message");
+      expect(appLease.access.toolNames).not.toContain("t3.send_turn");
+      const appClient = new Client({ name: "operator-tools-app-test", version: "1.0.0" });
+      try {
+        await appClient.connect(
+          new StreamableHTTPClientTransport(new URL(appLease.access.url), {
+            requestInit: { headers: { Authorization: `Bearer ${appLease.access.token}` } },
+          }),
+        );
+        // MCP discovery still describes the process-wide server surface. The
+        // capability is the security boundary, so bypassing the runtime's
+        // allow-list must fail server-side before a remote write happens.
+        const deniedEmail = await appClient.callTool({
+          name: "email.send",
+          arguments: { to: ["owner@example.com"], subject: "Report", text: "Done" },
+        });
+        expect(deniedEmail.isError).toBe(true);
+        expect(textResult(deniedEmail)).toContain("no crash-safe idempotency boundary");
+        const deniedTelegram = await appClient.callTool({
+          name: "telegram.send_message",
+          arguments: { text: "duplicate me" },
+        });
+        expect(deniedTelegram.isError).toBe(true);
+        expect(telegram.rich.some((message) => message.text === "duplicate me")).toBe(false);
+        expect(await callJson(appClient, "calendar.list_events", {
+          timeMin: "2026-08-21T09:00:00Z",
+        })).toMatchObject({ skipped: 0 });
+      } finally {
+        appLease.revoke();
+        await appClient.close().catch(() => undefined);
+      }
+
       lease.revoke();
       await expect(
         client.callTool({ name: "utility.time", arguments: {} }),
@@ -674,17 +718,33 @@ describe("OperatorToolServer", () => {
 
   it("keeps calendar event plus reminder replay-safe while preserving two intentional creates", async () => {
     const store = tempStore();
+    const scopedAutomation = createAutomation({
+      id: "automation_scoped_clear",
+      ownerId: "42",
+      name: "Scoped",
+      prompt: "prompt",
+      projectId: "project_scope",
+      schedule: { type: "once", runAt: "2026-08-23T09:00:00.000Z" },
+      chatId: 777,
+      now: new Date("2026-08-21T09:00:00.000Z"),
+    });
+    store.saveAutomation(scopedAutomation);
     const artifacts = new ArtifactRegistry(`${tempDirectory("operator-calendar-replay-")}/artifacts`, store);
     await artifacts.initialize();
     const operationKeys: string[] = [];
     const deleteRequests: Array<{ automationId: string; requestKey: string }> = [];
     let ambiguous = true;
+    let timedOut = true;
     const connectors = {
       createCalendarEvent: async (input: { title: string; start: string; end: string; idempotencyKey?: string }) => {
         operationKeys.push(input.idempotencyKey!);
         if (input.title === "Ambiguous" && ambiguous) {
           ambiguous = false;
           throw new GoogleWorkspaceHttpError(500);
+        }
+        if (input.title === "Timed out" && timedOut) {
+          timedOut = false;
+          throw Object.assign(new Error("request timed out after remote landing"), { name: "TimeoutError" });
         }
         return {
           id: input.idempotencyKey!,
@@ -756,6 +816,36 @@ describe("OperatorToolServer", () => {
       }) as typeof first;
       expect(operationKeys.at(-1)).toBe(operationKeys.at(-2));
       expect(retried.reminder.id).toMatch(/^automation_/);
+      await expect(callJson(firstAttempt.client, "calendar.create_event", {
+        title: "Timed out",
+        start: "2026-08-22T12:00:00+03:00",
+        end: "2026-08-22T12:30:00+03:00",
+      })).rejects.toThrow(/timed out/);
+      const timeoutKey = operationKeys.at(-1);
+      await callJson(firstAttempt.client, "calendar.create_event", {
+        title: "Timed out",
+        start: "2026-08-22T12:00:00+03:00",
+        end: "2026-08-22T12:30:00+03:00",
+      });
+      expect(operationKeys.at(-1)).toBe(timeoutKey);
+      const offsetAutomation = await callJson(firstAttempt.client, "scheduler.create_automation", {
+        name: "Offset instant",
+        prompt: "prompt",
+        schedule: { type: "once", runAt: "2026-08-23T12:00:00+03:00" },
+      }) as { id: string; nextRunAt: string };
+      expect(store.getAutomation(offsetAutomation.id)?.nextRunAt).toBe("2026-08-23T09:00:00.000Z");
+
+      await callJson(firstAttempt.client, "scheduler.update_automation", {
+        automationId: scopedAutomation.id,
+        name: "Still scoped",
+      });
+      expect(store.getAutomation(scopedAutomation.id)?.projectId).toBe("project_scope");
+      await callJson(firstAttempt.client, "scheduler.update_automation", {
+        automationId: scopedAutomation.id,
+        projectId: null,
+      });
+      expect(store.getAutomation(scopedAutomation.id)?.projectId).toBeUndefined();
+
       const createdAutomation = await callJson(firstAttempt.client, "scheduler.create_automation", {
         name: "Replay-safe schedule",
         prompt: "prompt",
@@ -782,6 +872,19 @@ describe("OperatorToolServer", () => {
         const replayedSecond = await callJson(replay.client, "calendar.create_event", args) as typeof first;
         expect(replayedFirst).toMatchObject({ id: first.id, reminder: { id: first.reminder.id } });
         expect(replayedSecond).toMatchObject({ id: second.id, reminder: { id: second.reminder.id } });
+        await callJson(replay.client, "scheduler.create_automation", {
+          name: "Offset instant",
+          prompt: "prompt",
+          schedule: { type: "once", runAt: "2026-08-23T12:00:00+03:00" },
+        });
+        await callJson(replay.client, "scheduler.update_automation", {
+          automationId: scopedAutomation.id,
+          name: "Still scoped",
+        });
+        await callJson(replay.client, "scheduler.update_automation", {
+          automationId: scopedAutomation.id,
+          projectId: null,
+        });
         const replayedCreate = await callJson(replay.client, "scheduler.create_automation", {
           name: "Replay-safe schedule",
           prompt: "prompt",
@@ -805,10 +908,10 @@ describe("OperatorToolServer", () => {
           id: updatedAutomation.id,
           nextRunAt: updatedAutomation.nextRunAt,
         });
-        expect(store.listAutomations("42")).toHaveLength(4);
+        expect(store.listAutomations("42")).toHaveLength(6);
         expect(store.db.prepare(
           "SELECT count(*) AS count FROM daemon_events WHERE event_type='automation.updated'",
-        ).get()).toEqual({ count: 1 });
+        ).get()).toEqual({ count: 3 });
         expect(store.db.prepare(
           "SELECT count(*) AS count FROM daemon_events WHERE event_type='automation.status.updated'",
         ).get()).toEqual({ count: 2 });

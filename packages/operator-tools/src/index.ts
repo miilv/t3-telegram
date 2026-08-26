@@ -170,12 +170,59 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "utility.file_metadata",
 ] as const;
 
+type OperatorMcpToolName = (typeof OPERATOR_MCP_TOOL_NAMES)[number];
+
+/**
+ * A scheduled app ingress may be replayed after a crash or owner preemption.
+ * Only reads and mutations with a durable per-ingress identity are exposed to
+ * that turn. In particular, a remote email/Telegram/T3 write cannot be made
+ * exactly-once merely by caching its result after the remote call: a process
+ * can die in between. Keep this an allow-list so a newly-added mutating tool
+ * fails closed until its replay contract is explicit.
+ */
+export const APP_TURN_REPLAY_SAFE_TOOL_NAMES: readonly OperatorMcpToolName[] = [
+  "t3.list_projects",
+  "t3.search_threads",
+  "t3.get_thread",
+  "t3.list_providers",
+  "t3.get_thread_status",
+  "t3.get_thread_summary",
+  "memory.search",
+  "memory.get",
+  "memory.journal",
+  "journal.note",
+  "journal.read",
+  "now.get",
+  "now.update",
+  "scheduler.list_automations",
+  "scheduler.create_automation",
+  "scheduler.update_automation",
+  "scheduler.pause_automation",
+  "scheduler.resume_automation",
+  "scheduler.delete_automation",
+  "calendar.list_events",
+  "calendar.create_event",
+  "email.search",
+  "policy.get",
+  "artifacts.resolve",
+  "artifacts.view_image",
+  "artifacts.read_text",
+  "utility.time",
+  "utility.web_search",
+  "utility.calculator",
+  "utility.file_metadata",
+];
+
+const APP_TURN_REPLAY_SAFE_TOOLS = new Set<string>(APP_TURN_REPLAY_SAFE_TOOL_NAMES);
+
 export interface OperatorToolTurnContext extends TelegramDestination {
   chatId: number;
   ownerId: string;
   originMessageId: number;
   allowedMessageIds?: number[];
   operatorTurnId: string;
+  /** Typed provenance controls the stricter replay-safe app capability. */
+  turnOrigin?: "human" | "digest" | "app";
   /**
    * The durable ingress job this turn processes. Threads dispatched under it
    * are recorded so a crash-replay of the job continues them (bug №28).
@@ -390,16 +437,19 @@ export class OperatorToolServer {
       journalCreateSeq: 0,
     });
     let revoked = false;
+    const toolNames = context.turnOrigin === "app"
+      ? [...APP_TURN_REPLAY_SAFE_TOOL_NAMES]
+      : [...OPERATOR_MCP_TOOL_NAMES];
     return {
       access: {
         url: this.endpoint,
         token,
         // Claude Code preserves the MCP-visible name, but normalizes dots to
         // underscores in its fully-qualified permission identifier.
-        allowedTools: OPERATOR_MCP_TOOL_NAMES.map(
+        allowedTools: toolNames.map(
           (name) => `mcp__operator__${name.replaceAll(".", "_")}`,
         ),
-        toolNames: [...OPERATOR_MCP_TOOL_NAMES],
+        toolNames,
       },
       revoke: () => {
         if (revoked) return;
@@ -1739,6 +1789,14 @@ export class OperatorToolServer {
       const startedAt = Date.now();
       try {
         const capability = this.requireCapability(token);
+        if (
+          capability.context.turnOrigin === "app" &&
+          !APP_TURN_REPLAY_SAFE_TOOLS.has(spec.name)
+        ) {
+          throw new Error(
+            `${spec.name} is unavailable to replayable scheduled app turns because its external side effect has no crash-safe idempotency boundary`,
+          );
+        }
         const value = await spec.handler(input as z.infer<T>, capability);
         this.options.store.appendEvent("operator.tool.completed", {
           correlationId: capability.context.operatorTurnId,

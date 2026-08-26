@@ -3,10 +3,13 @@ import {
   humanMoment,
   newId,
   ownerLocalParts,
+  parseExplicitInstant,
   pluralRu,
   resolveTimeZone,
 } from "../../shared/src/index.js";
 import { nextRruleDay, parseRrule, type CalendarDay, type ParsedRrule } from "./rrule.js";
+
+const MAX_INTERVAL_MINUTES = 525_600;
 
 export {
   nextRruleDay,
@@ -39,11 +42,13 @@ export function createAutomation(input: {
   const kind = input.kind ?? "automation";
   const escalate = input.escalate ?? false;
   validateEscalation(kind, escalate);
+  const name = requiredAutomationText(input.name, "automation name", 160);
+  const prompt = requiredAutomationText(input.prompt, "automation prompt", 64_000);
   return {
     id: input.id ?? newId("automation"),
     ownerId: input.ownerId,
-    name: input.name.trim().slice(0, 160),
-    prompt: input.prompt.trim().slice(0, 64_000),
+    name,
+    prompt,
     schedule: input.schedule,
     kind,
     escalate,
@@ -107,8 +112,12 @@ export function updateAutomation(
   validateEscalation(kind, escalate);
   const next: Automation = {
     ...automation,
-    name: patch.name === undefined ? automation.name : patch.name.trim().slice(0, 160),
-    prompt: patch.prompt === undefined ? automation.prompt : patch.prompt.trim().slice(0, 64_000),
+    name: patch.name === undefined
+      ? automation.name
+      : requiredAutomationText(patch.name, "automation name", 160),
+    prompt: patch.prompt === undefined
+      ? automation.prompt
+      : requiredAutomationText(patch.prompt, "automation prompt", 64_000),
     schedule,
     kind,
     escalate,
@@ -148,6 +157,12 @@ function validateEscalation(kind: AutomationKind, escalate: boolean): void {
   }
 }
 
+function requiredAutomationText(value: string, label: string, limit: number): string {
+  const normalized = value.trim().slice(0, limit);
+  if (!normalized) throw new Error(`${label} cannot be empty`);
+  return normalized;
+}
+
 /** A recurrence only makes sense on a `daily` schedule; that is where its clock comes from. */
 function normalizeRrule(schedule: AutomationSchedule, rrule?: string): string | undefined {
   const text = rrule?.trim();
@@ -167,13 +182,12 @@ export function firstAutomationRun(
   rrule?: string,
 ): string {
   if (schedule.type === "once") {
-    const runAt = new Date(schedule.runAt);
-    if (!Number.isFinite(runAt.getTime())) throw new Error("once schedule requires an ISO date-time");
-    return runAt.toISOString();
+    return parseExplicitInstant(schedule.runAt, "once schedule").toISOString();
   }
   if (schedule.type === "interval") {
-    if (!Number.isInteger(schedule.intervalMinutes) || schedule.intervalMinutes < 1) {
-      throw new Error("interval schedule requires at least one minute");
+    if (!Number.isInteger(schedule.intervalMinutes) ||
+        schedule.intervalMinutes < 1 || schedule.intervalMinutes > MAX_INTERVAL_MINUTES) {
+      throw new Error(`interval schedule requires 1..${MAX_INTERVAL_MINUTES} minutes`);
     }
     return new Date(now.getTime() + schedule.intervalMinutes * 60_000).toISOString();
   }
@@ -235,9 +249,7 @@ export function parseAutomationSchedule(
   const normalized = input.trim();
   const once = /^once\s+(.+)$/iu.exec(normalized);
   if (once) {
-    const parsed = new Date(once[1]!);
-    if (!Number.isFinite(parsed.getTime())) throw new Error("invalid once date-time");
-    return { type: "once", runAt: parsed.toISOString() };
+    return { type: "once", runAt: parseExplicitInstant(once[1]!, "once schedule").toISOString() };
   }
   const interval = /^(?:every|interval)\s+(\d+)(?:m|min|minutes?)?$/iu.exec(normalized);
   if (interval) {
@@ -259,14 +271,13 @@ export function parseAutomationSchedule(
 /** Strict write-time validation; read-time scheduling remains legacy-tolerant. */
 function validateAutomationSchedule(schedule: AutomationSchedule): void {
   if (schedule.type === "once") {
-    if (!Number.isFinite(Date.parse(schedule.runAt))) {
-      throw new Error("once schedule requires an ISO date-time");
-    }
+    parseExplicitInstant(schedule.runAt, "once schedule");
     return;
   }
   if (schedule.type === "interval") {
-    if (!Number.isInteger(schedule.intervalMinutes) || schedule.intervalMinutes < 1) {
-      throw new Error("interval schedule requires at least one minute");
+    if (!Number.isInteger(schedule.intervalMinutes) ||
+        schedule.intervalMinutes < 1 || schedule.intervalMinutes > MAX_INTERVAL_MINUTES) {
+      throw new Error(`interval schedule requires 1..${MAX_INTERVAL_MINUTES} minutes`);
     }
     return;
   }

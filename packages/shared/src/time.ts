@@ -22,6 +22,81 @@
 /** Fallback zone for owners who never configured one. */
 export const DEFAULT_TIME_ZONE = "UTC";
 
+export interface CivilDate {
+  year: number;
+  month: number;
+  day: number;
+}
+
+/**
+ * Parse an ISO/RFC3339 instant without JavaScript Date's normalization traps.
+ *
+ * Date accepts impossible civil input (`2026-02-31` becomes March 3), a bare
+ * date, and a zone-less date-time whose meaning depends on the host. Scheduler
+ * and calendar writes need a real instant, so the grammar requires `T` plus
+ * an explicit `Z` or numeric offset and round-trips every civil component
+ * before converting it to UTC.
+ */
+export function parseExplicitInstant(value: string, label = "instant"): Date {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:\d{2})$/u
+    .exec(value.trim());
+  if (!match) throw new Error(`${label} must be a valid explicit UTC or offset instant`);
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6] ?? "0");
+  const millisecond = Number((match[7] ?? "").padEnd(3, "0").slice(0, 3));
+  if (
+    !validCivilDate(year, month, day) ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    throw new Error(`${label} must be a valid explicit UTC or offset instant`);
+  }
+  const zone = match[8]!;
+  let offsetMinutes = 0;
+  if (zone !== "Z") {
+    const offsetHour = Number(zone.slice(1, 3));
+    const offsetMinute = Number(zone.slice(4, 6));
+    if (offsetHour > 23 || offsetMinute > 59) {
+      throw new Error(`${label} must be a valid explicit UTC or offset instant`);
+    }
+    offsetMinutes = (offsetHour * 60 + offsetMinute) * (zone[0] === "+" ? 1 : -1);
+  }
+  // setUTCFullYear keeps years 0000..0099 literal; Date.UTC aliases them to
+  // 1900..1999. Components were checked above, so no normalization is relied on.
+  const civil = new Date(0);
+  civil.setUTCFullYear(year, month - 1, day);
+  civil.setUTCHours(hour, minute, second, millisecond);
+  const instant = new Date(civil.getTime() - offsetMinutes * 60_000);
+  if (!Number.isFinite(instant.getTime())) {
+    throw new Error(`${label} must be a valid explicit UTC or offset instant`);
+  }
+  return instant;
+}
+
+/** Strict `YYYY-MM-DD` for Calendar all-day boundaries. */
+export function parseCivilDate(value: string, label = "date"): CivilDate {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value.trim());
+  if (!match) throw new Error(`${label} must be a valid YYYY-MM-DD civil date`);
+  const result = { year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) };
+  if (!validCivilDate(result.year, result.month, result.day)) {
+    throw new Error(`${label} must be a valid YYYY-MM-DD civil date`);
+  }
+  return result;
+}
+
+function validCivilDate(year: number, month: number, day: number): boolean {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (month < 1 || month > 12 || day < 1) return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= (days[month - 1] ?? 0);
+}
+
 // Only accepted zones are cached: the inputs are model- and API-supplied, and
 // remembering every rejected string would let a caller grow this map without
 // bound. Rejection is one Intl construction, and a rejected zone should not be
@@ -367,8 +442,9 @@ export function humanMoment(
  */
 const MACHINE_TIMESTAMP_PATTERNS: readonly RegExp[] = [
   /\d{4}-\d{2}-\d{2}/,
-  /\d{1,2}:\d{2}\s*(?:UTC|GMT|Z)\b/i,
-  /\d{1,2}:\d{2}\s*[+-]\d{2}:?\d{2}\b/,
+  /\b\d{8}T\d{6}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})\b/i,
+  /\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?\s*(?:UTC|GMT|Z)\b/i,
+  /\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?\s*[+-]\d{2}:?\d{2}\b/,
 ];
 
 /**

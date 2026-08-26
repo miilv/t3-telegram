@@ -394,7 +394,12 @@ pause-after-5. Расширяем их:
 - `automations.kind` = `'automation' | 'reminder'`; reminder — лёгкий fire
   («в момент X скажи владельцу про Y»), полноценный ход оркестратора, но с
   коротким промптом-контекстом: app envelope без полного push now/memory;
-  инструменты и персистентная сессия остаются доступными.
+  персистентная сессия остаётся доступной, а инструменты ограничены
+  replay-safe capability: чтения плюс идемпотентные `journal.note`,
+  `now.update`, `scheduler.*`, `calendar.create_event`. Email/Telegram send,
+  T3 dispatch/mutations, policy/global-memory writes и материализация файлов
+  закрыты: после удалённого side effect нет атомарной границы, которая могла
+  бы отличить успех от crash-before-local-commit при реплее app ingress.
 - `automations.rrule` — опционально, для повторов сложнее interval/daily;
   DST-пересчёт по зоне записи.
 - **`automation.update`** — тулза и для automations, и для reminders; закрывает

@@ -19,9 +19,11 @@ export {
   ownerLocalParts,
   ownerLocalTime,
   ownerLogicalDay,
+  parseCivilDate,
+  parseExplicitInstant,
   resolveTimeZone,
 } from "./time.js";
-export type { HumanMomentOptions, LocalTimeParts, OwnerLocalTimeOptions } from "./time.js";
+export type { CivilDate, HumanMomentOptions, LocalTimeParts, OwnerLocalTimeOptions } from "./time.js";
 
 export type Id = string;
 
@@ -92,6 +94,19 @@ export interface OperatorAppEvent {
   instruction: string;
   projectId?: string;
   acknowledgementItemId?: string;
+}
+
+/**
+ * Immutable delivery context retained by a reminder acknowledgement. Queue and
+ * run journals are prunable; an open acknowledgement is not, so the one
+ * permitted repeat must carry its own original instruction and destination.
+ */
+export interface ReminderAcknowledgementSnapshot {
+  appEvent: OperatorAppEvent;
+  chatId: number;
+  userId: number;
+  messageThreadId?: number;
+  directMessagesTopicId?: number;
 }
 
 export interface OperatorPolicySettings {
@@ -228,6 +243,10 @@ export type NowItemOrigin = {
   kind: "reminder_acknowledgement";
   automationId: string;
   scheduledFor: string;
+  /** Original fire payload/destination; independent of queue retention and later edits. */
+  snapshot?: ReminderAcknowledgementSnapshot;
+  /** Set only when the original durable app ingress and its run complete together. */
+  completedAt?: string;
 };
 
 /**

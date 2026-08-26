@@ -428,6 +428,10 @@ CREATE TABLE IF NOT EXISTS now_items (
   origin_kind TEXT,
   origin_id   TEXT,
   origin_run_at TEXT,
+  -- An open acknowledgement may outlive the 7/90-day queue/run journals.
+  -- Keep the immutable fire context and its successful-delivery gate here.
+  origin_snapshot_json TEXT,
+  origin_completed_at TEXT,
   escalated_at TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL

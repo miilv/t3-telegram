@@ -1,18 +1,26 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
-import { isValidTimeZone } from "../../shared/src/index.js";
+import {
+  isValidTimeZone,
+  parseCivilDate,
+  parseExplicitInstant,
+} from "../../shared/src/index.js";
 
 const calendarBoundarySchema = z.object({
   dateTime: z.string().optional(),
   date: z.string().optional(),
   timeZone: z.string().optional(),
-}).refine((value) => Boolean(value.dateTime || value.date), {
-  message: "calendar boundary requires dateTime or date",
-});
+}).refine((value) => validCalendarBoundary(value), {
+  message: "calendar boundary requires a valid RFC3339 dateTime or YYYY-MM-DD date",
+}).transform((value) => ({
+  value: value.dateTime ?? value.date!,
+  kind: value.dateTime !== undefined ? "dateTime" as const : "date" as const,
+  ...(value.timeZone ? { timeZone: value.timeZone } : {}),
+}));
 
 const calendarEventSchema = z.object({
-  id: z.string(),
+  id: z.string().min(1),
   summary: z.string().optional(),
   description: z.string().optional(),
   location: z.string().optional(),
@@ -168,11 +176,15 @@ export class GoogleWorkspaceConnectors {
         continue;
       }
       const event = parsed.data;
+      if (event.start.kind !== event.end.kind || !calendarBoundaryOrderIsValid(event.start, event.end)) {
+        skipped += 1;
+        continue;
+      }
       events.push({
         id: event.id,
         title: event.summary ?? "(untitled)",
-        start: event.start.dateTime ?? event.start.date,
-        end: event.end.dateTime ?? event.end.date,
+        start: event.start.value,
+        end: event.end.value,
         ...(event.location ? { location: event.location } : {}),
         ...(event.description ? { description: event.description.slice(0, 1_000) } : {}),
         ...(event.htmlLink ? { url: event.htmlLink } : {}),
@@ -278,10 +290,13 @@ export class GoogleWorkspaceConnectors {
     }
     const event = parsed.data;
     return {
-      id: event.id,
-      title: event.summary ?? title,
-      start: event.start.dateTime ?? event.start.date,
-      end: event.end.dateTime ?? event.end.date,
+      // The caller's normalized request is the authoritative result. A 409
+      // read-back may have been edited by an invitee; returning its summary
+      // raw would bypass the list path's untrusted-prose fence.
+      id: eventId,
+      title,
+      start: start.toISOString(),
+      end: end.toISOString(),
       ...(event.htmlLink ? { url: event.htmlLink } : {}),
       duplicate,
     };
@@ -395,11 +410,42 @@ function calendarEventId(seed: string): string {
 
 /** Parse an instant, naming the argument — these strings come from the model. */
 function parseInstant(value: string, field: string): Date {
-  const parsed = new Date(value);
-  if (!Number.isFinite(parsed.getTime())) {
-    throw new Error(`calendar event ${field} is not a valid date-time`);
+  return parseExplicitInstant(value, `calendar event ${field}`);
+}
+
+function validCalendarBoundary(value: { dateTime?: string | undefined; date?: string | undefined }): boolean {
+  if ((value.dateTime !== undefined) === (value.date !== undefined)) {
+    return false;
   }
-  return parsed;
+  // Presence wins over fallback: `{dateTime:"", date:"2026-08-21"}` is a
+  // malformed dateTime boundary, not an all-day date whose bad preferred
+  // representation should be silently ignored.
+  try {
+    if (value.dateTime !== undefined) {
+      parseExplicitInstant(value.dateTime, "calendar boundary dateTime");
+      return true;
+    }
+    if (value.date !== undefined) {
+      parseCivilDate(value.date, "calendar boundary date");
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function calendarBoundaryOrderIsValid(
+  start: { value: string; kind: "dateTime" | "date" },
+  end: { value: string; kind: "dateTime" | "date" },
+): boolean {
+  if (start.kind !== end.kind) return false;
+  if (start.kind === "date") return end.value > start.value;
+  try {
+    return parseExplicitInstant(end.value).getTime() > parseExplicitInstant(start.value).getTime();
+  } catch {
+    return false;
+  }
 }
 
 /**

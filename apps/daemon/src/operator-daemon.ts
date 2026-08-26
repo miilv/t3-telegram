@@ -554,6 +554,8 @@ const ZOMBIE_NOTICE_THROTTLE_MS = 60_000;
  * no longer allowed to reach the chat.
  */
 interface ActiveOperatorTurn {
+  /** Human input is owner work; digests are terminal stories; apps are durable proactive turns. */
+  origin: "human" | "digest" | "app";
   chatId: number;
   userId: number;
   /** Chat + user + topic: the conversation this turn belongs to (package 1.1). */
@@ -574,8 +576,9 @@ interface ActiveOperatorTurn {
    */
   lastEventAt: number;
   /**
-   * Package 1.5: `false` for a digest interpretation — the owner's message may
-   * not discard it (package 1.2), but the watchdog may still write it off.
+   * Package 1.5/3.3: `false` only for a digest interpretation — the owner's
+   * message may not discard a terminal story (package 1.2). A proactive app
+   * turn is durable and replayable, so owner input may preempt it.
    */
   preemptable?: boolean;
   /**
@@ -637,6 +640,12 @@ export class OperatorDaemon {
   private readonly monitorRoutes = new Map<string, MonitorRoute>();
   /** Chat/initiator of each in-flight direct Operator turn (bug №1, package 1.1). */
   private readonly activeOperatorTurns = new Set<ActiveOperatorTurn>();
+  /**
+   * Authorized human ingress from durable claim through preprocessing and the
+   * provider turn. Escalation must not reserve a repeat while OCR, media, or a
+   * command is still giving that same human a chance to acknowledge it.
+   */
+  private readonly activeHumanIngress = new Set<string>();
   /**
    * Package 1.1: newest real inbound message id per `chatId:userId`. Telegram
    * numbers messages monotonically per chat, so "there is something newer than
@@ -742,8 +751,8 @@ export class OperatorDaemon {
       logger: this.logger,
       syntheticMessageId: (seed) => syntheticNegativeMessageId(seed),
       humanTurnActive: (ownerId, chatId) => [...this.activeOperatorTurns].some(
-        (turn) => turn.preemptable && String(turn.userId) === ownerId && turn.chatId === chatId,
-      ),
+        (turn) => turn.origin === "human" && String(turn.userId) === ownerId && turn.chatId === chatId,
+      ) || this.activeHumanIngress.has(`${ownerId}:${chatId}`),
       notifyPaused: (automation, failures, reason) =>
         this.notifyAutomationPaused(automation, failures, reason),
     });
@@ -1485,14 +1494,18 @@ export class OperatorDaemon {
       // that ended) but also put it beyond the watchdog's reach: a wedged
       // digest froze the single voice with nothing able to notice. It is
       // tracked and NOT preemptable: the watchdog may write it off, an owner
-      // message may not.
+      // message may not. Package 3.3 app turns share the registry but not that
+      // exception: their ingress is durable, so owner input preempts and the
+      // app job is retried after the human turn.
+      const appTurn = update.appEvent !== undefined;
       const systemTurn: ActiveOperatorTurn = {
+        origin: appTurn ? "app" : "digest",
         chatId: update.chatId,
         userId: update.userId,
         conversationKey: this.conversationKey(update),
         ingressJobId: telegramIngressJobId(update),
         superseded: false,
-        preemptable: false,
+        preemptable: appTurn,
         lastEventAt: Date.now(),
       };
       this.activeOperatorTurns.add(systemTurn);
@@ -1899,6 +1912,7 @@ export class OperatorDaemon {
     // prompt. Mechanical facts (reply thread, focus, forwarded separation)
     // travel in the envelope; judgment stays with the agent.
     const turnOrigin: ActiveOperatorTurn = {
+      origin: "human",
       chatId: update.chatId,
       userId: update.userId,
       conversationKey: this.conversationKey(update),
@@ -2083,7 +2097,10 @@ export class OperatorDaemon {
     const sameChatTurns = [...this.activeOperatorTurns].filter(
       // Package 1.5: a digest interpretation is not the owner's turn to stop —
       // they never started it, and a cancel word means "stop what I asked for".
-      (turn) => turn.chatId === chatId && turn.preemptable !== false,
+      // The same applies to a proactive app turn: ordinary owner input may
+      // preempt it, but a bare cancellation command does not cancel its durable
+      // schedule or consume its ingress job.
+      (turn) => turn.chatId === chatId && turn.origin === "human",
     );
     if (!sameChatTurns.length) return [];
     if (this.isAdministrator(userId)) return sameChatTurns;
@@ -2535,6 +2552,13 @@ export class OperatorDaemon {
       this.markTurnSuperseded(turn, "newer_owner_message");
     }
     if (turn?.superseded) {
+      if (update.appEvent) {
+        this.store.appendEvent("operator.app.preempted_retry", {
+          correlationId,
+          payload: { operatorTurnId, attempt: 0 },
+        });
+        throw new Error("Scheduled app turn was preempted; replaying durable ingress");
+      }
       this.recordSupersededTurn(update, operatorTurnId, correlationId, 0, turn);
       return;
     }
@@ -2593,6 +2617,7 @@ export class OperatorDaemon {
       allowedArtifactIds: artifacts.map((artifact) => artifact.id),
       operatorTurnId,
       ingressJobId,
+      turnOrigin: isAppTurn ? "app" : isThreadEventTurn ? "digest" : "human",
       ...(update.messageThreadId ? { messageThreadId: update.messageThreadId } : {}),
       ...(update.directMessagesTopicId
         ? { directMessagesTopicId: update.directMessagesTopicId }
@@ -2942,6 +2967,17 @@ export class OperatorDaemon {
           attempt,
           turn.abandonedAt ?? Date.now(),
         );
+      }
+      if (isAppTurn && replacedByOwner) {
+        await this.discardDraft(writer);
+        this.store.appendEvent("operator.app.preempted_retry", {
+          correlationId,
+          payload: { operatorTurnId, attempt },
+        });
+        // The ingress drain owns attempts/backoff and atomically completes the
+        // linked automation run only after a successful replay. Returning here
+        // would spend a one-shot reminder without ever delivering it.
+        throw new Error("Scheduled app turn was preempted; replaying durable ingress");
       }
       this.recordSupersededTurn(update, operatorTurnId, correlationId, attempt, turn);
       // Package 1.5: this interpretation never happened, and its job is
@@ -3675,8 +3711,11 @@ export class OperatorDaemon {
     return this.localApprovals.request(input);
   }
 
-  private applyLocalApproval(target: LocalApprovalTarget): Promise<string> {
-    return this.localApprovals.apply(target);
+  private applyLocalApproval(
+    approvalId: string,
+    decision: "accept" | "acceptForSession" | "decline",
+  ): Promise<string> {
+    return this.localApprovals.decide(approvalId, decision);
   }
 
   async requestAutomationDeleteConfirmation(input: {
@@ -3949,12 +3988,10 @@ export class OperatorDaemon {
     if (approval.kind === "local") {
       // Nothing is waiting in T3, so an unanswered local confirmation retires
       // by simply not happening — no dispatch, no retry budget, no fuse.
-      this.store.resolveLocalApproval(approval.id, cause, "expiring");
+      const retired = this.store.finalizeLocalApprovalRetirement(approval.id, cause);
+      if (!retired.applied) return false;
       this.observeApprovalWait(approval.id, cause === "expired" ? "expired" : "superseded");
-      this.store.appendEvent("approval.resolved", {
-        payload: { approvalId: approval.id, decision: "decline", automatic: true, reason, local: true },
-      });
-      this.closeApprovalCard(approval, cause);
+      this.closeApprovalCard(retired.approval, cause);
       return true;
     }
     try {
@@ -4768,14 +4805,19 @@ export class OperatorDaemon {
     // derived from the approval id rather than the id itself.
     const approval = this.store
       .listPendingApprovalRequests()
-      .find((candidate) => compactCallbackToken(candidate.id) === match[1]!);
+      .find((candidate) => compactCallbackToken(candidate.id) === match[1]!) ??
+      this.store.listLocalApprovals()
+        .find((candidate) => compactCallbackToken(candidate.id) === match[1]!);
     if (!approval || approval.status !== "pending") {
       await this.telegram.answerCallback(update.callbackId, "Запрос уже неактивен");
-      if (approval?.chatId !== undefined && approval.messageId !== undefined) {
+      if (approval?.kind === "local") {
+        this.enqueueResolvedLocalApprovalCard(approval, eventKey);
+        await this.flushTelegramOutbox();
+      } else if (approval?.chatId !== undefined && approval.messageId !== undefined) {
         this.enqueueKeyboardCleanup(
           approval.chatId,
           approval.messageId,
-          approval.kind === "worker" ? approval.threadId : undefined,
+          approval.threadId,
           eventKey,
         );
         await this.flushTelegramOutbox();
@@ -4783,10 +4825,15 @@ export class OperatorDaemon {
       this.store.completeEvent(eventKey);
       return;
     }
-    if (!this.isAdministrator(update.userId)) {
+    const mayDecide = approval.kind === "local"
+      ? this.isAdministrator(update.userId) || approval.target.actorUserId === String(update.userId)
+      : this.isAdministrator(update.userId);
+    if (!mayDecide) {
       await this.telegram.answerCallback(
         update.callbackId,
-        "Решать по запросам разрешения может только владелец или админ",
+        approval.kind === "local"
+          ? "Подтвердить это действие может только его автор или админ"
+          : "Решать по запросам разрешения может только владелец или админ",
       );
       this.store.completeEvent(eventKey);
       return;
@@ -4819,9 +4866,7 @@ export class OperatorDaemon {
       // Same claim, same card cleanup, same event — only the delivery differs.
       let outcome: string;
       try {
-        outcome = decision === "decline"
-          ? "Отменено."
-          : await this.applyLocalApproval(approval.target);
+        outcome = await this.applyLocalApproval(approval.id, decision);
       } catch (error) {
         // The keyboard deliberately stays live: pressing again is the recovery,
         // exactly as on the worker path.
@@ -4845,37 +4890,11 @@ export class OperatorDaemon {
         await this.flushTelegramOutbox();
         return;
       }
-      this.store.resolveLocalApproval(approval.id, decision, "deciding");
       this.observeApprovalWait(approval.id, "answered");
-      this.store.appendEvent("approval.resolved", {
-        payload: { approvalId: approval.id, decision, local: true },
-      });
       // The card reports its own outcome, the way a retired card does. A
       // second message would be the daemon narrating in the chat next to the
       // Operator, and the owner is looking at the card they just pressed.
-      if (approval.chatId !== undefined && approval.messageId !== undefined) {
-        const payload = isRecord(approval.payload) ? approval.payload : {};
-        this.enqueueTelegramOutbox(
-          `telegram:approval:${approval.id}:local-outcome:${update.callbackId}`,
-          approval.chatId,
-          "rich",
-          {
-            text: [
-              renderApprovalPrompt(
-                payload,
-                typeof payload.title === "string" ? payload.title : approval.id,
-              ),
-              "",
-              outcome,
-            ].join("\n"),
-            options: {},
-            editMessageId: approval.messageId,
-            messageType: "approval_local_outcome",
-            correlationId: eventKey,
-          },
-        );
-        this.enqueueKeyboardCleanup(approval.chatId, approval.messageId, undefined, eventKey);
-      }
+      this.enqueueResolvedLocalApprovalCard(approval, eventKey, outcome);
       this.store.completeEvent(eventKey);
       await this.flushTelegramOutbox();
       return;
@@ -4938,6 +4957,47 @@ export class OperatorDaemon {
       ...(threadId ? { threadId } : {}),
       correlationId,
     });
+  }
+
+  private enqueueResolvedLocalApprovalCard(
+    approval: PendingLocalApproval,
+    correlationId: string,
+    knownOutcome?: string,
+  ): void {
+    // A caller may hold the pre-claim `pending` snapshot while the atomic local
+    // decision has already committed. Render and dedupe from the canonical row,
+    // so the same path also heals a restart after decision-before-outcome.
+    const resolved = this.store.getLocalApproval(approval.id) ?? approval;
+    if (resolved.chatId === undefined || resolved.messageId === undefined) return;
+    if (!["accept", "acceptForSession", "auto-accepted", "decline"].includes(resolved.status)) return;
+    const payload = isRecord(resolved.payload) ? resolved.payload : {};
+    const automation = this.store.getAutomation(resolved.target.automationId);
+    const accepted = ["accept", "acceptForSession", "auto-accepted"].includes(resolved.status);
+    const outcome = knownOutcome ?? (accepted
+      ? automation
+        ? `${automationKindWord(automation)} **${escapeMarkdownText(automation.name)}**: удалена.`
+        : "Автоматизация уже удалена."
+      : "Отменено.");
+    this.enqueueTelegramOutbox(
+      `telegram:approval:${resolved.id}:local-outcome`,
+      resolved.chatId,
+      "rich",
+      {
+        text: [
+          renderApprovalPrompt(
+            payload,
+            typeof payload.title === "string" ? payload.title : resolved.id,
+          ),
+          "",
+          outcome,
+        ].join("\n"),
+        options: {},
+        editMessageId: resolved.messageId,
+        messageType: "approval_local_outcome",
+        correlationId,
+      },
+    );
+    this.enqueueKeyboardCleanup(resolved.chatId, resolved.messageId, undefined, correlationId);
   }
 
   /**
@@ -6036,8 +6096,8 @@ export class OperatorDaemon {
         command: "/automation list",
         argument: pageOnly ? action : (id ?? ""),
         items: automations,
-        heading: "## Автоматизации",
-        empty: "Автоматизаций пока нет. Создайте: `/automation add daily 09:00 Europe/Moscow | Утренний обзор | Проверь активные проекты и пришли краткий обзор`.",
+        heading: "## Напоминания и автоматизации",
+        empty: "Напоминаний и автоматизаций пока нет. Создайте: `/automation add daily 09:00 Europe/Moscow | Утренний обзор | Проверь активные проекты и пришли краткий обзор`.",
         render: (automation) => [
           `- **${escapeMarkdownText(automation.name)}** · \`${automation.id}\``,
           `  ${this.automationLine(automation)}`,
@@ -6729,6 +6789,18 @@ export class OperatorDaemon {
         );
       }
     }
+    for (const approval of this.store.listLocalApprovals()) {
+      if (approval.status.startsWith("expired") || approval.status.startsWith("superseded")) {
+        const cause = approval.status.startsWith("expired") ? "expired" as const : "superseded" as const;
+        // Heal both historical crash cuts: the terminal status may have landed
+        // without its audit, and neither the terminal card nor its keyboard
+        // cleanup may have reached the durable outbox.
+        const retired = this.store.finalizeLocalApprovalRetirement(approval.id, cause);
+        this.closeApprovalCard(retired.approval, cause);
+      } else {
+        this.enqueueResolvedLocalApprovalCard(approval, `approval:${approval.id}`);
+      }
+    }
     for (const pending of this.store.listPendingUserInputs()) {
       if (pending.chatId === undefined) continue;
       try {
@@ -6766,8 +6838,20 @@ export class OperatorDaemon {
     // stable key is either pending, uncertain, or already delivered, never a
     // second keyboard identity.
     if (approval.kind === "local" && approval.messageId === undefined) {
+      const dedupeKey = `telegram:approval:${approval.id}:request`;
+      const delivered = this.store.getTelegramOutbox<DurableTelegramPayload>(dedupeKey);
+      const deliveredMessageId = delivered?.status === "delivered"
+        ? delivered.telegramMessageIds[0]
+        : undefined;
+      if (deliveredMessageId !== undefined) {
+        // Heal the exact old crash state from before delivery+mapping became
+        // one transaction: the keyboard landed and the outbox is terminal,
+        // but the local approval row missed its Telegram message id.
+        this.store.updateLocalApprovalMessage(approval.id, approval.chatId!, deliveredMessageId);
+        return;
+      }
       this.enqueueTelegramOutbox(
-        `telegram:approval:${approval.id}:request`,
+        dedupeKey,
         approval.chatId!,
         "approval",
         {
@@ -7154,8 +7238,14 @@ export class OperatorDaemon {
     for (let index = 0; index < 50; index += 1) {
       const job = claim();
       if (!job) return;
+      const update = job.payload.update;
+      const humanIngressKey = !update.synthetic && this.roleForUser(update.userId) !== "viewer"
+        ? `${update.userId}:${update.chatId}`
+        : undefined;
+      if (humanIngressKey) this.activeHumanIngress.add(humanIngressKey);
       try {
-        await this.handleUpdate(job.payload.update, job.payload.processExisting);
+        try {
+        await this.handleUpdate(update, job.payload.processExisting);
         if (job.payload.update.automationRunId) this.store.completeTelegramIngressJob(job.id);
         else this.store.completeBackgroundJob(job.id);
         // Package 1.2: one job, then look up. A drain used to hold its lane for
@@ -7167,9 +7257,12 @@ export class OperatorDaemon {
           requeue?.();
           return;
         }
-      } catch (error) {
+        } catch (error) {
         const classified = classifyOperationalError(error);
-        const gaveUp = this.store.retryBackgroundJob(job.id, classified.code);
+        const isAppIngress = job.payload.update.appEvent !== undefined;
+        const gaveUp = isAppIngress
+          ? this.store.retryAutomationIngressJob(job.id, classified.code)
+          : this.store.retryBackgroundJob(job.id, classified.code);
         // Package 1.5: wake the lane up when the retry becomes due. The user
         // lane has no pump of its own — its drains are queued by ARRIVING
         // messages — so a deferred message used to sit until the owner wrote
@@ -7204,6 +7297,21 @@ export class OperatorDaemon {
           throw error;
         }
         if (gaveUp) {
+          if (isAppIngress) {
+            const appEvent = job.payload.update.appEvent!;
+            this.enqueueTelegramOutbox(
+              `telegram:automation:${appEvent.runId}:ingress-failed`,
+              job.payload.update.chatId,
+              "rich",
+              {
+                text: `${appEvent.app === "reminder" ? "Напоминание" : "Автоматизация"} **${escapeMarkdownText(appEvent.name)}** не удалось выполнить после нескольких попыток. Проверьте расписание командой \`/automation\`.`,
+                options: destinationFromUpdate(job.payload.update),
+                messageType: "ingress_failed",
+                correlationId: correlationForUpdate(job.payload.update),
+              },
+            );
+            continue;
+          }
           this.enqueueTelegramOutbox(`telegram:job:${job.id}:gave_up`, job.payload.update.chatId, "rich", {
             text: `Не удалось обработать сообщение после нескольких попыток. ${classified.safeMessage}`,
             options: { replyToMessageId: job.payload.update.messageId },
@@ -7213,6 +7321,9 @@ export class OperatorDaemon {
           continue;
         }
         throw error;
+        }
+      } finally {
+        if (humanIngressKey) this.activeHumanIngress.delete(humanIngressKey);
       }
     }
   }
@@ -7236,7 +7347,7 @@ export class OperatorDaemon {
       "rich",
       {
         text: [
-          `Автоматизация **${escapeMarkdownText(automation.name)}** приостановлена после ${failures} ошибок подряд: ${escapeMarkdownText(reason)}`,
+          `${automationKindWord(automation)} **${escapeMarkdownText(automation.name)}** приостановлена после ${failures} ошибок подряд: ${escapeMarkdownText(reason)}`,
           `Возобновить: \`/automation resume ${automation.id}\``,
         ].join("\n\n"),
         options: {
@@ -7319,8 +7430,15 @@ export class OperatorDaemon {
       }
 
       this.recordDurableOutgoing(sent, payload);
-      this.store.markTelegramOutboxDelivered(item.id, sent.map((message) => message.messageId));
-      this.finalizeDurableTelegramDelivery(payload, sent);
+      const first = sent[0];
+      this.store.markTelegramOutboxDelivered(
+        item.id,
+        sent.map((message) => message.messageId),
+        payload.approvalId && payload.localApproval && first
+          ? { approvalId: payload.approvalId, chatId: first.chatId, messageId: first.messageId }
+          : undefined,
+      );
+      this.finalizeDurableTelegramDelivery(payload);
       this.store.appendEvent("telegram.outbox.delivered", {
         correlationId: payload.correlationId ?? item.dedupeKey,
         ...(payload.projectId ? { projectId: payload.projectId } : {}),
@@ -7435,7 +7553,7 @@ export class OperatorDaemon {
     }
   }
 
-  private finalizeDurableTelegramDelivery(payload: DurableTelegramPayload, sent: SentMessage[]): void {
+  private finalizeDurableTelegramDelivery(payload: DurableTelegramPayload): void {
     for (const threadId of payload.completionThreadIds ?? []) {
       this.store.setRuntimeState(`thread_completion_delivered:${threadId}`, nowIso());
     }
@@ -7444,10 +7562,6 @@ export class OperatorDaemon {
         threadId: payload.threadId,
         payload: { artifactId: payload.artifactId },
       });
-    }
-    const first = sent[0];
-    if (payload.approvalId && payload.localApproval && first) {
-      this.store.updateLocalApprovalMessage(payload.approvalId, first.chatId, first.messageId);
     }
   }
 
