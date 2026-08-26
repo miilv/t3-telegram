@@ -27,6 +27,7 @@ import {
   buildRollupPrompt,
   hasScribeWork,
   isReservedJournalSlug,
+  lastDayOfMonth,
   lintJournalNote,
   parseDescriptions,
   parseRollup,
@@ -129,9 +130,19 @@ describe("the night window and the logical day (memory-design §5, §2.7)", () =
     // the SAME night — and the later one would summarise a day half an hour old.
     expect(scribeTargetDay({ logicalDay: "2026-08-25", localHour: 2 })).toBe("2026-08-25");
     expect(scribeTargetDay({ logicalDay: "2026-08-26", localHour: 3 })).toBe("2026-08-25");
+    // The two rollovers the arithmetic can get wrong, at the one hour it runs.
+    expect(scribeTargetDay({ logicalDay: "2026-09-01", localHour: 3 })).toBe("2026-08-31");
+    expect(scribeTargetDay({ logicalDay: "2028-03-01", localHour: 3 })).toBe("2028-02-29");
     expect(previousDay("2026-03-01")).toBe("2026-02-28");
     expect(previousDay("2028-03-01")).toBe("2028-02-29");
+    expect(previousDay("2026-01-01")).toBe("2025-12-31");
     expect(previousMonth("2026-01-14")).toBe("2025-12");
+    // Verified by a throwaway sweep over every day of 2024–2027: previousDay is
+    // always exactly 86_400_000 ms back, lastDayOfMonth never leaves its month,
+    // and previousMonth is always exactly one month back.
+    expect(lastDayOfMonth("2028-02")).toBe("2028-02-29");
+    expect(lastDayOfMonth("2026-02")).toBe("2026-02-28");
+    expect(lastDayOfMonth("2026-12")).toBe("2026-12-31");
   });
 
   it("does not run outside 02:00–04:00, and runs once inside it", async () => {
