@@ -707,13 +707,14 @@ describe("OperatorStore", () => {
       purpose: "Fix refresh token concurrency",
       currentState: "Regression tests pass",
       importantDecisions: ["Use single-flight refresh"],
-      files: ["src/auth.ts"],
+      files: ["src/auth.ts", "/srv/api_key=release-path/report.txt"],
       openIssues: [],
       nextActions: ["Deploy canary"],
     });
     expect(store.getThreadSummary("thread_memory")).toMatchObject({
       currentState: "Regression tests pass",
       importantDecisions: ["Use single-flight refresh"],
+      files: ["src/auth.ts", "/srv/api_key=release-path/report.txt"],
     });
     expect(store.searchThreads("single flight refresh")[0]?.thread.id).toBe("thread_memory");
 

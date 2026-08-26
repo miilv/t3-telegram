@@ -39,6 +39,16 @@ export function privacyGuardT3Broker(broker: T3Broker): T3Broker {
         return (input: SendThreadTurnInput) => target.sendTurn({
           ...input,
           text: redactSecretsForOutput(input.text),
+          ...(input.artifacts
+            ? {
+                artifacts: input.artifacts.map((artifact) => ({
+                  ...artifact,
+                  ...(artifact.filename !== undefined
+                    ? { filename: redactSecretsForOutput(artifact.filename) }
+                    : {}),
+                })),
+              }
+            : {}),
         });
       }
       const value = Reflect.get(target, property, target) as unknown;
@@ -307,10 +317,13 @@ export class HttpT3Broker implements T3Broker {
     );
     const paths = (input.artifacts ?? [])
       .filter((artifact) => !artifact.mimeType?.startsWith("image/"))
-      .map((artifact) => `- ${artifact.filename ?? artifact.id}: ${artifact.localPath}`);
-    const text = redactSecretsForOutput(
-      paths.length ? `${input.text}\n\nMaterialized artifacts:\n${paths.join("\n")}` : input.text,
-    );
+      .map((artifact) =>
+        `- ${redactSecretsForOutput(artifact.filename ?? artifact.id)}: ${artifact.localPath}`,
+      );
+    const safeText = redactSecretsForOutput(input.text);
+    const text = paths.length
+      ? `${safeText}\n\nMaterialized artifacts:\n${paths.join("\n")}`
+      : safeText;
     await this.dispatch({
       type: "thread.turn.start",
       commandId,

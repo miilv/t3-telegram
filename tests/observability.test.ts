@@ -62,6 +62,7 @@ describe("observability", () => {
     logger.info(
       {
         client_secret: "root-log-secret",
+        openaiApiKey: "namespaced-log-secret",
         request: {
           auth: {
             sshKey: "nested-log-secret",
@@ -69,19 +70,24 @@ describe("observability", () => {
             checksum: sha,
           },
         },
+        deep: { one: { two: { three: { four: { token: "deep-log-secret" } } } } },
       },
       "Nested request",
     );
     const entry = JSON.parse(lines.at(-1)!) as {
       client_secret: string;
+      openaiApiKey: string;
       request: { auth: { sshKey: string; signing_key: string; checksum: string } };
+      deep: { one: { two: { three: { four: { token: string } } } } };
     };
     expect(entry.client_secret).toBe("[REDACTED]");
+    expect(entry.openaiApiKey).toBe("[REDACTED]");
     expect(entry.request.auth).toEqual({
       sshKey: "[REDACTED]",
       signing_key: "[REDACTED]",
       checksum: sha,
     });
+    expect(entry.deep.one.two.three.four.token).toBe("[REDACTED]");
   });
 
   it("masks token shapes in free text without hiding the surrounding reason", () => {

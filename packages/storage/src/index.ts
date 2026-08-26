@@ -865,7 +865,7 @@ export class OperatorStore {
       purpose: maskSecretsForStorage(input.purpose).trim().slice(0, 4_000),
       currentState: maskSecretsForStorage(input.currentState).trim().slice(0, 4_000),
       importantDecisions: boundedStrings(input.importantDecisions),
-      files: boundedStrings(input.files),
+      files: boundedOperationalPaths(input.files),
       openIssues: boundedStrings(input.openIssues),
       nextActions: boundedStrings(input.nextActions),
       updatedAt,
@@ -3116,6 +3116,17 @@ function boundedStrings(values: string[], limit = 50): string[] {
       values
         .filter((value): value is string => typeof value === "string")
         .map((value) => maskSecretsForStorage(value).trim().slice(0, 2_000))
+        .filter(Boolean),
+    ),
+  ].slice(0, limit);
+}
+
+function boundedOperationalPaths(values: string[], limit = 50): string[] {
+  return [
+    ...new Set(
+      values
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim().slice(0, 2_000))
         .filter(Boolean),
     ),
   ].slice(0, limit);

@@ -1,6 +1,10 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import pino, { type DestinationStream, type Logger } from "pino";
-import { redactSecretsForOutput, SECRET_REDACTION_PATHS } from "../../shared/src/index.js";
+import {
+  redactSecretsForOutput,
+  redactSecretsForOutputDeep,
+  SECRET_REDACTION_PATHS,
+} from "../../shared/src/index.js";
 
 export type MetricName =
   | "telegram_update_latency_ms"
@@ -186,6 +190,14 @@ export function createLogger(level = "info", destination?: DestinationStream): L
     {
       level,
       base: { service: "t3-telegram-operator" },
+      hooks: {
+        logMethod(inputArgs, method) {
+          for (let index = 0; index < inputArgs.length; index += 1) {
+            inputArgs[index] = sanitizeLogArgument(inputArgs[index]);
+          }
+          method.apply(this, inputArgs);
+        },
+      },
       redact: {
         paths: [
           ...SECRET_REDACTION_PATHS,
@@ -211,6 +223,24 @@ export function createLogger(level = "info", destination?: DestinationStream): L
     },
     destination,
   );
+}
+
+function sanitizeLogArgument(value: unknown): unknown {
+  return redactSecretsForOutputDeep(serializeLogErrors(value, new WeakMap<object, object>()));
+}
+
+function serializeLogErrors(value: unknown, seen: WeakMap<object, object>): unknown {
+  if (value instanceof Error) return serializeLogErrors(serializeSanitizedError(value), seen);
+  if (!value || typeof value !== "object" || value instanceof Date) return value;
+  const existing = seen.get(value);
+  if (existing) return existing;
+  const result: unknown[] | Record<string, unknown> = Array.isArray(value) ? [] : {};
+  seen.set(value, result);
+  for (const [key, item] of Object.entries(value)) {
+    if (Array.isArray(result)) result[Number(key)] = serializeLogErrors(item, seen);
+    else result[key] = serializeLogErrors(item, seen);
+  }
+  return result;
 }
 
 function serializeSanitizedError(error: unknown): unknown {

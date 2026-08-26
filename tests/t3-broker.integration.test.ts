@@ -14,19 +14,37 @@ import {
 } from "../packages/t3-broker/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
 import type { OperatorStore } from "../packages/storage/src/index.js";
+import type { SendThreadTurnInput } from "../packages/shared/src/index.js";
 
 describe("HttpT3Broker", () => {
   it("decorates arbitrary broker implementations before provider dispatch", async () => {
-    let captured: { text: string } | undefined;
+    let captured: SendThreadTurnInput | undefined;
     const inner = {
-      sendTurn: async (input: { text: string }) => {
+      sendTurn: async (input: SendThreadTurnInput) => {
         captured = input;
         return { threadId: "thread", commandId: "command" };
       },
     } as unknown as import("../packages/shared/src/index.js").T3Broker;
     const broker = privacyGuardT3Broker(inner);
-    await broker.sendTurn({ threadId: "thread", text: "Run token=t3-decorator-secret" });
+    await broker.sendTurn({
+      threadId: "thread",
+      text: "Run token=t3-decorator-secret",
+      artifacts: [{
+        id: "artifact_stable",
+        localPath: "/workspace/api_key=path-identity/result.bin",
+        filename: "token=display-name-secret.bin",
+        sizeBytes: 19,
+        sha256: "c".repeat(64),
+      }],
+    });
     expect(captured?.text).toBe("Run token=[REDACTED]");
+    expect(captured?.artifacts).toEqual([{
+      id: "artifact_stable",
+      localPath: "/workspace/api_key=path-identity/result.bin",
+      filename: "token=[REDACTED]",
+      sizeBytes: 19,
+      sha256: "c".repeat(64),
+    }]);
   });
 
   let fixture: T3Fixture;
@@ -84,6 +102,12 @@ describe("HttpT3Broker", () => {
         filename: "api_key=image-name-secret.png",
         mimeType: "image/png",
         sizeBytes: 11,
+      }, {
+        id: "artifact_opaque_document",
+        localPath: "/workspace/api_key=path-identity/report.txt",
+        filename: "token=document-name-secret.txt",
+        mimeType: "text/plain",
+        sizeBytes: 17,
       }],
     });
 
@@ -109,7 +133,12 @@ describe("HttpT3Broker", () => {
       options: [{ id: "effort", value: "max" }],
     });
     expect(fixture.commands[2]?.message).toMatchObject({
-      text: "Reproduce and fix it; api_key=[REDACTED]",
+      text: [
+        "Reproduce and fix it; api_key=[REDACTED]",
+        "",
+        "Materialized artifacts:",
+        "- token=[REDACTED]: /workspace/api_key=path-identity/report.txt",
+      ].join("\n"),
       attachments: [{ name: "api_key=[REDACTED]" }],
     });
     expect(fixture.authorizationHeaders).toEqual(["Bearer test-token", "Bearer test-token", "Bearer test-token"]);

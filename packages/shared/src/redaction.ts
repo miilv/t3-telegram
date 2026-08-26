@@ -156,7 +156,7 @@ export function maskSecretsForStorage(value: string): string {
 
 /** Remove high-confidence credentials from text leaving the trust boundary. */
 export function redactSecretsForOutput(value: string): string {
-  return redactText(value, "output");
+  return redactOutputString(value, 0, new WeakSet<object>());
 }
 
 function isSecretKey(key: string): boolean {
@@ -165,26 +165,58 @@ function isSecretKey(key: string): boolean {
 }
 
 const OUTPUT_REDACTION_MAX_DEPTH = 32;
+const SERIALIZED_JSON_MAX_CHARS = 64 * 1_024;
+
+function redactOutputString(value: string, depth: number, seen: WeakSet<object>): string {
+  const trimmed = value.trim();
+  if (/^\[REDACTED(?: [A-Z ]+)?\]$/.test(trimmed)) return value;
+  const jsonLooking =
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"));
+  if (!jsonLooking) return redactText(value, "output");
+  if (value.length > SERIALIZED_JSON_MAX_CHARS) return "[REDACTED JSON]";
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object") return redactText(value, "output");
+    return JSON.stringify(redactDeep(parsed, depth + 1, seen)) ?? "[REDACTED JSON]";
+  } catch {
+    return "[REDACTED JSON]";
+  }
+}
 
 function redactDeep(value: unknown, depth: number, seen: WeakSet<object>): unknown {
-  if (typeof value === "string") return redactSecretsForOutput(value);
+  if (
+    depth >= OUTPUT_REDACTION_MAX_DEPTH &&
+    (typeof value === "string" || Boolean(value && typeof value === "object"))
+  ) {
+    return "[REDACTED DEPTH]";
+  }
+  if (typeof value === "string") return redactOutputString(value, depth, seen);
   if (!value || typeof value !== "object") return value;
-  if (depth >= OUTPUT_REDACTION_MAX_DEPTH) return "[REDACTED DEPTH]";
+  if (value instanceof String) return redactOutputString(value.valueOf(), depth, seen);
+  if (value instanceof Number || value instanceof Boolean) return value.valueOf();
+  if (value instanceof Date) return value.toISOString();
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+    return "[REDACTED OBJECT]";
+  }
   if (seen.has(value)) return "[REDACTED CYCLE]";
 
   seen.add(value);
-  if (Array.isArray(value)) {
-    return value.map((item) => redactDeep(item, depth + 1, seen));
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item) => redactDeep(item, depth + 1, seen));
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = isSecretKey(key) && item !== null && item !== undefined
+        ? "[REDACTED]"
+        : redactDeep(item, depth + 1, seen);
+    }
+    return result;
+  } finally {
+    seen.delete(value);
   }
-  if (value instanceof Date) return value.toISOString();
-
-  const result: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
-    result[key] = isSecretKey(key) && item !== null && item !== undefined
-      ? "[REDACTED]"
-      : redactDeep(item, depth + 1, seen);
-  }
-  return result;
 }
 
 /** Fail-closed structured redaction for data crossing an output boundary. */

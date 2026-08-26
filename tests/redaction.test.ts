@@ -80,10 +80,54 @@ describe("canonical privacy redaction", () => {
     );
   });
 
+  it("unwraps boxed strings instead of exposing their character properties", () => {
+    const redacted = redactSecretsForOutputDeep(new String("token=boxed-secret"));
+    expect(redacted).toBe("token=[REDACTED]");
+    expect(JSON.stringify(redacted)).not.toContain("boxed-secret");
+  });
+
+  it("does not misclassify a repeated acyclic reference as a cycle", () => {
+    const shared = { label: "same safe value" };
+    expect(redactSecretsForOutputDeep({ first: shared, second: shared })).toEqual({
+      first: { label: "same safe value" },
+      second: { label: "same safe value" },
+    });
+  });
+
+  it("recursively redacts JSON serialized inside JSON strings", () => {
+    const sha = "b".repeat(40);
+    const inner = JSON.stringify({
+      token: 17,
+      nested: JSON.stringify({ privateKey: true }),
+      sha,
+    });
+    const outer = JSON.stringify({ payload: inner });
+    const redacted = redactSecretsForOutputDeep(outer);
+    expect(typeof redacted).toBe("string");
+    const decodedOuter = JSON.parse(redacted as string) as { payload: string };
+    const decodedInner = JSON.parse(decodedOuter.payload) as {
+      token: string;
+      nested: string;
+      sha: string;
+    };
+    expect(decodedInner).toEqual({
+      token: "[REDACTED]",
+      nested: '{"privateKey":"[REDACTED]"}',
+      sha,
+    });
+  });
+
+  it("fails closed for JSON-looking strings beyond the parse size budget", () => {
+    const oversized = `{"note":"${"x".repeat(70_000)}","token":17}`;
+    expect(redactSecretsForOutputDeep(oversized)).toBe("[REDACTED JSON]");
+  });
+
   it("keeps legacy-redacted note content recognizable and idempotent", () => {
     const legacy =
       "old note authorization=[REDACTED] token=[REDACTED TOKEN] and checksum [REDACTED HEX]";
     expect(maskSecretsForStorage(legacy)).toBe(legacy);
     expect(redactSecretsForOutput(legacy)).toBe(legacy);
+    expect(redactSecretsForOutput("[REDACTED]")).toBe("[REDACTED]");
+    expect(redactSecretsForOutput("[REDACTED TOKEN]")).toBe("[REDACTED TOKEN]");
   });
 });
