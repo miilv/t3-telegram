@@ -18,7 +18,7 @@ import type {
   WorkThread,
   WorkerEvent,
 } from "../../shared/src/index.js";
-import { newId, nowIso } from "../../shared/src/index.js";
+import { newId, nowIso, redactSecretsForOutput } from "../../shared/src/index.js";
 import { metrics } from "../../observability/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 import { EffectT3RpcClient, type T3LiveClient } from "./rpc.js";
@@ -30,6 +30,22 @@ export type {
   T3ShellSubscriptionInput,
   T3ThreadSubscriptionInput,
 } from "./rpc.js";
+
+/** Typed last-mile decorator for prose sent to any T3 broker implementation. */
+export function privacyGuardT3Broker(broker: T3Broker): T3Broker {
+  return new Proxy(broker, {
+    get(target, property) {
+      if (property === "sendTurn") {
+        return (input: SendThreadTurnInput) => target.sendTurn({
+          ...input,
+          text: redactSecretsForOutput(input.text),
+        });
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
 
 interface T3ProjectWire {
   id: string;
@@ -283,7 +299,7 @@ export class HttpT3Broker implements T3Broker {
         .slice(0, 8)
         .map(async (artifact) => ({
           type: "image" as const,
-          name: artifact.filename ?? `image-${artifact.id}`,
+          name: redactSecretsForOutput(artifact.filename ?? `image-${artifact.id}`),
           mimeType: artifact.mimeType!,
           sizeBytes: artifact.sizeBytes,
           dataUrl: `data:${artifact.mimeType};base64,${(await readFile(artifact.localPath)).toString("base64")}`,
@@ -292,7 +308,9 @@ export class HttpT3Broker implements T3Broker {
     const paths = (input.artifacts ?? [])
       .filter((artifact) => !artifact.mimeType?.startsWith("image/"))
       .map((artifact) => `- ${artifact.filename ?? artifact.id}: ${artifact.localPath}`);
-    const text = paths.length ? `${input.text}\n\nMaterialized artifacts:\n${paths.join("\n")}` : input.text;
+    const text = redactSecretsForOutput(
+      paths.length ? `${input.text}\n\nMaterialized artifacts:\n${paths.join("\n")}` : input.text,
+    );
     await this.dispatch({
       type: "thread.turn.start",
       commandId,

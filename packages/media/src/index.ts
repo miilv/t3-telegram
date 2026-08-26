@@ -5,7 +5,7 @@ import { basename, extname, join } from "node:path";
 import { inflateRawSync } from "node:zlib";
 import type { Logger } from "pino";
 import type { ArtifactRegistry } from "../../artifacts/src/index.js";
-import type { Artifact } from "../../shared/src/index.js";
+import { redactSecretsForOutput, type Artifact } from "../../shared/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 import type { TelegramAttachment } from "../../telegram/src/index.js";
 
@@ -265,7 +265,7 @@ export class MediaProcessor {
   }
 
   async synthesizeVoice(text: string): Promise<Artifact> {
-    const normalized = text.trim();
+    const normalized = redactSecretsForOutput(text).trim();
     if (!normalized) throw new Error("TTS text is empty");
     if (normalized.length > 10_000) throw new Error("TTS text exceeds 10,000 characters");
     const directory = await mkdtemp(join(tmpdir(), "t3-tts-"));

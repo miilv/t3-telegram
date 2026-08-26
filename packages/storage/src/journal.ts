@@ -1,6 +1,6 @@
 import { type DatabaseSync, type SQLInputValue } from "node:sqlite";
 import type { JournalEntry, JournalKind } from "../../shared/src/index.js";
-import { JOURNAL_KINDS, nowIso, redactSecrets } from "../../shared/src/index.js";
+import { JOURNAL_KINDS, maskSecretsForStorage, nowIso } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
 
@@ -70,7 +70,7 @@ export class JournalRepository {
   /** Insert inside a transaction the caller already owns (now-item close). */
   insert(input: JournalEntryInput): JournalEntry {
     const base = (input.slugBase.trim() || input.day).slice(0, 120);
-    const body = redactSecrets(input.body).trim().slice(0, 8_000);
+    const body = maskSecretsForStorage(input.body).trim().slice(0, 8_000);
     let slug = base;
     for (let suffix = 2; this.get(slug) && suffix < 1_000; suffix += 1) {
       slug = `${base}-${suffix}`;
@@ -102,7 +102,7 @@ export class JournalRepository {
     input: Omit<JournalEntryInput, "slugBase"> & { slug: string },
   ): JournalEntry | undefined {
     if (this.get(input.slug)) return undefined;
-    const body = redactSecrets(input.body).trim().slice(0, 8_000);
+    const body = maskSecretsForStorage(input.body).trim().slice(0, 8_000);
     this.db
       .prepare(
         "INSERT INTO journal_entries(slug,day,body,source,kind,thread_ref,origin_job,create_seq,created_at) VALUES (?,?,?,?,?,?,?,?,?)",

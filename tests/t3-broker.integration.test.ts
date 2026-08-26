@@ -1,19 +1,34 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { writeFileSync } from "node:fs";
 import pino from "pino";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   HttpT3Broker,
   isPermanentRpcError,
   resolveT3WebSocketUrl,
+  privacyGuardT3Broker,
   type T3LiveClient,
   type T3ShellSubscriptionInput,
   type T3ThreadSubscriptionInput,
 } from "../packages/t3-broker/src/index.js";
-import { tempStore } from "./helpers.js";
+import { tempDirectory, tempStore } from "./helpers.js";
 import type { OperatorStore } from "../packages/storage/src/index.js";
 
 describe("HttpT3Broker", () => {
+  it("decorates arbitrary broker implementations before provider dispatch", async () => {
+    let captured: { text: string } | undefined;
+    const inner = {
+      sendTurn: async (input: { text: string }) => {
+        captured = input;
+        return { threadId: "thread", commandId: "command" };
+      },
+    } as unknown as import("../packages/shared/src/index.js").T3Broker;
+    const broker = privacyGuardT3Broker(inner);
+    await broker.sendTurn({ threadId: "thread", text: "Run token=t3-decorator-secret" });
+    expect(captured?.text).toBe("Run token=[REDACTED]");
+  });
+
   let fixture: T3Fixture;
   let store: OperatorStore;
 
@@ -55,12 +70,21 @@ describe("HttpT3Broker", () => {
       projectId: project.id,
       title: "Auth refresh race",
     });
+    const imagePath = `${tempDirectory("t3-privacy-image-")}/image.png`;
+    writeFileSync(imagePath, "image-bytes");
     const turn = await broker.sendTurn({
       threadId: thread.id,
-      text: "Reproduce and fix it",
+      text: "Reproduce and fix it; api_key=t3-provider-secret",
       providerInstanceId: "codex_work",
       model: "gpt-5.6-sol",
       modelOptions: [{ id: "effort", value: "max" }],
+      artifacts: [{
+        id: "artifact_opaque_image",
+        localPath: imagePath,
+        filename: "api_key=image-name-secret.png",
+        mimeType: "image/png",
+        sizeBytes: 11,
+      }],
     });
 
     expect(turn.threadId).toBe(thread.id);
@@ -83,6 +107,10 @@ describe("HttpT3Broker", () => {
       instanceId: "codex_work",
       model: "gpt-5.6-sol",
       options: [{ id: "effort", value: "max" }],
+    });
+    expect(fixture.commands[2]?.message).toMatchObject({
+      text: "Reproduce and fix it; api_key=[REDACTED]",
+      attachments: [{ name: "api_key=[REDACTED]" }],
     });
     expect(fixture.authorizationHeaders).toEqual(["Bearer test-token", "Bearer test-token", "Bearer test-token"]);
   });

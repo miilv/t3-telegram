@@ -906,6 +906,15 @@ export {
   UNTRUSTED_LABELS,
 } from "./fencing.js";
 export type { Fence, UntrustedLabel } from "./fencing.js";
+export {
+  maskSecretsForStorage,
+  redactSecrets,
+  redactSecretsDeep,
+  redactSecretsForOutput,
+  redactSecretsForOutputDeep,
+  SECRET_FIELD_NAMES,
+  SECRET_REDACTION_PATHS,
+} from "./redaction.js";
 
 export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
@@ -919,64 +928,4 @@ export function unique<T>(values: readonly T[]): T[] {
 export function truncateCodePoints(value: string, limit: number): string {
   if (limit <= 0) return "";
   return [...value].slice(0, limit).join("");
-}
-
-/**
- * Targeted secret masking for text that ends up in logs or durable storage.
- * Unlike blanket field redaction, it keeps surrounding prose readable so a
- * failure reason stays diagnosable while credentials are masked.
- */
-export function redactSecrets(value: string): string {
-  return value
-    .replace(
-      /-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi,
-      "[REDACTED PRIVATE KEY]",
-    )
-    .replace(/\b\d{5,12}:[A-Za-z0-9_-]{30,}\b/g, "[REDACTED BOT TOKEN]")
-    .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
-    .replace(/\b(api[-_ ]?key|token|secret|password|authorization)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
-    .replace(/\b(?:sk|ghp|github_pat|xox[abprs])[-_][A-Za-z0-9_-]{12,}\b/g, "[REDACTED TOKEN]")
-    .replace(/\b[a-f0-9]{40,}\b/gi, "[REDACTED HEX]")
-    .replace(/(?<![\w/+=])[A-Za-z0-9+]{48,}={0,2}(?![\w/+=])/g, "[REDACTED BASE64]");
-}
-
-/**
- * The canonical secret-key list. Keys are normalised (separators dropped, lower
- * case) and matched as a suffix, so `accessToken`, `client_secret`, `X-Api-Key`
- * and `privateKey` all resolve to the same rule.
- * TODO: the pino redact paths in packages/observability/src/index.ts are a third
- * independent copy of this list and should be generated from it.
- */
-const SECRET_KEY_PATTERN =
-  /(?:token|secret|password|passphrase|authorization|apikey|bearer|credential|credentials|privatekey|cookie|sessionid)$/;
-
-function isSecretKey(key: string): boolean {
-  return SECRET_KEY_PATTERN.test(key.replace(/[_-]/g, "").toLowerCase());
-}
-
-const REDACTION_MAX_DEPTH = 8;
-
-/**
- * Redaction-at-write for structured payloads: every string leaf goes through
- * `redactSecrets`, and any value under a secret-shaped key is dropped entirely.
- * Structure-aware, so it must run BEFORE serialisation and truncation — once a
- * payload is a JSON string, key rules no longer see keys and a cut can split a
- * multi-line secret out of its own pattern.
- * Only plain objects and arrays are rebuilt; anything else (Date, class
- * instances) is passed through untouched so JSON serialisation is unchanged.
- */
-export function redactSecretsDeep(value: unknown, depth = 0): unknown {
-  if (typeof value === "string") return redactSecrets(value);
-  if (depth >= REDACTION_MAX_DEPTH || !value || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((item) => redactSecretsDeep(item, depth + 1));
-  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
-    return value;
-  }
-  const result: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    result[key] = isSecretKey(key) && item !== null && item !== undefined
-      ? "[REDACTED]"
-      : redactSecretsDeep(item, depth + 1);
-  }
-  return result;
 }

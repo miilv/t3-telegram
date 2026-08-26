@@ -45,7 +45,8 @@ import {
   ownerLogicalDay,
   resolveTimeZone,
   raiseOwnDispatchPending,
-  redactSecretsDeep,
+  redactSecretsForOutput,
+  redactSecretsForOutputDeep,
   releaseOwnDispatchPending,
   truncateFenceAware,
 } from "../../shared/src/index.js";
@@ -873,7 +874,7 @@ export class OperatorToolServer {
     });
     this.addTool(server, token, {
       name: "memory.remember",
-      description: "Persist a redacted durable Operator note for future turns.",
+      description: "Persist a privacy-masked durable Operator note for future turns.",
       schema: z.object({
         content: z.string().trim().min(1).max(8_000),
         category: z.string().trim().min(1).max(80).optional(),
@@ -2170,12 +2171,15 @@ function compactResult(value: unknown): ToolResult {
     return {
       resultType: "complete",
       content: [
-        { type: "text", text: boundedJson(value.metadata) },
+        { type: "text", text: boundedJson(redactSecretsForOutputDeep(value.metadata)) },
         { type: "image", data: value.image.data, mimeType: value.image.mimeType },
       ],
     };
   }
-  return { resultType: "complete", content: [{ type: "text", text: boundedJson(value) }] };
+  return {
+    resultType: "complete",
+    content: [{ type: "text", text: boundedJson(redactSecretsForOutputDeep(value)) }],
+  };
 }
 
 /** Journal budgets: enough to reconstruct a turn narrative, never a transcript. */
@@ -2192,7 +2196,7 @@ const JOURNAL_RESULT_LIMIT = 300;
  * that second layer catches payloads assembled elsewhere, it is not this one.
  */
 function journalSnippet(value: unknown, limit: number): string {
-  const redacted = redactSecretsDeep(value);
+  const redacted = redactSecretsForOutputDeep(value);
   if (typeof redacted === "string") return boundedText(redacted, limit);
   // The whole snippet is capped at `limit`, so no single string inside it can
   // usefully exceed that — capping per string keeps megabyte inputs
@@ -2211,9 +2215,15 @@ function journalResultValue(value: unknown): unknown {
 
 function toolError(error: unknown): ToolResult {
   const message = error instanceof Error ? error.message : String(error);
+  const safeMessage = redactSecretsForOutput(message).slice(0, 2_000);
   return {
     resultType: "complete",
-    content: [{ type: "text", text: boundedJson({ error: message.slice(0, 2_000) }) }],
+    content: [
+      {
+        type: "text",
+        text: boundedJson({ error: safeMessage }),
+      },
+    ],
     isError: true,
   };
 }

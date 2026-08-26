@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   ClaudeCliOperatorRuntime,
   CodexCliOperatorRuntime,
+  privacyGuardOperatorRuntime,
   SwitchableOperatorRuntime,
 } from "../packages/operator-runtime/src/index.js";
 import type { OperatorEvent, OperatorRuntime, OperatorSession } from "../packages/shared/src/index.js";
@@ -1017,6 +1018,83 @@ describe("SwitchableOperatorRuntime", () => {
     expect(claude.prompts).toEqual(["policy"]);
   });
 });
+
+describe("privacyGuardOperatorRuntime", () => {
+  it("redacts every provider-bound prose channel without changing tool capability tokens", async () => {
+    const inner = new CapturingRuntime();
+    const runtime = privacyGuardOperatorRuntime(inner);
+    await runtime.start({ systemPrompt: "policy api_key=start-secret" });
+    for await (const _event of runtime.sendTurn({
+      sessionId: "session",
+      prompt: "turn token=turn-secret",
+      toolAccess: { url: "http://127.0.0.1", token: "capability-token", allowedTools: [] },
+    })) {
+      // consume the decorated iterable
+    }
+    await runtime.resume("session", undefined, { systemPrompt: "resume ssh_key=resume-secret" });
+    await runtime.compact("compact password=compact-secret");
+    await runtime.oneShot?.({ prompt: "one secret=one-secret" });
+    await runtime.backgroundOneShot?.({ prompt: "night authorization=night-secret" });
+
+    expect(inner.seen).toEqual([
+      "policy api_key=[REDACTED]",
+      "turn token=[REDACTED]",
+      "resume ssh_key=[REDACTED]",
+      "compact password=[REDACTED]",
+      "one secret=[REDACTED]",
+      "night authorization=[REDACTED]",
+    ]);
+    expect(inner.toolToken).toBe("capability-token");
+  });
+});
+
+class CapturingRuntime implements OperatorRuntime {
+  seen: string[] = [];
+  toolToken: string | undefined;
+
+  async start(input: { systemPrompt: string }): Promise<OperatorSession> {
+    this.seen.push(input.systemPrompt);
+    return { id: "session" };
+  }
+
+  async *sendTurn(input: {
+    prompt: string;
+    toolAccess?: { token: string };
+  }): AsyncIterable<OperatorEvent> {
+    this.seen.push(input.prompt);
+    this.toolToken = input.toolAccess?.token;
+    yield { type: "result", text: "ok" };
+  }
+
+  async interrupt(): Promise<void> {}
+
+  async compact(reason?: string): Promise<{ sessionId: string }> {
+    this.seen.push(reason ?? "");
+    return { sessionId: "session" };
+  }
+
+  async resume(
+    _sessionId: string,
+    _providerId?: string,
+    options?: { systemPrompt?: string },
+  ): Promise<void> {
+    this.seen.push(options?.systemPrompt ?? "");
+  }
+
+  async oneShot(input: { prompt: string }): Promise<string> {
+    this.seen.push(input.prompt);
+    return "ok";
+  }
+
+  async backgroundOneShot(input: { prompt: string }): Promise<string> {
+    this.seen.push(input.prompt);
+    return "ok";
+  }
+
+  async health(): Promise<{ healthy: boolean }> {
+    return { healthy: true };
+  }
+}
 
 class StubRuntime implements OperatorRuntime {
   resumed: string[] = [];

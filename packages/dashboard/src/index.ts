@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Logger } from "pino";
 import type { OperatorPolicySettings } from "../../shared/src/index.js";
-import { humanMoment } from "../../shared/src/index.js";
+import { humanMoment, redactSecretsForOutputDeep } from "../../shared/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
 
 export interface DashboardServerOptions {
@@ -141,7 +141,7 @@ export class DashboardServer {
 
   private json(response: ServerResponse, status: number, value: unknown): void {
     response.writeHead(status, securityHeaders("application/json; charset=utf-8"));
-    response.end(JSON.stringify(value));
+    response.end(JSON.stringify(redactSecretsForOutputDeep(value)));
   }
 }
 

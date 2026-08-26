@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Logger } from "pino";
 import { metrics } from "../../observability/src/index.js";
+import { redactSecretsForOutput } from "../../shared/src/index.js";
 import { AsyncInputQueue, delay, TelegramOutboundQueue } from "./queues.js";
 import {
   markdownToTelegramHtml,
@@ -353,7 +354,7 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
     progress?: TelegramSendProgress,
   ): Promise<SentMessage[]> {
-    const richChunks = splitRichText(text || "…", RICH_SAFE_LIMIT);
+    const richChunks = splitRichText(redactSecretsForOutput(text) || "…", RICH_SAFE_LIMIT);
     // A retried multi-chunk delivery resumes after the chunks a previous
     // attempt already delivered instead of duplicating them.
     const completedChunks = Math.min(progress?.completedChunks ?? 0, richChunks.length);
@@ -385,10 +386,14 @@ export class TelegramBotTransport implements TelegramTransport {
   ): Promise<SentMessage | undefined> {
     const startedAt = Date.now();
     try {
-      const message = await this.bot.api.sendMessage(chatId, text.slice(0, 4_000), {
+      const message = await this.bot.api.sendMessage(
+        chatId,
+        redactSecretsForOutput(text).slice(0, 4_000),
+        {
         ...destinationOptions(options),
         link_preview_options: { is_disabled: true },
-      });
+        },
+      );
       metrics.observe("telegram_update_latency_ms", Date.now() - startedAt, { direction: "outbound_api" });
       return sentMessage(chatId, message.message_id, options);
     } catch (error) {
@@ -436,7 +441,8 @@ export class TelegramBotTransport implements TelegramTransport {
   async updateDraft(draft: StreamDraft, text: string): Promise<void> {
     const startedAt = Date.now();
     try {
-    const preview = truncateRichPreview(text);
+    const safeText = redactSecretsForOutput(text);
+    const preview = truncateRichPreview(safeText);
     draft.text = preview;
     if (draft.mode === "rich-draft") {
       try {
@@ -453,7 +459,7 @@ export class TelegramBotTransport implements TelegramTransport {
         const failure = classifyRichFailure(error);
         if (failure === "fatal" && !isDraftDestinationError(error)) throw error;
         if (failure === "capability" && isMethodUnavailable(error)) this.richDraftAvailable = false;
-        const plainPreview = truncateRichPreview(text, PLAIN_PREVIEW_LIMIT);
+        const plainPreview = truncateRichPreview(safeText, PLAIN_PREVIEW_LIMIT);
         if (await this.tryPlainDraft(draft, plainPreview)) return;
         await this.createEditableDraft(draft, plainPreview);
         return;
@@ -462,7 +468,7 @@ export class TelegramBotTransport implements TelegramTransport {
     // Fallback modes go through plain sendMessageDraft/editMessageText, whose
     // hard cap is 4096 rather than the rich 30k; re-truncate for them so the
     // preview keeps moving. The final answer is chunked in full regardless.
-    const plainPreview = truncateRichPreview(text, PLAIN_PREVIEW_LIMIT);
+    const plainPreview = truncateRichPreview(safeText, PLAIN_PREVIEW_LIMIT);
     if (draft.mode === "draft") {
       if (await this.tryPlainDraft(draft, plainPreview)) return;
       await this.createEditableDraft(draft, plainPreview);
@@ -491,7 +497,7 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   async finalizeDraft(draft: StreamDraft, text: string): Promise<SentMessage[]> {
-    const finalText = text || draft.text || "…";
+    const finalText = redactSecretsForOutput(text || draft.text) || "…";
     if (draft.mode !== "edit" || !draft.messageId) {
       return this.sendRich(draft.chatId, finalText, copySendOptions(draft));
     }
@@ -510,10 +516,11 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
     const file = await validateUpload(path, this.maxUploadBytes);
+    const safeCaption = redactSecretsForOutput(caption);
     const message = await this.outbound(chatId, () =>
-      this.bot.api.sendDocument(chatId, new InputFile(file.path, file.name), {
+      this.bot.api.sendDocument(chatId, new InputFile(file.path, redactSecretsForOutput(file.name)), {
         ...messageOptions(options),
-        ...(caption ? { caption: caption.slice(0, CAPTION_LIMIT) } : {}),
+        ...(safeCaption ? { caption: safeCaption.slice(0, CAPTION_LIMIT) } : {}),
       }),
     );
     return sentMessage(chatId, message.message_id, options);
@@ -526,20 +533,21 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
     const file = await validateUpload(path, this.maxUploadBytes);
+    const safeCaption = redactSecretsForOutput(caption);
     if (file.size > MAX_PHOTO_BYTES || !PHOTO_EXTENSIONS.has(extname(file.path).toLowerCase())) {
       return this.sendDocument(chatId, file.path, caption, options);
     }
     try {
       const message = await this.outbound(chatId, () =>
-        this.bot.api.sendPhoto(chatId, new InputFile(file.path, file.name), {
+        this.bot.api.sendPhoto(chatId, new InputFile(file.path, redactSecretsForOutput(file.name)), {
           ...messageOptions(options),
-          ...(caption ? { caption: caption.slice(0, CAPTION_LIMIT) } : {}),
+          ...(safeCaption ? { caption: safeCaption.slice(0, CAPTION_LIMIT) } : {}),
         }),
       );
       return sentMessage(chatId, message.message_id, options);
     } catch (error) {
       if (!isPhotoRejected(error)) throw error;
-      return this.sendDocument(chatId, file.path, caption, options);
+      return this.sendDocument(chatId, file.path, safeCaption, options);
     }
   }
 
@@ -557,8 +565,10 @@ export class TelegramBotTransport implements TelegramTransport {
     }
     const media = files.map((file, index) => ({
       type: "photo" as const,
-      media: new InputFile(file.path, file.name),
-      ...(items[index]?.caption ? { caption: items[index].caption!.slice(0, CAPTION_LIMIT) } : {}),
+      media: new InputFile(file.path, redactSecretsForOutput(file.name)),
+      ...(items[index]?.caption
+        ? { caption: redactSecretsForOutput(items[index].caption!).slice(0, CAPTION_LIMIT) }
+        : {}),
       ...(items[index]?.hasSpoiler ? { has_spoiler: true } : {}),
     }));
     try {
@@ -612,7 +622,7 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
     const message = await this.outbound(chatId, () =>
-      this.bot.api.sendMessage(chatId, this.legacyHtml(text), {
+      this.bot.api.sendMessage(chatId, this.legacyHtml(redactSecretsForOutput(text)), {
         ...messageOptions(options),
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
@@ -630,7 +640,7 @@ export class TelegramBotTransport implements TelegramTransport {
   ): Promise<void> {
     try {
       await this.outbound(chatId, () =>
-        this.bot.api.editMessageText(chatId, messageId, this.legacyHtml(text), {
+        this.bot.api.editMessageText(chatId, messageId, this.legacyHtml(redactSecretsForOutput(text)), {
           parse_mode: "HTML",
           link_preview_options: { is_disabled: true },
           reply_markup: approvalKeyboard(approvalId),
@@ -651,10 +661,15 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
     const message = await this.outbound(chatId, () =>
-      this.bot.api.sendMessage(chatId, this.legacyHtml(text), {
+      this.bot.api.sendMessage(chatId, this.legacyHtml(redactSecretsForOutput(text)), {
         ...messageOptions(options),
         parse_mode: "HTML",
-        reply_markup: userInputKeyboard(inputId, questionIndex, choices, multiSelect),
+        reply_markup: userInputKeyboard(
+          inputId,
+          questionIndex,
+          choices.map((choice) => ({ ...choice, label: redactSecretsForOutput(choice.label) })),
+          multiSelect,
+        ),
       }),
     );
     return sentMessage(chatId, message.message_id, options);
@@ -668,11 +683,11 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions = {},
   ): Promise<SentMessage> {
     const message = await this.outbound(chatId, () =>
-      this.bot.api.sendMessage(chatId, this.legacyHtml(text), {
+      this.bot.api.sendMessage(chatId, this.legacyHtml(redactSecretsForOutput(text)), {
         ...messageOptions(options),
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
-        reply_markup: choiceKeyboard(choiceId, labels),
+        reply_markup: choiceKeyboard(choiceId, labels.map(redactSecretsForOutput)),
       }),
     );
     return sentMessage(chatId, message.message_id, options);
@@ -688,9 +703,14 @@ export class TelegramBotTransport implements TelegramTransport {
     multiSelect: boolean,
   ): Promise<void> {
     await this.outbound(chatId, () =>
-      this.bot.api.editMessageText(chatId, messageId, this.legacyHtml(text), {
+      this.bot.api.editMessageText(chatId, messageId, this.legacyHtml(redactSecretsForOutput(text)), {
         parse_mode: "HTML",
-        reply_markup: userInputKeyboard(inputId, questionIndex, choices, multiSelect),
+        reply_markup: userInputKeyboard(
+          inputId,
+          questionIndex,
+          choices.map((choice) => ({ ...choice, label: redactSecretsForOutput(choice.label) })),
+          multiSelect,
+        ),
       }),
     );
   }
@@ -701,7 +721,7 @@ export class TelegramBotTransport implements TelegramTransport {
     text: string,
     options: TelegramDestination = {},
   ): Promise<void> {
-    await this.editRichSingle(chatId, messageId, text, options);
+    await this.editRichSingle(chatId, messageId, redactSecretsForOutput(text), options);
   }
 
   async clearInlineKeyboard(chatId: number, messageId: number): Promise<void> {
@@ -717,7 +737,10 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   async answerCallback(callbackId: string, text?: string): Promise<void> {
-    await this.outbound(0, () => this.bot.api.answerCallbackQuery(callbackId, text ? { text } : {}));
+    const safeText = text ? redactSecretsForOutput(text) : undefined;
+    await this.outbound(0, () =>
+      this.bot.api.answerCallbackQuery(callbackId, safeText ? { text: safeText } : {}),
+    );
   }
 
   async downloadFile(fileId: string): Promise<Uint8Array> {
@@ -818,8 +841,12 @@ export class TelegramBotTransport implements TelegramTransport {
     commands: TelegramBotCommand[],
     scope: TelegramCommandScope = { type: "default" },
   ): Promise<void> {
+    const safeCommands = commands.map((command) => ({
+      ...command,
+      description: redactSecretsForOutput(command.description),
+    }));
     await this.outbound(scope.type === "chat" ? scope.chatId : 0, () =>
-      this.bot.api.setMyCommands(commands, {
+      this.bot.api.setMyCommands(safeCommands, {
         scope: scope.type === "chat" ? { type: "chat", chat_id: scope.chatId } : { type: "default" },
       }),
     );
@@ -1087,6 +1114,7 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   private async sendRichChunk(chatId: number, chunk: string, options: TelegramSendOptions): Promise<SentMessage[]> {
+    chunk = redactSecretsForOutput(chunk);
     if (this.richFinalAvailable !== false) {
       try {
         const message = await this.outbound(chatId, () =>
@@ -1105,6 +1133,7 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   private async sendLegacy(chatId: number, text: string, options: TelegramSendOptions): Promise<SentMessage[]> {
+    text = redactSecretsForOutput(text);
     const sent: SentMessage[] = [];
     for (const [index, chunk] of splitRichText(text, 4000).entries()) {
       const chunkOptions = index === 0 ? options : withoutReply(options);
@@ -1170,6 +1199,7 @@ export class TelegramBotTransport implements TelegramTransport {
     text: string,
     options: TelegramDestination,
   ): Promise<SentMessage[]> {
+    text = redactSecretsForOutput(text);
     if (this.richFinalAvailable !== false && text.length <= RICH_SAFE_LIMIT) {
       try {
         await this.outbound(chatId, () =>
@@ -1211,6 +1241,7 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   private async tryPlainDraft(draft: StreamDraft, text: string): Promise<boolean> {
+    text = redactSecretsForOutput(text);
     if (this.draftAvailable === false) return false;
     try {
       await this.outbound(draft.chatId, () =>
@@ -1228,6 +1259,7 @@ export class TelegramBotTransport implements TelegramTransport {
   }
 
   private async createEditableDraft(draft: StreamDraft, text: string): Promise<void> {
+    text = redactSecretsForOutput(text);
     const message = await this.outbound(draft.chatId, () =>
       this.bot.api.sendMessage(draft.chatId, text, {
         ...messageOptions(draft),
@@ -1246,12 +1278,13 @@ export class TelegramBotTransport implements TelegramTransport {
     options: TelegramSendOptions,
   ): Promise<SentMessage> {
     const file = await validateUpload(path, this.maxUploadBytes);
+    caption = redactSecretsForOutput(caption);
     const common = {
       ...messageOptions(options),
       ...(caption ? { caption: caption.slice(0, CAPTION_LIMIT) } : {}),
     };
     const messageId = await this.outbound(chatId, async (): Promise<number> => {
-      const input = new InputFile(file.path, file.name);
+      const input = new InputFile(file.path, redactSecretsForOutput(file.name));
       switch (kind) {
         case "audio": return (await this.bot.api.sendAudio(chatId, input, common)).message_id;
         case "voice": return (await this.bot.api.sendVoice(chatId, input, common)).message_id;

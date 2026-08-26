@@ -57,6 +57,7 @@ import {
   truncateFenceAware,
   raiseOwnDispatchPending,
   releaseOwnDispatchPending,
+  redactSecretsForOutput,
 } from "../../../packages/shared/src/index.js";
 import type {
   BackgroundJob,
@@ -7571,7 +7572,16 @@ export class OperatorDaemon {
     operation: "rich" | "photo" | "document" | "clear_keyboard" | "approval",
     payload: DurableTelegramPayload,
   ): TelegramOutboxItem<DurableTelegramPayload> {
-    return this.store.enqueueTelegramOutbox({ dedupeKey, chatId, operation, payload });
+    const safePayload: DurableTelegramPayload = {
+      ...payload,
+      ...(payload.text !== undefined
+        ? { text: redactSecretsForOutput(payload.text) }
+        : {}),
+      ...(payload.caption !== undefined
+        ? { caption: redactSecretsForOutput(payload.caption) }
+        : {}),
+    };
+    return this.store.enqueueTelegramOutbox({ dedupeKey, chatId, operation, payload: safePayload });
   }
 
   private async drainT3Dispatches(): Promise<void> {

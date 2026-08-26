@@ -330,6 +330,31 @@ describe("MediaProcessor", () => {
     },
   );
 
+  it("redacts TTS text before it reaches a local speech process", async () => {
+    const home = tempDirectory("media-tts-privacy-");
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    await artifacts.initialize();
+    const captured = `${home}/captured-stdin.txt`;
+    const fakeSay = `${home}/fake-say`;
+    writeFileSync(
+      fakeSay,
+      `#!/bin/sh\nbody=$(cat)\nprintf '%s' "$body" > ${JSON.stringify(captured)}\nexit 23\n`,
+    );
+    chmodSync(fakeSay, 0o755);
+    const processor = new MediaProcessor(
+      mediaConfig({ sayBin: fakeSay }),
+      artifacts,
+      store,
+      pino({ enabled: false }),
+    );
+
+    await expect(
+      processor.synthesizeVoice("Speak this api_key=tts-provider-secret"),
+    ).rejects.toThrow();
+    expect(readFileSync(captured, "utf8")).toBe("Speak this api_key=[REDACTED]");
+  });
+
   it("prefers OpenRouter when configured and falls through the provider chain", async () => {
     const home = tempDirectory("media-openrouter-");
     const store = tempStore();

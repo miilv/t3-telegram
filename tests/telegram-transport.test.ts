@@ -21,6 +21,100 @@ afterEach(() => {
 });
 
 describe("grammY Telegram transport", () => {
+  it("redacts visible text and button labels at the last mile without mutating callback ids", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+
+    await transport.sendRich(7, "Result api_key=rich-visible-secret");
+    await transport.sendApproval(
+      7,
+      "Approve password=approval-visible-secret",
+      "approval_stable_id",
+    );
+    await transport.sendUserInput(
+      7,
+      "Question token=question-visible-secret",
+      "stable_input_id",
+      0,
+      [{ label: "Option password=button-visible-secret" }],
+      false,
+    );
+    await transport.answerCallback("callback_opaque_id", "secret=callback-visible-secret");
+    await transport.setMyCommands([
+      { command: "status", description: "Status token=menu-visible-secret" },
+    ]);
+
+    expect(calls[0]?.body.rich_message).toEqual({
+      markdown: "Result api_key=[REDACTED]",
+    });
+    expect(calls[1]?.body.text).toContain("Approve password=[REDACTED]");
+    expect(calls[2]?.body.text).toContain("Question token=[REDACTED]");
+    const keyboard = calls[2]?.body.reply_markup as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    };
+    expect(keyboard.inline_keyboard[0]?.[0]).toEqual({
+      text: "Option password=[REDACTED]",
+      callback_data: "ui:stable_input_id:0:o0",
+    });
+    expect(calls[3]?.body).toMatchObject({
+      callback_query_id: "callback_opaque_id",
+      text: "secret=[REDACTED]",
+    });
+    expect(calls[4]?.body.commands).toEqual([
+      { command: "status", description: "Status token=[REDACTED]" },
+    ]);
+  });
+
+  it("redacts streaming drafts and rich edits before any Telegram API attempt", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const draft = await transport.startDraft(7);
+    await transport.updateDraft(draft, "Partial api_key=draft-visible-secret");
+    await transport.finalizeDraft(draft, "Final token=final-visible-secret");
+    await transport.editRich(7, 100, "Edit password=edit-visible-secret");
+
+    expect(JSON.stringify(calls)).not.toMatch(
+      /draft-visible-secret|final-visible-secret|edit-visible-secret/u,
+    );
+    expect(JSON.stringify(calls)).toContain("api_key=[REDACTED]");
+    expect(JSON.stringify(calls)).toContain("token=[REDACTED]");
+    expect(JSON.stringify(calls)).toContain("password=[REDACTED]");
+  });
+
+  it("redacts upload captions and visible filenames while preserving the source path", async () => {
+    const home = tempDirectory("telegram-upload-privacy-");
+    const path = join(home, "api_key=filename-visible-secret.txt");
+    writeFileSync(path, "document");
+    let sentPath = "";
+    let sentName = "";
+    let sentCaption = "";
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const api = (transport as unknown as {
+      bot: {
+        api: {
+          sendDocument: (
+            chatId: number,
+            file: { fileData: string; filename?: string },
+            options: { caption?: string },
+          ) => Promise<{ message_id: number }>;
+        };
+      };
+    }).bot.api;
+    api.sendDocument = async (_chatId, file, options) => {
+      sentPath = String(file.fileData);
+      sentName = String(file.filename);
+      sentCaption = options.caption ?? "";
+      return { message_id: 101 };
+    };
+
+    await transport.sendDocument(7, path, "Caption token=caption-visible-secret");
+    expect(sentPath).toBe(path);
+    expect(sentName).toBe("api_key=[REDACTED]");
+    expect(sentCaption).toBe("Caption token=[REDACTED]");
+  });
+
   it("uses the Bot API 10.x rich_message argument and reply/topic parameters", async () => {
     const calls: ApiCall[] = [];
     vi.stubGlobal("fetch", successfulTelegramFetch(calls));

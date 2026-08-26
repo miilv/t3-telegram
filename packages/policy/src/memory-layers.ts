@@ -16,7 +16,12 @@
  */
 
 import { createHash } from "node:crypto";
-import { NOW_SECTIONS, openFence, ownerLocalParts } from "../../shared/src/index.js";
+import {
+  NOW_SECTIONS,
+  openFence,
+  ownerLocalParts,
+  redactSecretsForOutput,
+} from "../../shared/src/index.js";
 import type { Fence, NowSection, NowStatus } from "../../shared/src/index.js";
 
 /** memory-design §2.2 — now-state render budget. */
@@ -192,7 +197,7 @@ function nowItemLine(item: NowStateItem, timeZone?: string): string {
     ...(item.validUntil ? [`hidden after ${localStamp(item.validUntil, timeZone)}`] : []),
   ].join(", ");
   const journal = item.journalRef ? ` → journal ${item.journalRef}` : "";
-  return `- ${box}${clean(item.content, NOW_ITEM_CONTENT_CHARS)} (${facts})${journal}`;
+  return `- ${box}${clean(redactSecretsForOutput(item.content), NOW_ITEM_CONTENT_CHARS)} (${facts})${journal}`;
 }
 
 /**
@@ -303,8 +308,8 @@ export function renderMemoryIndex(
 
 function indexLine(note: MemoryIndexNote): string {
   const trigger = note.description?.trim()
-    ? clean(note.description, 120)
-    : clean(note.content, LEGACY_INDEX_EXCERPT_CHARS);
+    ? clean(redactSecretsForOutput(note.description), 120)
+    : clean(redactSecretsForOutput(note.content), LEGACY_INDEX_EXCERPT_CHARS);
   const reference = note.key?.trim() ? note.key.trim() : note.id;
   return `- ${trigger} → ${reference}`;
 }
@@ -376,13 +381,13 @@ export function fingerprintNowItems(items: readonly NowStateItem[]): NowItemFing
           item.section,
           item.status ?? "open",
           item.validUntil ?? "",
-          clean(item.content, NOW_ITEM_CONTENT_CHARS),
+          clean(redactSecretsForOutput(item.content), NOW_ITEM_CONTENT_CHARS),
         ].join(" "),
       ),
       // The label only has to NAME a vanished item in one diff line, and this
       // row is persisted for every item on every accepted turn — 40 characters
       // is a title, not a payload.
-      l: clean(item.content, 40),
+      l: clean(redactSecretsForOutput(item.content), 40),
     };
   }
   return fingerprints;
@@ -469,7 +474,9 @@ export function renderNowDiff(
 ): string | undefined {
   if (entries.length === 0) return undefined;
   const shown = entries.slice(0, options.limit ?? 12);
-  const body = shown.map((entry) => `- ${DIFF_VERB[entry.kind]}: ${entry.label}`).join("\n");
+  const body = shown
+    .map((entry) => `- ${DIFF_VERB[entry.kind]}: ${redactSecretsForOutput(entry.label)}`)
+    .join("\n");
   const lines = [NOW_DIFF_HEADER, fenceBody(body, options.fence)];
   if (entries.length > shown.length) {
     lines.push(`(+${entries.length - shown.length} more changes)`);

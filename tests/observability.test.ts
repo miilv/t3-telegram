@@ -55,6 +55,35 @@ describe("observability", () => {
     expect(entry.err.stack).not.toContain(botToken);
   });
 
+  it("uses the canonical secret vocabulary for nested structured log fields", () => {
+    const lines: string[] = [];
+    const logger = createLogger("info", { write: (line: string) => void lines.push(line) });
+    const sha = "d".repeat(40);
+    logger.info(
+      {
+        client_secret: "root-log-secret",
+        request: {
+          auth: {
+            sshKey: "nested-log-secret",
+            signing_key: "snake-log-secret",
+            checksum: sha,
+          },
+        },
+      },
+      "Nested request",
+    );
+    const entry = JSON.parse(lines.at(-1)!) as {
+      client_secret: string;
+      request: { auth: { sshKey: string; signing_key: string; checksum: string } };
+    };
+    expect(entry.client_secret).toBe("[REDACTED]");
+    expect(entry.request.auth).toEqual({
+      sshKey: "[REDACTED]",
+      signing_key: "[REDACTED]",
+      checksum: sha,
+    });
+  });
+
   it("masks token shapes in free text without hiding the surrounding reason", () => {
     const masked = redactSecrets(
       "request to api.telegram.org failed: Bearer eyJhbGciOi.payload, api_key=sk-live-material, sha 3b7e00a1c5d94f6288f1f0e2b9a4d7c6e5f40312",
@@ -62,7 +91,7 @@ describe("observability", () => {
     expect(masked).toContain("request to api.telegram.org failed");
     expect(masked).toContain("Bearer [REDACTED]");
     expect(masked).toContain("api_key=[REDACTED]");
-    expect(masked).toContain("[REDACTED HEX]");
+    expect(masked).toContain("3b7e00a1c5d94f6288f1f0e2b9a4d7c6e5f40312");
     expect(masked).not.toContain("sk-live-material");
     expect(redactSecrets("worker exited with code 1: tests failed in auth.spec.ts")).toBe(
       "worker exited with code 1: tests failed in auth.spec.ts",

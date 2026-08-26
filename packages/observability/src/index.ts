@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import pino, { type DestinationStream, type Logger } from "pino";
-import { redactSecrets } from "../../shared/src/index.js";
+import { redactSecretsForOutput, SECRET_REDACTION_PATHS } from "../../shared/src/index.js";
 
 export type MetricName =
   | "telegram_update_latency_ms"
@@ -186,20 +186,12 @@ export function createLogger(level = "info", destination?: DestinationStream): L
     {
       level,
       base: { service: "t3-telegram-operator" },
-      // TODO: third independent copy of the secret-key list. The canonical one
-      // is SECRET_KEY_PATTERN in packages/shared/src/index.ts (used by
-      // redactSecretsDeep); these pino paths should be generated from it so a
-      // new secret-shaped key cannot be covered in storage but leak in logs.
       redact: {
         paths: [
-          "token",
+          ...SECRET_REDACTION_PATHS,
           "telegram.token",
           "t3.bearerToken",
-          "authorization",
           "headers.authorization",
-          "*.token",
-          "*.apiKey",
-          "apiKey",
           "prompt",
           "transcript",
           "providerResponse",
@@ -222,17 +214,17 @@ export function createLogger(level = "info", destination?: DestinationStream): L
 }
 
 function serializeSanitizedError(error: unknown): unknown {
-  if (typeof error === "string") return redactSecrets(error);
+  if (typeof error === "string") return redactSecretsForOutput(error);
   if (!(error instanceof Error)) return error;
   return sanitizeSerializedError(pino.stdSerializers.errWithCause(error) as Record<string, unknown>);
 }
 
 function sanitizeSerializedError(serialized: Record<string, unknown>): Record<string, unknown> {
   for (const key of ["message", "stack"]) {
-    if (typeof serialized[key] === "string") serialized[key] = redactSecrets(serialized[key]);
+    if (typeof serialized[key] === "string") serialized[key] = redactSecretsForOutput(serialized[key]);
   }
   if (typeof serialized.cause === "string") {
-    serialized.cause = redactSecrets(serialized.cause);
+    serialized.cause = redactSecretsForOutput(serialized.cause);
   } else if (serialized.cause && typeof serialized.cause === "object") {
     serialized.cause = sanitizeSerializedError(serialized.cause as Record<string, unknown>);
   }

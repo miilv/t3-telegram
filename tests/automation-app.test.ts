@@ -9,6 +9,34 @@ import { containsMachineTimestamp } from "../packages/shared/src/index.js";
 import { tempStore } from "./helpers.js";
 
 describe("automation app service", () => {
+  it("keeps source-bearing automation instructions raw until the provider boundary", async () => {
+    const store = tempStore();
+    const automation = createAutomation({
+      ownerId: "42",
+      name: "Private source",
+      prompt: "Use api_key=source-automation-secret",
+      schedule: { type: "once", runAt: "2026-08-21T09:00:00.000Z" },
+      chatId: 7,
+      now: new Date("2026-08-21T08:00:00.000Z"),
+    });
+    store.saveAutomation(automation);
+    const service = new AutomationAppService({
+      store,
+      logger: pino({ enabled: false }),
+      now: () => new Date("2026-08-21T09:00:00.000Z"),
+      syntheticMessageId: () => -76,
+      notifyPaused: async () => undefined,
+    });
+
+    expect(await service.dispatchDue()).toBe(1);
+    const job = store.listBackgroundJobs<{
+      update: { appEvent?: { instruction?: string } };
+    }>("telegram_ingress")[0]!;
+    expect(job.payload.update.appEvent?.instruction).toBe(
+      "Use api_key=source-automation-secret",
+    );
+  });
+
   it("rewrites machine timestamps only on the app-turn output boundary", () => {
     const rendered = guardAutomationAppOutput(
       "Встреча начнётся 2026-08-22T10:00:00.000Z. Резерв 12:00 UTC.",
