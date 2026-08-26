@@ -83,6 +83,8 @@ export interface TelegramSendOptions extends TelegramDestination {
 export interface TelegramInboundBatchPart {
   messageId: number;
   text: string;
+  /** True when text is a transport-generated media stand-in, not sender-authored. */
+  textIsMediaPlaceholder?: boolean;
   replyToMessageId?: number;
   /**
    * Package 1.4: the quoted message of THIS part. The merged envelope keeps

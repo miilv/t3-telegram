@@ -186,6 +186,7 @@ describe("OperatorToolServer", () => {
       allowedMessageIds: [91, 92],
       allowedArtifactIds: [imageArtifact.id, textArtifact.id],
       operatorTurnId: "opturn_1",
+      turnOrigin: "human",
       messageThreadId: 12,
     });
     const client = new Client({ name: "operator-tools-test", version: "1.0.0" });
@@ -462,6 +463,42 @@ describe("OperatorToolServer", () => {
         labels: ["EU", "US"],
         messageThreadId: 12,
       });
+      expect(store.conversation.listAll().map((entry) => ({
+        direction: entry.direction,
+        evidenceRole: entry.evidenceRole,
+        sourceKind: entry.sourceKind,
+        delivered: Boolean(entry.deliveredAt),
+        text: entry.text,
+      }))).toEqual([
+        {
+          direction: "outbound",
+          evidenceRole: "context_only",
+          sourceKind: "operator_tool",
+          delivered: true,
+          text: "Read this aloud",
+        },
+        {
+          direction: "outbound",
+          evidenceRole: "context_only",
+          sourceKind: "operator_tool",
+          delivered: true,
+          text: "Working on it",
+        },
+        {
+          direction: "outbound",
+          evidenceRole: "context_only",
+          sourceKind: "operator_tool",
+          delivered: true,
+          text: "Still working",
+        },
+        {
+          direction: "outbound",
+          evidenceRole: "context_only",
+          sourceKind: "operator_tool",
+          delivered: true,
+          text: "Какой регион деплоя выбрать?",
+        },
+      ]);
       const badChoices = await client.callTool({
         name: "telegram.ask_choices",
         arguments: { question: "?", options: ["only one"] },

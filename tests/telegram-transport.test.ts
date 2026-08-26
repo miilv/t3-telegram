@@ -1546,6 +1546,34 @@ describe("inbound batch merging", () => {
     expect(merged.text).toContain("срочно зайди на сервер");
   });
 
+  it("keeps media placeholders in source while marking them out of authored batch text", () => {
+    const merged = mergeInboundBatch([
+      {
+        ...base,
+        updateId: 1,
+        messageId: 30,
+        messageIds: [30],
+        text: "(voice: audio/ogg)",
+        textIsMediaPlaceholder: true,
+        attachments: [{ type: "voice", fileId: "voice-30" }],
+      },
+      {
+        ...base,
+        updateId: 2,
+        messageId: 31,
+        messageIds: [31],
+        text: "это мой комментарий",
+      },
+    ]);
+
+    expect(merged.text).toBe("(voice: audio/ogg)\n\nэто мой комментарий");
+    expect(merged.ownText).toBe("это мой комментарий");
+    expect(merged.parts).toMatchObject([
+      { messageId: 30, textIsMediaPlaceholder: true },
+      { messageId: 31 },
+    ]);
+  });
+
   it("keeps every inline callback payload inside Telegram's 64-byte cap", async () => {
     const calls: ApiCall[] = [];
     vi.stubGlobal("fetch", successfulTelegramFetch(calls));

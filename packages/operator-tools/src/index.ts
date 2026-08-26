@@ -89,6 +89,7 @@ import {
   updateAutomation,
 } from "../../automations/src/index.js";
 import { replayIdentity, TurnReplayKeys } from "./replay.js";
+import { TurnConversationOutputs } from "./conversation-output.js";
 import { registerAutomationAndCalendarTools } from "./automation-tools.js";
 
 const CAPABILITY_TTL_MS = 2 * 60 * 60 * 1_000;
@@ -304,6 +305,8 @@ export interface TurnCapability {
   replayKeys: TurnReplayKeys;
   /** Replay ordinal for journal.note writes; independent from now creates. */
   journalCreateSeq: number;
+  /** Stable logical identities for direct text-bearing Telegram tool calls. */
+  conversationOutputs: TurnConversationOutputs;
 }
 
 interface ToolResult {
@@ -426,6 +429,7 @@ export class OperatorToolServer {
     if (!this.endpoint) throw new Error("Operator MCP server is not started");
     this.pruneExpiredCapabilities();
     const token = randomBytes(32).toString("base64url");
+    const turnSeed = context.ingressJobId ?? context.operatorTurnId;
     this.capabilities.set(token, {
       context: {
         ...context,
@@ -435,8 +439,20 @@ export class OperatorToolServer {
       expiresAt: Date.now() + CAPABILITY_TTL_MS,
       sentMessageIds: new Set(),
       nowCreateSeq: 0,
-      replayKeys: new TurnReplayKeys(context.ingressJobId ?? context.operatorTurnId),
+      replayKeys: new TurnReplayKeys(turnSeed),
       journalCreateSeq: 0,
+      conversationOutputs: new TurnConversationOutputs(this.options.store, {
+        turnSeed,
+        ownerId: context.ownerId,
+        role: context.teamRole,
+        ...(context.turnOrigin ? { turnOrigin: context.turnOrigin } : {}),
+        chatId: context.chatId,
+        ...(context.messageThreadId ? { messageThreadId: context.messageThreadId } : {}),
+        ...(context.directMessagesTopicId
+          ? { directMessagesTopicId: context.directMessagesTopicId }
+          : {}),
+        operatorTurnId: context.operatorTurnId,
+      }),
     });
     let revoked = false;
     const toolNames = context.turnOrigin === "app"
@@ -1609,6 +1625,8 @@ export class OperatorToolServer {
       schema: textSchema,
       handler: async ({ text, threadId }, capability) => {
         this.requireTeamMutation(capability, "send Telegram messages");
+        const logical = capability.conversationOutputs.begin("send_message", text);
+        if (logical?.alreadyDelivered) return { sent: [], replayed: true };
         // The message is the point, the binding is a bonus: send FIRST, then
         // resolve. Nothing about naming a thread may cost the owner the text —
         // least of all a T3 outage during a mandatory heads-up.
@@ -1617,6 +1635,7 @@ export class OperatorToolServer {
           text,
           destination(capability.context),
         );
+        if (logical) capability.conversationOutputs.delivered(logical.sourceKey);
         const bound = await this.resolveOutgoingThread(capability, threadId);
         return {
           ...this.recordSent(sent, capability, "operator_tool_message", [], bound.threadId),
@@ -1631,10 +1650,13 @@ export class OperatorToolServer {
       schema: textSchema,
       handler: async ({ text, threadId }, capability) => {
         this.requireTeamMutation(capability, "send Telegram replies");
+        const logical = capability.conversationOutputs.begin("reply", text);
+        if (logical?.alreadyDelivered) return { sent: [], replayed: true };
         const sent = await this.options.telegram.sendRich(capability.context.chatId, text, {
           ...destination(capability.context),
           replyToMessageId: capability.context.originMessageId,
         });
+        if (logical) capability.conversationOutputs.delivered(logical.sourceKey);
         const bound = await this.resolveOutgoingThread(capability, threadId);
         return {
           ...this.recordSent(sent, capability, "operator_tool_reply", [], bound.threadId),
@@ -1649,12 +1671,15 @@ export class OperatorToolServer {
       handler: async ({ messageId, text }, capability) => {
         this.requireTeamMutation(capability, "edit Telegram messages");
         if (!capability.sentMessageIds.has(messageId)) throw new Error("message was not sent by this turn capability");
+        const logical = capability.conversationOutputs.begin("edit", text);
+        if (logical?.alreadyDelivered) return { messageId, edited: true, replayed: true };
         await this.options.telegram.editRich(
           capability.context.chatId,
           messageId,
           text,
           destination(capability.context),
         );
+        if (logical) capability.conversationOutputs.delivered(logical.sourceKey);
         return { messageId, edited: true };
       },
     });
@@ -1669,6 +1694,8 @@ export class OperatorToolServer {
       }),
       handler: async ({ question, options }, capability) => {
         this.requireTeamMutation(capability, "ask Telegram choice questions");
+        const logical = capability.conversationOutputs.begin("ask_choices", question);
+        if (logical?.alreadyDelivered) return { sent: [], replayed: true };
         const choiceId = `pick_${randomBytes(9).toString("base64url")}`;
         const sent = await this.options.telegram.sendChoices(
           capability.context.chatId,
@@ -1696,6 +1723,7 @@ export class OperatorToolServer {
               : {}),
           }),
         );
+        if (logical) capability.conversationOutputs.delivered(logical.sourceKey);
         return this.recordSent([sent], capability, "operator_tool_choices");
       },
     });
@@ -1717,12 +1745,17 @@ export class OperatorToolServer {
           const artifact = await this.resolveOutboundArtifact(input, capability);
           const options = destination(capability.context);
           const caption = input.caption ?? "";
+          const logical = caption
+            ? capability.conversationOutputs.begin(`send_${kind}`, caption)
+            : undefined;
+          if (logical?.alreadyDelivered) return { sent: [], replayed: true };
           let sent: SentMessage;
           if (kind === "document") sent = await this.options.telegram.sendDocument(capability.context.chatId, artifact.localPath, caption, options);
           else if (kind === "photo") sent = await this.options.telegram.sendPhoto(capability.context.chatId, artifact.localPath, caption, options);
           else if (kind === "audio") sent = await this.options.telegram.sendAudio(capability.context.chatId, artifact.localPath, caption, options);
           else if (kind === "video") sent = await this.options.telegram.sendVideo(capability.context.chatId, artifact.localPath, caption, options);
           else throw new Error("unsupported Telegram media kind");
+          if (logical) capability.conversationOutputs.delivered(logical.sourceKey);
           return this.recordSent([sent], capability, `operator_tool_${kind}`, [artifact.id]);
         },
       });
@@ -1746,12 +1779,18 @@ export class OperatorToolServer {
         const voice = input.text
           ? await this.options.media.synthesizeVoice(input.text)
           : await this.options.media.normalizeVoice(await this.resolveOutboundArtifact(input, capability));
+        const logicalText = [input.text, input.caption].filter((value): value is string => Boolean(value)).join("\n\n");
+        const logical = logicalText
+          ? capability.conversationOutputs.begin("send_voice", logicalText)
+          : undefined;
+        if (logical?.alreadyDelivered) return { sent: [], replayed: true };
         const sent = await this.options.telegram.sendVoice(
           capability.context.chatId,
           voice.localPath,
           input.caption ?? "",
           destination(capability.context),
         );
+        if (logical) capability.conversationOutputs.delivered(logical.sourceKey);
         return this.recordSent([sent], capability, "operator_tool_voice", [voice.id]);
       },
     });

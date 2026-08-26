@@ -245,6 +245,89 @@ CREATE TABLE IF NOT EXISTS telegram_outbox (
   delivered_at TEXT
 );
 
+-- Package 3.2: one row per logical owner/operator utterance. This is separate
+-- from telegram_messages, whose rows are physical Telegram chunks and edit
+-- anchors. A logical outbound is visible to consumers only after delivered_at
+-- is settled by the same local transaction as its outbox row.
+CREATE TABLE IF NOT EXISTS conversation_ledger (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_id         TEXT NOT NULL,
+  conversation_key TEXT NOT NULL,
+  direction        TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+  actor            TEXT NOT NULL CHECK (actor IN ('owner','operator')),
+  text             TEXT NOT NULL,
+  source_kind      TEXT NOT NULL CHECK (
+    source_kind IN ('telegram_ingress','telegram_outbox','operator_tool')
+  ),
+  source_key       TEXT NOT NULL CHECK (length(source_key) > 0),
+  ingress_job_id   TEXT,
+  operator_turn_id TEXT,
+  owner_evidence_text TEXT,
+  evidence_role    TEXT NOT NULL CHECK (evidence_role IN ('owner_assertion','context_only')),
+  provenance_json  TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(provenance_json)),
+  delivered_at     TEXT,
+  created_at       TEXT NOT NULL,
+  UNIQUE(source_kind, source_key),
+  CHECK (
+    (
+      direction='inbound' AND actor='owner' AND source_kind='telegram_ingress'
+      AND ingress_job_id IS NOT NULL AND operator_turn_id IS NULL
+      AND delivered_at IS NOT NULL
+      AND (
+        (evidence_role='owner_assertion' AND length(owner_evidence_text) > 0)
+        OR (evidence_role='context_only' AND owner_evidence_text IS NULL)
+      )
+    ) OR (
+      direction='outbound' AND actor='operator'
+      AND source_kind IN ('telegram_outbox','operator_tool')
+      AND ingress_job_id IS NULL AND operator_turn_id IS NOT NULL
+      AND owner_evidence_text IS NULL AND evidence_role='context_only'
+    )
+  )
+);
+
+-- Pending outbounds live in the ledger immediately, but enter the monotonic
+-- consumer stream only when Telegram delivery is locally settled. A late
+-- settlement therefore gets a fresh stream sequence instead of leaving a
+-- hole that a cursor can skip or that blocks every later owner message.
+CREATE TABLE IF NOT EXISTS conversation_ledger_stream (
+  seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+  ledger_id  INTEGER NOT NULL UNIQUE
+    REFERENCES conversation_ledger(id) ON DELETE RESTRICT,
+  ready_at   TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS conversation_ledger_stream_on_insert
+AFTER INSERT ON conversation_ledger
+WHEN NEW.delivered_at IS NOT NULL
+BEGIN
+  INSERT OR IGNORE INTO conversation_ledger_stream(ledger_id,ready_at)
+  VALUES (NEW.id,NEW.delivered_at);
+END;
+
+CREATE TRIGGER IF NOT EXISTS conversation_ledger_stream_on_delivery
+AFTER UPDATE OF delivered_at ON conversation_ledger
+WHEN OLD.delivered_at IS NULL AND NEW.delivered_at IS NOT NULL
+BEGIN
+  INSERT OR IGNORE INTO conversation_ledger_stream(ledger_id,ready_at)
+  VALUES (NEW.id,NEW.delivered_at);
+END;
+
+CREATE TABLE IF NOT EXISTS conversation_ledger_cursors (
+  consumer   TEXT NOT NULL,
+  owner_id   TEXT NOT NULL,
+  last_seq   INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (consumer, owner_id)
+);
+
+-- Existing installations cannot be backfilled: telegram_messages never stored
+-- text. This durable marker makes the honest coverage boundary queryable.
+CREATE TABLE IF NOT EXISTS conversation_ledger_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 -- worker_groups, worker_group_members, thread_handoffs and
 -- routing_clarifications are legacy: the agent-routing refactor removed the
 -- code that wrote them. The DDL stays so existing databases keep migrating
@@ -511,6 +594,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_notes_active_key
   ON operator_notes(key) WHERE status='active' AND key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_telegram_outbox_delivery
   ON telegram_outbox(status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_conversation_ledger_owner_id
+  ON conversation_ledger(owner_id, id);
+CREATE INDEX IF NOT EXISTS idx_conversation_ledger_distillable
+  ON conversation_ledger(owner_id, delivered_at, id);
 CREATE INDEX IF NOT EXISTS idx_project_memberships_user
   ON project_memberships(user_id, access_role);
 CREATE INDEX IF NOT EXISTS idx_project_aliases_alias

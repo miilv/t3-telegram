@@ -68,6 +68,7 @@ import type {
   PendingUserInput,
   TelegramOutboxItem,
   UserInputDraftAnswer,
+  OperatorConversationOutbound,
 } from "../../../packages/storage/src/index.js";
 import {
   isCancelIntent,
@@ -177,6 +178,11 @@ import type {
 import { isOfficeDocument } from "../../../packages/media/src/index.js";
 import type { MediaProcessor } from "../../../packages/media/src/index.js";
 import type { DashboardServer } from "../../../packages/dashboard/src/index.js";
+import {
+  logicalConversationKey,
+  operatorOutboundConversation,
+  ownerIngressConversation,
+} from "./conversation-ledger.js";
 
 /** The cloud Bot API's hard getFile ceiling; only a local server lifts it. */
 const CLOUD_BOT_API_MAX_FILE_BYTES = 20 * 1024 * 1024;
@@ -388,6 +394,8 @@ interface DurableTelegramPayload {
   deliveryAlertSent?: boolean;
   /** First failed attempt of the current life; stall duration is measured from it. */
   firstFailureAt?: string;
+  /** Present only for a real owner's human Operator turn. */
+  conversation?: OperatorConversationOutbound;
 }
 
 interface MonitorRoute {
@@ -928,6 +936,7 @@ export class OperatorDaemon {
               !update.messageIds.some((messageId) =>
                 this.store.hasTelegramMessage(update.chatId, messageId),
               ),
+              true,
             );
             void this.operatorInputQueue
               .run("user", () => this.drainTelegramIngress(ingressClaims("user")))
@@ -2010,14 +2019,30 @@ export class OperatorDaemon {
     update: Extract<TelegramInbound, { type: "message" }>,
     lane: IngressLane,
     processExisting = true,
+    recordAcceptedBatch = false,
   ): string {
     const jobId = telegramIngressJobId(update);
-    this.store.enqueueBackgroundJob<DurableTelegramIngress>(
-      "telegram_ingress",
-      { update, processExisting, lane, enqueuedAt: nowIso() },
-      undefined,
-      { id: jobId, dedupeKey: jobId },
-    );
+    const payload: DurableTelegramIngress = { update, processExisting, lane, enqueuedAt: nowIso() };
+    const conversation = ownerIngressConversation({
+      update,
+      ingressJobId: jobId,
+      role: this.roleForUser(update.userId),
+      recordAcceptedBatch,
+    });
+    if (conversation) {
+      this.store.enqueueOwnerConversationIngressJob(
+        payload,
+        conversation,
+        { id: jobId, dedupeKey: jobId },
+      );
+    } else {
+      this.store.enqueueBackgroundJob<DurableTelegramIngress>(
+        "telegram_ingress",
+        payload,
+        undefined,
+        { id: jobId, dedupeKey: jobId },
+      );
+    }
     // Package 4.1 review, finding 8. A synthetic update is the daemon talking
     // to itself — nobody is watching that chat for a reply to it.
     if (!update.synthetic) {
@@ -2130,12 +2155,7 @@ export class OperatorDaemon {
     messageThreadId?: number;
     directMessagesTopicId?: number;
   }): string {
-    return [
-      scope.chatId,
-      scope.userId,
-      scope.messageThreadId ?? 0,
-      scope.directMessagesTopicId ?? 0,
-    ].join(":");
+    return logicalConversationKey(scope);
   }
 
   /** Package 1.1: the superseded-message handoff, per chat and topic. */
@@ -2582,6 +2602,7 @@ export class OperatorDaemon {
     const isThreadEventTurn = threadEvents.length > 0;
     const appEvent = update.appEvent;
     const isAppTurn = appEvent !== undefined;
+    const turnOrigin = isAppTurn ? "app" : isThreadEventTurn ? "digest" : "human";
     // Package 1.2: from here until this turn settles, the degraded fallback
     // must not fire — an interpretation that is merely WAITING (behind the
     // owner, behind another turn) is not an Operator that cannot speak, and
@@ -2618,7 +2639,7 @@ export class OperatorDaemon {
       allowedArtifactIds: artifacts.map((artifact) => artifact.id),
       operatorTurnId,
       ingressJobId,
-      turnOrigin: isAppTurn ? "app" : isThreadEventTurn ? "digest" : "human",
+      turnOrigin,
       ...(update.messageThreadId ? { messageThreadId: update.messageThreadId } : {}),
       ...(update.directMessagesTopicId
         ? { directMessagesTopicId: update.directMessagesTopicId }
@@ -3054,6 +3075,13 @@ export class OperatorDaemon {
     if (update.appEvent) {
       finalText = guardAutomationAppOutput(finalText, this.config.owner.timezone);
     }
+    const conversation = operatorOutboundConversation({
+      update,
+      text: finalText,
+      operatorTurnId,
+      turnOrigin,
+      role: this.roleForUser(update.userId),
+    });
     this.enqueueTelegramOutbox(finalDedupeKey, update.chatId, "rich", {
       text: finalText,
       options: replyOptions(update),
@@ -3065,6 +3093,7 @@ export class OperatorDaemon {
       ...(finalThreadId ? { threadId: finalThreadId } : {}),
       ...(finalRelatedThreadIds.length ? { relatedThreadIds: finalRelatedThreadIds } : {}),
       messageType,
+      ...(conversation ? { conversation } : {}),
     });
     // The answer is durable now, so the handoff this turn carried is spent.
     this.clearIssuedChatPending(update, turn);
@@ -7572,6 +7601,12 @@ export class OperatorDaemon {
     operation: "rich" | "photo" | "document" | "clear_keyboard" | "approval",
     payload: DurableTelegramPayload,
   ): TelegramOutboxItem<DurableTelegramPayload> {
+    const safeConversation = payload.conversation
+      ? {
+          ...payload.conversation,
+          text: redactSecretsForOutput(payload.conversation.text),
+        }
+      : undefined;
     const safePayload: DurableTelegramPayload = {
       ...payload,
       ...(payload.text !== undefined
@@ -7580,8 +7615,15 @@ export class OperatorDaemon {
       ...(payload.caption !== undefined
         ? { caption: redactSecretsForOutput(payload.caption) }
         : {}),
+      ...(safeConversation ? { conversation: safeConversation } : {}),
     };
-    return this.store.enqueueTelegramOutbox({ dedupeKey, chatId, operation, payload: safePayload });
+    return this.store.enqueueTelegramOutbox({
+      dedupeKey,
+      chatId,
+      operation,
+      payload: safePayload,
+      ...(safeConversation ? { conversation: safeConversation } : {}),
+    });
   }
 
   private async drainT3Dispatches(): Promise<void> {
