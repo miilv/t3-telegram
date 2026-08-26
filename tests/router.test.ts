@@ -14,6 +14,11 @@ describe("isCancelIntent", () => {
       "Stop it",
       "cancel",
       "стоп, пожалуйста",
+      // Package 4.3 review: the slash spellings package 1.3 retired are a panic
+      // too, and they used to buy a full LLM turn instead of the hatch.
+      "/stop",
+      "/cancel",
+      "/Стоп",
     ]) {
       expect(isCancelIntent(text), text).toBe(true);
     }
@@ -28,6 +33,10 @@ describe("isCancelIntent", () => {
       "останови работу",
       "",
       "   ",
+      // Still not cancel words, slash or no slash.
+      "/focus clear",
+      "/status",
+      "/stopwatch",
     ]) {
       expect(isCancelIntent(text), text).toBe(false);
     }

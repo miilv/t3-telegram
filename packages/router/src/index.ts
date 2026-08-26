@@ -13,11 +13,22 @@ const cancelWords = new Set(["стоп", "отмена", "отмени", "хва
  * cancel word — «стоп», «хватит, спасибо», "stop it please". A sentence that
  * merely begins with one ("stop doing X when the tests pass") is an
  * instruction, not an interrupt, and must not kill running work (bug №1).
+ *
+ * Package 4.3 review: punctuation is stripped from BOTH ends of the first word,
+ * so the slash forms count too. Package 1.3 deleted `/stop` and `/cancel` as
+ * commands, and until this fix they were the one spelling of a panic that
+ * bought a full LLM turn instead of the deterministic hatch — the worst
+ * possible outcome for the one phrase a user types when something is wrong.
+ * «/focus clear» is unaffected: it is not a cancel word and still reaches the
+ * agent as ordinary text.
  */
 export function isCancelIntent(text: string): boolean {
   const words = text.normalize("NFKC").trim().split(/\s+/u).filter(Boolean);
   if (words.length === 0 || words.length > 3) return false;
-  const first = words[0]!.toLocaleLowerCase().replace(/[^\p{L}\p{N}_]+$/u, "");
+  const first = words[0]!
+    .toLocaleLowerCase()
+    .replace(/^[^\p{L}\p{N}_]+/u, "")
+    .replace(/[^\p{L}\p{N}_]+$/u, "");
   return cancelWords.has(first);
 }
 
