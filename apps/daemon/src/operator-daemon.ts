@@ -41,6 +41,8 @@ import {
   newId,
   nowIso,
   openFence,
+  claimOwnDispatchMarker,
+  forgetOwnDispatchMarker,
   ownDispatchPendingCount,
   truncateFenceAware,
   raiseOwnDispatchPending,
@@ -288,6 +290,13 @@ const OWN_DISPATCH_GRACE_MS = 120_000;
 const STALLED_DELIVERY_ATTEMPTS = 10;
 /** At most one delivery alert per chat per minute, whatever produced it. */
 const DELIVERY_ALERT_THROTTLE_MS = 60_000;
+/**
+ * Package 1.5: how often the watchdog looks. Both deadlines it enforces are
+ * measured in tens of seconds at least, so this only bounds the slop.
+ */
+const WATCHDOG_TICK_MS = 5_000;
+/** Package 1.5: the race token that means "this turn was abandoned as a zombie". */
+const ZOMBIE = Symbol("zombie-turn");
 
 /**
  * Package 1.1: an in-flight direct Operator turn, as seen from outside the
@@ -304,6 +313,20 @@ interface ActiveOperatorTurn {
   ingressJobId: string;
   operatorTurnId?: string;
   superseded: boolean;
+  /**
+   * Package 1.5 — watchdog bookkeeping.
+   *
+   * `lastEventAt` is the last sign of life of the provider call: a streamed
+   * token or a tool step. `interruptedAt` is when this turn was told to stop
+   * (by preemption or by the watchdog) — the grace window is measured from it,
+   * and when the grace expires with the turn still running it is declared a
+   * zombie: `abandon()` releases the queue slot, and everything the turn does
+   * afterwards is inert.
+   */
+  lastEventAt: number;
+  interruptedAt?: number;
+  zombie?: boolean;
+  abandon?: () => void;
   /**
    * Package 1.1: the superseded-message handoff this turn put in its envelope.
    * It stays in `chat_pending` until this turn actually delivers a final — a
@@ -365,6 +388,13 @@ export class OperatorDaemon {
   /** Recipients with an alert in flight, so a fire-and-forget send is never launched twice. */
   private readonly deliveryAlertsInFlight = new Set<number>();
   private readonly monitorTasks = new Set<Promise<void>>();
+  /**
+   * Package 1.5: last event seen per monitored thread. In memory by design — a
+   * restart resubscribes, and a thread whose subscription is fresh has not been
+   * silent for us yet, whatever it was doing while we were down.
+   */
+  private readonly threadEventClock = new Map<string, number>();
+  private watchdogTimer: NodeJS.Timeout | undefined;
   /** Package 1.2: the single voice over worker events (apps/daemon/src/voice.ts). */
   private readonly voice: ThreadVoice;
   private readonly shutdown = new AbortController();
@@ -504,6 +534,11 @@ export class OperatorDaemon {
     await this.recoverWorkers();
     await this.maintain("startup");
     this.scheduler.start();
+    // Package 1.5: the watchdog tick. `unref` so it never keeps the process
+    // alive on its own, and every tick is guarded — a watchdog that throws
+    // would be a watchdog that stops watching.
+    this.watchdogTimer = setInterval(() => this.watchdogTick(), WATCHDOG_TICK_MS);
+    this.watchdogTimer.unref();
     // Package 0.1 (H1): a terminal catcher, so a pump that dies outside its own
     // per-iteration try/catch is logged instead of floating as a rejection.
     this.reliabilityTask = this.reliabilityLoop().catch((error: unknown) => {
@@ -578,6 +613,8 @@ export class OperatorDaemon {
   async stop(deadlineMs = SHUTDOWN_DEADLINE_MS): Promise<void> {
     this.shutdown.abort();
     this.scheduler.stop();
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = undefined;
     // Monitors are aborted up front rather than after the scheduler settles, so
     // a wedged scheduler cannot keep them subscribed for the whole deadline.
     for (const controller of this.monitors.values()) controller.abort();
@@ -1314,6 +1351,9 @@ export class OperatorDaemon {
       conversationKey: this.conversationKey(update),
       ingressJobId: telegramIngressJobId(update),
       superseded: false,
+      // Package 1.5: the clock starts here, not at the provider call — the
+      // media pipeline ahead of it is part of the turn the owner is waiting on.
+      lastEventAt: Date.now(),
     };
     this.activeOperatorTurns.add(turnOrigin);
     try {
@@ -1504,6 +1544,11 @@ export class OperatorDaemon {
     // and the observer may have flagged it already.
     if (turn.superseded) return;
     turn.superseded = true;
+    // Package 1.5: from this moment the turn is supposed to be going away. The
+    // zombie grace is measured from here for EVERY reason it was told to stop,
+    // so a turn that ignores an ordinary preemption is freed the same way as
+    // one the watchdog itself interrupted.
+    turn.interruptedAt ??= Date.now();
     this.store.appendEvent("operator.turn.superseded", {
       correlationId: turn.operatorTurnId ?? `chat:${turn.chatId}`,
       payload: {
@@ -1512,6 +1557,137 @@ export class OperatorDaemon {
         reason,
       },
     });
+  }
+
+  /**
+   * Package 1.5 — the watchdog tick. Public so a test can drive it without
+   * waiting out real minutes; production runs it from a timer started in
+   * `initialize()`.
+   */
+  watchdogTick(): void {
+    try {
+      this.sweepWedgedOperatorTurns();
+    } catch (error) {
+      this.logger.warn({ err: error }, "Operator-turn watchdog failed");
+    }
+    try {
+      this.sweepSilentThreads();
+    } catch (error) {
+      this.logger.warn({ err: error }, "Thread watchdog failed");
+    }
+  }
+
+  /**
+   * Package 1.5 — the wedged-turn watchdog, in two steps.
+   *
+   * The precondition for both is that SOMEONE IS WAITING: the single voice can
+   * legitimately spend ten minutes on one hard question, and a long turn that
+   * nobody is queued behind is not a problem to solve. When the owner is in the
+   * queue, though, silence has a budget.
+   *
+   *  1. a turn that has produced no stream event for `watchdogStallMs` is
+   *     interrupted — the same token-scoped interrupt preemption uses;
+   *  2. a turn that was told to stop (by the watchdog OR by an ordinary
+   *     preemption) and is still running `watchdogGraceMs` later is declared a
+   *     ZOMBIE: its queue slot is released by force, its late answer is never
+   *     delivered (the superseded machinery already guarantees that), the work
+   *     it dispatched travels to the next turn through `chat_pending`, and the
+   *     owner gets ONE line about it.
+   *
+   * The concession is deliberate (grok-bot §watchdog): a single hung turn must
+   * never freeze the system, even at the cost of leaving a process running.
+   */
+  private sweepWedgedOperatorTurns(): void {
+    if (!this.operatorInputQueue.depth("user")) return;
+    const now = Date.now();
+    const stallMs = this.config.operator.watchdogStallMs;
+    const graceMs = this.config.operator.watchdogGraceMs;
+    for (const turn of this.activeOperatorTurns) {
+      if (turn.zombie) continue;
+      if (turn.interruptedAt !== undefined) {
+        if (now - turn.interruptedAt < graceMs) continue;
+        this.declareZombieTurn(turn);
+        continue;
+      }
+      if (now - turn.lastEventAt < stallMs) continue;
+      this.logger.warn(
+        {
+          operatorTurnId: turn.operatorTurnId,
+          ingressJobId: turn.ingressJobId,
+          silentMs: now - turn.lastEventAt,
+        },
+        "Operator turn produced no events while the owner waits; interrupting",
+      );
+      metrics.increment("operator_turns_stalled_total");
+      this.markTurnSuperseded(turn, "watchdog_stall");
+      // A turn with no id has not reached the provider (media, queue), so an
+      // unnamed interrupt could only hit whatever else holds the runtime.
+      if (turn.operatorTurnId) this.interruptQuietly(turn.operatorTurnId);
+    }
+  }
+
+  /** Free the queue slot of a turn that ignored its interrupt (package 1.5). */
+  private declareZombieTurn(turn: ActiveOperatorTurn): void {
+    turn.zombie = true;
+    metrics.increment("operator_turns_zombie_total");
+    this.store.appendEvent("operator.turn.zombie", {
+      correlationId: turn.operatorTurnId ?? `chat:${turn.chatId}`,
+      payload: {
+        ...(turn.operatorTurnId ? { operatorTurnId: turn.operatorTurnId } : {}),
+        ingressJobId: turn.ingressJobId,
+        graceMs: this.config.operator.watchdogGraceMs,
+      },
+    });
+    this.logger.error(
+      { operatorTurnId: turn.operatorTurnId, ingressJobId: turn.ingressJobId },
+      "Operator turn ignored its interrupt; releasing the queue slot (zombie)",
+    );
+    // One more interrupt on the way out: harmless if it lands, and the runtime's
+    // own SIGKILL grace may still reclaim the process.
+    if (turn.operatorTurnId) this.interruptQuietly(turn.operatorTurnId);
+    turn.abandon?.();
+  }
+
+  /**
+   * Package 1.5 — the silent-thread watchdog. A work that is `running` with a
+   * live subscription and has produced NOTHING for `threadStallMs` becomes a
+   * daemon FACT in the digest. Two things it deliberately does not do:
+   *
+   *  - it does not interrupt the thread. Whether a long silence means "still
+   *    thinking" or "wedged" is judgement, and judgement belongs to the
+   *    Operator, who has `t3.interrupt_thread` and the owner's context;
+   *  - it does not tell the owner anything. Single voice: the fact goes to the
+   *    Operator, who decides whether it is worth a word.
+   *
+   * The fact repeats at most once per stall window — and `dispatchNextFollowup`
+   * never fires while the thread stays `running`, so this fact is the only
+   * chance the Operator gets to notice a work that will never end by itself.
+   */
+  private sweepSilentThreads(): void {
+    const stallMs = this.config.operator.threadStallMs;
+    const now = Date.now();
+    for (const [threadId, controller] of this.monitors) {
+      if (controller.signal.aborted) continue;
+      if (this.store.getThread(threadId)?.status !== "running") continue;
+      const lastEventAt = this.threadEventClock.get(threadId);
+      if (lastEventAt === undefined || now - lastEventAt < stallMs) continue;
+      const reportedAt = Date.parse(
+        this.store.getRuntimeState(`thread_stall_reported_at:${threadId}`) ?? "",
+      );
+      if (Number.isFinite(reportedAt) && now - reportedAt < stallMs) continue;
+      const route = this.monitorRoutes.get(threadId);
+      if (!route) continue;
+      this.store.setRuntimeState(`thread_stall_reported_at:${threadId}`, nowIso());
+      const minutes = Math.max(1, Math.round((now - lastEventAt) / 60_000));
+      metrics.increment("worker_threads_stalled_total");
+      this.store.appendEvent("worker.stalled", { threadId, payload: { silentMinutes: minutes } });
+      this.voice.noteDaemonFact(
+        threadId,
+        route,
+        this.threadTitle(threadId),
+        `работа числится выполняющейся, но не подаёт признаков жизни: ни одного события за ${minutes} мин.`,
+      );
+    }
   }
 
   /**
@@ -1808,6 +1984,17 @@ export class OperatorDaemon {
     let finalText: string;
     let messageType = "operator_answer";
     let retryDelayMs: number | undefined;
+    // Package 1.5 — the zombie escape hatch. The watchdog can resolve this, and
+    // both serial resources the turn holds (the lane queue through the await
+    // below, the runtime queue inside `askOperator`) are released at once.
+    let abandoned = false;
+    const abandonment = new Promise<typeof ZOMBIE>((resolve) => {
+      if (!turn) return;
+      turn.abandon = () => {
+        abandoned = true;
+        resolve(ZOMBIE);
+      };
+    });
     const runTurn = async (): Promise<string> => {
       // Package 1.1: the preemption can land in the gap between the entry check
       // and the provider call — `startDraft` is a network round trip. The
@@ -1818,6 +2005,10 @@ export class OperatorDaemon {
       return this.askOperator(
         prompt,
         (delta) => {
+          // Package 1.5: a zombie turn is inert. Its late tokens must not
+          // reappear in a draft that belongs to the next turn now.
+          if (turn?.zombie) return;
+          if (turn) turn.lastEventAt = Date.now();
           if (!observedFirstToken) {
             observedFirstToken = true;
             metrics.observe("operator_first_token_latency_ms", Date.now() - operatorStartedAt);
@@ -1827,6 +2018,10 @@ export class OperatorDaemon {
         },
         toolLease?.access,
         () => {
+          if (turn?.zombie) return;
+          // Package 1.5: a tool step is a sign of life too — a turn that thinks
+          // for ten minutes between two tool calls is working, not wedged.
+          if (turn) turn.lastEventAt = Date.now();
           toolSteps += 1;
           previewTouched = true;
           // Only the preamble before the very first tool call is throwaway
@@ -1836,20 +2031,34 @@ export class OperatorDaemon {
           if (toolSteps === 1) writer?.reset("⏳ Работаю…");
         },
         operatorTurnId,
+        abandonment,
       );
     };
     try {
-      const answer = await runTurn();
-      if (writer && !writer.text && answer) writer.append(answer);
-      finalText = isThreadEventTurn
-        ? answer.trim()
-        : answer || writer?.text || "Не смог сформировать ответ.";
-      // A superseded turn is not a completed one; it gets `dropped` below.
-      if (!turn?.superseded) {
-        this.store.appendEvent("operator.turn.completed", {
-          correlationId,
-          payload: { operatorTurnId, attempt },
-        });
+      const running = runTurn();
+      // The detached promise must never surface as an unhandled rejection once
+      // the race has been decided against it.
+      void running.catch(() => undefined);
+      const raced = await Promise.race([running, abandonment]);
+      if (raced === ZOMBIE) {
+        // Nothing is said from here: the turn is superseded, so the block below
+        // records it, hands its dispatched work to the next turn through
+        // `chat_pending` and drops the draft. The owner's one line about the
+        // freeze is enqueued there too.
+        finalText = "";
+      } else {
+        const answer = raced;
+        if (writer && !writer.text && answer) writer.append(answer);
+        finalText = isThreadEventTurn
+          ? answer.trim()
+          : answer || writer?.text || "Не смог сформировать ответ.";
+        // A superseded turn is not a completed one; it gets `dropped` below.
+        if (!turn?.superseded) {
+          this.store.appendEvent("operator.turn.completed", {
+            correlationId,
+            payload: { operatorTurnId, attempt },
+          });
+        }
       }
     } catch (error) {
       // Package 1.2: a thread-event turn has no one waiting for an apology —
@@ -1914,7 +2123,13 @@ export class OperatorDaemon {
       this.markTurnSuperseded(turn, "newer_owner_message");
     }
     if (turn?.superseded) {
+      // Package 1.5: the owner is owed exactly one line when their answer was
+      // not merely replaced but LOST — the turn hung and had to be abandoned.
+      if (abandoned) await this.reportZombieTurn(update, operatorTurnId, correlationId);
       this.recordSupersededTurn(update, operatorTurnId, correlationId, attempt, turn);
+      // Package 1.5: an interpretation that never happened must not hold the
+      // degraded fallback back — the wait for this terminal restarts now.
+      if (isThreadEventTurn) this.voice.failRelay(threadEvents);
       await this.discardDraft(writer);
       return;
     }
@@ -2003,6 +2218,38 @@ export class OperatorDaemon {
    * job, and the superseding message is a different job — so the note is
    * re-keyed per chat here and consumed once, by the next turn.
    */
+  /**
+   * Package 1.5 — the one line the owner gets about a zombie turn.
+   *
+   * It is not an apology and not a report: the answer they were waiting for is
+   * gone, and the daemon says so in one sentence so the silence is explained.
+   * Everything else about the abandoned turn (the work it dispatched) travels
+   * to the next turn through `chat_pending`, so the Operator can speak to it.
+   *
+   * Nothing is said for a turn the owner never asked for: a thread-event digest
+   * or another synthetic update has no one waiting on it.
+   */
+  private async reportZombieTurn(
+    update: Extract<TelegramInbound, { type: "message" }>,
+    operatorTurnId: string,
+    correlationId: string,
+  ): Promise<void> {
+    if (update.synthetic || update.threadEvents?.length) return;
+    this.enqueueTelegramOutbox(
+      `telegram:operator:${operatorTurnId}:zombie`,
+      update.chatId,
+      "rich",
+      {
+        text: "Предыдущий ответ завис — продолжаю с вашим новым сообщением.",
+        options: replyOptions(update),
+        operatorTurnId,
+        correlationId,
+        messageType: "operator_zombie_notice",
+      },
+    );
+    await this.flushTelegramOutbox();
+  }
+
   private recordSupersededTurn(
     update: Extract<TelegramInbound, { type: "message" }>,
     operatorTurnId: string,
@@ -2155,6 +2402,9 @@ export class OperatorDaemon {
     const controller = new AbortController();
     this.monitors.set(threadId, controller);
     this.store.setRuntimeState(`thread_monitor_started_at:${threadId}`, nowIso());
+    // Package 1.5: silence is measured from the moment we started listening.
+    this.threadEventClock.set(threadId, Date.now());
+    this.store.setRuntimeState(`thread_stall_reported_at:${threadId}`, "");
     metrics.set("active_workers", this.monitors.size);
     const currentRoute = (): MonitorRoute =>
       this.monitorRoutes.get(threadId) ?? {
@@ -2170,6 +2420,9 @@ export class OperatorDaemon {
       const subscribeOnce = async (): Promise<void> => {
         for await (const event of this.broker.subscribeThread(threadId, controller.signal)) {
           resubscribeAttempt = 0;
+          // Package 1.5: any event at all is a sign of life — including the
+          // ones this daemon deliberately keeps silent about.
+          this.threadEventClock.set(threadId, Date.now());
           const route = currentRoute();
           // Bug №41: terminal events go to their own accumulator queue so a
           // burst of completions never occupies the interactive slots. This
@@ -2187,10 +2440,27 @@ export class OperatorDaemon {
             });
             if (event.type === "started") {
               this.store.updateThreadStatus(threadId, "running");
-              await this.observeTurnOwnership(threadId, route.chatId, event.turnId, route.destination);
-            } else if (this.isExternalTurn(threadId) && (event.type === "progress" || event.type === "agent_message")) {
+              await this.observeTurnOwnership(
+                threadId,
+                route.chatId,
+                event.turnId,
+                route.destination,
+                event.commandId,
+              );
+            } else if (
+              this.isExternalTurn(threadId) &&
+              !this.hadRecentOwnDispatch(threadId) &&
+              (event.type === "progress" || event.type === "agent_message")
+            ) {
               // A collaborator is driving this thread directly in the T3 UI;
               // relaying their own steps back to the owner is noise.
+              //
+              // Package 1.5: …but only when the classification is trustworthy.
+              // The same grace that protects terminals now protects the
+              // narrative: after 1.2 a wrongly-suppressed progress or worker
+              // note is not noise saved, it is the story of OUR work lost in
+              // silence. Within OWN_DISPATCH_GRACE_MS of our own dispatch the
+              // events flow into the digest and the Operator judges them.
             } else if (event.type === "progress" && Date.now() - lastProgressAt > this.getPolicy().progressIntervalMs) {
               // Package 1.2: progress is an input to the Operator, not a
               // message. The digest coalesces the frames; the interval still
@@ -2263,6 +2533,8 @@ export class OperatorDaemon {
         const route = currentRoute();
         this.monitors.delete(threadId);
         this.monitorRoutes.delete(threadId);
+        this.threadEventClock.delete(threadId);
+        this.store.setRuntimeState(`thread_stall_reported_at:${threadId}`, "");
         metrics.set("active_workers", this.monitors.size);
         if (terminal) {
           const startedAt = Date.parse(this.store.getRuntimeState(`thread_monitor_started_at:${threadId}`) ?? "");
@@ -2334,7 +2606,8 @@ export class OperatorDaemon {
       (payload) => payload.threadId === threadId,
     );
     if (!job) return undefined;
-    raiseOwnDispatchPending(this.store, threadId);
+    // Package 1.5: the follow-up's commandId is the job id — its identity.
+    raiseOwnDispatchPending(this.store, threadId, job.id);
     try {
       await this.broker.sendTurn({
         threadId,
@@ -2351,6 +2624,7 @@ export class OperatorDaemon {
       });
     } catch (error) {
       releaseOwnDispatchPending(this.store, threadId);
+      forgetOwnDispatchMarker(this.store, threadId, job.id);
       const detail = safeExcerpt(error instanceof Error ? error.message : String(error), 1_000);
       const gaveUp = this.store.retryBackgroundJob(job.id, detail);
       if (gaveUp) {
@@ -3134,20 +3408,38 @@ export class OperatorDaemon {
    * ownership state is kept, so servers that do not expose turn identity
    * retain the old behavior.
    *
-   * Known limitation: without a server-side turnId↔commandId mapping the
-   * classification of WHICH turn is ours stays first-come-first-served. When
-   * our dispatch and a collaborator's start within the same window, the
-   * labels can be swapped; the OWN_DISPATCH_GRACE_MS terminal grace in
-   * deliverCompletion/deliverFailure keeps the result from being suppressed.
+   * Package 1.5 — classification BY IDENTITY where the server allows it. Every
+   * own dispatch now chooses its own `commandId` and remembers it as the turn
+   * it expects; a `started` event that echoes one of those ids is ours, full
+   * stop, and one that carries a foreign id is external, full stop. The
+   * counter below survives as the fallback for servers that do not echo the
+   * command id — and even then the OWN_DISPATCH_GRACE_MS window (now applied
+   * to progress and worker notes too, not only to terminals) keeps a lost race
+   * from silently swallowing the narrative of our own work.
    */
   private async observeTurnOwnership(
     threadId: string,
     chatId: number,
     turnId: string | undefined,
     destination: TelegramDestination,
+    commandId?: string,
   ): Promise<void> {
     const pending = ownDispatchPendingCount(this.store, threadId);
+    // Identity first: an echoed command id answers the question outright.
+    const identified = claimOwnDispatchMarker(this.store, threadId, commandId);
+    if (identified === true) {
+      if (pending > 0) releaseOwnDispatchPending(this.store, threadId);
+      if (turnId) this.store.setRuntimeState(`thread_seen_turn:${threadId}`, turnId);
+      this.store.setRuntimeState(`thread_turn_external:${threadId}`, "");
+      return;
+    }
     if (!turnId) {
+      // A foreign command id without a turn id is still someone else's turn —
+      // and it must not consume the slot our own dispatch is still waiting on.
+      if (identified === false) {
+        this.store.setRuntimeState(`thread_turn_external:${threadId}`, "1");
+        return;
+      }
       if (pending > 0) {
         releaseOwnDispatchPending(this.store, threadId);
         this.store.setRuntimeState(`thread_turn_external:${threadId}`, "");
@@ -3157,7 +3449,10 @@ export class OperatorDaemon {
     const seenKey = `thread_seen_turn:${threadId}`;
     if (this.store.getRuntimeState(seenKey) === turnId) return;
     this.store.setRuntimeState(seenKey, turnId);
-    const own = pending > 0;
+    // `identified === false` — a command id that is not one of ours: external
+    // by identity, so the pending own dispatch stays pending for OUR turn.
+    // `undefined` — no identity travelled; fall back to the counter.
+    const own = identified === undefined && pending > 0;
     if (own) releaseOwnDispatchPending(this.store, threadId);
     this.store.setRuntimeState(`thread_turn_external:${threadId}`, own ? "" : "1");
     if (own) return;
@@ -5250,7 +5545,9 @@ export class OperatorDaemon {
       await this.flushTelegramOutbox();
       return false;
     }
-    raiseOwnDispatchPending(this.store, payload.threadId);
+    // Package 1.5: the durable dispatch already carries its own commandId, so
+    // the started event that echoes it identifies THIS turn as ours.
+    raiseOwnDispatchPending(this.store, payload.threadId, payload.commandId);
     try {
       await this.broker.sendTurn({
         threadId: payload.threadId,
@@ -5302,6 +5599,7 @@ export class OperatorDaemon {
       return true;
     } catch (error) {
       releaseOwnDispatchPending(this.store, payload.threadId);
+      forgetOwnDispatchMarker(this.store, payload.threadId, payload.commandId);
       const classified = classifyOperationalError(error, "t3");
       const gaveUp = this.store.retryBackgroundJob(job.id, classified.code);
       if (gaveUp) {
@@ -5394,8 +5692,36 @@ export class OperatorDaemon {
      * mediation or memory call that took it next.
      */
     turnToken?: string,
+    /**
+     * Package 1.5: resolves when the caller's turn was declared a zombie. The
+     * single voice is TWO serial resources — the lane queue and this runtime
+     * queue — and freeing only the first would leave the next turn waiting on
+     * the wedged provider call anyway. When it fires, this call's queue slot is
+     * released and the provider call carries on detached and unheard.
+     *
+     * That the abandoned CLI may still be alive is accepted: it has been sent
+     * an interrupt, the runtime escalates SIGINT to SIGKILL after its own
+     * grace, and a hung turn must never freeze the system (grok-bot watchdog).
+     */
+    abandoned?: Promise<unknown>,
   ): Promise<string> {
     return this.operatorRuntimeQueue.run(async () => {
+      const call = this.streamOperatorTurn(prompt, onDelta, toolAccess, onToolStarted, turnToken);
+      if (!abandoned) return call;
+      void call.catch(() => undefined);
+      return Promise.race([call, abandoned.then(() => "")]);
+    });
+  }
+
+  /** The provider call itself; `askOperator` owns the queueing around it. */
+  private async streamOperatorTurn(
+    prompt: string,
+    onDelta?: (delta: string) => void,
+    toolAccess?: OperatorToolAccess,
+    onToolStarted?: (tool: string) => void,
+    turnToken?: string,
+  ): Promise<string> {
+    {
       let streamed = "";
       let segment = "";
       let lastInterSegment = "";
@@ -5476,7 +5802,7 @@ export class OperatorDaemon {
         }
         throw error;
       }
-    });
+    }
   }
 
   /** Owner-personalized policy (bug №44): name and language from config. */

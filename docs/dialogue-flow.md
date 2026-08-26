@@ -378,6 +378,51 @@ Operator turn at a time is a session invariant, not a queue detail):
 | `thread-events` | digested worker events (package 1.2 connects the feed) |
 | `background` | startup ingress replay, the 1 s reliability pump |
 
+### The watchdog: a hung turn may never freeze the system (package 1.5)
+
+Preemption covers "a new message against a LIVE turn". The watchdog covers the
+case preemption cannot: a turn that does not react to its interrupt at all. It
+ticks every 5 s and fires only when **someone is waiting** — `depth("user") > 0`
+on the lane queue. A long turn nobody is queued behind is not a problem to
+solve; the single voice is allowed to think for ten minutes.
+
+```
+step 1 — STALL          no stream event (token or tool step) for
+                        WATCHDOG_STALL_SECONDS (120) while the user lane waits
+                        → mark superseded (reason `watchdog_stall`) +
+                          runtime.interrupt(turnToken). Same interrupt as
+                          preemption; the answer is undeliverable from here on.
+step 2 — ZOMBIE         the turn was told to stop (BY ANYONE: the watchdog above
+                        or an ordinary preemption) and is still running
+                        WATCHDOG_GRACE_SECONDS (30) later
+                        → `turn.abandon()`:
+                          · the lane-queue slot is released — the awaited call
+                            in answerDirect resolves, the drain completes the
+                            ingress job (completed-as-superseded) and claims the
+                            next one, so the QUEUE CONTINUES;
+                          · the runtime-queue slot is released too — freeing
+                            only the lane would leave the next turn waiting on
+                            the same wedged provider call. `askOperator` races
+                            the same signal inside its serial task;
+                          · the provider call carries on DETACHED and unheard:
+                            deltas and tool steps are dropped (`turn.zombie`),
+                            the tool lease is revoked, the draft discarded, and
+                            the late final is never enqueued — the superseded
+                            machinery already guarantees that;
+                          · the owner gets ONE line, the only one the daemon
+                            authors here: «Предыдущий ответ завис — продолжаю с
+                            вашим новым сообщением.» (`operator_zombie_notice`,
+                            never for a synthetic or thread-event turn — nobody
+                            was waiting on those);
+                          · `operator.turn.zombie` is recorded, and the work the
+                            turn had dispatched travels to the next turn in
+                            `chat_pending` exactly like any supersession.
+```
+
+The concession is deliberate: an abandoned CLI may still be alive. It has been
+interrupted, the runtime escalates SIGINT→SIGKILL after its own grace, and one
+wedged turn must never cost the owner every later message.
+
 Starvation of the background lane is deliberate: every background producer is a
 repeating pump, so a skipped round retries. **The pump never awaits the lane** —
 it hands one drain over (`backgroundDrainQueued` keeps it to one in flight) and
@@ -477,6 +522,14 @@ switched to codex and `OPERATOR_CODEX_ENABLED` later returns to `false`,
 `resolveUnavailableProvider` falls back to the configured default (else any
 available provider), persists the correction, logs a warning and sends the
 owner one line — boot continues.
+
+**A hung turn no longer holds both serial resources** (package 1.5).
+`OPERATOR_TURN_TIMEOUT_MS` (600 s) remains the outer SIGKILL bound, but it is no
+longer the only one: `askOperator` takes an optional abandonment signal, and
+when the watchdog resolves it the runtime-queue task returns while the provider
+call keeps streaming into nothing. The next turn starts immediately. See §4 for
+the full stall→grace→zombie sequence and its config
+(`WATCHDOG_STALL_SECONDS`, `WATCHDOG_GRACE_SECONDS`).
 
 **A hung CLI hangs boot.** Runtime health is `spawn(binary, ["--version"])` with
 no watchdog. A non-zero exit aborts boot with one unattributed line; a binary
@@ -636,6 +689,31 @@ keep their own mediation path (unchanged, they are questions to the owner);
 `progress`, `agent_message` and the three terminal types go to the
 `ThreadEventDigest` and reach the owner only through an Operator turn (§14).
 Nothing in this path writes to the chat directly any more.
+
+**Turn ownership — by identity first** (package 1.5). Every own dispatch chooses
+its own `commandId` (`t3.send_turn`, the durable `t3_dispatch` job, a queued
+follow-up) and remembers it in `thread_expected_turns:<threadId>`. A `started`
+event that echoes one of those ids is OURS, full stop; one carrying a foreign
+command id is external, full stop, and it no longer consumes the pending slot
+our own dispatch is still waiting for. The old counter
+(`thread_own_dispatch_pending`) survives as the fallback for servers that do not
+echo the command id — and under that fallback the `OWN_DISPATCH_GRACE_MS`
+(120 s) window now also covers `progress` and `agent_message`, not just
+terminals: after 1.2 a mis-labelled turn no longer costs a duplicated message,
+it costs the whole narrative of our own work, told to nobody.
+
+**Silent-thread watchdog** (package 1.5). A thread that is `running` with a live
+subscription and has produced no event at all for `THREAD_STALL_MINUTES`
+(default 30) becomes a daemon FACT in the digest — «работа числится
+выполняющейся, но не подаёт признаков жизни: ни одного события за N мин.» — at
+most once per stall window (`thread_stall_reported_at:<threadId>`, cleared when
+the monitor ends). Two deliberate non-actions: the daemon does **not** interrupt
+the thread (whether a long silence means "thinking" or "wedged" is judgement,
+and the Operator holds `t3.interrupt_thread`), and it does **not** speak to the
+owner (single voice — the Operator decides whether it is worth a word). This
+fact is also the only chance the Operator gets to notice such a thread at all:
+`dispatchNextFollowup` only runs on a terminal event, so a forever-`running`
+thread would otherwise never surface.
 
 Monitor resubscribe: 10 attempts, 1 s base, 60 s cap. Exhaustion →
 `Потерял связь с тредом **<title>** после нескольких попыток переподключения.

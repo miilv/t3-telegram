@@ -64,7 +64,7 @@ describe("OperatorToolServer", () => {
     writeFileSync(workerReport, "worker report", { mode: 0o600 });
     store.upsertProject(project);
     store.upsertThread(thread);
-    const turns: Array<{ threadId: string; text: string }> = [];
+    const turns: Array<{ threadId: string; text: string; commandId?: string }> = [];
     const started: ToolStartedThread[] = [];
     const broker = {
       listProjects: async () => [project],
@@ -322,7 +322,11 @@ describe("OperatorToolServer", () => {
       expect(telegram.voices[0]?.path).toBe(voiceArtifact.localPath);
       expect(telegram.videoNotes[0]?.path).toBe(voiceArtifact.localPath);
       await callJson(client, "t3.send_turn", { threadId: thread.id, text: "Continue implementation" });
-      expect(turns).toEqual([{ threadId: thread.id, text: "Continue implementation" }]);
+      // Package 1.5: the dispatch carries its own commandId — the identity the
+      // daemon recognises when the turn starts, instead of guessing by order.
+      expect(turns).toMatchObject([{ threadId: thread.id, text: "Continue implementation" }]);
+      expect(turns[0]?.commandId).toMatch(/^cmd_/u);
+      expect(store.getRuntimeState(`thread_expected_turns:${thread.id}`)).toBe(turns[0]!.commandId);
       expect(started).toHaveLength(1);
       expect(started[0]?.context.chatId).toBe(777);
 

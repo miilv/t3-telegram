@@ -67,6 +67,24 @@ const envSchema = z.object({
    * enough that a finished work is relayed while the owner still cares.
    */
   THREAD_DIGEST_WINDOW_MS: z.coerce.number().int().min(0).max(600_000).default(3_000),
+  /**
+   * Package 1.5 — the wedged-turn watchdog. A turn that has produced no stream
+   * event for this long WHILE the owner is waiting in the queue is treated as
+   * stuck: it is interrupted, and if it does not settle within the grace below
+   * its queue slot is released by force (the "zombie" concession — one wedged
+   * turn may never freeze the whole system).
+   */
+  WATCHDOG_STALL_SECONDS: z.coerce.number().int().min(10).max(3_600).default(120),
+  /** Package 1.5: how long the interrupted turn is given to settle by itself. */
+  WATCHDOG_GRACE_SECONDS: z.coerce.number().int().min(1).max(600).default(30),
+  /**
+   * Package 1.5 — the silent-thread watchdog. A running work with a live
+   * subscription and no event for this long produces a daemon FACT in the
+   * digest ("work X has been silent for N minutes"). The daemon never
+   * interrupts the thread itself: what to do about it is the Operator's
+   * judgement, and telling the owner is the Operator's job (single voice).
+   */
+  THREAD_STALL_MINUTES: z.coerce.number().int().min(1).max(1_440).default(30),
   MAX_PARALLEL_WORKERS: z.coerce.number().int().min(2).max(4).default(4),
   PROGRESS_INTERVAL_MS: z.coerce.number().int().min(5_000).max(600_000).default(60_000),
   PROVIDER_OPTIMIZATION_ENABLED: z.enum(["true", "false"]).default("true"),
@@ -313,6 +331,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       mediationTimeoutMs: parsed.OPERATOR_MEDIATION_TIMEOUT_MS,
       voiceFallbackMs: parsed.OPERATOR_VOICE_FALLBACK_MINUTES * 60_000,
       threadDigestWindowMs: parsed.THREAD_DIGEST_WINDOW_MS,
+      watchdogStallMs: parsed.WATCHDOG_STALL_SECONDS * 1_000,
+      watchdogGraceMs: parsed.WATCHDOG_GRACE_SECONDS * 1_000,
+      threadStallMs: parsed.THREAD_STALL_MINUTES * 60_000,
       home: operatorHome,
       runtimeDir: resolve(operatorHome, "runtime"),
       artifactDir: resolve(operatorHome, "artifacts"),

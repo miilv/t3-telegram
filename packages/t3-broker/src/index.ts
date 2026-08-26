@@ -866,7 +866,16 @@ class ThreadSubscriptionProjection {
             : isRecord(payload.turn) && typeof payload.turn.turnId === "string"
               ? payload.turn.turnId
               : undefined;
-        this.pushStarted(events, requestedTurnId);
+        // Package 1.5: if the server echoes the commandId we sent, ownership of
+        // this turn is a fact rather than a guess. Best effort — absent on
+        // servers that do not echo it, and the daemon falls back to the counter.
+        const requestedCommandId =
+          typeof payload.commandId === "string"
+            ? payload.commandId
+            : isRecord(payload.turn) && typeof payload.turn.commandId === "string"
+              ? payload.turn.commandId
+              : undefined;
+        this.pushStarted(events, requestedTurnId, requestedCommandId);
         break;
       }
       case "thread.message-sent":
@@ -1037,7 +1046,7 @@ class ThreadSubscriptionProjection {
     return undefined;
   }
 
-  private pushStarted(events: WorkerEvent[], turnId?: string): void {
+  private pushStarted(events: WorkerEvent[], turnId?: string, commandId?: string): void {
     // A known, different turn id means a NEW turn began inside a live
     // subscription (e.g. someone continued the thread from the T3 UI); it must
     // surface even though this subscription already emitted a start.
@@ -1045,7 +1054,12 @@ class ThreadSubscriptionProjection {
     if (this.startedEmitted && !newTurn) return;
     this.startedEmitted = true;
     if (turnId) this.lastTurnId = turnId;
-    events.push({ type: "started", threadId: this.threadId, ...(turnId ? { turnId } : {}) });
+    events.push({
+      type: "started",
+      threadId: this.threadId,
+      ...(turnId ? { turnId } : {}),
+      ...(commandId ? { commandId } : {}),
+    });
   }
 
   private pushProgress(events: WorkerEvent[], summary: string): void {
