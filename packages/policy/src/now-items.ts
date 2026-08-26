@@ -51,6 +51,18 @@ export const NOW_HINT_UNKNOWN_ITEM =
 export const NOW_HINT_CREATE_NEEDS_FIELDS =
   "Creating a now item needs both section and content. Pass an id instead to change an item that already exists.";
 
+/**
+ * Review B2. Closing a daemon item used to succeed, and it erased live work:
+ * the reconciliation skipped the closed row, the unique `thread_ref` refused a
+ * replacement, and the thread fell out of the state and out of the focus
+ * derivation permanently. The reconciliation now heals that, but the call is
+ * still refused — a daemon item's life is the thread's life, and the agent
+ * asking for one to end has a real tool for that.
+ */
+export const NOW_HINT_DAEMON_CLOSE =
+  "This item is the daemon's record of a work thread, so it closes when the thread does — not on request. " +
+  "To actually stop the work, call t3.interrupt_thread; to say it is not what is happening now, move it (section) instead.";
+
 export const NOW_HINT_CLOSE_NEEDS_ID =
   "Closing archives an item into the journal, so it needs the id of the item you are closing. Call now.get for the current list.";
 
@@ -132,7 +144,10 @@ export function selectNowItemsForRender(
       content: item.content,
       updatedAt: item.updatedAt,
       source: item.source,
+      status: item.status,
       ...(item.threadRef ? { threadRef: item.threadRef } : {}),
+      ...(item.validUntil ? { validUntil: item.validUntil } : {}),
+      ...(item.journalRef ? { journalRef: item.journalRef } : {}),
       pinned: item.source === "daemon" && PINNED_SECTIONS.includes(item.section),
     }));
 }

@@ -16,8 +16,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { NOW_SECTIONS, openFence } from "../../shared/src/index.js";
-import type { Fence, NowSection } from "../../shared/src/index.js";
+import { NOW_SECTIONS, openFence, ownerLocalParts } from "../../shared/src/index.js";
+import type { Fence, NowSection, NowStatus } from "../../shared/src/index.js";
 
 /** memory-design §2.2 — now-state render budget. */
 export const NOW_STATE_BUDGET_CHARS = 3_000;
@@ -76,6 +76,12 @@ export interface NowStateItem {
   updatedAt: string;
   source?: "agent" | "daemon";
   threadRef?: string;
+  /** `half` renders blick's `[~]`; the remainder itself lives in `content` (§2.2). */
+  status?: NowStatus;
+  /** Rendered as the hiding deadline, so a TTL is not an invisible trapdoor. */
+  validUntil?: string;
+  /** Slug of the archive entry, for an item that carries one. */
+  journalRef?: string;
   /**
    * §2.2: "демоновские active/blocked всегда, дальше по updated_at". The
    * caller marks what may not be dropped; the renderer only ranks.
@@ -104,6 +110,8 @@ export interface RenderOptions {
    * vocabulary; a renderer called on its own opens its own.
    */
   fence?: Fence;
+  /** Owner's IANA zone, for the timestamps on now items (§2.2, persona rule 11). */
+  timeZone?: string;
 }
 
 /**
@@ -152,6 +160,56 @@ function fitToBudget<T>(
     if (candidate.length <= budget) best = candidate;
   }
   return best;
+}
+
+/**
+ * One now item, in the shape of the §2.2 example.
+ *
+ * Review S6: the 2.1 line was the content alone, which cost the agent four
+ * things it is expected to act on. `half` was indistinguishable from `open`, so
+ * blick's `[~]` semantics — "done halfway, the remainder is written down" —
+ * never reached the model at all. The id was missing, so correcting an item
+ * meant a `now.get` round trip for something the envelope already had. The TTL
+ * was invisible, which makes hiding-on-expiry look like data loss. And the
+ * thread reference was missing, so the agent could not tell which item is the
+ * work it is about to continue.
+ *
+ * The cost is about 45 characters per item against a 3000-character budget —
+ * the layer degrades to the overflow tail around 40 items instead of around 90,
+ * and the tail is the designed answer to that.
+ *
+ * Annotations are OUR words and therefore English, like the section headers and
+ * the overflow tail; only `content` is "как записан" (§2.2).
+ */
+function nowItemLine(item: NowStateItem, timeZone?: string): string {
+  // The status box goes first, blick-style. `open` prints nothing: it is the
+  // default, and a box on every line would be noise rather than information.
+  const box = item.status === "half" ? "[~] " : "";
+  const facts = [
+    item.id,
+    ...(item.threadRef ? [`thread ${item.threadRef}`] : []),
+    `updated ${localStamp(item.updatedAt, timeZone)}`,
+    ...(item.validUntil ? [`hidden after ${localStamp(item.validUntil, timeZone)}`] : []),
+  ].join(", ");
+  const journal = item.journalRef ? ` → journal ${item.journalRef}` : "";
+  return `- ${box}${clean(item.content, NOW_ITEM_CONTENT_CHARS)} (${facts})${journal}`;
+}
+
+/**
+ * An instant in the owner's zone, `YYYY-MM-DD HH:MM`.
+ *
+ * Owner-local because persona rule 11 and the two-layer rule behind it say the
+ * agent should never have to convert a zone in its head; the full date rather
+ * than the example's bare `14:02` because the render must not depend on when it
+ * is read — a time-relative form would make the snapshot hash drift at
+ * midnight and turn "did anything change" into "is it tomorrow yet".
+ */
+function localStamp(iso: string, timeZone?: string): string {
+  const instant = new Date(iso);
+  if (!Number.isFinite(instant.getTime())) return iso;
+  const parts = ownerLocalParts(instant, timeZone);
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)} ${pad(parts.hour)}:${pad(parts.minute)}`;
 }
 
 /**
@@ -205,7 +263,7 @@ export function renderNowState(
         if (inSection.length === 0) continue;
         body.push(section.toUpperCase());
         for (const item of inSection) {
-          body.push(`- ${clean(item.content, NOW_ITEM_CONTENT_CHARS)}`);
+          body.push(nowItemLine(item, options.timeZone));
         }
       }
       lines.push(fenceBody(body.join("\n"), options.fence));
@@ -279,6 +337,8 @@ export interface StateLayerInput {
   notes: readonly MemoryIndexNote[];
   antiRediscovery: readonly MemoryIndexNote[];
   nowOverflowTool?: string;
+  /** Owner's IANA zone, for the timestamps the now layer prints. */
+  timeZone?: string;
 }
 
 export interface RenderedStateLayers {
@@ -307,7 +367,18 @@ export function fingerprintNowItems(items: readonly NowStateItem[]): NowItemFing
   const fingerprints: NowItemFingerprints = {};
   for (const item of items.slice(0, 100)) {
     fingerprints[item.id] = {
-      h: hashText(`${item.section} ${clean(item.content, NOW_ITEM_CONTENT_CHARS)}`),
+      // Everything the render now SHOWS is part of the fingerprint. `status`
+      // and `valid_until` became visible in package 2.2 (review S6), and a
+      // field the agent can read but the diff cannot see is a change the
+      // envelope silently swallows — marking an item `half` would move nothing.
+      h: hashText(
+        [
+          item.section,
+          item.status ?? "open",
+          item.validUntil ?? "",
+          clean(item.content, NOW_ITEM_CONTENT_CHARS),
+        ].join(" "),
+      ),
       // The label only has to NAME a vanished item in one diff line, and this
       // row is persisted for every item on every accepted turn — 40 characters
       // is a title, not a payload.
@@ -325,6 +396,7 @@ export function renderStateLayers(input: StateLayerInput): RenderedStateLayers {
   const now = renderNowState(input.now, {
     fence,
     ...(input.nowOverflowTool ? { overflowTool: input.nowOverflowTool } : {}),
+    ...(input.timeZone ? { timeZone: input.timeZone } : {}),
   });
   const index = renderMemoryIndex(input.notes, { fence });
   const antiRediscovery = renderAntiRediscovery(input.antiRediscovery, { fence });

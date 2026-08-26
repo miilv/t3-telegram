@@ -48,6 +48,7 @@ import {
 import {
   NOW_HINT_CLOSE_NEEDS_ID,
   NOW_HINT_CREATE_NEEDS_FIELDS,
+  NOW_HINT_DAEMON_CLOSE,
   NOW_HINT_DAEMON_CONTENT,
   NOW_HINT_UNKNOWN_ITEM,
   journalSlugBase,
@@ -172,6 +173,12 @@ export interface OperatorToolServerOptions {
    * night's work lands in the day it belongs to.
    */
   ownerTimeZone?: () => string | undefined;
+  /**
+   * Bring the daemon's half of the now-state ledger up to date before a read
+   * (review S5). Optional like `activeWorkers`: a tool server booted without a
+   * daemon still answers, it just answers from the table as it stands.
+   */
+  reconcileNowItems?: () => void;
   logger: Logger;
   onThreadStarted?: (input: ToolStartedThread) => void | Promise<void>;
   fetchImpl?: typeof fetch;
@@ -837,6 +844,12 @@ export class OperatorToolServer {
       readOnly: true,
       handler: ({ includeClosed }, capability) => {
         this.requireAdministrativeRole(capability, "read the Operator now-state");
+        // Review S5: persona rule 6 sends the agent here ON DOUBT, and the
+        // description promises the complete state — so this must not answer
+        // from a ledger the daemon has not reconciled since the last push. A
+        // finished thread would otherwise be reported as active to the one
+        // caller that asked precisely because it did not trust its memory.
+        this.options.reconcileNowItems?.();
         const items = this.options.store.listNowItems({
           ownerId: capability.context.ownerId,
           ...(includeClosed ? { includeClosed: true } : {}),
@@ -884,8 +897,11 @@ export class OperatorToolServer {
         validUntil: z
           .string()
           .datetime()
+          .nullable()
           .optional()
-          .describe("Hide the item from the pushed state after this instant."),
+          .describe(
+            "Hide the item from the pushed state after this instant; pass null to remove a deadline you set earlier.",
+          ),
       }),
       handler: (input, capability) => {
         this.requireAdministrativeRole(capability, "write the Operator now-state");
@@ -895,7 +911,13 @@ export class OperatorToolServer {
           const existing = store.getNowItem(input.id);
           // Scoped by owner as well as by id: the ledger is per-owner, and an
           // id from another owner's ledger must read as absent, not as denied.
-          if (!existing || existing.ownerId !== ownerId) {
+          //
+          // A CLOSED item reads as absent too (review L9). It is archived: its
+          // journal entry already describes it in the past tense, and letting
+          // an update resurrect it would leave that entry describing something
+          // alive — and, for a daemon item, hand the reconciliation a second
+          // close to write a second entry for.
+          if (!existing || existing.ownerId !== ownerId || existing.status === "closed") {
             return { ok: false, hint: NOW_HINT_UNKNOWN_ITEM };
           }
           const rewording =
@@ -912,7 +934,14 @@ export class OperatorToolServer {
           }
           const content = rewording ? input.content!.trim() : existing.content;
           if (input.status === "closed") {
-            const closed = this.closeNowItemWithJournal(existing.id, content, "agent");
+            // Review B2: a daemon item's life is its thread's life. Closing one
+            // by hand removed live work from the state for good — the unique
+            // `thread_ref` refuses a replacement — and "stop this" has a real
+            // tool that actually stops it.
+            if (existing.source === "daemon") {
+              return { ok: false, hint: NOW_HINT_DAEMON_CLOSE };
+            }
+            const closed = this.closeNowItemWithJournal(existing.id, content);
             if (closed.ok) this.markNowWrite(capability);
             return closed;
           }
@@ -920,7 +949,9 @@ export class OperatorToolServer {
             ...(input.section ? { section: input.section } : {}),
             ...(rewording ? { content } : {}),
             ...(input.status ? { status: input.status } : {}),
-            ...(input.validUntil ? { validUntil: input.validUntil } : {}),
+            // `null` clears the deadline, `undefined` leaves it alone — the two
+            // are different intentions and the schema keeps them apart (L10).
+            ...(input.validUntil !== undefined ? { validUntil: input.validUntil } : {}),
           });
           if (!updated) return { ok: false, hint: NOW_HINT_UNKNOWN_ITEM };
           this.markNowWrite(capability);
@@ -1799,7 +1830,6 @@ export class OperatorToolServer {
   private closeNowItemWithJournal(
     id: string,
     content: string,
-    source: JournalEntry["source"],
   ): { ok: true; item: ReturnType<typeof compactNowItem>; journalRef: string } | { ok: false; hint: string } {
     const existing = this.options.store.getNowItem(id);
     if (!existing) return { ok: false, hint: NOW_HINT_UNKNOWN_ITEM };
@@ -1810,7 +1840,10 @@ export class OperatorToolServer {
       slugBase: journalSlugBase(day, content),
       day,
       body: renderClosedItemJournalBody(closing, at.toISOString()),
-      source,
+      // Review L12: the entry's `source` is who KEPT the item, not who asked
+      // for the close. An archive attributed to the wrong bookkeeper is a
+      // journal the secretary cannot reconcile against the event log.
+      source: existing.source === "daemon" ? "daemon" : "agent",
     });
     if (!closed) return { ok: false, hint: NOW_HINT_UNKNOWN_ITEM };
     return { ok: true, item: compactNowItem(closed.item), journalRef: closed.entry.slug };

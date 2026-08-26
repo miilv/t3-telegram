@@ -1248,6 +1248,35 @@ export class OperatorStore {
   }
 
   /**
+   * Bring a closed daemon item back to life (review B2).
+   *
+   * Reachable two ways: a thread that finished and was deliberately run again
+   * (package 1.3 supports that), and — before the tool refused it — an agent
+   * closing a daemon item by hand. Either way the projection has to converge on
+   * the thread being alive, and the unique `thread_ref` means the row cannot
+   * simply be replaced.
+   *
+   * `created_at` is untouched: the work started when it started, and focus
+   * ranks by that (§2.2). `journal_ref` is cleared because the item is no
+   * longer archived — the entry itself stays in the journal, as the record of
+   * the close that did happen.
+   */
+  reopenNowItem(id: string, patch: { section: NowSection; content: string }): NowItem | undefined {
+    return this.transaction(() => {
+      const existing = this.getNowItem(id);
+      if (!existing) return undefined;
+      const content = redactSecrets(patch.content).trim();
+      if (!content) throw new Error("Now item cannot be empty");
+      this.db
+        .prepare(
+          "UPDATE now_items SET status='open',journal_ref=NULL,section=?,content=?,updated_at=? WHERE id=?",
+        )
+        .run(patch.section, content, nowIso(), id);
+      return this.getNowItem(id);
+    });
+  }
+
+  /**
    * Close an item and archive it in the same transaction (§2.2: "при закрытии
    * автоматически создаётся журнальная запись").
    *

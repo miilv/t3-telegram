@@ -403,8 +403,11 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON daemon_events(created_at DESC);
 -- memory-design §2.4.2: "did this turn mutate anything" is answered by reading
 -- one turn's own tool events, so the correlation id needs to be an index and
--- not a scan of a 30-day table.
-CREATE INDEX IF NOT EXISTS idx_events_correlation ON daemon_events(correlation_id);
+-- not a scan of a 30-day table. PARTIAL, because most rows carry no correlation
+-- id at all and indexing their NULLs would grow the index without ever being
+-- read through it.
+CREATE INDEX IF NOT EXISTS idx_events_correlation
+  ON daemon_events(correlation_id) WHERE correlation_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_operator_notes_status ON operator_notes(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_telegram_outbox_delivery
   ON telegram_outbox(status, next_attempt_at, created_at);

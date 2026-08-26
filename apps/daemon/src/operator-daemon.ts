@@ -415,9 +415,15 @@ const NOW_CHECK_MAX_STREAK = 2;
  * rather than accusing, and it explicitly sanctions doing nothing — a nudge the
  * agent cannot decline is a loop, and the state being already correct is the
  * single most likely reason it wrote nothing.
+ *
+ * "A recent turn", not "your previous turn" (review L11): the flag is raised by
+ * any turn that mutated, thread-event digests included, but it is only ever
+ * DELIVERED on the owner's own turn — so the turn it refers to is frequently
+ * not the one immediately before this envelope, and the line must not claim it
+ * was. Both are the agent's own turns either way.
  */
 const NOW_CHECK_REMINDER =
-  "[state check: your previous turn changed things — dispatched work, sent messages, or wrote data — but recorded nothing in the state above. " +
+  "[state check: a recent turn of yours changed things — dispatched work, sent messages, or wrote data — but recorded nothing in the state above. " +
   "If something you started, finished, handed off or are now waiting on is missing there, put it in with now.update. If the state above is already right, ignore this line.]";
 /**
  * Statuses in which a work thread is LIVE, and therefore carries an open daemon
@@ -917,17 +923,28 @@ export class OperatorDaemon {
       currentState: "Delegated to T3 and awaiting a worker result.",
       ...(input.intentText ? { nextAction: input.intentText } : {}),
     });
-    // Package 2.2 (memory-design §2.2): the owner's focus stopped being SET
-    // here and became a reading of the ledger. Opening the thread's daemon item
-    // first and deriving second keeps the outcome identical for the ordinary
-    // case — a brand-new thread is the newest active item — while making the
-    // agent's later "перенеси в blocked" actually take the work out of focus,
-    // which a direct write at dispatch time could never have honoured.
+    // Package 2.2 (memory-design §2.2): the owner's focus is a reading of the
+    // ledger, not something written here — moving an item to `blocked` drops
+    // that work out of the CANDIDATES, which a write at dispatch time could
+    // never have honoured. (It only visibly changes the focus when another
+    // active work is there to take it: the derivation promotes, it never
+    // clears, so blocking the only running work leaves the binding where it
+    // was — see `syncDerivedFocus`. Review L14.)
     //
-    // Another user's focus is not derived: the ledger is the owner's, and a
-    // team member's binding has no items to be read from.
+    // But dispatch itself still SPEAKS (review B1). §2.2 ranks the passive
+    // derivation by the item's creation instant to stop the daemon's own
+    // content regeneration from dragging the focus around; it says nothing
+    // about an explicit `send_turn`, which is the agent acting for the owner
+    // exactly as a start is. Without this, an owner who started two works,
+    // came back to the first, and typed "стоп" had the SECOND one cancelled —
+    // and §2.2 calls that binding a "детерминированный аварийный люк", which
+    // is the one thing it may not get wrong.
+    //
+    // Another user's focus is not derived at all: the ledger is the owner's,
+    // and a team member's binding has no items to be read from.
     if (input.context.ownerId === this.ownerLedgerId()) {
       this.reconcileDaemonNowItems();
+      this.promoteFocusToDispatchedThread(thread);
     } else {
       this.store.setFocus(
         input.context.ownerId,
@@ -4502,6 +4519,42 @@ export class OperatorDaemon {
   }
 
   /**
+   * Bring the daemon's half of the ledger up to date on demand (review S5).
+   *
+   * `now.get` calls this: persona rule 6 sends the agent there when it does not
+   * trust its memory of the state, so answering out of an unreconciled table
+   * would fail the one caller that asked for the truth.
+   */
+  reconcileNowState(): void {
+    this.reconcileDaemonNowItems();
+  }
+
+  /**
+   * Review B1 — an explicit dispatch moves the focus to the work dispatched.
+   *
+   * Only when that work is a legitimate candidate by §2.2's own rules: its
+   * daemon item exists, is open and sits in `active`. A thread the agent
+   * continued but previously moved to `blocked` does not steal the focus back;
+   * neither does one whose item the reconciliation has just archived.
+   */
+  private promoteFocusToDispatchedThread(thread: WorkThread): void {
+    const ownerId = this.ownerLedgerId();
+    const item = this.store.getDaemonNowItemForThread(thread.id);
+    if (!item || item.status === "closed" || item.section !== "active") return;
+    const focus = this.store.getFocus(ownerId);
+    if (focus.primary?.threadId === thread.id) return;
+    this.store.setFocus(
+      ownerId,
+      updateFocus(
+        focus,
+        { projectId: thread.projectId, threadId: thread.id },
+        this.store.getRuntimeState(`thread_user_intent:${thread.id}`) || thread.title,
+        0.9,
+      ),
+    );
+  }
+
+  /**
    * The daemon's half of the double bookkeeping (§2.2).
    *
    * A projection, not a set of hooks. Every live thread must have exactly one
@@ -4539,7 +4592,28 @@ export class OperatorDaemon {
         });
         continue;
       }
-      if (existing.status === "closed") continue;
+      if (existing.status === "closed") {
+        // Review B2. A projection's whole advantage over hooks is that it
+        // converges on reality, and a CLOSED item for a LIVE thread is the one
+        // case where the old code declined to: it skipped the row, the unique
+        // `thread_ref` refused a fresh one, and the work vanished from the
+        // state and from the focus derivation permanently.
+        //
+        // It is not only reachable through the (now refused) manual close —
+        // package 1.3 deliberately lets a finished thread run again, and that
+        // has to be visible. `created_at` stays put: the work started when it
+        // started, and the archive entry of the previous close stays in the
+        // journal as the record of what happened then.
+        this.store.reopenNowItem(existing.id, {
+          section: derived.section,
+          content: derived.content,
+        });
+        this.store.appendEvent("memory.now_item.reopened", {
+          threadId: thread.id,
+          payload: { itemId: existing.id, status: thread.status },
+        });
+        continue;
+      }
       const section = reconcileDaemonSection(existing.section, derived.section);
       if (existing.content === derived.content && existing.section === section) continue;
       this.store.updateNowItem(existing.id, { section, content: derived.content });
@@ -4557,7 +4631,13 @@ export class OperatorDaemon {
       if (liveIds.has(item.threadRef)) continue;
       const thread = this.store.getThread(item.threadRef);
       if (thread && !TERMINAL_THREAD_STATUSES.includes(thread.status)) continue;
-      this.closeNowItem(item, item.content, "daemon");
+      // Review S3: the archive is filed under the day the WORK ended, not the
+      // day the reconciliation noticed. A daemon that was down over the
+      // weekend would otherwise file Friday's work under Monday, and §2.4
+      // builds the daily summary and the monthly rollup out of `day` — a
+      // reconciliation timestamp turns both into fiction. It also stops work
+      // that ended at 23:59 from landing in tomorrow.
+      this.closeNowItem(item, item.content, "daemon", thread ? new Date(thread.updatedAt) : undefined);
     }
     this.syncDerivedFocus();
   }
@@ -4638,8 +4718,15 @@ export class OperatorDaemon {
     const streak = Number(this.store.getRuntimeState(NOW_CHECK_STREAK_KEY) ?? "0");
     if (!Number.isFinite(streak) || streak >= NOW_CHECK_MAX_STREAK) {
       // §2.4.2(b): hand it over rather than repeat a third time.
+      //
+      // Review S4: the streak deliberately STAYS at the ceiling. Resetting it
+      // here made the anti-loop a two-on-one-off cycle — silent turn, silent
+      // turn, "handover", silent turn, two more reminders, forever — which is
+      // the nagging the counter exists to stop. It is reset by the two things
+      // that genuinely end the streak: the agent actually recording something,
+      // and the episode ending. Until one of those happens, this is the
+      // secretary's problem, as §2.4.2 says.
       this.store.deleteRuntimeState(NOW_CHECK_PENDING_KEY);
-      this.store.setRuntimeState(NOW_CHECK_STREAK_KEY, "0");
       this.store.appendEvent("memory.now_check.exhausted", { payload: { turn: pending } });
       return undefined;
     }
@@ -4655,9 +4742,21 @@ export class OperatorDaemon {
     };
   }
 
-  /** Close one item and archive it (§2.2); the journal entry is the item's afterlife. */
-  private closeNowItem(item: NowItem, content: string, source: "agent" | "daemon"): void {
-    const at = new Date();
+  /**
+   * Close one item and archive it (§2.2); the journal entry is the item's
+   * afterlife.
+   *
+   * `closedAt` is the instant the work actually ended, not the instant this ran
+   * (review S3). It falls back to now only when the thread row is gone and
+   * there is nothing better to claim.
+   */
+  private closeNowItem(
+    item: NowItem,
+    content: string,
+    source: "agent" | "daemon",
+    closedAt?: Date,
+  ): void {
+    const at = closedAt && Number.isFinite(closedAt.getTime()) ? closedAt : new Date();
     const day = ownerLogicalDay(at, this.config.owner.timezone);
     this.store.closeNowItem(item.id, {
       slugBase: journalSlugBase(day, content),
@@ -4741,6 +4840,7 @@ export class OperatorDaemon {
       // The 2.1 placeholder pointed at `t3.search_threads` only because
       // `now.get` did not exist and the ledger it reads was the thread table.
       nowOverflowTool: "now.get",
+      ...(this.config.owner.timezone ? { timeZone: this.config.owner.timezone } : {}),
     });
   }
 
