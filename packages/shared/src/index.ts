@@ -24,6 +24,17 @@ export {
   resolveTimeZone,
 } from "./time.js";
 export type { CivilDate, HumanMomentOptions, LocalTimeParts, OwnerLocalTimeOptions } from "./time.js";
+export {
+  OPERATOR_NOTE_SOURCES,
+  OPERATOR_NOTE_STATUSES,
+} from "./operator-notes.js";
+export type {
+  OperatorNote,
+  OperatorNoteSource,
+  OperatorNoteStatus,
+  OperatorNoteWriteIdentity,
+  PreparedNoteVector,
+} from "./operator-notes.js";
 
 export type Id = string;
 
@@ -178,24 +189,6 @@ export interface ThreadSummary {
   openIssues: string[];
   nextActions: string[];
   updatedAt: string;
-}
-
-export interface OperatorNote {
-  id: string;
-  category: string;
-  content: string;
-  status: "active" | "obsolete";
-  source: "manual" | "maintenance" | "system";
-  createdAt: string;
-  updatedAt: string;
-  expiresAt?: string;
-  /**
-   * The index line of §2.3: TRIGGER -> what is inside. Absent on every note
-   * written before package 3.1, which is exactly what the night secretary
-   * fills in lazily (§6.4) — the memory index falls back to the first ~100
-   * characters of the content until it does.
-   */
-  description?: string;
 }
 
 /** memory-design §2.2 — the five now-state sections, in render order. */

@@ -8014,7 +8014,7 @@ export class OperatorDaemon {
     const obsoletedNoteIds: string[] = [];
     const protectedNoteIds: string[] = [];
     for (const id of plan.obsoleteNoteIds.slice(0, 50)) {
-      if (this.store.getOperatorNote(id)?.category === "user") {
+      if (this.store.getOperatorNoteVersion(id)?.category === "user") {
         protectedNoteIds.push(id);
         continue;
       }

@@ -702,7 +702,8 @@ describe("OperatorStore", () => {
     expect(store.searchOperatorNotes("authentication regression")[0]?.id).toBe(expired.id);
     expect(store.expireOperatorNotes("2021-01-01T00:00:00.000Z")).toBe(1);
     expect(store.searchOperatorNotes("authentication regression")).toHaveLength(0);
-    expect(store.getOperatorNote(expired.id)?.status).toBe("obsolete");
+    expect(store.getOperatorNote(expired.id)).toBeUndefined();
+    expect(store.getOperatorNoteVersion(expired.id)?.status).toBe("obsolete");
     const redacted = store.rememberOperatorNote({
       content: "authorization=sensitive-value-that-must-not-persist",
     });
@@ -715,7 +716,7 @@ describe("OperatorStore", () => {
     const vector = store.db
       .prepare("SELECT model,dimensions FROM operator_note_vectors WHERE note_id=?")
       .get(hybrid.id);
-    expect(vector).toMatchObject({ model: "local-hybrid-v1", dimensions: 128 });
+    expect(vector).toMatchObject({ model: "local-hash-v2", dimensions: 128 });
     store.close();
   });
 

@@ -58,9 +58,41 @@ import {
   type JournalFilter,
   type JournalSelection,
 } from "./journal.js";
+import {
+  OperatorNoteRepository,
+  operatorNoteInputHash,
+  rowToOperatorNote as rowToOperatorNoteV2,
+} from "./operator-notes.js";
+import { migrateOperatorNotesV2 } from "./migrations.js";
+import { LocalNoteEmbeddingService } from "./note-embeddings.js";
+import { OperatorNoteWriter, type KeyedOperatorNoteDraft } from "./operator-note-writer.js";
 
 export { JournalRepository } from "./journal.js";
 export type { JournalEntryInput, JournalFilter, JournalSelection } from "./journal.js";
+export { OperatorNoteRepository, operatorNoteInputHash } from "./operator-notes.js";
+export {
+  HASH_NOTE_EMBEDDING_MODEL,
+  LocalNoteEmbeddingService,
+  MINILM_NOTE_EMBEDDING_MODEL,
+  NOTE_EMBEDDING_DIMENSIONS,
+} from "./note-embeddings.js";
+export {
+  MINILM_CROSS_LINK_THRESHOLD,
+  MINILM_MERGE_PROPOSAL_THRESHOLD,
+  OperatorNoteWriter,
+} from "./operator-note-writer.js";
+export type {
+  OperatorNoteVersionInput,
+  OperatorNoteWriteResult,
+  StoredNoteVector,
+} from "./operator-notes.js";
+export type {
+  KeyedOperatorNoteDraft,
+  KeyedOperatorNoteWriteResult,
+  NoteEmbeddingPort,
+  NoteSimilarity,
+} from "./operator-note-writer.js";
+export type { NoteEmbeddingBackfillResult } from "./note-embeddings.js";
 
 type Row = Record<string, unknown>;
 
@@ -161,6 +193,9 @@ export class OperatorStore {
   private readonly localApprovals: LocalApprovalRepository;
   private readonly automations: AutomationRepository;
   readonly journal: JournalRepository;
+  readonly notes: OperatorNoteRepository;
+  readonly noteEmbeddings: LocalNoteEmbeddingService;
+  readonly noteWriter: OperatorNoteWriter;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -177,6 +212,9 @@ export class OperatorStore {
       },
     );
     this.journal = new JournalRepository(this.db, (fn) => this.transaction(fn));
+    this.notes = new OperatorNoteRepository(this.db, (fn) => this.transaction(fn));
+    this.noteEmbeddings = new LocalNoteEmbeddingService();
+    this.noteWriter = new OperatorNoteWriter(this.notes, this.noteEmbeddings);
   }
 
   migrate(): void {
@@ -213,6 +251,19 @@ export class OperatorStore {
         this.db.exec(
           "ALTER TABLE operator_notes ADD COLUMN description_attempts INTEGER NOT NULL DEFAULT 0",
         );
+      }
+      for (const [name, definition] of [
+        ["key", "TEXT"],
+        ["verified_at", "TEXT"],
+        ["valid_until", "TEXT"],
+        ["superseded_by", "TEXT"],
+        ["input_hash", "TEXT NOT NULL DEFAULT ''"],
+        ["access_count", "INTEGER NOT NULL DEFAULT 0"],
+        ["last_accessed_at", "TEXT"],
+      ] as const) {
+        if (!noteColumns.some((column) => column.name === name)) {
+          this.db.exec(`ALTER TABLE operator_notes ADD COLUMN ${name} ${definition}`);
+        }
       }
     }
     // Package 3.1 (§2.4): `kind` separates a rollup and an automatic archive
@@ -313,16 +364,10 @@ export class OperatorStore {
       this.db.exec("ALTER TABLE processed_events ADD COLUMN updated_at TEXT");
       this.db.prepare("UPDATE processed_events SET updated_at=created_at WHERE updated_at IS NULL").run();
     }
-    for (const row of this.db.prepare("SELECT id,category,content,updated_at FROM operator_notes WHERE status='active'").all() as Row[]) {
-      this.upsertNoteVector(
-        String(row.id),
-        `${String(row.category)} ${String(row.content)}`,
-        String(row.updated_at),
-      );
-    }
     this.db
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)")
       .run(nowIso());
+    migrateOperatorNotesV2(this.db, (work) => this.transaction(work));
   }
 
   /**
@@ -1071,17 +1116,37 @@ export class OperatorStore {
     const id = existing ? String(existing.id) : input.id ?? newId("note");
     const createdAt = existing ? String(existing.created_at) : now;
     const source = input.source ?? (existing ? rowToOperatorNote(existing).source : "manual");
+    const categoryValue = category;
+    const inputHash = operatorNoteInputHash({
+      key: existing?.key ? String(existing.key) : "",
+      description: existing?.description ? String(existing.description) : "",
+      category: categoryValue,
+      content,
+    });
     this.transaction(() => {
       this.db
         .prepare(`
           INSERT INTO operator_notes(
-            id,category,content,status,source,expires_at,created_at,updated_at
-          ) VALUES (?,?,?,?,?,?,?,?)
+            id,category,content,status,source,expires_at,valid_until,input_hash,created_at,updated_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(id) DO UPDATE SET
             category=excluded.category,content=excluded.content,status='active',
-            source=excluded.source,expires_at=excluded.expires_at,updated_at=excluded.updated_at
+            source=excluded.source,expires_at=excluded.expires_at,
+            valid_until=excluded.valid_until,input_hash=excluded.input_hash,
+            superseded_by=NULL,updated_at=excluded.updated_at
         `)
-        .run(id, category, content, "active", source, input.expiresAt ?? null, createdAt, now);
+        .run(
+          id,
+          category,
+          content,
+          "active",
+          source,
+          input.expiresAt ?? null,
+          input.expiresAt ?? null,
+          inputHash,
+          createdAt,
+          now,
+        );
       // The upsert above does not clear `description`, so the index must not
       // either — re-remembering a described note would otherwise silently make
       // its trigger line unsearchable again while the table still shows it.
@@ -1093,15 +1158,46 @@ export class OperatorStore {
       const described = this.db
         .prepare("SELECT description FROM operator_notes WHERE id=?")
         .get(id) as Row | undefined;
-      this.reindexNoteSearch(id, category, content, described?.description as string | undefined);
-      this.upsertNoteVector(id, `${category} ${content}`, now);
+      this.reindexNoteSearch(
+        id,
+        category,
+        content,
+        described?.description as string | undefined,
+        existing?.key as string | undefined,
+      );
+      this.upsertNoteVector(id, `${category} ${content}`, inputHash, now);
     });
     return this.getOperatorNote(id)!;
   }
 
+  /** Keyed v2 write boundary; legacy unkeyed notes remain compatible above. */
+  async rememberKeyedOperatorNote(
+    input: Omit<KeyedOperatorNoteDraft, "operationKey"> & { operationKey?: string },
+  ) {
+    const normalized = {
+      key: input.key,
+      description: input.description,
+      category: input.category ?? "general",
+      content: input.content,
+    };
+    return this.noteWriter.write({
+      ...input,
+      operationKey: input.operationKey ?? `manual:${operatorNoteInputHash(normalized)}`,
+    });
+  }
+
+  /** Explicit bounded maintenance operation; it is intentionally not a boot path. */
+  async backfillOperatorNoteEmbeddings(limit = 25) {
+    return this.noteEmbeddings.backfill(this.notes, limit);
+  }
+
   getOperatorNote(id: string): OperatorNote | undefined {
-    const row = this.db.prepare("SELECT * FROM operator_notes WHERE id=?").get(id) as Row | undefined;
-    return row ? rowToOperatorNote(row) : undefined;
+    return this.notes.getActive(id);
+  }
+
+  /** Internal historical lookup; never expose through an agent read tool. */
+  getOperatorNoteVersion(id: string): OperatorNote | undefined {
+    return this.notes.getVersion(id);
   }
 
   listOperatorNotes(input: { status?: OperatorNote["status"]; limit?: number } = {}): OperatorNote[] {
@@ -1109,12 +1205,18 @@ export class OperatorStore {
     // 200 can ask for one more and TELL the reader there are older notes
     // instead of silently presenting a truncated list as the whole memory.
     const limit = Math.max(1, Math.min(input.limit ?? 50, 201));
-    const rows = input.status
-      ? this.db
-          .prepare("SELECT * FROM operator_notes WHERE status=? ORDER BY updated_at DESC LIMIT ?")
-          .all(input.status, limit)
-      : this.db.prepare("SELECT * FROM operator_notes ORDER BY updated_at DESC LIMIT ?").all(limit);
+    // Compatibility callers historically supplied `{ status: 'active' }`.
+    // Deliberately ignore any other requested status: outward list reads are
+    // current-state reads; history is explicit through listOperatorNoteVersions.
+    const rows = this.db
+      .prepare("SELECT * FROM operator_notes WHERE status='active' ORDER BY updated_at DESC LIMIT ?")
+      .all(limit);
     return (rows as Row[]).map(rowToOperatorNote);
+  }
+
+  /** Internal historical listing; never wire this into a public memory tool. */
+  listOperatorNoteVersions(input: { status?: OperatorNote["status"]; limit?: number } = {}): OperatorNote[] {
+    return this.notes.listVersions(input);
   }
 
   searchOperatorNotes(query: string, limit = 8): OperatorNote[] {
@@ -1140,12 +1242,19 @@ export class OperatorStore {
       .prepare(`
         SELECT n.*,v.vector_json FROM operator_note_vectors v
         JOIN operator_notes n ON n.id=v.note_id
-        WHERE n.status='active' ORDER BY n.updated_at DESC LIMIT 500
+        WHERE n.status='active' AND v.model='local-hash-v2' AND v.dimensions=?
+          AND v.input_hash=n.input_hash
+        ORDER BY n.updated_at DESC LIMIT 500
       `)
-      .all() as Row[];
-    const ranked = vectorRows.map((row) => {
-      const vector = JSON.parse(String(row.vector_json)) as number[];
-      const similarity = cosineSimilarity(queryVector, vector);
+      .all(MEMORY_VECTOR_DIMENSIONS) as Row[];
+    const vectorById = new Map(vectorRows.map((row) => [String(row.id), row]));
+    const candidates = [
+      ...vectorRows,
+      ...lexical.filter((row) => !vectorById.has(String(row.id))),
+    ];
+    const ranked = candidates.map((row) => {
+      const parsedVector = parseMemoryVector(row.vector_json, MEMORY_VECTOR_DIMENSIONS);
+      const similarity = parsedVector ? cosineSimilarity(queryVector, parsedVector) : 0;
       const lexicalScore = lexicalRank.get(String(row.id)) ?? 0;
       return { row, similarity, score: lexicalScore * 0.62 + Math.max(0, similarity) * 0.38 };
     }).filter((entry) => lexicalRank.has(String(entry.row.id)) || entry.similarity >= 0.18)
@@ -1183,8 +1292,12 @@ export class OperatorStore {
         .run(now, id);
       const category = String(row.category);
       const content = String(row.content);
-      this.reindexNoteSearch(id, category, content, row.description as string | undefined);
-      this.upsertNoteVector(id, `${category} ${content}`, now);
+      const description = row.description as string | undefined;
+      const key = row.key as string | undefined;
+      const inputHash = operatorNoteInputHash({ key: key ?? "", description: description ?? "", category, content });
+      this.db.prepare("UPDATE operator_notes SET input_hash=? WHERE id=?").run(inputHash, id);
+      this.reindexNoteSearch(id, category, content, description, key);
+      this.upsertNoteVector(id, `${category} ${content}`, inputHash, now);
       return true;
     });
   }
@@ -1713,8 +1826,15 @@ export class OperatorStore {
       // a background job quietly rewriting what the agent is shown. The queue
       // does not need the bump either: a note leaves it by HAVING a
       // description, not by being recent.
-      this.db.prepare("UPDATE operator_notes SET description=? WHERE id=?").run(trimmed, id);
-      this.reindexNoteSearch(id, String(row.category), String(row.content), trimmed);
+      const inputHash = operatorNoteInputHash({
+        key: row.key ? String(row.key) : "",
+        description: trimmed,
+        category: String(row.category),
+        content: String(row.content),
+      });
+      this.db.prepare("UPDATE operator_notes SET description=?,input_hash=? WHERE id=?").run(trimmed, inputHash, id);
+      this.db.prepare("DELETE FROM operator_note_vectors WHERE note_id=?").run(id);
+      this.reindexNoteSearch(id, String(row.category), String(row.content), trimmed, row.key as string | undefined);
       return true;
     });
   }
@@ -1738,12 +1858,12 @@ export class OperatorStore {
     category: string,
     content: string,
     description?: string | null,
+    key?: string | null,
   ): void {
-    const trimmed = description?.trim();
     this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
     this.db
-      .prepare("INSERT INTO operator_note_search(id,category,content) VALUES (?,?,?)")
-      .run(id, category, trimmed ? `${content}\n${trimmed}` : content);
+      .prepare("INSERT INTO operator_note_search(id,key,description,category,content) VALUES (?,?,?,?,?)")
+      .run(id, key?.trim() ?? "", description?.trim() ?? "", category, content);
   }
 
   saveArtifact(artifact: Artifact): void {
@@ -2843,16 +2963,17 @@ export class OperatorStore {
     ).map(rowToConversationCompaction);
   }
 
-  private upsertNoteVector(noteId: string, text: string, updatedAt: string): void {
+  private upsertNoteVector(noteId: string, text: string, inputHash: string, updatedAt: string): void {
     const vector = localMemoryVector(text);
     this.db
       .prepare(`
-        INSERT INTO operator_note_vectors(note_id,model,dimensions,vector_json,updated_at)
-        VALUES (?,'local-hybrid-v1',?,?,?)
-        ON CONFLICT(note_id) DO UPDATE SET model=excluded.model,
-          dimensions=excluded.dimensions,vector_json=excluded.vector_json,updated_at=excluded.updated_at
+        INSERT INTO operator_note_vectors(note_id,model,dimensions,input_hash,vector_json,updated_at)
+        VALUES (?,'local-hash-v2',?,?,?,?)
+        ON CONFLICT(note_id,model) DO UPDATE SET
+          dimensions=excluded.dimensions,input_hash=excluded.input_hash,
+          vector_json=excluded.vector_json,updated_at=excluded.updated_at
       `)
-      .run(noteId, vector.length, JSON.stringify(vector), updatedAt);
+      .run(noteId, vector.length, inputHash, JSON.stringify(vector), updatedAt);
   }
 
 }
@@ -2925,20 +3046,7 @@ function rowToThreadSummary(row: Row): ThreadSummary {
 }
 
 function rowToOperatorNote(row: Row): OperatorNote {
-  const status = String(row.status ?? "active");
-  const source = String(row.source ?? "manual");
-  return {
-    id: String(row.id),
-    category: String(row.category ?? "general"),
-    content: String(row.content),
-    status: status === "obsolete" ? "obsolete" : "active",
-    source:
-      source === "maintenance" || source === "system" ? source : "manual",
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    ...(row.expires_at ? { expiresAt: String(row.expires_at) } : {}),
-    ...(row.description ? { description: String(row.description) } : {}),
-  };
+  return rowToOperatorNoteV2(row);
 }
 
 /**
@@ -3160,4 +3268,19 @@ function cosineSimilarity(left: number[], right: number[]): number {
     rightNorm += rightValue * rightValue;
   }
   return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
+}
+
+function parseMemoryVector(value: unknown, dimensions: number): number[] | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      !Array.isArray(parsed) ||
+      parsed.length !== dimensions ||
+      !parsed.every((entry) => typeof entry === "number" && Number.isFinite(entry))
+    ) return undefined;
+    return parsed as number[];
+  } catch {
+    return undefined;
+  }
 }

@@ -72,6 +72,19 @@ export {
 } from "./note-descriptions.js";
 export type { NoteDescriptionLintResult } from "./note-descriptions.js";
 export {
+  OPERATOR_NOTE_CONTENT_CHARS,
+  OPERATOR_NOTE_CONTENT_HINT,
+  OPERATOR_NOTE_KEY_CHARS,
+  OPERATOR_NOTE_KEY_HINT,
+  normalizeNoteDescription,
+  normalizeOperatorNoteKey,
+  operatorNotePushScore,
+  rankOperatorNotesForPush,
+  staleOperatorNoteWarning,
+  validateOperatorNoteDraft,
+} from "./operator-notes.js";
+export type { NoteDraftValidation } from "./operator-notes.js";
+export {
   LOGICAL_DAY_BOUNDARY_HOUR,
   PAUSE_COLD_AFTER_MS,
   PAUSE_LIGHT_AFTER_MS,

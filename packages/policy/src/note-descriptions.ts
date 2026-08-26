@@ -19,8 +19,11 @@ export function lintNoteDescription(value: string): NoteDescriptionLintResult {
   if ([...description].length > NOTE_DESCRIPTION_CHARS) {
     return { ok: false, hint: NOTE_DESCRIPTION_HINT_TOO_LONG };
   }
-  const arrow = description.indexOf("→");
-  if (arrow < 1 || !description.slice(0, arrow).trim() || !description.slice(arrow + 1).trim()) {
+  const unicodeArrow = description.indexOf("→");
+  const asciiArrow = description.indexOf("->");
+  const arrow = unicodeArrow >= 0 ? unicodeArrow : asciiArrow;
+  const width = unicodeArrow >= 0 ? 1 : 2;
+  if (arrow < 1 || !description.slice(0, arrow).trim() || !description.slice(arrow + width).trim()) {
     return { ok: false, hint: NOTE_DESCRIPTION_HINT_TRIGGER };
   }
   return { ok: true };

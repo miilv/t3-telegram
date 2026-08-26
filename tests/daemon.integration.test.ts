@@ -7504,7 +7504,7 @@ describe("OperatorDaemon product flow", () => {
 
     // The user's own note survives; only the system note was obsoleted, loudly.
     expect(store.getOperatorNote(userNote.id)?.status).toBe("active");
-    expect(store.getOperatorNote(systemNote.id)?.status).toBe("obsolete");
+    expect(store.getOperatorNoteVersion(systemNote.id)?.status).toBe("obsolete");
     const journal = store.db
       .prepare("SELECT payload_json FROM daemon_events WHERE event_type='memory.notes.obsoleted'")
       .get() as { payload_json: string };
@@ -7516,7 +7516,7 @@ describe("OperatorDaemon product flow", () => {
 
     // An explicit user "забудь" still works for user notes.
     telegram.push(message(1, `/memory forget ${userNote.id}`));
-    await waitFor(() => store.getOperatorNote(userNote.id)?.status === "obsolete");
+    await waitFor(() => store.getOperatorNoteVersion(userNote.id)?.status === "obsolete");
 
     // /memory restore reactivates a wrongly obsoleted note, searchably.
     telegram.push(message(2, `/memory restore ${systemNote.id}`));

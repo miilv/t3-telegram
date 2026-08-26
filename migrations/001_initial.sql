@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS focus_state (
 
 CREATE TABLE IF NOT EXISTS operator_notes (
   id TEXT PRIMARY KEY,
+  key TEXT,
   category TEXT NOT NULL DEFAULT 'general',
   content TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active',
@@ -119,23 +120,41 @@ CREATE TABLE IF NOT EXISTS operator_notes (
   -- has nothing to say about sits at the head of the queue forever and every
   -- "quiet" night costs a call.
   description_attempts INTEGER NOT NULL DEFAULT 0,
+  verified_at TEXT,
+  valid_until TEXT,
+  superseded_by TEXT,
+  input_hash TEXT NOT NULL DEFAULT '',
+  access_count INTEGER NOT NULL DEFAULT 0,
+  last_accessed_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (superseded_by) REFERENCES operator_notes(id) ON DELETE SET NULL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS operator_note_search USING fts5(
   id UNINDEXED,
+  key,
+  description,
   category,
   content,
   tokenize = 'unicode61'
 );
 
 CREATE TABLE IF NOT EXISTS operator_note_vectors (
-  note_id TEXT PRIMARY KEY,
+  note_id TEXT NOT NULL,
   model TEXT NOT NULL,
   dimensions INTEGER NOT NULL,
+  input_hash TEXT NOT NULL,
   vector_json TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  PRIMARY KEY (note_id, model),
+  FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS operator_note_operations (
+  operation_key TEXT PRIMARY KEY,
+  note_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
   FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
 );
 
@@ -488,6 +507,8 @@ CREATE INDEX IF NOT EXISTS idx_events_created ON daemon_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_correlation
   ON daemon_events(correlation_id) WHERE correlation_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_operator_notes_status ON operator_notes(status, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_notes_active_key
+  ON operator_notes(key) WHERE status='active' AND key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_telegram_outbox_delivery
   ON telegram_outbox(status, next_attempt_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_project_memberships_user
@@ -520,17 +541,3 @@ CREATE INDEX IF NOT EXISTS idx_journal_entries_thread
 CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_entries_replay
   ON journal_entries(origin_job, create_seq)
   WHERE origin_job IS NOT NULL AND create_seq IS NOT NULL;
-
-DELETE FROM operator_note_search;
--- The description is indexed WITH the content (package 3.1, memory-design
--- §2.3/§6.4): a trigger line's job is "when will I need this", which is a
--- retrieval question, and one that cannot be found by its own words answers
--- nobody. This rebuild runs on EVERY boot, so leaving it on content alone
--- would quietly undo every description the night secretary indexed the moment
--- the daemon restarted.
-INSERT INTO operator_note_search(id,category,content)
-  SELECT id, category,
-         CASE WHEN description IS NOT NULL AND TRIM(description) <> ''
-              THEN content || char(10) || description
-              ELSE content END
-  FROM operator_notes WHERE status='active';

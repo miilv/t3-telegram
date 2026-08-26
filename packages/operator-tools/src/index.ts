@@ -67,6 +67,7 @@ import {
   monthOfDay,
   isReservedJournalSlug,
   lintJournalNote,
+  staleOperatorNoteWarning,
   renderJournalSkeleton,
 } from "../../policy/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
@@ -837,7 +838,7 @@ export class OperatorToolServer {
         const bounded = limit ?? 8;
         const fence = openFence("worker");
         return {
-          notes: this.options.store.searchOperatorNotes(query, bounded),
+          notes: this.options.store.searchOperatorNotes(query, bounded).map(noteForMemoryRead),
           threads: this.options.store.searchThreads(query, undefined, bounded).map((candidate) => ({
             ...compactThread(candidate.thread, fence),
             score: candidate.score,
@@ -868,19 +869,34 @@ export class OperatorToolServer {
             hint: `No note with reference "${key}". Use the reference exactly as printed in the memory index, or search with memory.search.`,
           };
         }
-        return { ok: true, note };
+        return { ok: true, note: noteForMemoryRead(note) };
       },
     });
     this.addTool(server, token, {
       name: "memory.remember",
-      description: "Persist a redacted durable Operator note for future turns.",
+      description: "Persist a durable Operator note. Key and trigger description create a versioned v2 fact; omitted together preserves a legacy note.",
       schema: z.object({
         content: z.string().trim().min(1).max(8_000),
         category: z.string().trim().min(1).max(80).optional(),
         expiresAt: z.string().datetime().optional(),
+        key: z.string().trim().min(1).max(200).optional(),
+        description: z.string().trim().min(1).max(200).optional(),
+        validUntil: z.string().datetime().optional(),
+      }).refine((input) => Boolean(input.key) === Boolean(input.description), {
+        message: "key and description must be supplied together",
       }),
-      handler: (input, capability) => {
+      handler: async (input, capability) => {
         this.requireAdministrativeRole(capability, "write global Operator memory");
+        if (input.key && input.description) {
+          return this.options.store.rememberKeyedOperatorNote({
+            key: input.key,
+            description: input.description,
+            content: input.content,
+            ...(input.category ? { category: input.category } : {}),
+            ...(input.validUntil ? { validUntil: input.validUntil } : {}),
+            source: "manual",
+          });
+        }
         return this.options.store.rememberOperatorNote({
           content: input.content,
           ...(input.category ? { category: input.category } : {}),
@@ -2090,6 +2106,11 @@ export class OperatorToolServer {
       if (capability.expiresAt <= Date.now()) this.capabilities.delete(token);
     }
   }
+}
+
+function noteForMemoryRead<T extends { validUntil?: string }>(note: T): T & { warning?: string } {
+  const warning = staleOperatorNoteWarning(note as unknown as Parameters<typeof staleOperatorNoteWarning>[0]);
+  return warning ? { ...note, warning } : note;
 }
 
 
