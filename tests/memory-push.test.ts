@@ -421,8 +421,12 @@ describe("layer renderers and their budgets", () => {
 
     expect(references).toContain("route-199");
     expect(references).not.toContain("route-0");
-    expect(references.every((reference) => layers.index.includes(`→ ${reference}`))).toBe(true);
+    expect(layers.operatorReferences.every(
+      (reference) => layers.index.includes(`→ ${reference.marker}`),
+    )).toBe(true);
     expect(new Set(references).size).toBe(references.length);
+    expect(new Set(layers.operatorReferences.map((reference) => reference.marker)).size)
+      .toBe(layers.operatorReferences.length);
   });
 
   it("keeps the anti-rediscovery block inside its own 1000 characters", () => {

@@ -175,9 +175,22 @@ export class ScribeFinalizer {
     };
   }
 
-  persistOwnerTurn(input: ScribeOwnerTurnInput): string {
+  persistOwnerTurn(
+    input: ScribeOwnerTurnInput,
+    options: { repairInvalidLegacyReferences?: boolean } = {},
+  ): string {
     const key = `${SCRIBE_PENDING_TURN_PREFIX}${input.dedupeKey}`;
-    this.deps.store.setRuntimeState(key, JSON.stringify(input));
+    // The dedupe key names one durable owner-turn intent. Marker identities
+    // are part of that intent: rebuilding the same proposal after a restart
+    // must not overwrite its prompt with fresh markers between failed enqueue
+    // attempts.
+    const existing = this.deps.store.getRuntimeState(key);
+    if (
+      existing === undefined ||
+      (options.repairInvalidLegacyReferences && !hasValidMarkedOwnerTurn(existing, input.dedupeKey))
+    ) {
+      this.deps.store.setRuntimeState(key, JSON.stringify(input));
+    }
     return key;
   }
 
@@ -220,5 +233,18 @@ export class ScribeFinalizer {
         "Scribe owner turn remains pending after enqueue failed",
       );
     }
+  }
+}
+
+function hasValidMarkedOwnerTurn(serialized: string, dedupeKey: string): boolean {
+  try {
+    const parsed = JSON.parse(serialized) as Partial<ScribeOwnerTurnInput>;
+    return parsed.dedupeKey === dedupeKey &&
+      typeof parsed.prompt === "string" &&
+      Array.isArray(parsed.operatorReferences) &&
+      parsed.operatorReferences.length > 0 &&
+      parsed.operatorReferences.every(isOperatorNotePromptReference);
+  } catch {
+    return false;
   }
 }

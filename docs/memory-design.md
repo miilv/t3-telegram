@@ -279,11 +279,17 @@ CREATE UNIQUE INDEX operator_notes_key ON operator_notes(key)
   description/content/category. Аналогично typed-результаты сохраняют пути,
   id и hashes, редактируя только видимые имена и пояснения.
   Если валидированный Notes-v2 key намеренно показан провайдеру как pull-ref,
-  prompt builder несёт его отдельным typed metadata-каналом через обычный ход,
-  compaction/provider-switch restore и fresh-session replay. Privacy guard
-  повторно валидирует этот metadata и защищает только указанные spans; похожий
-  текст в description/content или произвольном prompt не может сам объявить
-  себя операционным ref и остаётся под canonical redaction.
+  prompt builder ставит на **каждый намеренный span** отдельный случайный opaque
+  marker и несёт пару `{marker, value}` отдельным typed metadata-каналом через
+  обычный ход, durable Scribe ingress, compaction/provider-switch restore и
+  fresh-session replay. Privacy guard проверяет строгую грамматику marker,
+  collision/ровно одно вхождение и его инвариантность под canonical redaction;
+  сначала редактирует весь prompt, затем восстанавливает только эти marker'ы.
+  Поэтому key `password`, `token` или даже `a` не защищает одноимённые куски
+  description/content и произвольного prompt. Бюджеты и snapshotHash считаются
+  по итоговому provider-visible key, а не по длине случайного marker. Два
+  намеренных span одного key получают разные marker identity; объединение
+  секций дедуплицирует только одинаковые marker'ы, не одинаковые key.
 
 ### 2.4 Журнал
 

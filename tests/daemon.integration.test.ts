@@ -22,6 +22,7 @@ import {
 import { createAutomation } from "../packages/automations/src/index.js";
 import { OperatorToolServer } from "../packages/operator-tools/src/index.js";
 import { privacyGuardOperatorRuntime } from "../packages/operator-runtime/src/index.js";
+import { SCRIBE_PENDING_TURN_PREFIX } from "../packages/policy/src/index.js";
 import type { MediaProcessor } from "../packages/media/src/index.js";
 import type { Config } from "../packages/shared/src/config.js";
 import type {
@@ -9436,13 +9437,56 @@ describe("Operator push envelope (package 2.1)", () => {
   it("carries only validated note references through the real provider privacy guard", async () => {
     const home = tempDirectory("daemon-push-reference-guard-");
     const store = tempStore();
-    await store.rememberKeyedOperatorNote({
-      key: "sk-abcdefghijklmnop",
+    store.notes.writeVersion({
+      key: "operator-reference",
       description: "when api_key=push-description-secret matters → pull the exact note",
       content: "Body password=push-body-secret",
       category: "people",
       source: "manual",
+      operationKey: "seed:overlapping-longer",
+    }).note;
+    store.notes.writeVersion({
+      key: "operator",
+      description: "when token=short-description-secret matters → pull the short note",
+      content: "Short body authorization=short-body-secret",
+      category: "people",
+      source: "manual",
+      operationKey: "seed:overlapping-shorter",
     });
+    const exactKey = store.notes.writeVersion({
+      key: "password",
+      description: "when password=index-description-secret matters → pull the exact-key note",
+      content: "Exact-key body token=index-body-secret",
+      category: "people",
+      source: "manual",
+      operationKey: "seed:exact-key-marker",
+    }).note;
+    // This pending proposal represents a crash/restart cut before its owner
+    // notification was enqueued. Its two typed references overlap too.
+    const replayKey = "distilled:overlapping-recovered-proposal";
+    const proposalDedupeKey = `scribe-merge-proposal:${replayKey}`;
+    store.distillationProposals.put({
+      replayKey,
+      ownerId: "42",
+      candidateKey: "password",
+      description: "when password=proposal-description-secret matters → ask the owner",
+      content: "Candidate token=proposal-body-secret",
+      category: "people",
+      validUntil: null,
+      evidenceSeqs: [1],
+      matchingNoteId: exactKey.id,
+      reason: "semantic",
+      score: 0.9,
+    });
+    // Exact 3af durable shape: the reference predates marker identities. The
+    // authoritative pending proposal must regenerate this one invalid payload
+    // after restart rather than strand it forever or dispatch its raw key.
+    const pendingTurnKey = `${SCRIBE_PENDING_TURN_PREFIX}${proposalDedupeKey}`;
+    store.setRuntimeState(pendingTurnKey, JSON.stringify({
+      dedupeKey: proposalDedupeKey,
+      prompt: "Candidate key: password; password=legacy-pending-secret",
+      operatorReferences: [{ kind: "operator-note-key", value: "password" }],
+    }));
     const captured = new FakeRuntime();
     const runtime = privacyGuardOperatorRuntime(captured);
     const broker = new FakeBroker();
@@ -9468,20 +9512,145 @@ describe("Operator push envelope (package 2.1)", () => {
     telegram.push(message(1, "столица Франции?"));
     await waitFor(() => captured.prompts.some((prompt) => prompt.includes("User message:")));
     const prompt = captured.prompts.find((candidate) => candidate.includes("User message:"))!;
-    expect(prompt).toContain("sk-abcdefghijklmnop");
+    expect(prompt).toContain("operator-reference");
+    expect(prompt).toMatch(/→ operator(?:\n|$)/u);
+    expect(prompt).toMatch(/→ password(?:\n|$)/u);
     expect(prompt).toContain("api_key=[REDACTED]");
     expect(prompt).not.toContain("push-description-secret");
     expect(prompt).not.toContain("push-body-secret");
+    expect(prompt).not.toContain("short-description-secret");
+    expect(prompt).not.toContain("short-body-secret");
+    expect(prompt).not.toContain("index-description-secret");
+    expect(prompt).not.toContain("index-body-secret");
+
+    // Force the recovered synthetic turn to compose a new full push. The same
+    // key then has three independent marker identities: pushed index,
+    // candidate slot and matching-note slot.
+    store.deleteRuntimeState("memory_push_baseline");
+    await daemon.runNightScribe({ force: true });
+    expect(store.getRuntimeState(pendingTurnKey)).toBeUndefined();
+    expect(store.distillationProposals.listPending()).toEqual([]);
+    await waitFor(() => captured.prompts.some((candidate) =>
+      candidate.includes("Candidate key: password") &&
+      candidate.includes("Matching active note: password")
+    ));
+    const recoveredProposal = captured.prompts.find((candidate) =>
+      candidate.includes("Candidate key: password") &&
+      candidate.includes("Matching active note: password")
+    )!;
+    expect(recoveredProposal).toMatch(/→ password(?:\n|$)/u);
+    expect(recoveredProposal).not.toContain("proposal-description-secret");
+    expect(recoveredProposal).not.toContain("push-description-secret");
+    expect(recoveredProposal).not.toContain("index-description-secret");
+    expect(recoveredProposal).not.toContain("index-body-secret");
+    expect(recoveredProposal).not.toMatch(/[\u{e000}\u{e001}]/u);
 
     await daemon.compact("reference propagation regression");
     const restore = captured.prompts.findLast((candidate) => candidate.includes("CONTEXT_RESTORED"))!;
-    expect(restore).toContain("sk-abcdefghijklmnop");
+    expect(restore).toContain("operator-reference");
+    expect(restore).toMatch(/→ operator(?:\n|$)/u);
+    expect(restore).toMatch(/→ password(?:\n|$)/u);
     expect(restore).toContain("api_key=[REDACTED]");
     expect(restore).not.toContain("push-description-secret");
     expect(restore).not.toContain("push-body-secret");
+    expect(restore).not.toContain("short-description-secret");
+    expect(restore).not.toContain("short-body-secret");
+    expect(restore).not.toMatch(/[\u{e000}\u{e001}]/u);
 
     telegram.finish();
     await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("upgrades a pre-marker enqueued Scribe ingress before guarded restart delivery", async () => {
+    const home = tempDirectory("daemon-scribe-reference-upgrade-");
+    const store = tempStore();
+    const key = "sk-abcdefghijklmnop";
+    const matching = store.notes.writeVersion({
+      key,
+      description: "when password=stored-description-secret matters → read the matching note",
+      content: "Stored token=stored-body-secret",
+      category: "people",
+      source: "manual",
+      operationKey: "seed:legacy-enqueued-marker",
+    }).note;
+    const replayKey = "distilled:legacy-enqueued-marker";
+    const proposal = store.distillationProposals.put({
+      replayKey,
+      ownerId: "42",
+      candidateKey: key,
+      description: "when password=proposal-description-secret matters → ask the owner",
+      content: "Candidate token=proposal-body-secret",
+      category: "people",
+      validUntil: null,
+      evidenceSeqs: [1],
+      matchingNoteId: matching.id,
+      reason: "exact-key",
+      score: 1,
+    });
+    expect(store.distillationProposals.markNotificationEnqueued(proposal.id)).toBe(true);
+    const dedupeKey = `scribe-merge-proposal:${replayKey}`;
+    const syntheticId = syntheticNegativeMessageId(dedupeKey);
+    const legacyUpdate = {
+      ...message(syntheticId, [
+        `Candidate key: ${key}`,
+        "Candidate trigger: password=legacy-proposal-secret",
+        `Matching active note: ${key} (${matching.id})`,
+      ].join("\n")),
+      updateId: syntheticId,
+      synthetic: true as const,
+      messageId: syntheticId,
+      messageIds: [syntheticId],
+      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+    };
+    const ingressId = `telegram-ingress:${legacyUpdate.chatId}:${syntheticId}`;
+    store.enqueueBackgroundJob(
+      "telegram_ingress",
+      {
+        update: legacyUpdate,
+        processExisting: true,
+        lane: "background",
+        enqueuedAt: nowIso(),
+      },
+      undefined,
+      { id: ingressId, dedupeKey: ingressId },
+    );
+
+    const captured = new FakeRuntime();
+    const runtime = privacyGuardOperatorRuntime(captured);
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(
+      config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools,
+    );
+
+    await daemon.initialize();
+
+    const proposals = captured.prompts.filter((prompt) => prompt.includes("Candidate key:"));
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]).toContain(`Candidate key: ${key}`);
+    expect(proposals[0]).toContain(`Matching active note: ${key}`);
+    expect(proposals[0]).toContain("password=[REDACTED]");
+    expect(proposals[0]).not.toContain("legacy-proposal-secret");
+    expect(proposals[0]).not.toContain("stored-description-secret");
+    expect(proposals[0]).not.toContain("stored-body-secret");
+    expect(proposals[0]).not.toMatch(/[\u{e000}\u{e001}]/u);
+    expect(store.getBackgroundJob(ingressId)?.status).toBe("completed");
+    expect(store.listBackgroundJobs("telegram_ingress", "completed")
+      .filter((job) => job.id === ingressId)).toHaveLength(1);
+
     await daemon.stop();
   }, 20_000);
 
@@ -9693,7 +9862,24 @@ describe("Operator push envelope (package 2.1)", () => {
   it("rebuilds a diff turn as a full snapshot when the runtime loses the session (§1г)", async () => {
     const home = tempDirectory("daemon-push-replay-");
     const store = tempStore();
-    const runtime = new SessionLossRuntime();
+    store.notes.writeVersion({
+      key: "operator-reference",
+      description: "when password=session-description-secret matters → use the longer note",
+      content: "Longer session fact",
+      category: "general",
+      source: "manual",
+      operationKey: "seed:session-overlap-longer",
+    });
+    store.notes.writeVersion({
+      key: "operator",
+      description: "when token=session-short-secret matters → use the shorter note",
+      content: "Shorter session fact",
+      category: "general",
+      source: "manual",
+      operationKey: "seed:session-overlap-shorter",
+    });
+    const captured = new SessionLossRuntime();
+    const runtime = privacyGuardOperatorRuntime(captured);
     const broker = new FakeBroker();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
@@ -9718,13 +9904,20 @@ describe("Operator push envelope (package 2.1)", () => {
     telegram.push(message(2, "а столица Италии?"));
     await waitFor(() => telegram.sent.filter((entry) => entry.text === "Париж.").length >= 2, 8_000);
 
-    expect(runtime.lostPrompts).toHaveLength(1);
-    expect(runtime.lostPrompts[0]).not.toContain("Operator state snapshot");
-    const replayed = directEnvelopes(runtime).at(-1)!;
+    expect(captured.lostPrompts).toHaveLength(1);
+    expect(captured.lostPrompts[0]).not.toContain("Operator state snapshot");
+    const replayed = directEnvelopes(captured).at(-1)!;
     // The replay is not the diff that failed: it carries the whole state, so a
     // brand-new session is not blind until the next compaction.
     expect(replayed).toContain("Operator state snapshot");
     expect(replayed).toContain("а столица Италии?");
+    expect(replayed).toContain("operator-reference");
+    expect(replayed).toMatch(/→ operator(?:\n|$)/u);
+    expect(replayed).toContain("password=[REDACTED]");
+    expect(replayed).toContain("token=[REDACTED]");
+    expect(replayed).not.toContain("session-description-secret");
+    expect(replayed).not.toContain("session-short-secret");
+    expect(replayed).not.toMatch(/[\u{e000}\u{e001}]/u);
 
     telegram.finish();
     await run;

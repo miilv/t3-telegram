@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import type { OperatorNote, OperatorPromptReference } from "../../shared/src/index.js";
+import { redactSecretsForOutput } from "../../shared/src/index.js";
 import { lintNoteDescription } from "./note-descriptions.js";
 
 export const OPERATOR_NOTE_KEY_CHARS = 120;
@@ -20,13 +22,33 @@ export function normalizeOperatorNoteKey(value: string): string {
     .replace(/-+/gu, "-");
 }
 
-/** Build the typed provider-visible form only for an already canonical Notes-v2 key. */
-export function operatorNotePromptReference(value: string): OperatorPromptReference | undefined {
+const OPERATOR_NOTE_MARKER_PATTERN =
+  /^\u{e000}t3-note:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\u{e001}$/u;
+
+function isCanonicalOperatorNoteKey(value: string): boolean {
   const normalized = normalizeOperatorNoteKey(value);
-  if (normalized !== value || !normalized || [...normalized].length > OPERATOR_NOTE_KEY_CHARS) {
-    return undefined;
+  return normalized === value && Boolean(normalized) &&
+    [...normalized].length <= OPERATOR_NOTE_KEY_CHARS;
+}
+
+/**
+ * Bind one validated Notes-v2 key to an unforgeable prompt occurrence.
+ * Callers render `marker`, never `value`, and carry the pair to the guarded
+ * provider boundary. `occupied` makes collision avoidance deterministic even
+ * for adversarial prose already containing marker-shaped text.
+ */
+export function operatorNotePromptReference(
+  value: string,
+  occupied: readonly string[] = [],
+): OperatorPromptReference | undefined {
+  if (!isCanonicalOperatorNoteKey(value)) return undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const marker = `\u{e000}t3-note:${randomUUID()}\u{e001}`;
+    if (occupied.some((text) => text.includes(marker))) continue;
+    if (redactSecretsForOutput(marker) !== marker) continue;
+    return { kind: "operator-note-key", value, marker };
   }
-  return { kind: "operator-note-key", value: normalized };
+  throw new Error("could not allocate a collision-free Operator note marker");
 }
 
 export function isOperatorNotePromptReference(value: unknown): value is OperatorPromptReference {
@@ -34,7 +56,10 @@ export function isOperatorNotePromptReference(value: unknown): value is Operator
   const candidate = value as Record<string, unknown>;
   return candidate.kind === "operator-note-key" &&
     typeof candidate.value === "string" &&
-    operatorNotePromptReference(candidate.value) !== undefined;
+    isCanonicalOperatorNoteKey(candidate.value) &&
+    typeof candidate.marker === "string" &&
+    OPERATOR_NOTE_MARKER_PATTERN.test(candidate.marker) &&
+    redactSecretsForOutput(candidate.marker) === candidate.marker;
 }
 
 export function normalizeNoteDescription(value: string): string {

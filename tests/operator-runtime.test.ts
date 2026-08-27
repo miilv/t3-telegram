@@ -8,6 +8,12 @@ import {
   privacyGuardOperatorRuntime,
   SwitchableOperatorRuntime,
 } from "../packages/operator-runtime/src/index.js";
+import {
+  MEMORY_INDEX_BUDGET_CHARS,
+  operatorNotePromptReference,
+  renderStateLayers,
+} from "../packages/policy/src/index.js";
+import type { MemoryIndexNote } from "../packages/policy/src/index.js";
 import type { OperatorEvent, OperatorRuntime, OperatorSession } from "../packages/shared/src/index.js";
 import { tempDirectory } from "./helpers.js";
 
@@ -1024,13 +1030,14 @@ describe("privacyGuardOperatorRuntime", () => {
     const inner = new CapturingRuntime();
     const runtime = privacyGuardOperatorRuntime(inner);
     const key = "sk-abcdefghijklmnop";
+    const reference = operatorNotePromptReference(key)!;
     const input = {
       systemPrompt: [
-        `Memory reference: ${key}`,
+        `Memory reference: ${reference.marker}`,
         "Description password=start-description-secret",
         "Proposal token=start-proposal-secret",
       ].join("\n"),
-      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+      operatorReferences: [reference],
     };
 
     await runtime.start(input);
@@ -1046,14 +1053,15 @@ describe("privacyGuardOperatorRuntime", () => {
     const inner = new CapturingRuntime();
     const runtime = privacyGuardOperatorRuntime(inner);
     const key = "sk-abcdefghijklmnop";
+    const reference = operatorNotePromptReference(key)!;
     const input = {
       sessionId: "session",
       prompt: [
-        `Pull the note with memory.get ${key}`,
+        `Pull the note with memory.get ${reference.marker}`,
         "Body api_key=turn-body-secret",
         "Proposal password=turn-proposal-secret",
       ].join("\n"),
-      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+      operatorReferences: [reference],
     };
 
     for await (const _event of runtime.sendTurn(input)) {
@@ -1071,13 +1079,14 @@ describe("privacyGuardOperatorRuntime", () => {
     const inner = new CapturingRuntime();
     const runtime = privacyGuardOperatorRuntime(inner);
     const key = "sk-abcdefghijklmnop";
+    const reference = operatorNotePromptReference(key)!;
     const resumeOptions = {
-      systemPrompt: `Resume ${key}; password=resume-secret`,
-      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+      systemPrompt: `Resume ${reference.marker}; password=resume-secret`,
+      operatorReferences: [reference],
     };
     const switchInput = {
-      systemPrompt: `Switch ${key}; token=switch-secret`,
-      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+      systemPrompt: `Switch ${reference.marker}; token=switch-secret`,
+      operatorReferences: [reference],
     };
 
     await runtime.resume("session", undefined, resumeOptions);
@@ -1087,6 +1096,158 @@ describe("privacyGuardOperatorRuntime", () => {
       `Resume ${key}; password=[REDACTED]`,
       `Switch ${key}; token=[REDACTED]`,
     ]);
+  });
+
+  it("preserves overlapping typed note references across every guarded session boundary", async () => {
+    const inner = new CapturingRuntime();
+    const runtime = privacyGuardOperatorRuntime(inner);
+    const longer = "operator-reference";
+    const shorter = "operator";
+    const preexistingSentinel = "\u{e000}0:0\u{e001}";
+    const longerReference = operatorNotePromptReference(longer, [preexistingSentinel])!;
+    const shorterReference = operatorNotePromptReference(shorter, [
+      preexistingSentinel,
+      longerReference.marker,
+    ])!;
+    const operatorReferences = [
+      longerReference,
+      shorterReference,
+      longerReference,
+      shorterReference,
+    ];
+
+    await runtime.start({
+      systemPrompt:
+        `Start ${longerReference.marker} then ${shorterReference.marker}; ` +
+        `sentinel ${preexistingSentinel}; token=start-secret`,
+      operatorReferences,
+    });
+    for await (const _event of runtime.sendTurn({
+      sessionId: "session",
+      prompt: `Turn ${longerReference.marker} then ${shorterReference.marker}; api_key=turn-secret`,
+      operatorReferences,
+    })) {
+      // consume the decorated iterable
+    }
+    await runtime.resume("session", undefined, {
+      systemPrompt:
+        `Resume ${longerReference.marker} then ${shorterReference.marker}; password=resume-secret`,
+      operatorReferences,
+    });
+    await runtime.switchProvider?.("claude", {
+      systemPrompt:
+        `Switch ${longerReference.marker} then ${shorterReference.marker}; authorization=switch-secret`,
+      operatorReferences,
+    });
+
+    expect(inner.seen).toEqual([
+      `Start ${longer} then ${shorter}; sentinel ${preexistingSentinel}; token=[REDACTED]`,
+      `Turn ${longer} then ${shorter}; api_key=[REDACTED]`,
+      `Resume ${longer} then ${shorter}; password=[REDACTED]`,
+      `Switch ${longer} then ${shorter}; authorization=[REDACTED]`,
+    ]);
+    expect(inner.seen.join("\n")).not.toMatch(/operator-reference-[0-9a-f-]{36}/u);
+    expect(inner.seen.join("\n")).not.toContain("start-secret");
+    expect(inner.seen.join("\n")).not.toContain("turn-secret");
+    expect(inner.seen.join("\n")).not.toContain("resume-secret");
+    expect(inner.seen.join("\n")).not.toContain("switch-secret");
+  });
+
+  it("restores only builder-marked reference spans and still redacts matching secret labels", async () => {
+    const inner = new CapturingRuntime();
+    const runtime = privacyGuardOperatorRuntime(inner);
+    const passwordMarker = "\u{e000}t3-note:00000000-0000-4000-8000-000000000001\u{e001}";
+    const tokenMarker = "\u{e000}t3-note:00000000-0000-4000-8000-000000000002\u{e001}";
+    const shortMarker = "\u{e000}t3-note:00000000-0000-4000-8000-000000000003\u{e001}";
+    const operatorReferences = [
+      { kind: "operator-note-key" as const, value: "password", marker: passwordMarker },
+      { kind: "operator-note-key" as const, value: "token", marker: tokenMarker },
+      { kind: "operator-note-key" as const, value: "a", marker: shortMarker },
+    ];
+    const marked =
+      `Pull exact notes ${passwordMarker}, ${tokenMarker}, ${shortMarker}. ` +
+      "password=supersecretvalue token=othervaluesecret api_key=thirdsecretvalue";
+    const visible =
+      "Pull exact notes password, token, a. " +
+      "password=[REDACTED] token=[REDACTED] api_key=[REDACTED]";
+
+    await runtime.start({ systemPrompt: marked, operatorReferences });
+    for await (const _event of runtime.sendTurn({
+      sessionId: "session",
+      prompt: marked,
+      operatorReferences,
+    })) {
+      // consume the decorated iterable
+    }
+    await runtime.resume("session", undefined, {
+      systemPrompt: marked,
+      operatorReferences,
+    });
+    await runtime.switchProvider?.("claude", {
+      systemPrompt: marked,
+      operatorReferences,
+    });
+
+    expect(inner.seen).toEqual([visible, visible, visible, visible]);
+    expect(inner.seen.join("\n")).not.toMatch(/[\u{e000}\u{e001}]/u);
+    expect(inner.seen.join("\n")).not.toContain("supersecretvalue");
+    expect(inner.seen.join("\n")).not.toContain("othervaluesecret");
+    expect(inner.seen.join("\n")).not.toContain("thirdsecretvalue");
+  });
+
+  it("budgets mixed-length note keys by final provider text and restores every selected slot", async () => {
+    const notes: MemoryIndexNote[] = Array.from({ length: 160 }, (_, index) => ({
+      id: `note_${index}`,
+      key: index % 2 === 0
+        ? `k-${index}`
+        : `long-${"x".repeat(90)}-${index}`,
+      description: `when route ${index} matters → read the selected note`,
+      content: `body ${index}`,
+      updatedAt: new Date(Date.UTC(2026, 7, 26, 9, 0, index)).toISOString(),
+      pushScore: 0.5,
+    }));
+    const layers = renderStateLayers({ now: [], notes, antiRediscovery: [] });
+    const inner = new CapturingRuntime();
+    const runtime = privacyGuardOperatorRuntime(inner);
+
+    for await (const _event of runtime.sendTurn({
+      sessionId: "session",
+      prompt: layers.index,
+      operatorReferences: layers.operatorReferences,
+    })) {
+      // consume the decorated iterable
+    }
+
+    const visible = inner.seen[0]!;
+    const selectedIndices = layers.operatorReferences.map((reference) =>
+      Number(reference.value.match(/-(\d+)$/u)![1]),
+    );
+    expect([...visible].length).toBeLessThanOrEqual(MEMORY_INDEX_BUDGET_CHARS);
+    expect(selectedIndices.length).toBeGreaterThan(2);
+    expect(selectedIndices).toEqual(
+      Array.from({ length: selectedIndices.length }, (_, offset) => 159 - offset),
+    );
+    expect(visible).toContain("when route 159 matters");
+    expect(visible).toContain("when route 158 matters");
+    expect(visible).not.toContain("when route 0 matters");
+    expect(layers.operatorReferences.every((reference) =>
+      visible.includes(`→ ${reference.value}`) && !visible.includes(reference.marker)
+    )).toBe(true);
+    expect(visible.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(
+      layers.operatorReferences.length,
+    );
+  });
+
+  it("fails closed when an opaque reference marker collides with another prompt span", async () => {
+    const reference = operatorNotePromptReference("warehouse-owner")!;
+    const inner = new CapturingRuntime();
+    const runtime = privacyGuardOperatorRuntime(inner);
+
+    expect(() => runtime.start({
+      systemPrompt: `Intended ${reference.marker}; colliding prose ${reference.marker}`,
+      operatorReferences: [reference],
+    })).toThrow("must occur exactly once");
+    expect(inner.seen).toEqual([]);
   });
 
   it("redacts every provider-bound prose channel without changing tool capability tokens", async () => {

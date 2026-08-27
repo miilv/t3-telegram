@@ -96,6 +96,17 @@ export class DistillationProposalRepository {
     return (rows as Row[]).map(rowToProposal);
   }
 
+  /** One-time compatibility scan for pre-marker notifications already queued at crash time. */
+  listEnqueued(ownerId?: string): DistillationMergeProposal[] {
+    const owner = ownerId?.trim();
+    const where = owner
+      ? "WHERE proposal.notification_status='enqueued' AND proposal.owner_id=?"
+      : "WHERE proposal.notification_status='enqueued'";
+    const statement = this.selectBase(`${where} ORDER BY proposal.created_at,proposal.id`);
+    const rows = owner ? statement.all(owner) : statement.all();
+    return (rows as Row[]).map(rowToProposal);
+  }
+
   markNotificationEnqueued(id: string, at = nowIso()): boolean {
     return this.db.prepare(`
       UPDATE memory_merge_proposals SET notification_status='enqueued',notified_at=?

@@ -618,10 +618,14 @@ export interface OperatorToolAccess {
   toolNames?: string[];
 }
 
-/** A validated Notes-v2 key that prompt builders intentionally expose as an operational reference. */
+/**
+ * A validated Notes-v2 key bound to one opaque marker inserted by a trusted
+ * prompt builder at the exact provider-visible reference span.
+ */
 export interface OperatorPromptReference {
   kind: "operator-note-key";
   value: string;
+  marker: string;
 }
 
 export interface OperatorRuntime {

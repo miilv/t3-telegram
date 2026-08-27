@@ -2461,6 +2461,14 @@ export class OperatorStore {
     return id;
   }
 
+  /** Replace one not-yet-run job in place without changing its identity or retry history. */
+  replacePendingBackgroundJobPayload<T>(id: string, kind: string, payload: T): boolean {
+    return this.db.prepare(`
+      UPDATE background_jobs SET payload_json=?,updated_at=?
+      WHERE id=? AND kind=? AND status='pending'
+    `).run(JSON.stringify(payload), nowIso(), id, kind).changes > 0;
+  }
+
   /**
    * The accepted owner utterance and the durable ingress job are one fact.
    * Keeping their inserts in one transaction prevents either a lost transcript

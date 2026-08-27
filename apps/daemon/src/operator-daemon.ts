@@ -121,6 +121,7 @@ import {
 } from "../../../packages/telegram/src/index.js";
 import {
   buildOperatorSystemPrompt,
+  buildDistillationMergeProposalTurn,
   classifyPause,
   decidePushMode,
   NOW_ITEM_CONTENT_CHARS,
@@ -241,6 +242,7 @@ const LONG_MEDIA_TOTAL_SECONDS = 180;
  */
 const BULK_INGEST_ELEMENTS = 3;
 const BULK_INGEST_BYTES = 10 * 1024 * 1024;
+const SCRIBE_MARKED_INGRESS_REPAIR_KEY = "scribe_marked_ingress_repair_v1";
 /** Attachment kinds the media pipeline is expected to transcribe. */
 const TRANSCRIBED_ATTACHMENT_TYPES = new Set(["voice", "audio", "video", "video_note"]);
 /** Attachment kinds OCR is attempted on, when OCR is configured at all. */
@@ -835,6 +837,7 @@ export class OperatorDaemon {
     const interruptedOutbox = this.store.resetInterruptedTelegramOutbox();
     const interruptedDispatches = this.store.resetInterruptedBackgroundJobs();
     const interruptedAutomations = this.store.resetRunningAutomations();
+    const repairedLegacyScribeIngress = this.repairLegacyScribeIngressReferences();
     await this.artifacts.initialize();
     await mkdir(this.config.operator.runtimeDir, { recursive: true, mode: 0o700 });
     await this.operatorTools?.start();
@@ -887,6 +890,7 @@ export class OperatorDaemon {
         interruptedOutbox,
         interruptedDispatches,
         interruptedAutomations,
+        repairedLegacyScribeIngress,
       },
       "Operator initialized",
     );
@@ -2786,13 +2790,19 @@ export class OperatorDaemon {
         ...push.operatorReferences,
         ...(update.operatorReferences ?? []).filter(isOperatorNotePromptReference),
       ];
+      const referencesByMarker = new Map<string, OperatorPromptReference>();
+      for (const reference of operatorReferences) {
+        const existing = referencesByMarker.get(reference.marker);
+        if (existing && existing.value !== reference.value) {
+          throw new Error("Operator prompt reference marker maps to conflicting note keys");
+        }
+        referencesByMarker.set(reference.marker, reference);
+      }
       return {
         text: [...push.sections, ...turnInstruction]
           .filter((line): line is string => Boolean(line))
           .join("\n\n"),
-        operatorReferences: [...new Map(
-          operatorReferences.map((reference) => [reference.value, reference]),
-        ).values()],
+        operatorReferences: [...referencesByMarker.values()],
         commit: push.commit,
       };
     };
@@ -5274,6 +5284,71 @@ export class OperatorDaemon {
    */
   async runNightScribe(options: { force?: boolean } = {}): Promise<ScribeRunOutcome> {
     return this.scribe.run(options);
+  }
+
+  /**
+   * Upgrade the second pre-marker crash cut: the proposal notification was
+   * marked enqueued and its runtime-state intent deleted, but the durable
+   * synthetic ingress had not reached the provider. The proposal plus the
+   * deterministic synthetic id are authoritative provenance; update that same
+   * pending job in place so delivery remains exactly once.
+   */
+  private repairLegacyScribeIngressReferences(): number {
+    if (this.store.getRuntimeState(SCRIBE_MARKED_INGRESS_REPAIR_KEY) === "done") return 0;
+    const jobs = this.store.listBackgroundJobs<DurableTelegramIngress>(
+      "telegram_ingress",
+      "pending",
+    );
+    let repaired = 0;
+    for (const proposal of this.store.distillationProposals.listEnqueued(this.ownerLedgerId())) {
+      const dedupeKey = `scribe-merge-proposal:${proposal.replayKey}`;
+      const syntheticId = syntheticNegativeMessageId(dedupeKey);
+      const job = jobs.find((candidate) => {
+        const update = candidate.payload.update;
+        return update.synthetic === true &&
+          update.messageId === syntheticId &&
+          update.messageIds.length === 1 &&
+          update.messageIds[0] === syntheticId &&
+          String(update.userId) === proposal.ownerId;
+      });
+      if (!job) continue;
+      const existingReferences = job.payload.update.operatorReferences;
+      if (
+        Array.isArray(existingReferences) &&
+        existingReferences.length > 0 &&
+        existingReferences.every(isOperatorNotePromptReference)
+      ) {
+        continue;
+      }
+      const turn = buildDistillationMergeProposalTurn({
+        candidateKey: proposal.candidateKey,
+        description: proposal.description,
+        evidenceSeqs: proposal.evidenceSeqs,
+        matchingNote: {
+          id: proposal.matchingNote.id,
+          ...(proposal.matchingNote.key ? { key: proposal.matchingNote.key } : {}),
+          ...(proposal.matchingNote.description
+            ? { description: proposal.matchingNote.description }
+            : {}),
+        },
+      });
+      if (this.store.replacePendingBackgroundJobPayload(
+        job.id,
+        "telegram_ingress",
+        {
+          ...job.payload,
+          update: {
+            ...job.payload.update,
+            text: turn.prompt,
+            operatorReferences: turn.operatorReferences,
+          },
+        } satisfies DurableTelegramIngress,
+      )) {
+        repaired += 1;
+      }
+    }
+    this.store.setRuntimeState(SCRIBE_MARKED_INGRESS_REPAIR_KEY, "done");
+    return repaired;
   }
 
   /**

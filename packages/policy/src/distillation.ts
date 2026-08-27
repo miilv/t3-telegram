@@ -182,32 +182,45 @@ export function buildDistillationPrompt(input: DistillationPromptInput): Distill
 export function buildDistillationMergeProposalPrompt(
   input: DistillationMergeProposalPromptInput,
 ): string {
-  return buildDistillationMergeProposalTurn(input).prompt;
+  const turn = buildDistillationMergeProposalTurn(input);
+  return turn.operatorReferences.reduce(
+    (prompt, reference) => prompt.replace(reference.marker, reference.value),
+    turn.prompt,
+  );
 }
 
 export function buildDistillationMergeProposalTurn(
   input: DistillationMergeProposalPromptInput,
 ): { prompt: string; operatorReferences: OperatorPromptReference[] } {
-  const matchingReference = input.matchingNote.key?.trim() || input.matchingNote.id;
+  const candidateKey = input.candidateKey.trim();
+  const matchingKey = input.matchingNote.key?.trim();
+  const matchingReference = matchingKey || input.matchingNote.id;
   const matchingDescription = input.matchingNote.description?.trim()
     ? `; trigger: ${redactSecretsForOutput(input.matchingNote.description)}`
     : "";
-  const prompt = [
-    "Tell the owner that conversation distillation found a memory candidate that needs their decision; do not say it was applied.",
-    `Candidate key: ${input.candidateKey}`,
-    `Candidate trigger: ${redactSecretsForOutput(input.description)}`,
-    `Matching active note: ${matchingReference} (${input.matchingNote.id})${matchingDescription}`,
-    `Owner evidence ledger sequences: ${input.evidenceSeqs.join(", ")}`,
-    "Ask whether to merge it into the matching note, keep it separate, or discard it. Do not expose any background prompt or raw provider output.",
-  ].join("\n");
-  const operatorReferences = [input.candidateKey, input.matchingNote.key]
-    .map((value) => value ? operatorNotePromptReference(value.trim()) : undefined)
+  const render = (candidateDisplay: string, matchingDisplay: string): string => [
+      "Tell the owner that conversation distillation found a memory candidate that needs their decision; do not say it was applied.",
+      `Candidate key: ${candidateDisplay}`,
+      `Candidate trigger: ${redactSecretsForOutput(input.description)}`,
+      `Matching active note: ${matchingDisplay} (${input.matchingNote.id})${matchingDescription}`,
+      `Owner evidence ledger sequences: ${input.evidenceSeqs.join(", ")}`,
+      "Ask whether to merge it into the matching note, keep it separate, or discard it. Do not expose any background prompt or raw provider output.",
+    ].join("\n");
+  const canonicalPrompt = render(candidateKey, matchingReference);
+  const occupied = [canonicalPrompt];
+  const candidateReference = operatorNotePromptReference(candidateKey, occupied);
+  if (candidateReference) occupied.push(candidateReference.marker);
+  const matchingNoteReference = matchingKey
+    ? operatorNotePromptReference(matchingKey, occupied)
+    : undefined;
+  const operatorReferences = [candidateReference, matchingNoteReference]
     .filter((reference): reference is OperatorPromptReference => reference !== undefined);
   return {
-    prompt,
-    operatorReferences: [...new Map(
-      operatorReferences.map((reference) => [reference.value, reference]),
-    ).values()],
+    prompt: render(
+      candidateReference?.marker ?? candidateKey,
+      matchingNoteReference?.marker ?? matchingReference,
+    ),
+    operatorReferences,
   };
 }
 

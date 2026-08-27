@@ -247,7 +247,7 @@ export class NightScribe {
       const stateKey = this.finalizer.persistOwnerTurn({
         dedupeKey,
         ...turn,
-      });
+      }, { repairInvalidLegacyReferences: true });
       return { proposal, stateKey };
     });
     this.finalizer.flushPendingOwnerTurns();

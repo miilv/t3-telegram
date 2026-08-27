@@ -165,20 +165,30 @@ function redactProviderPrompt(
   prompt: string,
   references: readonly OperatorPromptReference[] | undefined,
 ): string {
-  const protectedReferences = [...new Set(
-    (references ?? [])
-      .filter(isOperatorNotePromptReference)
-      .map((reference) => reference.value),
-  )].sort((left, right) => right.length - left.length);
-  let protectedPrompt = prompt;
-  const placeholders = protectedReferences.map((reference) => {
-    const placeholder = `«operator-reference-${randomUUID()}»`;
-    protectedPrompt = protectedPrompt.replaceAll(reference, placeholder);
-    return { placeholder, reference };
-  });
-  let redacted = redactSecretsForOutput(protectedPrompt);
-  for (const { placeholder, reference } of placeholders) {
-    redacted = redacted.replaceAll(placeholder, reference);
+  const byMarker = new Map<string, OperatorPromptReference>();
+  for (const reference of references ?? []) {
+    if (!isOperatorNotePromptReference(reference)) {
+      throw new Error("Operator prompt contains an invalid note reference marker");
+    }
+    const existing = byMarker.get(reference.marker);
+    if (existing && existing.value !== reference.value) {
+      throw new Error("Operator prompt reference marker maps to multiple note keys");
+    }
+    byMarker.set(reference.marker, reference);
+  }
+  if (byMarker.size === 0) return redactSecretsForOutput(prompt);
+
+  for (const marker of byMarker.keys()) {
+    if (prompt.split(marker).length !== 2) {
+      throw new Error("Operator prompt reference marker must occur exactly once");
+    }
+  }
+  let redacted = redactSecretsForOutput(prompt);
+  for (const { marker, value } of byMarker.values()) {
+    if (redacted.split(marker).length !== 2) {
+      throw new Error("Operator prompt reference marker was altered by provider redaction");
+    }
+    redacted = redacted.replace(marker, value);
   }
   return redacted;
 }

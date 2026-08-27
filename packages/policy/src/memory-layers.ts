@@ -312,44 +312,56 @@ export function renderMemoryIndex(
   notes: readonly MemoryIndexNote[],
   options: RenderOptions = {},
 ): string {
-  return renderMemoryIndexResult(notes, options).text;
+  return renderMemoryIndexResult(notes, options).canonicalText;
 }
 
 function renderMemoryIndexResult(
   notes: readonly MemoryIndexNote[],
   options: RenderOptions = {},
-): { text: string; operatorReferences: OperatorPromptReference[] } {
+): {
+  text: string;
+  canonicalText: string;
+  operatorReferences: OperatorPromptReference[];
+} {
   const budget = options.budget ?? MEMORY_INDEX_BUDGET_CHARS;
   const overflowTool = options.overflowTool ?? "memory.search";
   if (notes.length === 0) {
     return {
       text: `${MEMORY_INDEX_HEADER}\n${MEMORY_INDEX_EMPTY}`,
+      canonicalText: `${MEMORY_INDEX_HEADER}\n${MEMORY_INDEX_EMPTY}`,
       operatorReferences: [],
     };
   }
   const ranked = [...notes].sort(byPushScoreThenRecency);
-  const render = (selected: readonly MemoryIndexNote[], omitted: number): string => {
+  const render = (
+    selected: readonly MemoryIndexNote[],
+    omitted: number,
+    marked: readonly (OperatorPromptReference | undefined)[] = [],
+  ): string => {
     const lines = [MEMORY_INDEX_HEADER];
     if (selected.length > 0) {
-      lines.push(fenceBody(selected.map(indexLine).join("\n"), options.fence));
+      lines.push(fenceBody(
+        selected.map((note, index) => indexLine(note, marked[index]?.marker)).join("\n"),
+        options.fence,
+      ));
     }
     if (omitted > 0) lines.push(`(+${omitted} notes — ${overflowTool})`);
     return lines.join("\n");
   };
-  const { text, selected } = fitToBudgetSelection(ranked, budget, render);
+  const { text: canonicalText, selected } = fitToBudgetSelection(ranked, budget, render);
+  const marked = markSelectedNoteReferences(selected, canonicalText);
   return {
-    text,
-    operatorReferences: selected
-      .map((note) => note.key ? operatorNotePromptReference(note.key.trim()) : undefined)
-      .filter((reference): reference is OperatorPromptReference => reference !== undefined),
+    text: render(selected, ranked.length - selected.length, marked.byIndex),
+    canonicalText,
+    operatorReferences: marked.references,
   };
 }
 
-function indexLine(note: MemoryIndexNote): string {
+function indexLine(note: MemoryIndexNote, markedReference?: string): string {
   const trigger = note.description?.trim()
     ? clean(redactSecretsForOutput(note.description), 120)
     : clean(redactSecretsForOutput(note.content), LEGACY_INDEX_EXCERPT_CHARS);
-  const reference = note.key?.trim() ? note.key.trim() : note.id;
+  const reference = markedReference ?? (note.key?.trim() ? note.key.trim() : note.id);
   const warning = note.warning?.trim() ? ` ${clean(note.warning, 100)}` : "";
   return `- ${trigger} → ${reference}${warning}`;
 }
@@ -363,36 +375,71 @@ export function renderAntiRediscovery(
   notes: readonly MemoryIndexNote[],
   options: RenderOptions = {},
 ): string {
-  return renderAntiRediscoveryResult(notes, options).text;
+  return renderAntiRediscoveryResult(notes, options).canonicalText;
 }
 
 function renderAntiRediscoveryResult(
   notes: readonly MemoryIndexNote[],
   options: RenderOptions = {},
-): { text: string; operatorReferences: OperatorPromptReference[] } {
+): {
+  text: string;
+  canonicalText: string;
+  operatorReferences: OperatorPromptReference[];
+} {
   const budget = options.budget ?? ANTI_REDISCOVERY_BUDGET_CHARS;
   const overflowTool = options.overflowTool ?? "memory.search";
   if (notes.length === 0) {
     return {
       text: `${ANTI_REDISCOVERY_HEADER}\n${ANTI_REDISCOVERY_EMPTY}`,
+      canonicalText: `${ANTI_REDISCOVERY_HEADER}\n${ANTI_REDISCOVERY_EMPTY}`,
       operatorReferences: [],
     };
   }
   const ranked = [...notes].sort(byPushScoreThenRecency);
-  const render = (selected: readonly MemoryIndexNote[], omitted: number): string => {
+  const render = (
+    selected: readonly MemoryIndexNote[],
+    omitted: number,
+    marked: readonly (OperatorPromptReference | undefined)[] = [],
+  ): string => {
     const lines = [ANTI_REDISCOVERY_HEADER];
     if (selected.length > 0) {
-      lines.push(fenceBody(selected.map(indexLine).join("\n"), options.fence));
+      lines.push(fenceBody(
+        selected.map((note, index) => indexLine(note, marked[index]?.marker)).join("\n"),
+        options.fence,
+      ));
     }
     if (omitted > 0) lines.push(`(+${omitted} entries — ${overflowTool})`);
     return lines.join("\n");
   };
-  const { text, selected } = fitToBudgetSelection(ranked, budget, render);
+  const { text: canonicalText, selected } = fitToBudgetSelection(ranked, budget, render);
+  const marked = markSelectedNoteReferences(selected, canonicalText);
   return {
-    text,
-    operatorReferences: selected
-      .map((note) => note.key ? operatorNotePromptReference(note.key.trim()) : undefined)
-      .filter((reference): reference is OperatorPromptReference => reference !== undefined),
+    text: render(selected, ranked.length - selected.length, marked.byIndex),
+    canonicalText,
+    operatorReferences: marked.references,
+  };
+}
+
+function markSelectedNoteReferences(
+  selected: readonly MemoryIndexNote[],
+  canonicalText: string,
+): {
+  byIndex: Array<OperatorPromptReference | undefined>;
+  references: OperatorPromptReference[];
+} {
+  const occupied = [canonicalText];
+  const byIndex = selected.map((note) => {
+    const key = note.key?.trim();
+    if (!key) return undefined;
+    const reference = operatorNotePromptReference(key, occupied);
+    if (reference) occupied.push(reference.marker);
+    return reference;
+  });
+  return {
+    byIndex,
+    references: byIndex.filter(
+      (reference): reference is OperatorPromptReference => reference !== undefined,
+    ),
   };
 }
 
@@ -475,17 +522,23 @@ export function renderStateLayers(input: StateLayerInput): RenderedStateLayers {
   // the diff baseline into noise. The nonce is replaced by a constant of the
   // same length first, so the hash tracks CONTENT and nothing else.
   const canonical = (text: string): string => text.replaceAll(fence.nonce, CANONICAL_NONCE);
+  const canonicalSnapshot = [
+    SNAPSHOT_LEAD,
+    now,
+    indexResult.canonicalText,
+    antiRediscoveryResult.canonicalText,
+  ].join("\n\n");
   return {
     now,
     index,
     antiRediscovery,
     snapshot,
     nowHash: hashText(canonical(now)),
-    snapshotHash: hashText(canonical(snapshot)),
+    snapshotHash: hashText(canonical(canonicalSnapshot)),
     items: fingerprintNowItems(input.now),
     operatorReferences: [...new Map(
       [...indexResult.operatorReferences, ...antiRediscoveryResult.operatorReferences]
-        .map((reference) => [reference.value, reference]),
+        .map((reference) => [reference.marker, reference]),
     ).values()],
   };
 }

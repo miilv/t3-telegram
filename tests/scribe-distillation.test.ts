@@ -85,7 +85,7 @@ describe("Night Scribe conversation distillation collaboration", () => {
   it("retries a pending proposal notification after restart and enqueues its stable turn once", async () => {
     const store = tempStore();
     store.notes.writeVersion({
-      key: "sk-abcdefghijklmnop",
+      key: "password",
       description: "when warehouse ownership matters → read the curated fact",
       content: "Dan owns the warehouse",
       category: "people",
@@ -104,10 +104,14 @@ describe("Night Scribe conversation distillation collaboration", () => {
     const turns: Array<{
       dedupeKey: string;
       prompt: string;
-      operatorReferences?: readonly { kind: "operator-note-key"; value: string }[];
+      operatorReferences?: readonly {
+        kind: "operator-note-key";
+        value: string;
+        marker: string;
+      }[];
     }> = [];
     const response = JSON.stringify([{
-      key: "sk-abcdefghijklmnop",
+      key: "password",
       description: "when warehouse ownership matters → read the owner fact",
       content: "Ira owns the warehouse",
       category: "people",
@@ -138,10 +142,14 @@ describe("Night Scribe conversation distillation collaboration", () => {
     expect(second.status).toBe("no-work");
     expect(turns).toHaveLength(2);
     expect(turns[1]!.dedupeKey).toBe(turns[0]!.dedupeKey);
-    expect(turns[1]!.prompt).toContain("sk-abcdefghijklmnop");
-    expect(turns[1]!.operatorReferences).toEqual([
-      { kind: "operator-note-key", value: "sk-abcdefghijklmnop" },
-    ]);
+    expect(turns[1]!.prompt).toBe(turns[0]!.prompt);
+    expect(turns[1]!.operatorReferences).toEqual(turns[0]!.operatorReferences);
+    expect(turns[1]!.prompt).not.toContain("password");
+    expect(turns[1]!.operatorReferences?.map((reference) => reference.value))
+      .toEqual(["password", "password"]);
+    const markers = turns[1]!.operatorReferences?.map((reference) => reference.marker) ?? [];
+    expect(new Set(markers).size).toBe(2);
+    expect(markers.every((marker) => turns[1]!.prompt.split(marker).length === 2)).toBe(true);
     expect(turns[1]!.prompt).toContain(String(row.seq));
     expect(store.distillationProposals.listPending()).toEqual([]);
 
