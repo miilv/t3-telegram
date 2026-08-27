@@ -1,5 +1,10 @@
-import { openFence, redactSecretsForOutput } from "../../shared/src/index.js";
-import { validateOperatorNoteDraft } from "./operator-notes.js";
+import type { OperatorPromptReference } from "../../shared/src/index.js";
+import {
+  isStrictRfc3339Instant,
+  openFence,
+  redactSecretsForOutput,
+} from "../../shared/src/index.js";
+import { operatorNotePromptReference, validateOperatorNoteDraft } from "./operator-notes.js";
 
 const CANDIDATE_FIELDS = [
   "category",
@@ -104,7 +109,7 @@ export function parseDistillationResponse(
       if (!validated.ok) return rejected(validated.hint);
       if (keys.has(validated.key)) return rejected("candidate keys must be unique");
       keys.add(validated.key);
-      if (value.validUntil !== null && !isStrictIsoInstant(value.validUntil)) {
+      if (value.validUntil !== null && !isStrictRfc3339Instant(value.validUntil)) {
         return rejected("candidate validUntil is not a valid RFC 3339 instant");
       }
       const evidenceSeqs = validateEvidence(value.evidenceSeqs, ownerEvidence);
@@ -177,11 +182,17 @@ export function buildDistillationPrompt(input: DistillationPromptInput): Distill
 export function buildDistillationMergeProposalPrompt(
   input: DistillationMergeProposalPromptInput,
 ): string {
+  return buildDistillationMergeProposalTurn(input).prompt;
+}
+
+export function buildDistillationMergeProposalTurn(
+  input: DistillationMergeProposalPromptInput,
+): { prompt: string; operatorReferences: OperatorPromptReference[] } {
   const matchingReference = input.matchingNote.key?.trim() || input.matchingNote.id;
   const matchingDescription = input.matchingNote.description?.trim()
     ? `; trigger: ${redactSecretsForOutput(input.matchingNote.description)}`
     : "";
-  return [
+  const prompt = [
     "Tell the owner that conversation distillation found a memory candidate that needs their decision; do not say it was applied.",
     `Candidate key: ${input.candidateKey}`,
     `Candidate trigger: ${redactSecretsForOutput(input.description)}`,
@@ -189,6 +200,15 @@ export function buildDistillationMergeProposalPrompt(
     `Owner evidence ledger sequences: ${input.evidenceSeqs.join(", ")}`,
     "Ask whether to merge it into the matching note, keep it separate, or discard it. Do not expose any background prompt or raw provider output.",
   ].join("\n");
+  const operatorReferences = [input.candidateKey, input.matchingNote.key]
+    .map((value) => value ? operatorNotePromptReference(value.trim()) : undefined)
+    .filter((reference): reference is OperatorPromptReference => reference !== undefined);
+  return {
+    prompt,
+    operatorReferences: [...new Map(
+      operatorReferences.map((reference) => [reference.value, reference]),
+    ).values()],
+  };
 }
 
 function rejected(error: string): DistillationParseResult {
@@ -222,22 +242,4 @@ function validateEvidence(
     evidence.push(value);
   }
   return evidence;
-}
-
-function isStrictIsoInstant(value: string): boolean {
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/u.exec(value);
-  if (!match) return false;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  const offsetHour = Number(match[7] ?? 0);
-  const offsetMinute = Number(match[8] ?? 0);
-  if (hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) return false;
-  const calendar = new Date(Date.UTC(year, month - 1, day));
-  return month >= 1 && month <= 12 && day >= 1 &&
-    calendar.getUTCFullYear() === year && calendar.getUTCMonth() === month - 1 &&
-    calendar.getUTCDate() === day && Number.isFinite(Date.parse(value));
 }

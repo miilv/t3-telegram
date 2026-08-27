@@ -1020,6 +1020,75 @@ describe("SwitchableOperatorRuntime", () => {
 });
 
 describe("privacyGuardOperatorRuntime", () => {
+  it("preserves a typed validated note key in a start prompt while redacting surrounding prose", async () => {
+    const inner = new CapturingRuntime();
+    const runtime = privacyGuardOperatorRuntime(inner);
+    const key = "sk-abcdefghijklmnop";
+    const input = {
+      systemPrompt: [
+        `Memory reference: ${key}`,
+        "Description password=start-description-secret",
+        "Proposal token=start-proposal-secret",
+      ].join("\n"),
+      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+    };
+
+    await runtime.start(input);
+
+    expect(inner.seen[0]).toContain(key);
+    expect(inner.seen[0]).toContain("password=[REDACTED]");
+    expect(inner.seen[0]).toContain("token=[REDACTED]");
+    expect(inner.seen[0]).not.toContain("start-description-secret");
+    expect(inner.seen[0]).not.toContain("start-proposal-secret");
+  });
+
+  it("preserves a typed validated note key in a turn prompt while redacting body and proposal prose", async () => {
+    const inner = new CapturingRuntime();
+    const runtime = privacyGuardOperatorRuntime(inner);
+    const key = "sk-abcdefghijklmnop";
+    const input = {
+      sessionId: "session",
+      prompt: [
+        `Pull the note with memory.get ${key}`,
+        "Body api_key=turn-body-secret",
+        "Proposal password=turn-proposal-secret",
+      ].join("\n"),
+      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+    };
+
+    for await (const _event of runtime.sendTurn(input)) {
+      // consume the decorated iterable
+    }
+
+    expect(inner.seen[0]).toContain(key);
+    expect(inner.seen[0]).toContain("api_key=[REDACTED]");
+    expect(inner.seen[0]).toContain("password=[REDACTED]");
+    expect(inner.seen[0]).not.toContain("turn-body-secret");
+    expect(inner.seen[0]).not.toContain("turn-proposal-secret");
+  });
+
+  it("preserves typed note references across resume and provider-switch system prompts", async () => {
+    const inner = new CapturingRuntime();
+    const runtime = privacyGuardOperatorRuntime(inner);
+    const key = "sk-abcdefghijklmnop";
+    const resumeOptions = {
+      systemPrompt: `Resume ${key}; password=resume-secret`,
+      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+    };
+    const switchInput = {
+      systemPrompt: `Switch ${key}; token=switch-secret`,
+      operatorReferences: [{ kind: "operator-note-key" as const, value: key }],
+    };
+
+    await runtime.resume("session", undefined, resumeOptions);
+    await runtime.switchProvider?.("claude", switchInput);
+
+    expect(inner.seen).toEqual([
+      `Resume ${key}; password=[REDACTED]`,
+      `Switch ${key}; token=[REDACTED]`,
+    ]);
+  });
+
   it("redacts every provider-bound prose channel without changing tool capability tokens", async () => {
     const inner = new CapturingRuntime();
     const runtime = privacyGuardOperatorRuntime(inner);
@@ -1079,6 +1148,14 @@ class CapturingRuntime implements OperatorRuntime {
     options?: { systemPrompt?: string },
   ): Promise<void> {
     this.seen.push(options?.systemPrompt ?? "");
+  }
+
+  async switchProvider(
+    _providerId: string,
+    input: { systemPrompt: string },
+  ): Promise<OperatorSession> {
+    this.seen.push(input.systemPrompt);
+    return { id: "session" };
   }
 
   async oneShot(input: { prompt: string }): Promise<string> {

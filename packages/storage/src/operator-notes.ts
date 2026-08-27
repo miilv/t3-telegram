@@ -6,7 +6,7 @@ import type {
   OperatorNoteStatus,
   PreparedNoteVector,
 } from "../../shared/src/index.js";
-import { newId, nowIso } from "../../shared/src/index.js";
+import { isStrictRfc3339Instant, newId, nowIso } from "../../shared/src/index.js";
 
 type Row = Record<string, unknown>;
 
@@ -517,6 +517,7 @@ export function rowToOperatorNote(row: Row): OperatorNote {
 }
 
 export function canonicalNoteValidUntil(value: string): string {
+  if (!isStrictRfc3339Instant(value)) throw new Error("operator note validUntil is invalid");
   const epoch = Date.parse(value);
   if (!Number.isFinite(epoch)) throw new Error("operator note validUntil is invalid");
   return new Date(epoch).toISOString();

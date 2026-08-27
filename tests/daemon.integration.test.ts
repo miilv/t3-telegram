@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { GrammyError } from "grammy";
 import pino from "pino";
 import type { Logger } from "pino";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   ingressClaims,
   ingressLane,
@@ -14,9 +14,14 @@ import {
   syntheticNegativeMessageId,
 } from "../apps/daemon/src/operator-daemon.js";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
-import { compactCallbackToken, mergeInboundBatch } from "../packages/telegram/src/index.js";
+import {
+  compactCallbackToken,
+  mergeInboundBatch,
+  TelegramBotTransport,
+} from "../packages/telegram/src/index.js";
 import { createAutomation } from "../packages/automations/src/index.js";
 import { OperatorToolServer } from "../packages/operator-tools/src/index.js";
+import { privacyGuardOperatorRuntime } from "../packages/operator-runtime/src/index.js";
 import type { MediaProcessor } from "../packages/media/src/index.js";
 import type { Config } from "../packages/shared/src/config.js";
 import type {
@@ -7338,9 +7343,11 @@ describe("OperatorDaemon product flow", () => {
     expect(capabilityRows).toHaveLength(1);
     expect(capabilityRows[0]).toMatchObject({ status: "delivered", attempts: 1 });
     expect(JSON.parse(capabilityRows[0]!.payload_json)).toMatchObject({
-      dashboardCapability: { kind: "loopback-dashboard", url: link },
+      dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" },
       messageType: "dashboard_capability",
     });
+    expect(capabilityRows[0]!.payload_json).not.toContain(link);
+    expect(capabilityRows[0]!.payload_json).not.toContain(token);
 
     const url = new URL(link);
     url.hash = "";
@@ -7371,6 +7378,218 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   }, 20_000);
+
+  it("late-binds a recovered dashboard delivery to the restarted process capability", async () => {
+    const home = tempDirectory("daemon-dashboard-restart-");
+    const databasePath = join(home, "operator.db");
+    const logLines: string[] = [];
+    const logger = pino({ level: "trace" }, { write: (line: string) => logLines.push(line) });
+    const nativeFetch = globalThis.fetch;
+    let daemonA: OperatorDaemon | undefined;
+    let daemonB: OperatorDaemon | undefined;
+    let telegramA: FakeTelegram | undefined;
+    let storeA: OperatorStore | undefined;
+    let storeB: OperatorStore | undefined;
+    let runA: Promise<void> | undefined;
+    try {
+      storeA = new OperatorStore(databasePath);
+      storeA.migrate();
+      const runtimeA = new FakeRuntime();
+      const brokerA = new FakeBroker();
+      telegramA = new FakeTelegram();
+      telegramA.dashboardCapabilityFailures = 1;
+      telegramA.dashboardCapabilityRetryAfterSeconds = 60;
+      const artifactsA = new ArtifactRegistry(`${home}/artifacts-a`, storeA);
+      let daemonARef: OperatorDaemon;
+      const toolsA = new OperatorToolServer({
+        broker: brokerA,
+        store: storeA,
+        telegram: telegramA,
+        artifacts: artifactsA,
+        logger,
+        onThreadStarted: (input) => daemonARef.trackOperatorToolThread(input),
+      });
+      const dashboardA = new DashboardServer({
+        store: storeA,
+        logger,
+        getPolicy: () => daemonARef.getPolicy(),
+        updatePolicy: () => daemonARef.getPolicy(),
+        health: async () => ({ telegram: true, t3: true, operator: true, database: true }),
+      });
+      const schedulerA = new DailyScheduler(() => daemonARef.compact(), logger);
+      daemonARef = new OperatorDaemon(
+        config(home), storeA, runtimeA, brokerA, telegramA, artifactsA, schedulerA,
+        logger, toolsA, undefined, dashboardA,
+      );
+      daemonA = daemonARef;
+      await daemonA.initialize();
+      runA = daemonA.run();
+      const oldLink = dashboardA.link()!;
+      const oldUrl = new URL(oldLink);
+      const oldToken = new URLSearchParams(oldUrl.hash.slice(1)).get("token")!;
+      const oldPort = Number(oldUrl.port);
+
+      telegramA.push(message(70, "/dashboard"));
+      await waitFor(() => {
+        const row = storeA!.db.prepare(
+          "SELECT status FROM telegram_outbox WHERE operation='dashboard_capability'",
+        ).get() as { status?: string } | undefined;
+        return row?.status === "pending";
+      }, 8_000);
+      oldUrl.hash = "";
+      expect((await nativeFetch(new URL("/api/state", oldUrl), {
+        headers: { authorization: `Bearer ${oldToken}` },
+      })).status).toBe(200);
+
+      telegramA.finish();
+      await runA;
+      runA = undefined;
+      storeA.db.prepare(
+        "UPDATE telegram_outbox SET status='sending',next_attempt_at=NULL WHERE operation='dashboard_capability'",
+      ).run();
+      await daemonA.stop();
+      daemonA = undefined;
+      storeA = undefined;
+      await expect(nativeFetch(new URL("/api/state", oldUrl), {
+        headers: { authorization: `Bearer ${oldToken}` },
+      })).rejects.toThrow();
+
+      const telegramApiCalls: Array<{ method: string; body: Record<string, unknown> }> = [];
+      vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" || input instanceof URL ? String(input) : input.url;
+        if (!url.startsWith("https://api.telegram.org/")) return nativeFetch(input, init);
+        const method = url.split("/").at(-1)!;
+        const body = typeof init?.body === "string"
+          ? JSON.parse(init.body) as Record<string, unknown>
+          : {};
+        telegramApiCalls.push({ method, body });
+        return new Response(JSON.stringify({
+          ok: true,
+          result: {
+            message_id: 700,
+            date: 1_700_000_000,
+            chat: { id: 7, type: "private", first_name: "M" },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      });
+
+      storeB = new OperatorStore(databasePath);
+      storeB.migrate();
+      const runtimeB = new FakeRuntime();
+      const brokerB = new FakeBroker();
+      const finalTransport = new TelegramBotTransport("test-token", 42, 1, logger);
+      const telegramB = new BoundaryDashboardTelegram(finalTransport);
+      const artifactsB = new ArtifactRegistry(`${home}/artifacts-b`, storeB);
+      let daemonBRef: OperatorDaemon;
+      const toolsB = new OperatorToolServer({
+        broker: brokerB,
+        store: storeB,
+        telegram: telegramB,
+        artifacts: artifactsB,
+        logger,
+        onThreadStarted: (input) => daemonBRef.trackOperatorToolThread(input),
+      });
+      const dashboardB = new DashboardServer({
+        store: storeB,
+        logger,
+        port: oldPort === 65_535 ? oldPort - 1 : oldPort + 1,
+        getPolicy: () => daemonBRef.getPolicy(),
+        updatePolicy: () => daemonBRef.getPolicy(),
+        health: async () => ({ telegram: true, t3: true, operator: true, database: true }),
+      });
+      const schedulerB = new DailyScheduler(() => daemonBRef.compact(), logger);
+      daemonBRef = new OperatorDaemon(
+        config(home), storeB, runtimeB, brokerB, telegramB, artifactsB, schedulerB,
+        logger, toolsB, undefined, dashboardB,
+      );
+      daemonB = daemonBRef;
+      await daemonB.initialize();
+      const currentLink = dashboardB.link()!;
+      const currentUrl = new URL(currentLink);
+      const currentToken = new URLSearchParams(currentUrl.hash.slice(1)).get("token")!;
+
+      expect(currentUrl.port).not.toBe(String(oldPort));
+      expect(currentToken).not.toBe(oldToken);
+      expect(telegramApiCalls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
+      expect(telegramApiCalls[0]?.body).toMatchObject({
+        chat_id: 7,
+        link_preview_options: { is_disabled: true },
+      });
+      expect(String(telegramApiCalls[0]?.body.text)).toContain(currentLink);
+      currentUrl.hash = "";
+      expect((await nativeFetch(new URL("/api/state", currentUrl), {
+        headers: { authorization: `Bearer ${currentToken}` },
+      })).status).toBe(200);
+
+      const durable = JSON.stringify({
+        outbox: storeB.db.prepare("SELECT dedupe_key,payload_json FROM telegram_outbox").all(),
+        events: storeB.db.prepare("SELECT payload_json FROM daemon_events").all(),
+        generalMessages: telegramB.sent,
+      });
+      expect(durable).not.toContain(oldToken);
+      expect(durable).not.toContain(currentToken);
+      const row = storeB.db.prepare(
+        "SELECT status,payload_json FROM telegram_outbox WHERE operation='dashboard_capability'",
+      ).get() as { status: string; payload_json: string };
+      expect(row.status).toBe("delivered");
+      expect(JSON.parse(row.payload_json)).toMatchObject({
+        dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" },
+      });
+      expect(logLines.join("\n")).not.toContain(oldToken);
+      expect(logLines.join("\n")).not.toContain(currentToken);
+    } finally {
+      vi.unstubAllGlobals();
+      telegramA?.finish();
+      if (runA) await runA.catch(() => undefined);
+      if (daemonB) await daemonB.stop().catch(() => undefined);
+      else storeB?.close();
+      if (daemonA) await daemonA.stop().catch(() => undefined);
+      else storeA?.close();
+    }
+  }, 30_000);
+
+  it("keeps a recovered dashboard intent retryable while the dashboard is disabled", async () => {
+    const home = tempDirectory("daemon-dashboard-disabled-recovery-");
+    const store = new OperatorStore(join(home, "operator.db"));
+    store.migrate();
+    const queued = store.enqueueTelegramOutbox({
+      dedupeKey: "telegram:dashboard:disabled-recovery",
+      chatId: 7,
+      operation: "dashboard_capability",
+      payload: {
+        dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" },
+        options: {},
+        messageType: "dashboard_capability",
+      },
+    });
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(
+      config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools,
+    );
+    await daemon.initialize();
+    expect(store.getTelegramOutbox(queued.id)).toMatchObject({
+      status: "pending",
+      attempts: 1,
+      lastErrorCode: "TELEGRAM_SERVER",
+      payload: { dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" } },
+    });
+    expect(telegram.dashboardCapabilities).toHaveLength(0);
+    await daemon.stop();
+  });
 
   it("never resurrects the pre-tool preamble in the final answer (bug №40)", async () => {
     const home = tempDirectory("daemon-preamble-");
@@ -9214,6 +9433,58 @@ describe("Operator push envelope (package 2.1)", () => {
   const hoursAgo = (hours: number): string =>
     new Date(Date.now() - hours * 60 * 60_000).toISOString();
 
+  it("carries only validated note references through the real provider privacy guard", async () => {
+    const home = tempDirectory("daemon-push-reference-guard-");
+    const store = tempStore();
+    await store.rememberKeyedOperatorNote({
+      key: "sk-abcdefghijklmnop",
+      description: "when api_key=push-description-secret matters → pull the exact note",
+      content: "Body password=push-body-secret",
+      category: "people",
+      source: "manual",
+    });
+    const captured = new FakeRuntime();
+    const runtime = privacyGuardOperatorRuntime(captured);
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(
+      config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "столица Франции?"));
+    await waitFor(() => captured.prompts.some((prompt) => prompt.includes("User message:")));
+    const prompt = captured.prompts.find((candidate) => candidate.includes("User message:"))!;
+    expect(prompt).toContain("sk-abcdefghijklmnop");
+    expect(prompt).toContain("api_key=[REDACTED]");
+    expect(prompt).not.toContain("push-description-secret");
+    expect(prompt).not.toContain("push-body-secret");
+
+    await daemon.compact("reference propagation regression");
+    const restore = captured.prompts.findLast((candidate) => candidate.includes("CONTEXT_RESTORED"))!;
+    expect(restore).toContain("sk-abcdefghijklmnop");
+    expect(restore).toContain("api_key=[REDACTED]");
+    expect(restore).not.toContain("push-description-secret");
+    expect(restore).not.toContain("push-body-secret");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
   it("pushes a full snapshot once, then diffs inside the episode, then re-pushes after a cold gap", async () => {
     const home = tempDirectory("daemon-push-snapshot-");
     const store = tempStore();
@@ -11007,6 +11278,7 @@ class FakeTelegram implements TelegramTransport {
   private inboundObserver: ((message: InboundMessageSignal) => void) | undefined;
   readonly dashboardCapabilities: Array<{ chatId: number; url: string }> = [];
   dashboardCapabilityFailures = 0;
+  dashboardCapabilityRetryAfterSeconds = 0;
 
   setInboundObserver(observer: (message: InboundMessageSignal) => void): void {
     this.inboundObserver = observer;
@@ -11057,7 +11329,7 @@ class FakeTelegram implements TelegramTransport {
           ok: false,
           error_code: 429,
           description: "Too Many Requests: retry later",
-          parameters: { retry_after: 0 },
+          parameters: { retry_after: this.dashboardCapabilityRetryAfterSeconds },
         },
         "sendMessage",
         {},
@@ -11232,6 +11504,21 @@ class FakeTelegram implements TelegramTransport {
   }
   async health(): Promise<{ healthy: boolean; username: string }> {
     return { healthy: true, username: "operator_test_bot" };
+  }
+}
+
+/** Uses the production grammY boundary only for the intentionally typed dashboard link. */
+class BoundaryDashboardTelegram extends FakeTelegram {
+  constructor(private readonly boundary: TelegramBotTransport) {
+    super();
+  }
+
+  override sendDashboardCapability(
+    chatId: number,
+    url: string,
+    options?: TelegramDestination,
+  ): Promise<SentMessage> {
+    return this.boundary.sendDashboardCapability(chatId, url, options);
   }
 }
 

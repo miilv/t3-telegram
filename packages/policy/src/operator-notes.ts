@@ -1,4 +1,4 @@
-import type { OperatorNote } from "../../shared/src/index.js";
+import type { OperatorNote, OperatorPromptReference } from "../../shared/src/index.js";
 import { lintNoteDescription } from "./note-descriptions.js";
 
 export const OPERATOR_NOTE_KEY_CHARS = 120;
@@ -18,6 +18,23 @@ export function normalizeOperatorNoteKey(value: string): string {
     .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/gu, "")
     .replace(/-+/gu, "-");
+}
+
+/** Build the typed provider-visible form only for an already canonical Notes-v2 key. */
+export function operatorNotePromptReference(value: string): OperatorPromptReference | undefined {
+  const normalized = normalizeOperatorNoteKey(value);
+  if (normalized !== value || !normalized || [...normalized].length > OPERATOR_NOTE_KEY_CHARS) {
+    return undefined;
+  }
+  return { kind: "operator-note-key", value: normalized };
+}
+
+export function isOperatorNotePromptReference(value: unknown): value is OperatorPromptReference {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.kind === "operator-note-key" &&
+    typeof candidate.value === "string" &&
+    operatorNotePromptReference(candidate.value) !== undefined;
 }
 
 export function normalizeNoteDescription(value: string): string {

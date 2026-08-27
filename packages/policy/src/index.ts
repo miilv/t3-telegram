@@ -77,6 +77,8 @@ export {
   OPERATOR_NOTE_KEY_HINT,
   normalizeNoteDescription,
   normalizeOperatorNoteKey,
+  isOperatorNotePromptReference,
+  operatorNotePromptReference,
   operatorNotePushScore,
   rankOperatorNotesForPush,
   staleOperatorNoteWarning,
@@ -89,6 +91,7 @@ export {
   DISTILLATION_MAX_CANDIDATES,
   DISTILLATION_PROMPT_MAX_CHARS,
   buildDistillationMergeProposalPrompt,
+  buildDistillationMergeProposalTurn,
   buildDistillationPrompt,
   parseDistillationResponse,
 } from "./distillation.js";

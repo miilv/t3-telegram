@@ -1,4 +1,4 @@
-import type { OperatorAppEvent } from "../../shared/src/index.js";
+import type { OperatorAppEvent, OperatorPromptReference } from "../../shared/src/index.js";
 
 export type TelegramChatType = "private" | "group" | "supergroup" | "channel";
 
@@ -159,6 +159,11 @@ export interface TelegramMessageInbound extends TelegramDestination {
   batchWatermarkId?: number;
   /** Daemon-created proactive ingress; never passed through Telegram normalization. */
   synthetic?: boolean;
+  /**
+   * Validated daemon-authored operational note references carried beside a
+   * synthetic prompt. Telegram normalization never accepts this metadata.
+   */
+  operatorReferences?: readonly OperatorPromptReference[];
   automationRunId?: string;
   /** Trusted app provenance; handled by its own turn-envelope branch. */
   appEvent?: OperatorAppEvent;

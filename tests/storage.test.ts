@@ -470,6 +470,40 @@ describe("OperatorStore", () => {
       lastErrorCode: "TELEGRAM_AMBIGUOUS",
     });
     expect(store.claimNextTelegramOutbox()).toBeUndefined();
+
+    // A dashboard row stores no URL, so an interrupted send cannot preserve
+    // a usable old-process capability. Recovery must late-bind and resend the
+    // current process's link instead of parking a stale intent as uncertain.
+    const interruptedDashboard = store.enqueueTelegramOutbox({
+      dedupeKey: "dashboard:restart",
+      chatId: 7,
+      operation: "dashboard_capability",
+      payload: { dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" } },
+    });
+    expect(store.claimNextTelegramOutbox()?.id).toBe(interruptedDashboard.id);
+    expect(store.resetInterruptedTelegramOutbox()).toBe(1);
+    expect(store.getTelegramOutbox(interruptedDashboard.id)).toMatchObject({
+      status: "pending",
+      payload: { dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" } },
+    });
+    const legacyToken = "a".repeat(43);
+    store.db.prepare("UPDATE telegram_outbox SET payload_json=? WHERE id=?").run(
+      JSON.stringify({
+        dashboardCapability: {
+          kind: "loopback-dashboard",
+          url: `http://127.0.0.1:43127/#token=${legacyToken}`,
+        },
+        options: {},
+        messageType: "dashboard_capability",
+      }),
+      interruptedDashboard.id,
+    );
+    store.migrate();
+    const migratedDashboard = store.getTelegramOutbox(interruptedDashboard.id)!;
+    expect(migratedDashboard.payload).toMatchObject({
+      dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" },
+    });
+    expect(JSON.stringify(migratedDashboard.payload)).not.toContain(legacyToken);
     store.close();
   });
 

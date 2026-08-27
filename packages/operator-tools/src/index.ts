@@ -37,6 +37,7 @@ import {
   NOW_STATUSES,
   forgetOwnDispatchMarker,
   humanMoment,
+  isStrictRfc3339Instant,
   isValidTimeZone,
   knownFenceNonces,
   newId,
@@ -901,10 +902,10 @@ export class OperatorToolServer {
       schema: z.object({
         content: z.string().trim().min(1).max(8_000),
         category: z.string().trim().min(1).max(80).optional(),
-        expiresAt: z.string().datetime().optional(),
+        expiresAt: z.string().refine(isStrictRfc3339Instant, "Invalid RFC3339 instant").optional(),
         key: z.string().trim().min(1).max(200).optional(),
         description: z.string().trim().min(1).max(200).optional(),
-        validUntil: z.string().datetime().optional(),
+        validUntil: z.string().refine(isStrictRfc3339Instant, "Invalid RFC3339 instant").optional(),
       }).refine((input) => Boolean(input.key) === Boolean(input.description), {
         message: "key and description must be supplied together",
       }),

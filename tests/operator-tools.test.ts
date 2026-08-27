@@ -86,6 +86,70 @@ describe("OperatorToolServer", () => {
     }
   });
 
+  it("accepts strict offset RFC3339 note deadlines over the real MCP boundary", async () => {
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(
+      `${tempDirectory("operator-tools-offset-deadlines-")}/artifacts`,
+      store,
+    );
+    await artifacts.initialize();
+    const server = new OperatorToolServer({
+      broker: { health: async () => ({ healthy: true }) } as unknown as T3Broker,
+      store,
+      telegram: new ToolTelegram() as unknown as TelegramTransport,
+      artifacts,
+      logger: pino({ enabled: false }),
+      now: () => new Date("2026-08-27T14:00:00.000Z"),
+    });
+    await server.start();
+    const lease = server.issue({
+      chatId: 777,
+      ownerId: "42",
+      teamRole: "owner",
+      originMessageId: 92,
+      operatorTurnId: "opturn_offset_deadlines",
+      turnOrigin: "human",
+    });
+    const client = new Client({ name: "operator-note-offset-test", version: "1.0.0" });
+    try {
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(lease.access.url), {
+          requestInit: { headers: { Authorization: `Bearer ${lease.access.token}` } },
+        }),
+      );
+      const remember = (key: string, validUntil: string) => callJson(client, "memory.remember", {
+        key,
+        description: `when ${key} matters → read this fact`,
+        content: `Deadline fact for ${key}`,
+        category: "general",
+        validUntil,
+      });
+
+      await expect(remember("offset-stale-mcp", "2026-08-27T20:00:00+10:00"))
+        .resolves.toMatchObject({ write: { note: { validUntil: "2026-08-27T10:00:00.000Z" } } });
+      await expect(remember("offset-fresh-mcp", "2026-08-27T10:00:00-05:00"))
+        .resolves.toMatchObject({ write: { note: { validUntil: "2026-08-27T15:00:00.000Z" } } });
+      await expect(remember("offset-equal-mcp", "2026-08-28T00:00:00+10:00"))
+        .resolves.toMatchObject({ write: { note: { validUntil: "2026-08-27T14:00:00.000Z" } } });
+      await expect(callJson(client, "memory.remember", {
+        content: "Legacy note with an offset deadline",
+        category: "general",
+        expiresAt: "2026-08-28T01:00:00+10:00",
+      })).resolves.toMatchObject({ validUntil: "2026-08-27T15:00:00.000Z" });
+      expect(store.notes.listStale("2026-08-27T14:00:00.000Z").map((note) => note.key))
+        .toEqual(["offset-stale-mcp"]);
+
+      await expect(remember("invalid-calendar-mcp", "2026-02-30T10:00:00+10:00"))
+        .rejects.toThrow();
+      expect(store.notes.getActive("invalid-calendar-mcp")).toBeUndefined();
+    } finally {
+      lease.revoke();
+      await client.close().catch(() => undefined);
+      await server.stop();
+      store.close();
+    }
+  });
+
   it("serves the complete compact tool surface under a revocable turn capability", async () => {
     const store = tempStore();
     const artifacts = new ArtifactRegistry(`${tempDirectory("operator-tools-")}/artifacts`, store);

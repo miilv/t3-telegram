@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { nowIso } from "../../shared/src/index.js";
+import { isStrictRfc3339Instant, nowIso } from "../../shared/src/index.js";
 import { canonicalNoteValidUntil, operatorNoteInputHash } from "./operator-notes.js";
 
 type Row = Record<string, unknown>;
@@ -35,7 +35,7 @@ export function migrateOperatorNotesV2(
     `).all() as Row[];
     for (const deadline of deadlines) {
       const value = String(deadline.valid_until);
-      if (!Number.isFinite(Date.parse(value))) continue;
+      if (!isStrictRfc3339Instant(value)) continue;
       deadlineUpdate.run(canonicalNoteValidUntil(value), String(deadline.id));
     }
     db.prepare(`

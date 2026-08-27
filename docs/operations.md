@@ -17,9 +17,11 @@ message, the work behind it (dialogue-flow §4).
 - `/automation` — timezone-aware `once`, `every`, and `daily` proactive work.
 - `/policy` — live approval, concurrency, progress, and routing controls.
 - `/dashboard` — owner/admin-only link to the loopback operations cockpit. Its
-  capability travels in a discriminated durable outbox field and a dedicated
-  Telegram send boundary; generic messages/events/logs still redact it, replay
-  dedupes by the inbound command, and ambiguous in-flight sends are quarantined.
+  durable outbox row contains only a token-free discriminated delivery intent;
+  dispatch late-binds the current process's capability through a dedicated
+  Telegram send boundary. Generic messages/events/logs still redact it, replay
+  dedupes by the inbound command, and an interrupted old-process intent is
+  retried with the new link (same-process ambiguous remote sends remain quarantined).
 - `/team` — owner/admin team roster; `/team set <id> <role>` changes a role for
   an ID already present in `TELEGRAM_ALLOWED_USERS` (only owner may appoint
   owner/admin).
@@ -97,7 +99,10 @@ header-injection checks. Calendar creation and email sending are admin-only.
 
 The dashboard binds only `127.0.0.1`, puts its random capability in the URL
 fragment, requires `Authorization: Bearer` on its APIs, sends `no-store` and
-restrictive security headers, and exposes no credentials or raw messages.
+restrictive security headers, and exposes no credentials or raw messages. A
+pending `/dashboard` delivery stores no URL or token: restart recovery resolves
+the link from the newly started dashboard, while a disabled dashboard leaves the
+intent retryable instead of emitting or discarding a stale capability.
 
 Telegram message/reply/media tools cannot select another chat. Reactions may
 target only the triggering envelope or a same-turn sent message, and edits may

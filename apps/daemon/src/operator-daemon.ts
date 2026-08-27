@@ -8,13 +8,14 @@ import type {
   ArtifactRef,
   ApprovalRiskCategory,
   Automation,
+  DashboardCapabilityDeliveryIntent,
   InteractionMediation,
-  LoopbackDashboardCapability,
   MediatedQuestion,
   NowItem,
   NowSection,
   OperatorEvent,
   OperatorNote,
+  OperatorPromptReference,
   OperatorPolicySettings,
   OperatorRuntime,
   OperatorToolAccess,
@@ -44,6 +45,7 @@ import {
   defangMarkers,
   fenceUntrusted,
   humanMoment,
+  isDashboardCapabilityDeliveryIntent,
   knownFenceNonces,
   LaneQueue,
   ThreadEventDigest,
@@ -90,6 +92,7 @@ import {
 } from "./commands.js";
 import { ThreadVoice } from "./voice.js";
 import { NightScribe, type ScribeRunOutcome } from "./scribe.js";
+import type { ScribeOwnerTurnInput } from "./scribe-finalization.js";
 import {
   SHUTDOWN_DEADLINE_MS,
   awaitShutdownSteps,
@@ -124,6 +127,7 @@ import {
   deriveFocusThreadRef,
   diffNowItems,
   journalSlugBase,
+  isOperatorNotePromptReference,
   mayAutoApprove,
   parsePushBaseline,
   readOperatorPolicy,
@@ -364,7 +368,7 @@ interface DurableTelegramPayload {
   text?: string;
   path?: string;
   caption?: string;
-  dashboardCapability?: LoopbackDashboardCapability;
+  dashboardCapabilityIntent?: DashboardCapabilityDeliveryIntent;
   messageId?: number;
   editMessageId?: number;
   options: TelegramSendOptions;
@@ -397,6 +401,13 @@ interface DurableTelegramPayload {
   firstFailureAt?: string;
   /** Present only for a real owner's human Operator turn. */
   conversation?: OperatorConversationOutbound;
+}
+
+class DashboardCapabilityUnavailableError extends Error {
+  constructor() {
+    super("dashboard capability is unavailable in the current process");
+    this.name = "DashboardCapabilityUnavailableError";
+  }
 }
 
 interface MonitorRoute {
@@ -459,9 +470,14 @@ interface AbandonHandle {
  * second one must not replay a diff into a session that has never seen a
  * snapshot, so the prompt is REBUILT as a full snapshot instead (§1г).
  */
+interface OperatorPromptContent {
+  text: string;
+  operatorReferences: readonly OperatorPromptReference[];
+}
+
 interface OperatorPushHandle {
   /** Rebuild the same turn's prompt as a full snapshot, for a fresh session. */
-  rebuild: () => string;
+  rebuild: () => OperatorPromptContent;
   /** The provider accepted the prompt: the pushed state is now history. */
   accepted: () => void;
 }
@@ -490,6 +506,8 @@ interface OperatorTurnOptions {
    * of hitting "runtime already has an active turn".
    */
   abandon?: AbandonHandle;
+  /** Validated operational note references intentionally present in `prompt`. */
+  operatorReferences?: readonly OperatorPromptReference[];
   /**
    * Package 2.1: the push side of this turn (memory-design §1). Absent for the
    * service one-shots that carry no state layer at all — failure recovery and
@@ -1246,7 +1264,10 @@ export class OperatorDaemon {
         "Reply exactly CONTEXT_RESTORED.",
       ].join("\n\n"),
     );
-    await this.askOperator(restore.prompt, { push: restore.push });
+    await this.askOperator(restore.prompt, {
+      operatorReferences: restore.operatorReferences,
+      push: restore.push,
+    });
   }
 
   /**
@@ -2753,14 +2774,25 @@ export class OperatorDaemon {
     // and receive a gap line addressed to the owner (finding №3, one actor over).
     const ownerTurn =
       !isThreadEventTurn && !update.synthetic && this.roleForUser(update.userId) === "owner";
-    const composePrompt = (force: boolean): { text: string; commit: () => void } => {
+    const composePrompt = (force: boolean): OperatorPromptContent & { commit: () => void } => {
       const push = mayReadState
         ? this.buildPushSections({ ...(force ? { force: true } : {}), at: pushAt, ownerTurn })
-        : { sections: [] as string[], commit: (): void => undefined };
+        : {
+            sections: [] as string[],
+            operatorReferences: [] as OperatorPromptReference[],
+            commit: (): void => undefined,
+          };
+      const operatorReferences = [
+        ...push.operatorReferences,
+        ...(update.operatorReferences ?? []).filter(isOperatorNotePromptReference),
+      ];
       return {
         text: [...push.sections, ...turnInstruction]
           .filter((line): line is string => Boolean(line))
           .join("\n\n"),
+        operatorReferences: [...new Map(
+          operatorReferences.map((reference) => [reference.value, reference]),
+        ).values()],
         commit: push.commit,
       };
     };
@@ -2768,7 +2800,10 @@ export class OperatorDaemon {
     const pushHandle: OperatorPushHandle = {
       rebuild: () => {
         composed = composePrompt(true);
-        return composed.text;
+        return {
+          text: composed.text,
+          operatorReferences: composed.operatorReferences,
+        };
       },
       accepted: () => composed.commit(),
     };
@@ -2845,6 +2880,7 @@ export class OperatorDaemon {
       // waiting behind it. Spend no provider turn on an undeliverable answer.
       if (turn?.superseded) return "";
       return this.askOperator(composed.text, {
+        operatorReferences: composed.operatorReferences,
         onDelta: (delta) => {
           // Package 1.5: a zombie turn is inert. Its late tokens must not
           // reappear in a draft that belongs to the next turn now.
@@ -5071,14 +5107,13 @@ export class OperatorDaemon {
 
   private async dashboardCapabilityReply(
     update: Extract<TelegramInbound, { type: "message" }>,
-    url: string,
   ): Promise<void> {
     this.enqueueTelegramOutbox(
       `telegram:command:${stableUpdateOperationKey(update)}:dashboard-capability`,
       update.chatId,
       "dashboard_capability",
       {
-        dashboardCapability: { kind: "loopback-dashboard", url },
+        dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" },
         options: replyOptions(update),
         messageType: "dashboard_capability",
         correlationId: correlationForUpdate(update),
@@ -5254,7 +5289,7 @@ export class OperatorDaemon {
    * their own chat, and the age escalation of package 1.2 keeps it from
    * starving behind a busy one.
    */
-  private requestScribeOwnerTurn(input: { dedupeKey: string; prompt: string }): boolean {
+  private requestScribeOwnerTurn(input: ScribeOwnerTurnInput): boolean {
     const chatId = this.ownerChatId();
     if (chatId === undefined) {
       // No chat has ever been seen, so there is nobody to tell. The journal
@@ -5276,6 +5311,9 @@ export class OperatorDaemon {
       date: Math.floor(Date.now() / 1_000),
       text: input.prompt,
       attachments: [],
+      ...(input.operatorReferences?.length
+        ? { operatorReferences: input.operatorReferences }
+        : {}),
     };
     this.enqueueIngressJob(update, "background");
     this.store.appendEvent("memory.scribe.turn_requested", {
@@ -5657,6 +5695,7 @@ export class OperatorDaemon {
     options: { force?: boolean; at?: Date; ownerTurn: boolean },
   ): {
     sections: string[];
+    operatorReferences: readonly OperatorPromptReference[];
     commit: () => void;
     reason: string;
   } {
@@ -5683,10 +5722,12 @@ export class OperatorDaemon {
       ...(options.force ? { force: true } : {}),
     });
     const sections: string[] = [];
+    let operatorReferences: readonly OperatorPromptReference[] = [];
     let commit = (): void => undefined;
     if (decision.mode === "full") {
       const rendered = stateLayers();
       sections.push(rendered.snapshot);
+      operatorReferences = rendered.operatorReferences;
       commit = () => this.commitPushBaseline(rendered, decision.reason, options.ownerTurn, "full");
     } else {
       const diff = renderNowDiff(diffNowItems(baseline?.items ?? {}, nowItems));
@@ -5717,6 +5758,7 @@ export class OperatorDaemon {
     const pushCommit = commit;
     return {
       sections,
+      operatorReferences,
       commit: () => {
         pushCommit();
         reminder?.commit();
@@ -5733,19 +5775,27 @@ export class OperatorDaemon {
    */
   private fullSnapshotPrompt(compose: (state: string) => string): {
     prompt: string;
+    operatorReferences: readonly OperatorPromptReference[];
     push: OperatorPushHandle;
   } {
     let commit = (): void => undefined;
-    const build = (): string => {
+    const build = (): OperatorPromptContent => {
       const layers = this.buildStateLayers();
       // A compaction recovery or a provider handoff re-seeds the epoch for
       // everyone, the owner included: it IS the state they will next reason
       // from, so it advances their baseline too.
       commit = () => this.commitPushBaseline(layers, "forced", true, "full");
-      return compose(layers.snapshot);
+      return {
+        text: compose(layers.snapshot),
+        operatorReferences: layers.operatorReferences,
+      };
     };
-    const prompt = build();
-    return { prompt, push: { rebuild: build, accepted: () => commit() } };
+    const content = build();
+    return {
+      prompt: content.text,
+      operatorReferences: content.operatorReferences,
+      push: { rebuild: build, accepted: () => commit() },
+    };
   }
 
   private buildOperatorMemorySnapshot(): Record<string, unknown> {
@@ -6014,7 +6064,7 @@ export class OperatorDaemon {
         return true;
       }
       const link = this.dashboard?.link();
-      if (link) await this.dashboardCapabilityReply(update, link);
+      if (link) await this.dashboardCapabilityReply(update);
       else await this.commandReply(update, "Панель отключена в конфигурации.");
       return true;
     }
@@ -6486,7 +6536,10 @@ export class OperatorDaemon {
           "Reply exactly PROVIDER_CONTEXT_RESTORED.",
         ].join("\n\n"),
       );
-      const restored = await this.askOperator(restore.prompt, { push: restore.push });
+      const restored = await this.askOperator(restore.prompt, {
+        operatorReferences: restore.operatorReferences,
+        push: restore.push,
+      });
       this.store.appendEvent("operator.provider.switched", {
         payload: {
           from: current,
@@ -7451,10 +7504,14 @@ export class OperatorDaemon {
           sent = await this.sendDurableRich(item, payload);
         }
       } else if (item.operation === "dashboard_capability") {
-        if (!payload.dashboardCapability) throw new Error("Durable dashboard capability is missing");
+        if (!isDashboardCapabilityDeliveryIntent(payload.dashboardCapabilityIntent)) {
+          throw new Error("Durable dashboard capability intent is missing");
+        }
+        const currentLink = this.dashboard?.link();
+        if (!currentLink) throw new DashboardCapabilityUnavailableError();
         sent = [await this.telegram.sendDashboardCapability(
           item.chatId,
-          payload.dashboardCapability.url,
+          currentLink,
           payload.options,
         )];
       } else if (item.operation === "photo") {
@@ -7492,7 +7549,14 @@ export class OperatorDaemon {
       });
       return true;
     } catch (error) {
-      const disposition = classifyTelegramDeliveryError(error);
+      const disposition = error instanceof DashboardCapabilityUnavailableError
+        ? {
+            code: "TELEGRAM_SERVER" as const,
+            retryable: true,
+            ambiguous: false,
+            retryAfterMs: 5_000,
+          }
+        : classifyTelegramDeliveryError(error);
       const detail = disposition.code;
       const idempotentEdit = Boolean(
         ((payload.editMessageId || anchor) && item.operation === "rich") ||
@@ -7813,7 +7877,15 @@ export class OperatorDaemon {
   }
 
   private async askOperator(prompt: string, options: OperatorTurnOptions = {}): Promise<string> {
-    const { onDelta, toolAccess, onToolStarted, turnToken, abandon, push } = options;
+    const {
+      onDelta,
+      toolAccess,
+      onToolStarted,
+      turnToken,
+      abandon,
+      operatorReferences,
+      push,
+    } = options;
     return this.operatorRuntimeQueue.run(async () => {
       // Blocker: a turn abandoned WHILE IT WAITED on this queue (behind a
       // compaction, mediation or maintenance call) must not start at all.
@@ -7834,6 +7906,7 @@ export class OperatorDaemon {
         onToolStarted,
         turnToken,
         abandon,
+        operatorReferences,
         push,
       );
       if (!abandon) return call;
@@ -7889,6 +7962,7 @@ export class OperatorDaemon {
     onToolStarted?: (tool: string) => void,
     turnToken?: string,
     abandon?: AbandonHandle,
+    operatorReferences?: readonly OperatorPromptReference[],
     push?: OperatorPushHandle,
   ): Promise<string> {
     // Package 2.1: the first event of a stream means the provider took the
@@ -7902,6 +7976,7 @@ export class OperatorDaemon {
       push?.accepted();
     };
     let sent = prompt;
+    let sentOperatorReferences = operatorReferences;
     let streamed = "";
     let segment = "";
     let lastInterSegment = "";
@@ -7922,6 +7997,9 @@ export class OperatorDaemon {
       for await (const event of this.runtime.sendTurn({
         sessionId: this.operatorSessionId,
         prompt: sent,
+        ...(sentOperatorReferences?.length
+          ? { operatorReferences: sentOperatorReferences }
+          : {}),
         ...(toolAccess ? { toolAccess } : {}),
         ...(turnToken ? { turnToken } : {}),
       })) {
@@ -7962,7 +8040,9 @@ export class OperatorDaemon {
         // NOTHING. Replaying a diff there would leave the operator without
         // now-state and without its memory index until the next compaction, so
         // the prompt is rebuilt as a full snapshot against the new session id.
-        sent = push ? push.rebuild() : prompt;
+        const rebuilt = push?.rebuild();
+        sent = rebuilt?.text ?? prompt;
+        sentOperatorReferences = rebuilt?.operatorReferences ?? operatorReferences;
         accepted = false;
         streamed = "";
         result = "";
@@ -7973,6 +8053,9 @@ export class OperatorDaemon {
         for await (const event of this.runtime.sendTurn({
           sessionId: this.operatorSessionId,
           prompt: sent,
+          ...(sentOperatorReferences?.length
+            ? { operatorReferences: sentOperatorReferences }
+            : {}),
           ...(toolAccess ? { toolAccess } : {}),
           ...(turnToken ? { turnToken } : {}),
         })) {

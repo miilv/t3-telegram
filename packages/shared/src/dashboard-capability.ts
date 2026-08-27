@@ -3,6 +3,19 @@ export interface LoopbackDashboardCapability {
   url: string;
 }
 
+/** Token-free durable instruction; the current process supplies the URL at delivery time. */
+export interface DashboardCapabilityDeliveryIntent {
+  kind: "loopback-dashboard-delivery";
+}
+
+export function isDashboardCapabilityDeliveryIntent(
+  value: unknown,
+): value is DashboardCapabilityDeliveryIntent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.kind === "loopback-dashboard-delivery" && Object.keys(candidate).length === 1;
+}
+
 /**
  * The only secret-bearing URL intentionally allowed through a public delivery
  * boundary. Keep this grammar narrower than a generic loopback URL: one

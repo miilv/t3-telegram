@@ -51,7 +51,7 @@ import {
   NOTE_DESCRIPTION_CHARS,
   NOW_SECTIONS,
   NOW_STATUSES,
-  isLoopbackDashboardCapability,
+  isDashboardCapabilityDeliveryIntent,
   newId,
   nowIso,
   maskSecretsForStorage,
@@ -66,6 +66,7 @@ import {
   type JournalSelection,
 } from "./journal.js";
 import {
+  canonicalNoteValidUntil,
   OperatorNoteRepository,
   operatorNoteInputHash,
   rowToOperatorNote as rowToOperatorNoteV2,
@@ -420,7 +421,39 @@ export class OperatorStore {
     this.db
       .prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)")
       .run(nowIso());
+    this.migrateDashboardCapabilityOutbox();
     migrateOperatorNotesV2(this.db, (work) => this.transaction(work));
+  }
+
+  /** Remove process-local dashboard credentials written by pre-intent builds. */
+  private migrateDashboardCapabilityOutbox(): void {
+    const rows = this.db.prepare(
+      "SELECT id,payload_json FROM telegram_outbox WHERE operation='dashboard_capability'",
+    ).all() as Row[];
+    const update = this.db.prepare("UPDATE telegram_outbox SET payload_json=?,updated_at=? WHERE id=?");
+    for (const row of rows) {
+      let payload: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(String(row.payload_json)) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+        payload = parsed as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (
+        payload.dashboardCapability === undefined &&
+        isDashboardCapabilityDeliveryIntent(payload.dashboardCapabilityIntent)
+      ) continue;
+      const { dashboardCapability: _discardedCapability, ...safePayload } = payload;
+      update.run(
+        JSON.stringify({
+          ...safePayload,
+          dashboardCapabilityIntent: { kind: "loopback-dashboard-delivery" },
+        }),
+        nowIso(),
+        String(row.id),
+      );
+    }
   }
 
   /**
@@ -1158,6 +1191,7 @@ export class OperatorStore {
     const content = maskSecretsForStorage(input.content).trim().slice(0, 8_000);
     if (!content) throw new Error("Operator note cannot be empty");
     const category = (input.category?.trim() || "general").slice(0, 80);
+    const expiresAt = input.expiresAt ? canonicalNoteValidUntil(input.expiresAt) : undefined;
     const existing = this.db
       .prepare(`
         SELECT * FROM operator_notes
@@ -1194,8 +1228,8 @@ export class OperatorStore {
           content,
           "active",
           source,
-          input.expiresAt ?? null,
-          input.expiresAt ?? null,
+          expiresAt ?? null,
+          expiresAt ?? null,
           inputHash,
           createdAt,
           now,
@@ -2762,6 +2796,8 @@ export class OperatorStore {
         }
         const idempotent =
           String(row.operation) === "clear_keyboard" ||
+          (String(row.operation) === "dashboard_capability" &&
+            isDashboardCapabilityDeliveryIntent(payload.dashboardCapabilityIntent)) ||
           (String(row.operation) === "rich" &&
             (typeof payload.editMessageId === "number" ||
               (payload.anchor !== null && typeof payload.anchor === "object")));
@@ -3292,11 +3328,14 @@ function rowToTelegramOutbox<T>(row: Row): TelegramOutboxItem<T> {
 function redactTelegramOutboxPayload<T>(payload: T): T {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
   const value = payload as Record<string, unknown>;
+  if (value.dashboardCapability !== undefined) {
+    throw new Error("dashboard capability URLs must not be persisted");
+  }
   if (
-    value.dashboardCapability !== undefined &&
-    !isLoopbackDashboardCapability(value.dashboardCapability)
+    value.dashboardCapabilityIntent !== undefined &&
+    !isDashboardCapabilityDeliveryIntent(value.dashboardCapabilityIntent)
   ) {
-    throw new Error("invalid dashboard capability outbox payload");
+    throw new Error("invalid dashboard capability delivery intent");
   }
   return {
     ...value,

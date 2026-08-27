@@ -5,11 +5,13 @@ import { join } from "node:path";
 import type { Logger } from "pino";
 import type {
   OperatorEvent,
+  OperatorPromptReference,
   OperatorRuntime,
   OperatorSession,
   OperatorToolAccess,
 } from "../../shared/src/index.js";
 import { redactSecretsForOutput } from "../../shared/src/index.js";
+import { isOperatorNotePromptReference } from "../../policy/src/index.js";
 import { DAEMON_SECRET_ENV_NAMES } from "../../shared/src/config.js";
 
 /** Package 1.1: default SIGINT→SIGKILL grace for an interrupted turn. */
@@ -97,10 +99,13 @@ export const BACKGROUND_ONESHOT_PROVIDER = "claude";
  */
 export function privacyGuardOperatorRuntime(runtime: OperatorRuntime): OperatorRuntime {
   return {
-    start: (input) => runtime.start({ systemPrompt: redactSecretsForOutput(input.systemPrompt) }),
+    start: (input) => runtime.start({
+      ...input,
+      systemPrompt: redactProviderPrompt(input.systemPrompt, input.operatorReferences),
+    }),
     sendTurn: (input) => runtime.sendTurn({
       ...input,
-      prompt: redactSecretsForOutput(input.prompt),
+      prompt: redactProviderPrompt(input.prompt, input.operatorReferences),
     }),
     interrupt: (turnToken) => runtime.interrupt(turnToken),
     ...(runtime.abandon ? { abandon: (turnToken?: string) => runtime.abandon?.(turnToken) } : {}),
@@ -109,7 +114,13 @@ export function privacyGuardOperatorRuntime(runtime: OperatorRuntime): OperatorR
       sessionId,
       providerId,
       options?.systemPrompt
-        ? { ...options, systemPrompt: redactSecretsForOutput(options.systemPrompt) }
+        ? {
+            ...options,
+            systemPrompt: redactProviderPrompt(
+              options.systemPrompt,
+              options.operatorReferences,
+            ),
+          }
         : options,
     ),
     ...(runtime.oneShot
@@ -134,13 +145,42 @@ export function privacyGuardOperatorRuntime(runtime: OperatorRuntime): OperatorR
       : {}),
     ...(runtime.switchProvider
       ? {
-          switchProvider: (providerId: string, input: { systemPrompt: string }) =>
+          switchProvider: (providerId: string, input: {
+            systemPrompt: string;
+            operatorReferences?: readonly OperatorPromptReference[];
+          }) =>
             runtime.switchProvider!(providerId, {
-              systemPrompt: redactSecretsForOutput(input.systemPrompt),
+              ...input,
+              systemPrompt: redactProviderPrompt(
+                input.systemPrompt,
+                input.operatorReferences,
+              ),
             }),
         }
       : {}),
   };
+}
+
+function redactProviderPrompt(
+  prompt: string,
+  references: readonly OperatorPromptReference[] | undefined,
+): string {
+  const protectedReferences = [...new Set(
+    (references ?? [])
+      .filter(isOperatorNotePromptReference)
+      .map((reference) => reference.value),
+  )].sort((left, right) => right.length - left.length);
+  let protectedPrompt = prompt;
+  const placeholders = protectedReferences.map((reference) => {
+    const placeholder = `«operator-reference-${randomUUID()}»`;
+    protectedPrompt = protectedPrompt.replaceAll(reference, placeholder);
+    return { placeholder, reference };
+  });
+  let redacted = redactSecretsForOutput(protectedPrompt);
+  for (const { placeholder, reference } of placeholders) {
+    redacted = redacted.replaceAll(placeholder, reference);
+  }
+  return redacted;
 }
 
 export class SwitchableOperatorRuntime implements OperatorRuntime {
@@ -162,13 +202,17 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
     return Object.keys(this.providers);
   }
 
-  start(input: { systemPrompt: string }): Promise<OperatorSession> {
+  start(input: {
+    systemPrompt: string;
+    operatorReferences?: readonly OperatorPromptReference[];
+  }): Promise<OperatorSession> {
     return this.current().start(input);
   }
 
   sendTurn(input: {
     sessionId: string;
     prompt: string;
+    operatorReferences?: readonly OperatorPromptReference[];
     toolAccess?: OperatorToolAccess;
     turnToken?: string;
   }): AsyncIterable<OperatorEvent> {
@@ -226,7 +270,10 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
   async resume(
     sessionId: string,
     providerId?: string,
-    options?: { systemPrompt?: string },
+    options?: {
+      systemPrompt?: string;
+      operatorReferences?: readonly OperatorPromptReference[];
+    },
   ): Promise<void> {
     if (providerId) {
       if (!this.providers[providerId]) throw new Error(`configured Operator provider is unavailable: ${providerId}`);
@@ -241,7 +288,10 @@ export class SwitchableOperatorRuntime implements OperatorRuntime {
 
   async switchProvider(
     providerId: string,
-    input: { systemPrompt: string },
+    input: {
+      systemPrompt: string;
+      operatorReferences?: readonly OperatorPromptReference[];
+    },
   ): Promise<OperatorSession> {
     if (!this.providers[providerId]) throw new Error(`Operator provider is unavailable: ${providerId}`);
     const previousProviderId = this.providerId;

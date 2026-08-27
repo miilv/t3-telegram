@@ -1850,8 +1850,10 @@ take one finalization path: skip row + event + day stamp, without an outage miss
   ends in `PRAGMA quick_check` over the whole database on the daemon's own
   synchronous handle, and also spawns `<claude|codex> --version` and calls
   `getMe`. `/debug` does the same once.
-- **Every `/dashboard` link dies on restart** — the capability is
-  `randomBytes(32)` per instance and `DASHBOARD_PORT` defaults to `0`.
+- **Every already-open `/dashboard` link dies on restart** — the capability is
+  `randomBytes(32)` per instance and `DASHBOARD_PORT` defaults to `0`. Pending
+  Telegram delivery rows persist only a token-free intent, so restart recovery
+  late-binds and delivers the new process's link rather than the dead one.
 - **Dashboard policy edits are invisible in Telegram.** `POST /api/policy`
   appends `policy.updated {source:"dashboard"}` and nothing reaches the chat, so
   adding `destructive` to `approvalAutoAllow` from a browser removes the

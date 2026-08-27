@@ -278,6 +278,12 @@ CREATE UNIQUE INDEX operator_notes_key ON operator_notes(key)
   proposal, evidence и самой заметке; маскирование применяется только к
   description/content/category. Аналогично typed-результаты сохраняют пути,
   id и hashes, редактируя только видимые имена и пояснения.
+  Если валидированный Notes-v2 key намеренно показан провайдеру как pull-ref,
+  prompt builder несёт его отдельным typed metadata-каналом через обычный ход,
+  compaction/provider-switch restore и fresh-session replay. Privacy guard
+  повторно валидирует этот metadata и защищает только указанные spans; похожий
+  текст в description/content или произвольном prompt не может сам объявить
+  себя операционным ref и остаётся под canonical redaction.
 
 ### 2.4 Журнал
 

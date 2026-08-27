@@ -618,11 +618,21 @@ export interface OperatorToolAccess {
   toolNames?: string[];
 }
 
+/** A validated Notes-v2 key that prompt builders intentionally expose as an operational reference. */
+export interface OperatorPromptReference {
+  kind: "operator-note-key";
+  value: string;
+}
+
 export interface OperatorRuntime {
-  start(input: { systemPrompt: string }): Promise<OperatorSession>;
+  start(input: {
+    systemPrompt: string;
+    operatorReferences?: readonly OperatorPromptReference[];
+  }): Promise<OperatorSession>;
   sendTurn(input: {
     sessionId: string;
     prompt: string;
+    operatorReferences?: readonly OperatorPromptReference[];
     toolAccess?: OperatorToolAccess;
     /** Internal runtime maintenance may opt into Claude's built-in /compact command. */
     allowBuiltInSlashCommands?: boolean;
@@ -664,7 +674,10 @@ export interface OperatorRuntime {
   resume(
     sessionId: string,
     providerId?: string,
-    options?: { systemPrompt?: string },
+    options?: {
+      systemPrompt?: string;
+      operatorReferences?: readonly OperatorPromptReference[];
+    },
   ): Promise<void>;
   /**
    * Cheap side-channel call outside the main Operator session: no resume, no
@@ -700,7 +713,10 @@ export interface OperatorRuntime {
   }>;
   currentProvider?(): string;
   availableProviders?(): string[];
-  switchProvider?(providerId: string, input: { systemPrompt: string }): Promise<OperatorSession>;
+  switchProvider?(providerId: string, input: {
+    systemPrompt: string;
+    operatorReferences?: readonly OperatorPromptReference[];
+  }): Promise<OperatorSession>;
 }
 
 export interface TurnHandle {
@@ -909,9 +925,12 @@ export {
   SECRET_REDACTION_PATHS,
 } from "./redaction.js";
 export {
+  isDashboardCapabilityDeliveryIntent,
   isLoopbackDashboardCapability,
+  type DashboardCapabilityDeliveryIntent,
   type LoopbackDashboardCapability,
 } from "./dashboard-capability.js";
+export { isStrictRfc3339Instant } from "./rfc3339.js";
 
 export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;

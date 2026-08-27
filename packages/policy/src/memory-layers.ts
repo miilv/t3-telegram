@@ -22,7 +22,13 @@ import {
   ownerLocalParts,
   redactSecretsForOutput,
 } from "../../shared/src/index.js";
-import type { Fence, NowSection, NowStatus } from "../../shared/src/index.js";
+import type {
+  Fence,
+  NowSection,
+  NowStatus,
+  OperatorPromptReference,
+} from "../../shared/src/index.js";
+import { operatorNotePromptReference } from "./operator-notes.js";
 
 /** memory-design §2.2 — now-state render budget. */
 export const NOW_STATE_BUDGET_CHARS = 3_000;
@@ -154,17 +160,31 @@ function byPushScoreThenRecency(a: MemoryIndexNote, b: MemoryIndexNote): number 
  * by more than the item added to it. Breaking early would drop a list that fits
  * whole and print a "(+1 items)" tail nobody needed.
  */
+interface BudgetFit<T> {
+  text: string;
+  selected: readonly T[];
+}
+
+function fitToBudgetSelection<T>(
+  ranked: readonly T[],
+  budget: number,
+  render: (selected: readonly T[], omitted: number) => string,
+): BudgetFit<T> {
+  let best: BudgetFit<T> = { text: render([], ranked.length), selected: [] };
+  for (let count = 1; count <= ranked.length; count += 1) {
+    const selected = ranked.slice(0, count);
+    const text = render(selected, ranked.length - count);
+    if (text.length <= budget) best = { text, selected };
+  }
+  return best;
+}
+
 function fitToBudget<T>(
   ranked: readonly T[],
   budget: number,
   render: (selected: readonly T[], omitted: number) => string,
 ): string {
-  let best = render([], ranked.length);
-  for (let count = 1; count <= ranked.length; count += 1) {
-    const candidate = render(ranked.slice(0, count), ranked.length - count);
-    if (candidate.length <= budget) best = candidate;
-  }
-  return best;
+  return fitToBudgetSelection(ranked, budget, render).text;
 }
 
 /**
@@ -292,18 +312,37 @@ export function renderMemoryIndex(
   notes: readonly MemoryIndexNote[],
   options: RenderOptions = {},
 ): string {
+  return renderMemoryIndexResult(notes, options).text;
+}
+
+function renderMemoryIndexResult(
+  notes: readonly MemoryIndexNote[],
+  options: RenderOptions = {},
+): { text: string; operatorReferences: OperatorPromptReference[] } {
   const budget = options.budget ?? MEMORY_INDEX_BUDGET_CHARS;
   const overflowTool = options.overflowTool ?? "memory.search";
-  if (notes.length === 0) return `${MEMORY_INDEX_HEADER}\n${MEMORY_INDEX_EMPTY}`;
+  if (notes.length === 0) {
+    return {
+      text: `${MEMORY_INDEX_HEADER}\n${MEMORY_INDEX_EMPTY}`,
+      operatorReferences: [],
+    };
+  }
   const ranked = [...notes].sort(byPushScoreThenRecency);
-  return fitToBudget(ranked, budget, (selected, omitted) => {
+  const render = (selected: readonly MemoryIndexNote[], omitted: number): string => {
     const lines = [MEMORY_INDEX_HEADER];
     if (selected.length > 0) {
       lines.push(fenceBody(selected.map(indexLine).join("\n"), options.fence));
     }
     if (omitted > 0) lines.push(`(+${omitted} notes — ${overflowTool})`);
     return lines.join("\n");
-  });
+  };
+  const { text, selected } = fitToBudgetSelection(ranked, budget, render);
+  return {
+    text,
+    operatorReferences: selected
+      .map((note) => note.key ? operatorNotePromptReference(note.key.trim()) : undefined)
+      .filter((reference): reference is OperatorPromptReference => reference !== undefined),
+  };
 }
 
 function indexLine(note: MemoryIndexNote): string {
@@ -324,18 +363,37 @@ export function renderAntiRediscovery(
   notes: readonly MemoryIndexNote[],
   options: RenderOptions = {},
 ): string {
+  return renderAntiRediscoveryResult(notes, options).text;
+}
+
+function renderAntiRediscoveryResult(
+  notes: readonly MemoryIndexNote[],
+  options: RenderOptions = {},
+): { text: string; operatorReferences: OperatorPromptReference[] } {
   const budget = options.budget ?? ANTI_REDISCOVERY_BUDGET_CHARS;
   const overflowTool = options.overflowTool ?? "memory.search";
-  if (notes.length === 0) return `${ANTI_REDISCOVERY_HEADER}\n${ANTI_REDISCOVERY_EMPTY}`;
+  if (notes.length === 0) {
+    return {
+      text: `${ANTI_REDISCOVERY_HEADER}\n${ANTI_REDISCOVERY_EMPTY}`,
+      operatorReferences: [],
+    };
+  }
   const ranked = [...notes].sort(byPushScoreThenRecency);
-  return fitToBudget(ranked, budget, (selected, omitted) => {
+  const render = (selected: readonly MemoryIndexNote[], omitted: number): string => {
     const lines = [ANTI_REDISCOVERY_HEADER];
     if (selected.length > 0) {
       lines.push(fenceBody(selected.map(indexLine).join("\n"), options.fence));
     }
     if (omitted > 0) lines.push(`(+${omitted} entries — ${overflowTool})`);
     return lines.join("\n");
-  });
+  };
+  const { text, selected } = fitToBudgetSelection(ranked, budget, render);
+  return {
+    text,
+    operatorReferences: selected
+      .map((note) => note.key ? operatorNotePromptReference(note.key.trim()) : undefined)
+      .filter((reference): reference is OperatorPromptReference => reference !== undefined),
+  };
 }
 
 export interface StateLayerInput {
@@ -359,6 +417,8 @@ export interface RenderedStateLayers {
   snapshotHash: string;
   /** Per-item fingerprints, so the next turn can diff without re-reading history. */
   items: NowItemFingerprints;
+  /** Validated note keys intentionally rendered as pull references. */
+  operatorReferences: OperatorPromptReference[];
 }
 
 /** id → { h: fingerprint, l: short label } (the label is what a CLOSED item is named by). */
@@ -404,8 +464,10 @@ export function renderStateLayers(input: StateLayerInput): RenderedStateLayers {
     ...(input.nowOverflowTool ? { overflowTool: input.nowOverflowTool } : {}),
     ...(input.timeZone ? { timeZone: input.timeZone } : {}),
   });
-  const index = renderMemoryIndex(input.notes, { fence });
-  const antiRediscovery = renderAntiRediscovery(input.antiRediscovery, { fence });
+  const indexResult = renderMemoryIndexResult(input.notes, { fence });
+  const antiRediscoveryResult = renderAntiRediscoveryResult(input.antiRediscovery, { fence });
+  const index = indexResult.text;
+  const antiRediscovery = antiRediscoveryResult.text;
   const snapshot = [SNAPSHOT_LEAD, now, index, antiRediscovery].join("\n\n");
   // The fence nonce is drawn fresh for every render — hashing the text as-is
   // would make every layer look changed on every turn, which would quietly turn
@@ -421,6 +483,10 @@ export function renderStateLayers(input: StateLayerInput): RenderedStateLayers {
     nowHash: hashText(canonical(now)),
     snapshotHash: hashText(canonical(snapshot)),
     items: fingerprintNowItems(input.now),
+    operatorReferences: [...new Map(
+      [...indexResult.operatorReferences, ...antiRediscoveryResult.operatorReferences]
+        .map((reference) => [reference.value, reference]),
+    ).values()],
   };
 }
 

@@ -408,6 +408,23 @@ describe("layer renderers and their budgets", () => {
     expect(rendered).not.toContain("note_0 ");
   });
 
+  it("protects only validated note keys that survived the canonical render budget", () => {
+    const notes = Array.from({ length: 200 }, (_, index) =>
+      note(`note_${index}`, {
+        key: `route-${index}`,
+        description: `when route ${index} matters → read this note`,
+        updatedAt: new Date(Date.UTC(2026, 7, 26, 9, 0, index)).toISOString(),
+      }),
+    );
+    const layers = renderStateLayers({ now: [], notes, antiRediscovery: [] });
+    const references = layers.operatorReferences.map((reference) => reference.value);
+
+    expect(references).toContain("route-199");
+    expect(references).not.toContain("route-0");
+    expect(references.every((reference) => layers.index.includes(`→ ${reference}`))).toBe(true);
+    expect(new Set(references).size).toBe(references.length);
+  });
+
   it("keeps the anti-rediscovery block inside its own 1000 characters", () => {
     const notes = Array.from({ length: 60 }, (_, index) =>
       note(`ar_${index}`, {

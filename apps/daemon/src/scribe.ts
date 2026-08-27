@@ -21,7 +21,7 @@ import {
   SCRIBE_WORK_EVENT_PREFIXES,
   buildDailySummaryPrompt,
   buildDescriptionPrompt,
-  buildDistillationMergeProposalPrompt,
+  buildDistillationMergeProposalTurn,
   buildMonthlyProposalPrompt,
   buildRollupPrompt,
   firstDayOfMonth,
@@ -37,7 +37,11 @@ import {
   summarySlug,
 } from "../../../packages/policy/src/index.js";
 import type { OperatorStore } from "../../../packages/storage/src/index.js";
-import { ScribeFinalizer, type ScribeProgress } from "./scribe-finalization.js";
+import {
+  ScribeFinalizer,
+  type ScribeOwnerTurnInput,
+  type ScribeProgress,
+} from "./scribe-finalization.js";
 import type { ScribeRunOutcome } from "./scribe-finalization.js";
 import { ScribeReconciler } from "./scribe-reconciler.js";
 import {
@@ -69,7 +73,7 @@ export interface NightScribeDeps {
   backgroundOneShot?: (input: { prompt: string; timeoutMs?: number }) => Promise<string>;
   reconcileNowItems: () => void;
   /** True only after the owner turn has been durably enqueued. */
-  requestOwnerTurn: (input: { dedupeKey: string; prompt: string }) => boolean;
+  requestOwnerTurn: (input: ScribeOwnerTurnInput) => boolean;
   now?: () => Date;
   timeoutMs?: number;
 }
@@ -228,20 +232,21 @@ export class NightScribe {
     const pending = this.deps.store.distillationProposals.listPending(50, this.deps.ownerId());
     const intents = pending.map((proposal) => {
       const dedupeKey = `scribe-merge-proposal:${proposal.replayKey}`;
+      const turn = buildDistillationMergeProposalTurn({
+        candidateKey: proposal.candidateKey,
+        description: proposal.description,
+        evidenceSeqs: proposal.evidenceSeqs,
+        matchingNote: {
+          id: proposal.matchingNote.id,
+          ...(proposal.matchingNote.key ? { key: proposal.matchingNote.key } : {}),
+          ...(proposal.matchingNote.description
+            ? { description: proposal.matchingNote.description }
+            : {}),
+        },
+      });
       const stateKey = this.finalizer.persistOwnerTurn({
         dedupeKey,
-        prompt: buildDistillationMergeProposalPrompt({
-          candidateKey: proposal.candidateKey,
-          description: proposal.description,
-          evidenceSeqs: proposal.evidenceSeqs,
-          matchingNote: {
-            id: proposal.matchingNote.id,
-            ...(proposal.matchingNote.key ? { key: proposal.matchingNote.key } : {}),
-            ...(proposal.matchingNote.description
-              ? { description: proposal.matchingNote.description }
-              : {}),
-          },
-        }),
+        ...turn,
       });
       return { proposal, stateKey };
     });

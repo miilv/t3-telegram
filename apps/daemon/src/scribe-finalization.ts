@@ -9,9 +9,11 @@ import {
   SCRIBE_PENDING_TURN_PREFIX,
   SCRIBE_RECOVERY_RUN_KEY,
   buildMissAlertPrompt,
+  isOperatorNotePromptReference,
   renderScribeSkipBody,
   skipSlug,
 } from "../../../packages/policy/src/index.js";
+import type { OperatorPromptReference } from "../../../packages/shared/src/index.js";
 import type { OperatorStore } from "../../../packages/storage/src/index.js";
 
 export type ScribeRunStatus =
@@ -54,7 +56,13 @@ export interface ScribeProgress {
 interface FinalizerDeps {
   store: OperatorStore;
   logger: Logger;
-  requestOwnerTurn: (input: { dedupeKey: string; prompt: string }) => boolean;
+  requestOwnerTurn: (input: ScribeOwnerTurnInput) => boolean;
+}
+
+export interface ScribeOwnerTurnInput {
+  dedupeKey: string;
+  prompt: string;
+  operatorReferences?: readonly OperatorPromptReference[];
 }
 
 export class ScribeFinalizer {
@@ -167,7 +175,7 @@ export class ScribeFinalizer {
     };
   }
 
-  persistOwnerTurn(input: { dedupeKey: string; prompt: string }): string {
+  persistOwnerTurn(input: ScribeOwnerTurnInput): string {
     const key = `${SCRIBE_PENDING_TURN_PREFIX}${input.dedupeKey}`;
     this.deps.store.setRuntimeState(key, JSON.stringify(input));
     return key;
@@ -175,13 +183,26 @@ export class ScribeFinalizer {
 
   flushPendingOwnerTurns(): void {
     for (const pending of this.deps.store.listRuntimeState(SCRIBE_PENDING_TURN_PREFIX)) {
-      let input: { dedupeKey: string; prompt: string };
+      let input: ScribeOwnerTurnInput;
       try {
-        const parsed = JSON.parse(pending.value) as Partial<{ dedupeKey: string; prompt: string }>;
+        const parsed = JSON.parse(pending.value) as Partial<ScribeOwnerTurnInput>;
         if (typeof parsed.dedupeKey !== "string" || typeof parsed.prompt !== "string") {
           throw new Error("pending owner turn is missing its dedupe key or prompt");
         }
-        input = { dedupeKey: parsed.dedupeKey, prompt: parsed.prompt };
+        if (
+          parsed.operatorReferences !== undefined &&
+          (!Array.isArray(parsed.operatorReferences) ||
+            !parsed.operatorReferences.every(isOperatorNotePromptReference))
+        ) {
+          throw new Error("pending owner turn has invalid Operator note references");
+        }
+        input = {
+          dedupeKey: parsed.dedupeKey,
+          prompt: parsed.prompt,
+          ...(parsed.operatorReferences?.length
+            ? { operatorReferences: parsed.operatorReferences }
+            : {}),
+        };
       } catch (error) {
         this.deps.logger.error({ err: error, key: pending.key }, "Invalid pending scribe owner turn");
         continue;
@@ -190,7 +211,7 @@ export class ScribeFinalizer {
     }
   }
 
-  private flushOne(key: string, input: { dedupeKey: string; prompt: string }): void {
+  private flushOne(key: string, input: ScribeOwnerTurnInput): void {
     try {
       if (this.deps.requestOwnerTurn(input) === true) this.deps.store.deleteRuntimeState(key);
     } catch (error) {
