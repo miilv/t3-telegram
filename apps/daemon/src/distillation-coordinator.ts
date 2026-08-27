@@ -5,8 +5,11 @@ import {
   buildDistillationPrompt,
   parseDistillationResponse,
 } from "../../../packages/policy/src/index.js";
-import type { DistilledNoteCandidate } from "../../../packages/policy/src/index.js";
-import type { OperatorStore } from "../../../packages/storage/src/index.js";
+import type {
+  DistillationPrompt,
+  DistilledNoteCandidate,
+} from "../../../packages/policy/src/index.js";
+import type { ConversationBatch, OperatorStore } from "../../../packages/storage/src/index.js";
 
 export const DISTILLATION_CONSUMER = "night-scribe-distillation";
 export const DISTILLATION_MAX_BATCHES_PER_RUN = 3;
@@ -58,13 +61,14 @@ export class ConversationDistillationCoordinator {
         });
         if (!batch.entries.length) break;
       }
-      const built = buildDistillationPrompt({
+      const fitted = buildLargestFittingPrompt({
         ownerId,
         afterSeq,
         highWaterSeq: frozenHighWater,
-        throughSeq: batch.throughSeq,
-        entries: batch.entries,
+        batch,
       });
+      batch = fitted.batch;
+      const built = fitted.prompt;
       let response: string;
       try {
         response = await this.deps.oneShot(built.prompt);
@@ -207,6 +211,66 @@ export class ConversationDistillationCoordinator {
     }
     return { written, proposals, crossLinks };
   }
+}
+
+/** The final redacted, JSON-escaped and fenced prompt is the real page budget. */
+function buildLargestFittingPrompt(input: {
+  ownerId: string;
+  afterSeq: number;
+  highWaterSeq: number;
+  batch: ConversationBatch;
+}): { batch: ConversationBatch; prompt: DistillationPrompt } {
+  let lower = 1;
+  let upper = input.batch.entries.length;
+  let best: { count: number; prompt: DistillationPrompt } | undefined;
+  while (lower <= upper) {
+    const count = Math.floor((lower + upper) / 2);
+    const entries = input.batch.entries.slice(0, count);
+    const throughSeq = entries.at(-1)!.seq;
+    try {
+      const prompt = buildDistillationPrompt({
+        ownerId: input.ownerId,
+        afterSeq: input.afterSeq,
+        highWaterSeq: input.highWaterSeq,
+        throughSeq,
+        entries,
+      });
+      best = { count, prompt };
+      lower = count + 1;
+    } catch (error) {
+      if (!isPromptHardBound(error)) throw error;
+      upper = count - 1;
+    }
+  }
+  if (!best) {
+    // The selector's single-row projection is itself bounded. Rebuilding it
+    // here preserves the precise structural error if that invariant regresses.
+    const entries = input.batch.entries.slice(0, 1);
+    return {
+      batch: { ...input.batch, entries, throughSeq: entries[0]!.seq, hasMore: true },
+      prompt: buildDistillationPrompt({
+        ownerId: input.ownerId,
+        afterSeq: input.afterSeq,
+        highWaterSeq: input.highWaterSeq,
+        throughSeq: entries[0]!.seq,
+        entries,
+      }),
+    };
+  }
+  const entries = input.batch.entries.slice(0, best.count);
+  return {
+    batch: {
+      ...input.batch,
+      entries,
+      throughSeq: entries.at(-1)!.seq,
+      hasMore: input.batch.hasMore || best.count < input.batch.entries.length,
+    },
+    prompt: best.prompt,
+  };
+}
+
+function isPromptHardBound(error: unknown): boolean {
+  return error instanceof Error && error.message === "distillation prompt exceeded its hard bound";
 }
 
 export function distillationCandidateReplayKey(input: {
