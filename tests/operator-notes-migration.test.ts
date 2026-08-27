@@ -11,7 +11,7 @@ describe("operator notes v2 migration", () => {
     const path = join(tempDirectory("memory-v2-upgrade-"), "operator.db");
     const baseSql = execFileSync(
       "git",
-      ["show", "744c2d7204be01a8067f33e4d4d456fe496e094e:migrations/001_initial.sql"],
+      ["show", "cad5f88f336f7b4234c33221105e3a30549b23f4:migrations/001_initial.sql"],
       { encoding: "utf8" },
     );
     const legacy = new DatabaseSync(path);
