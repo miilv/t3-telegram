@@ -51,6 +51,7 @@ import {
   NOTE_DESCRIPTION_CHARS,
   NOW_SECTIONS,
   NOW_STATUSES,
+  isLoopbackDashboardCapability,
   newId,
   nowIso,
   maskSecretsForStorage,
@@ -81,6 +82,7 @@ import {
   type KeyedOperatorNoteDraft,
 } from "./operator-note-writer.js";
 import { DistillationProposalRepository } from "./distillation-proposals.js";
+export { getPublicOperatorNote, searchPublicOperatorNotes } from "./operator-note-access.js";
 
 export { JournalRepository } from "./journal.js";
 export type { JournalEntryInput, JournalFilter, JournalSelection } from "./journal.js";
@@ -1343,7 +1345,7 @@ export class OperatorStore {
         JOIN operator_notes n ON n.id=v.note_id
         WHERE n.status='active' AND v.model=? AND v.dimensions=?
           AND v.input_hash=n.input_hash
-        ORDER BY n.updated_at DESC LIMIT 500
+        ORDER BY n.updated_at DESC
       `)
       .all(queryVector.model, queryVector.dimensions) as Row[];
     const vectorById = new Map(vectorRows.map((row) => [String(row.id), row]));
@@ -3290,6 +3292,12 @@ function rowToTelegramOutbox<T>(row: Row): TelegramOutboxItem<T> {
 function redactTelegramOutboxPayload<T>(payload: T): T {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
   const value = payload as Record<string, unknown>;
+  if (
+    value.dashboardCapability !== undefined &&
+    !isLoopbackDashboardCapability(value.dashboardCapability)
+  ) {
+    throw new Error("invalid dashboard capability outbox payload");
+  }
   return {
     ...value,
     ...(typeof value.text === "string"

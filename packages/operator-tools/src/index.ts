@@ -72,6 +72,7 @@ import {
   renderJournalSkeleton,
 } from "../../policy/src/index.js";
 import type { OperatorStore } from "../../storage/src/index.js";
+import { getPublicOperatorNote, searchPublicOperatorNotes } from "../../storage/src/index.js";
 import type {
   SentMessage,
   TelegramDestination,
@@ -344,6 +345,8 @@ export interface RegisteredToolInput<T extends z.ZodType<Record<string, unknown>
   schema: T;
   readOnly?: boolean;
   destructive?: boolean;
+  /** Top-level machine identities that must survive prose redaction byte-for-byte. */
+  operationalResultFields?: readonly string[];
   handler: (input: z.infer<T>, capability: TurnCapability) => Promise<unknown> | unknown;
 }
 
@@ -522,6 +525,7 @@ export class OperatorToolServer {
         workspaceRoot: z.string().trim().min(1).max(4_096),
         createWorkspaceRootIfMissing: z.boolean().optional(),
       }),
+      operationalResultFields: ["id", "workspaceRoot"],
       handler: async (input, capability) => {
         this.requireTeamMutation(capability, "create projects");
         const project = await this.options.broker.createProject({
@@ -850,12 +854,14 @@ export class OperatorToolServer {
       description: "Search durable Operator notes and compact thread summaries.",
       schema: z.object({ query: z.string().trim().min(2).max(1_000), limit: z.number().int().min(1).max(20).optional() }),
       readOnly: true,
+      operationalResultFields: ["notes.*.id", "notes.*.key"],
       handler: async ({ query, limit }, capability) => {
         this.requireAdministrativeRole(capability, "search global Operator memory");
         const bounded = limit ?? 8;
         const fence = openFence("worker");
         return {
-          notes: (await this.options.store.searchOperatorNotesEmbedded(query, undefined, bounded)).map(noteForMemoryRead),
+          notes: (await searchPublicOperatorNotes(this.options.store, query, bounded))
+            .map(noteForMemoryRead),
           threads: this.options.store.searchThreads(query, undefined, bounded).map((candidate) => ({
             ...compactThread(candidate.thread, fence),
             score: candidate.score,
@@ -876,9 +882,10 @@ export class OperatorToolServer {
         "Read ONE durable Operator note in full by the reference printed in the pushed memory index (a note key, or a note id for notes written before keys existed).",
       schema: z.object({ key: z.string().trim().min(1).max(200) }),
       readOnly: true,
+      operationalResultFields: ["note.id", "note.key"],
       handler: ({ key }, capability) => {
         this.requireAdministrativeRole(capability, "read global Operator memory");
-        const note = this.options.store.getOperatorNote(key);
+        const note = getPublicOperatorNote(this.options.store, key);
         if (!note) {
           return {
             ok: false,
@@ -901,6 +908,16 @@ export class OperatorToolServer {
       }).refine((input) => Boolean(input.key) === Boolean(input.description), {
         message: "key and description must be supplied together",
       }),
+      operationalResultFields: [
+        "id",
+        "key",
+        "write.note.id",
+        "write.note.key",
+        "mergeProposal.note.id",
+        "mergeProposal.note.key",
+        "crossLinks.*.note.id",
+        "crossLinks.*.note.key",
+      ],
       handler: async (input, capability) => {
         this.requireAdministrativeRole(capability, "write global Operator memory");
         if (input.key && input.description) {
@@ -1457,6 +1474,14 @@ export class OperatorToolServer {
       description: "Resolve a registered artifact to validated compact metadata and its local path.",
       schema: z.object({ artifactId: z.string().min(1) }),
       readOnly: true,
+      operationalResultFields: [
+        "id",
+        "localPath",
+        "sha256",
+        "projectId",
+        "threadId",
+        "derivedFromArtifactId",
+      ],
       handler: ({ artifactId }, capability) => {
         const artifact = this.options.artifacts.resolve(artifactId);
         this.requireArtifactAccess(capability, artifact);
@@ -1521,6 +1546,14 @@ export class OperatorToolServer {
       name: "artifacts.materialize_for_thread",
       description: "Copy a registered artifact into a T3 thread's project-local .operator-inbox.",
       schema: z.object({ artifactId: z.string().min(1), threadId: z.string().min(1) }),
+      operationalResultFields: [
+        "id",
+        "localPath",
+        "sha256",
+        "projectId",
+        "threadId",
+        "derivedFromArtifactId",
+      ],
       handler: async ({ artifactId, threadId }, capability) => {
         this.requireArtifactAccess(capability, this.options.artifacts.resolve(artifactId));
         const thread = await this.requireThreadAccess(capability, threadId, true);
@@ -1870,7 +1903,7 @@ export class OperatorToolServer {
               : {}),
           },
         });
-        return compactResult(value);
+        return compactResult(value, spec.operationalResultFields);
       } catch (error) {
         const capability = this.getCapability(token);
         this.options.store.appendEvent("operator.tool.failed", {
@@ -2217,9 +2250,10 @@ function compactThread(thread: WorkThread, fence: Fence = openFence("worker")): 
 function compactArtifact(artifact: ArtifactRef, includePath = false): Record<string, unknown> {
   return {
     id: artifact.id,
-    filename: artifact.filename ?? basename(artifact.localPath),
+    filename: artifactDisplayName(artifact.filename ?? basename(artifact.localPath)),
     ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}),
     sizeBytes: artifact.sizeBytes,
+    ...(artifact.sha256 ? { sha256: artifact.sha256 } : {}),
     ...(artifact.projectId ? { projectId: artifact.projectId } : {}),
     ...(artifact.threadId ? { threadId: artifact.threadId } : {}),
     ...(artifact.derivedFromArtifactId
@@ -2229,7 +2263,14 @@ function compactArtifact(artifact: ArtifactRef, includePath = false): Record<str
   };
 }
 
-function compactResult(value: unknown): ToolResult {
+function artifactDisplayName(filename: string): string {
+  if (/(^|[._-])(env|secret|token|credential|id_rsa|id_ed25519)([._-]|$)/iu.test(filename)) {
+    return "[REDACTED FILENAME]";
+  }
+  return redactSecretsForOutput(filename);
+}
+
+function compactResult(value: unknown, operationalFields: readonly string[] = []): ToolResult {
   if (isImageToolPayload(value)) {
     return {
       resultType: "complete",
@@ -2239,10 +2280,34 @@ function compactResult(value: unknown): ToolResult {
       ],
     };
   }
+  const redacted = redactSecretsForOutputDeep(value);
+  for (const path of operationalFields) restoreOperationalPath(value, redacted, path.split("."));
   return {
     resultType: "complete",
-    content: [{ type: "text", text: boundedJson(redactSecretsForOutputDeep(value)) }],
+    content: [{ type: "text", text: boundedJson(redacted) }],
   };
+}
+
+function restoreOperationalPath(source: unknown, target: unknown, segments: readonly string[]): void {
+  const [head, ...tail] = segments;
+  if (!head) return;
+  if (head === "*") {
+    if (!Array.isArray(source) || !Array.isArray(target)) return;
+    for (let index = 0; index < Math.min(source.length, target.length); index += 1) {
+      restoreOperationalPath(source[index], target[index], tail);
+    }
+    return;
+  }
+  if (!isPlainObject(source) || !isPlainObject(target) || !(head in source)) return;
+  if (!tail.length) {
+    target[head] = source[head];
+    return;
+  }
+  restoreOperationalPath(source[head], target[head], tail);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Journal budgets: enough to reconstruct a turn narrative, never a transcript. */

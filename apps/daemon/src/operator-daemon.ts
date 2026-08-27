@@ -9,6 +9,7 @@ import type {
   ApprovalRiskCategory,
   Automation,
   InteractionMediation,
+  LoopbackDashboardCapability,
   MediatedQuestion,
   NowItem,
   NowSection,
@@ -70,6 +71,7 @@ import type {
   UserInputDraftAnswer,
   OperatorConversationOutbound,
 } from "../../../packages/storage/src/index.js";
+import { searchPublicOperatorNotes } from "../../../packages/storage/src/index.js";
 import {
   isCancelIntent,
   resolveProjectReference,
@@ -362,6 +364,7 @@ interface DurableTelegramPayload {
   text?: string;
   path?: string;
   caption?: string;
+  dashboardCapability?: LoopbackDashboardCapability;
   messageId?: number;
   editMessageId?: number;
   options: TelegramSendOptions;
@@ -5066,6 +5069,24 @@ export class OperatorDaemon {
     await this.flushTelegramOutbox();
   }
 
+  private async dashboardCapabilityReply(
+    update: Extract<TelegramInbound, { type: "message" }>,
+    url: string,
+  ): Promise<void> {
+    this.enqueueTelegramOutbox(
+      `telegram:command:${stableUpdateOperationKey(update)}:dashboard-capability`,
+      update.chatId,
+      "dashboard_capability",
+      {
+        dashboardCapability: { kind: "loopback-dashboard", url },
+        options: replyOptions(update),
+        messageType: "dashboard_capability",
+        correlationId: correlationForUpdate(update),
+      },
+    );
+    await this.flushTelegramOutbox();
+  }
+
   private async cancelBoundWork(
     update: Extract<TelegramInbound, { type: "message" }>,
     threadId?: string,
@@ -5993,9 +6014,8 @@ export class OperatorDaemon {
         return true;
       }
       const link = this.dashboard?.link();
-      await this.commandReply(update, link
-          ? `Локальная панель: ${link}\n\nСсылка работает только на машине демона и содержит временный ключ доступа.`
-          : "Панель отключена в конфигурации.");
+      if (link) await this.dashboardCapabilityReply(update, link);
+      else await this.commandReply(update, "Панель отключена в конфигурации.");
       return true;
     }
     if (command === "/policy") {
@@ -6637,7 +6657,7 @@ export class OperatorDaemon {
       return;
     }
     if (["search", "find", "найди"].includes(action.toLocaleLowerCase())) {
-      const notes = detail ? this.store.searchOperatorNotes(detail, 10) : [];
+      const notes = detail ? await searchPublicOperatorNotes(this.store, detail, 10) : [];
       await this.commandReply(update, notes.length
           ? `## Поиск по памяти\n\n${notes.map(renderOperatorNote).join("\n")}`
           : "Подходящих активных заметок нет.");
@@ -6710,7 +6730,7 @@ export class OperatorDaemon {
       return true;
     }
     const notes = intent.query
-      ? this.store.searchOperatorNotes(intent.query, 10)
+      ? await searchPublicOperatorNotes(this.store, intent.query, 10)
       : this.store.listOperatorNotes({ status: "active", limit: 10 });
     await this.commandReply(update, notes.length
         ? `Вот сохранённые заметки:\n\n${notes.map(renderOperatorNote).join("\n")}`
@@ -7430,6 +7450,13 @@ export class OperatorDaemon {
         } else {
           sent = await this.sendDurableRich(item, payload);
         }
+      } else if (item.operation === "dashboard_capability") {
+        if (!payload.dashboardCapability) throw new Error("Durable dashboard capability is missing");
+        sent = [await this.telegram.sendDashboardCapability(
+          item.chatId,
+          payload.dashboardCapability.url,
+          payload.options,
+        )];
       } else if (item.operation === "photo") {
         if (!payload.path) throw new Error("Durable photo has no path");
         sent = [await this.telegram.sendPhoto(item.chatId, payload.path, payload.caption, payload.options)];
@@ -7586,7 +7613,7 @@ export class OperatorDaemon {
   private enqueueTelegramOutbox(
     dedupeKey: string,
     chatId: number,
-    operation: "rich" | "photo" | "document" | "clear_keyboard" | "approval",
+    operation: "rich" | "dashboard_capability" | "photo" | "document" | "clear_keyboard" | "approval",
     payload: DurableTelegramPayload,
   ): TelegramOutboxItem<DurableTelegramPayload> {
     const safeConversation = payload.conversation

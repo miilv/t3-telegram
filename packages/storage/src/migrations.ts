@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { nowIso } from "../../shared/src/index.js";
-import { operatorNoteInputHash } from "./operator-notes.js";
+import { canonicalNoteValidUntil, operatorNoteInputHash } from "./operator-notes.js";
 
 type Row = Record<string, unknown>;
 
@@ -10,6 +10,7 @@ export function migrateOperatorNotesV2(
   transaction: <T>(work: () => T) => T,
 ): void {
   const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE version=2").get();
+  const deadlineMigration = db.prepare("SELECT 1 FROM schema_migrations WHERE version=3").get();
   const searchColumns = tableColumns(db, "operator_note_search");
   const vectorColumns = tableColumns(db, "operator_note_vectors");
   const exactSearch = ["id", "key", "description", "category", "content"]
@@ -21,10 +22,22 @@ export function migrateOperatorNotesV2(
     .every((column) => evidenceTable.has(column));
   const operationColumns = tableColumns(db, "operator_note_operations");
   const exactOperationOutcome = operationColumns.has("outcome_json");
-  if (applied && exactSearch && exactVectors && exactEvidence && exactOperationOutcome) return;
+  if (
+    applied && deadlineMigration && exactSearch && exactVectors && exactEvidence &&
+    exactOperationOutcome
+  ) return;
 
   transaction(() => {
     db.prepare("UPDATE operator_notes SET valid_until=expires_at WHERE valid_until IS NULL AND expires_at IS NOT NULL").run();
+    const deadlineUpdate = db.prepare("UPDATE operator_notes SET valid_until=? WHERE id=?");
+    const deadlines = db.prepare(`
+      SELECT id,valid_until FROM operator_notes WHERE valid_until IS NOT NULL
+    `).all() as Row[];
+    for (const deadline of deadlines) {
+      const value = String(deadline.valid_until);
+      if (!Number.isFinite(Date.parse(value))) continue;
+      deadlineUpdate.run(canonicalNoteValidUntil(value), String(deadline.id));
+    }
     db.prepare(`
       UPDATE operator_notes SET category='legacy-redacted'
       WHERE content LIKE '%[REDACTED%' AND category!='legacy-redacted'
@@ -102,6 +115,8 @@ export function migrateOperatorNotesV2(
         ON operator_note_vectors(model,dimensions,input_hash);
     `);
     db.prepare("INSERT OR REPLACE INTO schema_migrations(version,applied_at) VALUES (2,?)")
+      .run(nowIso());
+    db.prepare("INSERT OR REPLACE INTO schema_migrations(version,applied_at) VALUES (3,?)")
       .run(nowIso());
   });
 }

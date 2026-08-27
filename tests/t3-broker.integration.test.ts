@@ -14,7 +14,13 @@ import {
 } from "../packages/t3-broker/src/index.js";
 import { tempDirectory, tempStore } from "./helpers.js";
 import type { OperatorStore } from "../packages/storage/src/index.js";
-import type { SendThreadTurnInput } from "../packages/shared/src/index.js";
+import type {
+  ApprovalDecision,
+  CreateProjectInput,
+  CreateThreadInput,
+  SendThreadTurnInput,
+  UserInputDecision,
+} from "../packages/shared/src/index.js";
 
 describe("HttpT3Broker", () => {
   it("decorates arbitrary broker implementations before provider dispatch", async () => {
@@ -45,6 +51,112 @@ describe("HttpT3Broker", () => {
       sizeBytes: 19,
       sha256: "c".repeat(64),
     }]);
+  });
+
+  it("guards every prose-bearing broker input without changing operational identity", async () => {
+    const captured: Record<string, unknown> = {};
+    const inner = {
+      createProject: async (input: CreateProjectInput) => {
+        captured.createProject = input;
+        return {};
+      },
+      renameProject: async (projectId: string, name: string) => {
+        captured.renameProject = { projectId, name };
+      },
+      searchThreads: async (input: { query: string; projectId?: string; limit?: number }) => {
+        captured.searchThreads = input;
+        return [];
+      },
+      createThread: async (input: CreateThreadInput) => {
+        captured.createThread = input;
+        return {};
+      },
+      respondApproval: async (input: ApprovalDecision) => {
+        captured.respondApproval = input;
+      },
+      respondUserInput: async (input: UserInputDecision) => {
+        captured.respondUserInput = input;
+      },
+    } as unknown as import("../packages/shared/src/index.js").T3Broker;
+    const broker = privacyGuardT3Broker(inner);
+
+    await broker.createProject({
+      projectId: "prj_stable",
+      commandId: "cmd_project_stable",
+      name: "api_key=project-secret",
+      workspaceRoot: "/workspace/password=path-identity",
+      createWorkspaceRootIfMissing: true,
+    });
+    await broker.renameProject("prj_stable", "token=rename-secret");
+    await broker.searchThreads({
+      query: "password=search-secret",
+      projectId: "prj_stable",
+      limit: 7,
+    });
+    await broker.createThread({
+      threadId: "th_stable",
+      commandId: "cmd_thread_stable",
+      projectId: "prj_stable",
+      title: "token=title-secret",
+      providerInstanceId: "provider-stable",
+      model: "model-stable",
+      modelOptions: [{ id: "effort", value: "api_key=operational-option" }],
+    });
+    await broker.respondApproval({
+      threadId: "th_stable",
+      approvalId: "approval_stable",
+      commandId: "cmd_approval_stable",
+      decision: "decline",
+      reason: "password=approval-secret",
+      timeoutMs: 321,
+    });
+    await broker.respondUserInput({
+      threadId: "th_stable",
+      requestId: "request_stable",
+      commandId: "cmd_input_stable",
+      answers: {
+        single: "token=answer-secret",
+        multiple: ["api_key=first-secret", "safe answer"],
+      },
+    });
+
+    expect(captured).toEqual({
+      createProject: {
+        projectId: "prj_stable",
+        commandId: "cmd_project_stable",
+        name: "api_key=[REDACTED]",
+        workspaceRoot: "/workspace/password=path-identity",
+        createWorkspaceRootIfMissing: true,
+      },
+      renameProject: { projectId: "prj_stable", name: "token=[REDACTED]" },
+      searchThreads: { query: "password=[REDACTED]", projectId: "prj_stable", limit: 7 },
+      createThread: {
+        threadId: "th_stable",
+        commandId: "cmd_thread_stable",
+        projectId: "prj_stable",
+        title: "token=[REDACTED]",
+        providerInstanceId: "provider-stable",
+        model: "model-stable",
+        modelOptions: [{ id: "effort", value: "api_key=operational-option" }],
+      },
+      respondApproval: {
+        threadId: "th_stable",
+        approvalId: "approval_stable",
+        commandId: "cmd_approval_stable",
+        decision: "decline",
+        reason: "password=[REDACTED]",
+        timeoutMs: 321,
+      },
+      respondUserInput: {
+        threadId: "th_stable",
+        requestId: "request_stable",
+        commandId: "cmd_input_stable",
+        answers: {
+          single: "token=[REDACTED]",
+          multiple: ["api_key=[REDACTED]", "safe answer"],
+        },
+      },
+    });
   });
 
   let fixture: T3Fixture;

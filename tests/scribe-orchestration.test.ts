@@ -407,6 +407,47 @@ describe("TTL transfers (memory-design §2.2, §5)", () => {
 // ---------------------------------------------------------------------------
 
 describe("the monthly rollup (memory-design §2.4)", () => {
+  it("selects stale verification facts by instant across RFC3339 offsets", async () => {
+    const store = tempStore();
+    for (const input of [
+      {
+        key: "offset-stale",
+        content: "Positive-offset fact is stale",
+        validUntil: "2026-08-26T08:00:00+10:00",
+      },
+      {
+        key: "offset-fresh",
+        content: "Negative-offset fact is fresh",
+        validUntil: "2026-08-25T20:00:00-05:00",
+      },
+      {
+        key: "offset-equal",
+        content: "Equality-boundary fact is fresh",
+        validUntil: "2026-08-26T10:00:00+10:00",
+      },
+    ]) {
+      store.notes.writeVersion({
+        ...input,
+        category: "people",
+        description: `when ${input.key} matters → verify it`,
+        source: "manual",
+        operationKey: `seed:${input.key}`,
+      });
+    }
+    const turns: Array<{ prompt: string }> = [];
+    const outcome = await new NightScribe({
+      ...baseDeps(store, []),
+      requestOwnerTurn: (input) => { turns.push(input); return true; },
+      now: () => NIGHT,
+    }).run({ force: true });
+
+    expect(outcome.reasons).toContain("stale-facts:1");
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.prompt).toContain("Positive-offset fact is stale");
+    expect(turns[0]!.prompt).not.toContain("Negative-offset fact is fresh");
+    expect(turns[0]!.prompt).not.toContain("Equality-boundary fact is fresh");
+  });
+
   it("asks one bounded owner question about stale valid-until facts without retiring them", async () => {
     const store = tempStore();
     const stale = store.notes.writeVersion({

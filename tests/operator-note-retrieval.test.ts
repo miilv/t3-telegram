@@ -33,6 +33,49 @@ function write(store: ReturnType<typeof tempStore>, key: string, model: string, 
 }
 
 describe("embedded note retrieval", () => {
+  it("retrieves the oldest selected-model vector beyond 2000 active notes", async () => {
+    const store = tempStore();
+    const insertNote = store.db.prepare(`
+      INSERT INTO operator_notes(
+        id,key,category,content,status,source,description,input_hash,created_at,updated_at
+      ) VALUES (?,?,'people',?,'active','manual',?,?,?,?)
+    `);
+    const insertVector = store.db.prepare(`
+      INSERT INTO operator_note_vectors(note_id,model,dimensions,input_hash,vector_json,updated_at)
+      VALUES (?,? ,2,?,?,?)
+    `);
+    store.db.exec("BEGIN");
+    try {
+      for (let index = 0; index < 2_001; index += 1) {
+        const id = `complete-retrieval-${String(index).padStart(4, "0")}`;
+        const key = index === 0 ? "oldest-selected-match" : `newer-selected-${index}`;
+        const hash = `complete-retrieval-hash-${index}`;
+        const updatedAt = index === 0
+          ? "2020-01-01T00:00:00.000Z"
+          : "2026-08-27T00:00:00.000Z";
+        insertNote.run(id, key, `${key} fact`, `when ${key} matters → read it`, hash, updatedAt, updatedAt);
+        insertVector.run(
+          id,
+          "selected-test-model",
+          hash,
+          index === 0 ? "[1,0]" : "[0,1]",
+          updatedAt,
+        );
+      }
+      store.db.exec("COMMIT");
+    } catch (error) {
+      store.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    await expect(store.searchOperatorNotesEmbedded("unrelated words", async () => ({
+      model: "selected-test-model",
+      dimensions: 2,
+      values: [1, 0],
+    }), 1)).resolves.toMatchObject([{ key: "oldest-selected-match" }]);
+    store.close();
+  });
+
   it("ranks MiniLM vectors with the matching async query embedding", async () => {
     const store = tempStore();
     write(store, "nearest", MINILM_NOTE_EMBEDDING_MODEL, unit(1, 0));

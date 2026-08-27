@@ -4,6 +4,7 @@ import { join } from "node:path";
 import pino from "pino";
 import { describe, expect, it } from "vitest";
 import { ArtifactRegistry } from "../packages/artifacts/src/index.js";
+import { currentMemoryNotesForPush } from "../apps/daemon/src/operator-memory-index.js";
 import { createAutomation } from "../packages/automations/src/index.js";
 import {
   GoogleWorkspaceHttpError,
@@ -31,6 +32,60 @@ import type {
 import { tempDirectory, tempStore } from "./helpers.js";
 
 describe("OperatorToolServer", () => {
+  it("preserves an artifact's operational path and hash while redacting its display name", async () => {
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(
+      `${tempDirectory("operator-tools-api_key=path-identity-")}/artifacts`,
+      store,
+    );
+    await artifacts.initialize();
+    const artifact = await artifacts.ingestTelegram({
+      bytes: Buffer.from("byte-sensitive artifact"),
+      filename: "token=display-secret.bin",
+      mimeType: "application/octet-stream",
+      telegramFileId: "artifact_identity",
+      chatId: 777,
+      messageId: 91,
+    });
+    const server = new OperatorToolServer({
+      broker: { health: async () => ({ healthy: true }) } as unknown as T3Broker,
+      store,
+      telegram: new ToolTelegram() as unknown as TelegramTransport,
+      artifacts,
+      logger: pino({ enabled: false }),
+    });
+    await server.start();
+    const lease = server.issue({
+      chatId: 777,
+      ownerId: "42",
+      teamRole: "owner",
+      originMessageId: 91,
+      operatorTurnId: "opturn_artifact_identity",
+      allowedArtifactIds: [artifact.id],
+    });
+    const client = new Client({ name: "artifact-identity-test", version: "1.0.0" });
+    try {
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(lease.access.url), {
+          requestInit: { headers: { Authorization: `Bearer ${lease.access.token}` } },
+        }),
+      );
+      const resolved = await callJson(client, "artifacts.resolve", {
+        artifactId: artifact.id,
+      }) as Record<string, unknown>;
+
+      expect(resolved.localPath).toBe(artifact.localPath);
+      expect(resolved.id).toBe(artifact.id);
+      expect(resolved.sha256).toBe(artifact.sha256);
+      expect(resolved.filename).not.toContain("display-secret");
+    } finally {
+      lease.revoke();
+      await client.close().catch(() => undefined);
+      await server.stop();
+      store.close();
+    }
+  });
+
   it("serves the complete compact tool surface under a revocable turn capability", async () => {
     const store = tempStore();
     const artifacts = new ArtifactRegistry(`${tempDirectory("operator-tools-")}/artifacts`, store);
@@ -327,6 +382,18 @@ describe("OperatorToolServer", () => {
           content: "Use MCP capabilities authorization=[REDACTED]",
         },
       });
+      expect(store.getOperatorNote(noteWritten.id)?.accessCount).toBe(2);
+      const untouched = store.rememberOperatorNote({
+        category: "decision",
+        content: "A competing note that was never publicly retrieved",
+        source: "manual",
+      });
+      store.db.prepare("UPDATE operator_notes SET updated_at=? WHERE id IN (?,?)")
+        .run("2026-08-21T09:10:11.000Z", noteWritten.id, untouched.id);
+      const ranked = currentMemoryNotesForPush(store, new Date("2026-08-21T09:10:11.000Z"));
+      expect(ranked.index.findIndex((note) => note.id === noteWritten.id))
+        .toBeLessThan(ranked.index.findIndex((note) => note.id === untouched.id));
+      expect(store.getOperatorNote(noteWritten.id)?.accessCount).toBe(2);
       const staleWrite = await callJson(client, "memory.remember", {
         key: "warehouse-owner",
         description: "when warehouse ownership matters → read this fact",
@@ -346,6 +413,21 @@ describe("OperatorToolServer", () => {
       expect(await callJson(client, "memory.search", { query: "warehouse owner" })).toMatchObject({
         notes: [{ status: "active", warning: expect.stringContaining("treat as hypothesis") }],
       });
+      const secretShapedKey = "sk-abcdefghijklmnop";
+      expect(await callJson(client, "memory.remember", {
+        key: secretShapedKey,
+        description: "when stable operational keys matter → read the exact key fact",
+        category: "people",
+        content: "The operational key stays exact",
+      })).toMatchObject({
+        write: { note: { key: secretShapedKey } },
+      });
+      expect(await callJson(client, "memory.get", { key: secretShapedKey })).toMatchObject({
+        note: { key: secretShapedKey },
+      });
+      expect(await callJson(client, "memory.search", { query: "operational key exact" })).toMatchObject({
+        notes: expect.arrayContaining([expect.objectContaining({ key: secretShapedKey })]),
+      });
       await callJson(client, "journal.note", {
         day: "2026-08-21",
         done: "Deployed release authorization=journal-output-secret",
@@ -364,6 +446,7 @@ describe("OperatorToolServer", () => {
       };
       expect(missing.ok).toBe(false);
       expect(missing.hint).toContain("memory.search");
+      expect(store.getOperatorNote(noteWritten.id)?.accessCount).toBe(2);
 
       store.appendEvent("worker.completed", { threadId: thread.id, payload: { status: "completed" } });
       store.appendEvent("automation.dispatched", { payload: { automationId: "auto_brief" } });

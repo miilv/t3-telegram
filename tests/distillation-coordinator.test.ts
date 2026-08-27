@@ -373,7 +373,7 @@ describe("ledger-driven conversation distillation", () => {
         model: MINILM_NOTE_EMBEDDING_MODEL,
         dimensions: NOTE_EMBEDDING_DIMENSIONS,
         inputHash: operatorNoteInputHash(input),
-        values: unit(input.key === "warehouse-contact" ? 0.90 : 0.75),
+        values: unit(input.key === "sk-abcdefghijklmnop" ? 0.90 : 0.75),
       }),
     });
     Object.defineProperty(store, "noteWriter", { value: writer });
@@ -381,7 +381,7 @@ describe("ledger-driven conversation distillation", () => {
       store,
       oneShot: async () => JSON.stringify([
         {
-          key: "warehouse-contact",
+          key: "sk-abcdefghijklmnop",
           description: "when warehouse contact matters → read the owner fact",
           content: "Ira is the warehouse contact",
           category: "people",
@@ -406,11 +406,11 @@ describe("ledger-driven conversation distillation", () => {
       crossLinks: 1,
     });
     expect(store.distillationProposals.listPending()).toMatchObject([{
-      candidateKey: "warehouse-contact",
+      candidateKey: "sk-abcdefghijklmnop",
       matchingNote: { key: "warehouse-owner" },
       reason: "semantic",
     }]);
-    expect(store.notes.getActive("warehouse-contact")).toBeUndefined();
+    expect(store.notes.getActive("sk-abcdefghijklmnop")).toBeUndefined();
     expect(store.notes.getActive("warehouse-invoices")?.content).toBe("Lee handles warehouse invoices");
     store.close();
   });

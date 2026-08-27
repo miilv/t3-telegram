@@ -908,6 +908,10 @@ export {
   SECRET_FIELD_NAMES,
   SECRET_REDACTION_PATHS,
 } from "./redaction.js";
+export {
+  isLoopbackDashboardCapability,
+  type LoopbackDashboardCapability,
+} from "./dashboard-capability.js";
 
 export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;

@@ -1,7 +1,11 @@
 import type { DatabaseSync } from "node:sqlite";
+import {
+  normalizeOperatorNoteKey,
+  OPERATOR_NOTE_KEY_CHARS,
+} from "../../policy/src/operator-notes.js";
 import type { OperatorNote } from "../../shared/src/index.js";
 import { maskSecretsForStorage, newId, nowIso } from "../../shared/src/index.js";
-import { rowToOperatorNote } from "./operator-notes.js";
+import { canonicalNoteValidUntil, rowToOperatorNote } from "./operator-notes.js";
 
 type Row = Record<string, unknown>;
 
@@ -126,9 +130,15 @@ function validateInput(input: DistillationMergeProposalInput): DistillationMerge
 } {
   const replayKey = input.replayKey.trim();
   const ownerId = input.ownerId.trim();
-  const candidateKey = maskSecretsForStorage(input.candidateKey).trim();
+  const candidateKey = normalizeOperatorNoteKey(input.candidateKey);
   const evidenceSeqs = [...input.evidenceSeqs];
-  if (!replayKey || !ownerId || !candidateKey || !input.matchingNoteId.trim()) {
+  if (
+    !replayKey ||
+    !ownerId ||
+    !candidateKey ||
+    [...candidateKey].length > OPERATOR_NOTE_KEY_CHARS ||
+    !input.matchingNoteId.trim()
+  ) {
     throw new Error("merge proposal identity fields cannot be empty");
   }
   if (!evidenceSeqs.length || evidenceSeqs.some((seq) => !Number.isSafeInteger(seq) || seq < 1)) {
@@ -148,6 +158,7 @@ function validateInput(input: DistillationMergeProposalInput): DistillationMerge
     description: maskSecretsForStorage(input.description),
     content: maskSecretsForStorage(input.content),
     category: maskSecretsForStorage(input.category),
+    validUntil: input.validUntil ? canonicalNoteValidUntil(input.validUntil) : null,
     evidenceSeqs: evidenceSeqs.sort((left, right) => left - right),
   };
 }

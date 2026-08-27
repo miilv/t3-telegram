@@ -29,6 +29,50 @@ function writeInput(operationKey: string, patch: Partial<{
 }
 
 describe("OperatorNoteRepository version transactions", () => {
+  it("canonicalizes offset valid-until values and selects stale notes by instant", async () => {
+    const store = tempStore();
+    const common = {
+      category: "people",
+      description: "when validity matters → inspect the canonical deadline",
+      content: "deadline-sensitive owner fact",
+      source: "manual" as const,
+    };
+    const stale = await store.rememberKeyedOperatorNote({
+      ...common,
+      key: "offset-stale",
+      validUntil: "2026-08-27T20:00:00+10:00",
+    });
+    const fresh = await store.rememberKeyedOperatorNote({
+      ...common,
+      key: "offset-fresh",
+      validUntil: "2026-08-27T10:00:00-05:00",
+    });
+    const equal = await store.rememberKeyedOperatorNote({
+      ...common,
+      key: "offset-equal",
+      validUntil: "2026-08-28T00:00:00+10:00",
+    });
+
+    expect(stale).toMatchObject({
+      ok: true,
+      kind: "written",
+      write: { note: { validUntil: "2026-08-27T10:00:00.000Z" } },
+    });
+    expect(fresh).toMatchObject({
+      ok: true,
+      kind: "written",
+      write: { note: { validUntil: "2026-08-27T15:00:00.000Z" } },
+    });
+    expect(equal).toMatchObject({
+      ok: true,
+      kind: "written",
+      write: { note: { validUntil: "2026-08-27T14:00:00.000Z" } },
+    });
+    expect(store.notes.listStale("2026-08-27T14:00:00.000Z").map((note) => note.key))
+      .toEqual(["offset-stale"]);
+    store.close();
+  });
+
   it("supersedes one key atomically and keeps every public read active-only", () => {
     const store = tempStore();
     const first = store.notes.writeVersion(writeInput("job:a:0"));

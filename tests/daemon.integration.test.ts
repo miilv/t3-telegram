@@ -41,7 +41,15 @@ import type {
 } from "../packages/shared/src/index.js";
 import { APPROVAL_RISK_RU, nowIso } from "../packages/shared/src/index.js";
 import { DailyScheduler } from "../packages/scheduler/src/index.js";
-import { OperatorStore } from "../packages/storage/src/index.js";
+import {
+  HASH_NOTE_EMBEDDING_MODEL,
+  LocalNoteEmbeddingService,
+  MINILM_NOTE_EMBEDDING_MODEL,
+  NOTE_EMBEDDING_DIMENSIONS,
+  OperatorStore,
+  operatorNoteInputHash,
+} from "../packages/storage/src/index.js";
+import { DashboardServer } from "../packages/dashboard/src/index.js";
 import type {
   SentMessage,
   InboundMessageSignal,
@@ -3817,6 +3825,91 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("uses selected-model and offline-fallback vectors for command and natural memory search", async () => {
+    const home = tempDirectory("daemon-embedded-memory-");
+    const store = tempStore();
+    const exact = [1, ...new Array(NOTE_EMBEDDING_DIMENSIONS - 1).fill(0)];
+    const selectedService = new LocalNoteEmbeddingService({
+      loadRuntime: async () => ({
+        env: { allowRemoteModels: true, allowLocalModels: false },
+        pipeline: async () => async () => ({ data: Float32Array.from(exact) }),
+      }),
+    });
+    Object.defineProperty(store, "noteEmbeddings", { value: selectedService });
+    const selectedInput = {
+      key: "selected-vector-note",
+      description: "when selected vectors are queried → read the MiniLM fact",
+      category: "people",
+      content: "MiniLM finds this vector-only memory",
+    };
+    const selected = store.notes.writeVersion({
+      ...selectedInput,
+      source: "manual",
+      operationKey: "seed:selected-vector-note",
+      vectors: [{
+        model: MINILM_NOTE_EMBEDDING_MODEL,
+        dimensions: NOTE_EMBEDDING_DIMENSIONS,
+        inputHash: operatorNoteInputHash(selectedInput),
+        values: exact,
+      }],
+    }).note;
+
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /implement/u }));
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+    store.db.prepare("DELETE FROM operator_note_search").run();
+
+    telegram.push(message(70, "/memory search selected-vector-query"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("MiniLM finds this")));
+    expect(store.getOperatorNote(selected.id)?.accessCount).toBe(1);
+
+    const fallbackService = new LocalNoteEmbeddingService({
+      loadRuntime: async () => {
+        throw new Error("local model root is missing");
+      },
+    });
+    const fallbackInput = {
+      key: "fallback-vector-note",
+      description: "when fallback vectors are queried → read the offline fact",
+      category: "people",
+      content: "Fallback finds this vector-only memory",
+    };
+    const fallbackQuery = await fallbackService.embedQuery("fallback-vector-query");
+    expect(fallbackQuery.model).toBe(HASH_NOTE_EMBEDDING_MODEL);
+    Object.defineProperty(store, "noteEmbeddings", { value: fallbackService });
+    const fallback = store.notes.writeVersion({
+      ...fallbackInput,
+      source: "manual",
+      operationKey: "seed:fallback-vector-note",
+      vectors: [{ ...fallbackQuery, inputHash: operatorNoteInputHash(fallbackInput) }],
+    }).note;
+    store.db.prepare("DELETE FROM operator_note_search").run();
+
+    telegram.push(message(71, "что ты помнишь про fallback-vector-query?"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("Fallback finds this")));
+    expect(store.getOperatorNote(fallback.id)?.accessCount).toBe(1);
+    expect(broker.turns).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("fans a separable task out to three independent monitored workers", async () => {
     const home = tempDirectory("daemon-fanout-");
     const store = tempStore();
@@ -7187,6 +7280,98 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("delivers the dashboard capability through its typed durable path and never leaks it elsewhere", async () => {
+    const home = tempDirectory("daemon-dashboard-capability-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /implement/u }));
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    telegram.dashboardCapabilityFailures = 1;
+    const logLines: string[] = [];
+    const logger = pino({ level: "trace" }, { write: (line: string) => logLines.push(line) });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const dashboard = new DashboardServer({
+      store,
+      logger,
+      getPolicy: () => daemon.getPolicy(),
+      updatePolicy: () => daemon.getPolicy(),
+      health: async () => ({ telegram: true, t3: true, operator: true, database: true }),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(
+      config(home),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+      undefined,
+      dashboard,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    const dashboardUpdate = message(40, "/dashboard");
+    const link = dashboard.link()!;
+    const token = new URLSearchParams(new URL(link).hash.slice(1)).get("token")!;
+
+    telegram.push(dashboardUpdate);
+    await waitFor(() => telegram.dashboardCapabilities.length === 1, 8_000);
+    expect(telegram.dashboardCapabilities).toEqual([{ chatId: 7, url: link }]);
+    expect(telegram.sent.some((entry) => entry.text.includes(token))).toBe(false);
+
+    const capabilityRows = store.db.prepare(`
+      SELECT operation,payload_json,status,attempts FROM telegram_outbox
+      WHERE operation='dashboard_capability'
+    `).all() as Array<{ operation: string; payload_json: string; status: string; attempts: number }>;
+    expect(capabilityRows).toHaveLength(1);
+    expect(capabilityRows[0]).toMatchObject({ status: "delivered", attempts: 1 });
+    expect(JSON.parse(capabilityRows[0]!.payload_json)).toMatchObject({
+      dashboardCapability: { kind: "loopback-dashboard", url: link },
+      messageType: "dashboard_capability",
+    });
+
+    const url = new URL(link);
+    url.hash = "";
+    const stateResponse = await fetch(new URL("/api/state", url), {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(stateResponse.status).toBe(200);
+
+    // Reprocessing the same durable ingress cannot enqueue or deliver another
+    // copy: the capability operation is keyed by the stable update identity.
+    store.enqueueBackgroundJob(
+      "telegram_ingress",
+      { update: dashboardUpdate, processExisting: true },
+      undefined,
+      { id: "replayed-dashboard-command", dedupeKey: "replayed-dashboard-command" },
+    );
+    telegram.push(message(41, "/status"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.includes("## Работа")), 5_000);
+    expect(telegram.dashboardCapabilities).toHaveLength(1);
+
+    const durableEvents = store.db
+      .prepare("SELECT payload_json FROM daemon_events")
+      .all() as Array<{ payload_json: string }>;
+    expect(JSON.stringify(durableEvents)).not.toContain(token);
+    expect(logLines.join("\n")).not.toContain(token);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
   it("never resurrects the pre-tool preamble in the final answer (bug №40)", async () => {
     const home = tempDirectory("daemon-preamble-");
     const store = tempStore();
@@ -7758,6 +7943,9 @@ describe("OperatorDaemon product flow", () => {
       "bulk_ingest_ack",
       "compaction_notice",
       "daemon_restart_notice",
+      // Owner/admin command plumbing: the typed capability contains no work
+      // prose and is deliberately excluded from the Operator's single voice.
+      "dashboard_capability",
       "delivery_failed",
       "ingress_failed",
       "interaction_keyboard_cleared",
@@ -10817,6 +11005,8 @@ class FakeTelegram implements TelegramTransport {
   private readonly queue = new AsyncInputQueue<TelegramInbound>();
   private nextMessageId = 100;
   private inboundObserver: ((message: InboundMessageSignal) => void) | undefined;
+  readonly dashboardCapabilities: Array<{ chatId: number; url: string }> = [];
+  dashboardCapabilityFailures = 0;
 
   setInboundObserver(observer: (message: InboundMessageSignal) => void): void {
     this.inboundObserver = observer;
@@ -10857,6 +11047,25 @@ class FakeTelegram implements TelegramTransport {
     this.visible.push({ kind: "message", at });
     this.sent.push({ messageId, text, at });
     return [{ chatId: 7, messageId }];
+  }
+  async sendDashboardCapability(chatId: number, url: string): Promise<SentMessage> {
+    if (this.dashboardCapabilityFailures > 0) {
+      this.dashboardCapabilityFailures -= 1;
+      throw new GrammyError(
+        "Call to method failed",
+        {
+          ok: false,
+          error_code: 429,
+          description: "Too Many Requests: retry later",
+          parameters: { retry_after: 0 },
+        },
+        "sendMessage",
+        {},
+      );
+    }
+    const messageId = this.nextMessageId++;
+    this.dashboardCapabilities.push({ chatId, url });
+    return { chatId, messageId };
   }
   readonly alerts: Array<{ chatId: number; text: string; options: TelegramDestination }> = [];
   /** When true every alert attempt is recorded but reports itself as undelivered. */

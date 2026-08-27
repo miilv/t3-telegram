@@ -63,7 +63,13 @@ export class OperatorNoteRepository {
     private readonly transaction: <T>(work: () => T) => T,
   ) {}
 
-  writeVersion(input: OperatorNoteVersionInput): OperatorNoteWriteResult {
+  writeVersion(rawInput: OperatorNoteVersionInput): OperatorNoteWriteResult {
+    const input: OperatorNoteVersionInput = {
+      ...rawInput,
+      ...(rawInput.validUntil
+        ? { validUntil: canonicalNoteValidUntil(rawInput.validUntil) }
+        : {}),
+    };
     const evidence = validateNoteEvidence(input);
     return this.transaction(() => {
       const replay = this.db
@@ -250,7 +256,7 @@ export class OperatorNoteRepository {
     return rows.map(rowToOperatorNote);
   }
 
-  comparableVectors(model: string, dimensions: number, limit = 500): StoredNoteVector[] {
+  comparableVectors(model: string, dimensions: number): StoredNoteVector[] {
     const rows = this.db
       .prepare(`
         SELECT n.*,v.model AS vector_model,v.dimensions AS vector_dimensions,
@@ -259,9 +265,9 @@ export class OperatorNoteRepository {
         JOIN operator_notes n ON n.id=v.note_id
         WHERE n.status='active' AND v.model=? AND v.dimensions=?
           AND v.input_hash=n.input_hash
-        ORDER BY n.updated_at DESC,n.id LIMIT ?
+        ORDER BY n.updated_at DESC,n.id
       `)
-      .all(model, dimensions, bounded(limit, 1, 2_000)) as Row[];
+      .all(model, dimensions) as Row[];
     const vectors: StoredNoteVector[] = [];
     for (const row of rows) {
       const values = parseVector(row.vector_json, dimensions);
@@ -404,8 +410,9 @@ export class OperatorNoteRepository {
     const rows = this.db
       .prepare(`
         SELECT * FROM operator_notes
-        WHERE status='active' AND valid_until IS NOT NULL AND valid_until<?
-        ORDER BY valid_until DESC,id LIMIT ?
+        WHERE status='active' AND valid_until IS NOT NULL
+          AND julianday(valid_until)<julianday(?)
+        ORDER BY julianday(valid_until) DESC,id LIMIT ?
       `)
       .all(at, bounded(limit, 1, 200)) as Row[];
     return rows.map(rowToOperatorNote);
@@ -507,6 +514,12 @@ export function rowToOperatorNote(row: Row): OperatorNote {
     ...(row.access_count !== undefined ? { accessCount: Number(row.access_count) || 0 } : {}),
     ...(row.last_accessed_at ? { lastAccessedAt: String(row.last_accessed_at) } : {}),
   };
+}
+
+export function canonicalNoteValidUntil(value: string): string {
+  const epoch = Date.parse(value);
+  if (!Number.isFinite(epoch)) throw new Error("operator note validUntil is invalid");
+  return new Date(epoch).toISOString();
 }
 
 function samePayload(row: Row, input: OperatorNoteVersionInput): boolean {

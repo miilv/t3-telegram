@@ -74,8 +74,11 @@ describe("operator notes v2 migration", () => {
       CREATE TABLE operator_note_operations(
         operation_key TEXT PRIMARY KEY,note_id TEXT NOT NULL,created_at TEXT NOT NULL
       );
-      INSERT INTO operator_notes(id,category,content,status,source,created_at,updated_at)
-        VALUES ('legacy-1','general','legacy note','active','manual','2026-01-01','2026-01-01');
+      INSERT INTO operator_notes(id,category,content,status,source,valid_until,created_at,updated_at)
+        VALUES (
+          'legacy-1','general','legacy note','active','manual','2026-08-27T20:00:00+10:00',
+          '2026-01-01','2026-01-01'
+        );
       INSERT INTO operator_note_operations(operation_key,note_id,created_at)
         VALUES ('legacy-operation','legacy-1','2026-01-01');
     `);
@@ -89,6 +92,8 @@ describe("operator notes v2 migration", () => {
     migrateOperatorNotesV2(db, transaction);
 
     expect(db.prepare("SELECT content FROM operator_notes WHERE id='legacy-1'").get()).toMatchObject({ content: "legacy note" });
+    expect(db.prepare("SELECT valid_until FROM operator_notes WHERE id='legacy-1'").get())
+      .toMatchObject({ valid_until: "2026-08-27T10:00:00.000Z" });
     expect(db.prepare("SELECT operation_key,outcome_json FROM operator_note_operations").all())
       .toEqual([{ operation_key: "legacy-operation", outcome_json: null }]);
     expect((db.prepare("PRAGMA table_info(operator_note_operations)").all() as Array<{ name: string }>)

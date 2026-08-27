@@ -10,6 +10,7 @@ import {
 } from "./note-embeddings.js";
 import {
   OperatorNoteRepository,
+  canonicalNoteValidUntil,
   type OperatorNoteWriterOutcome,
   type OperatorNoteWriteResult,
 } from "./operator-notes.js";
@@ -71,7 +72,9 @@ export function automaticOperatorNoteOperationKey(
         content: validated.content,
         source: protectedDraft.source,
         verifiedAt: protectedDraft.verifiedAt ?? "",
-        validUntil: protectedDraft.validUntil ?? "",
+        validUntil: protectedDraft.validUntil
+          ? canonicalNoteValidUntil(protectedDraft.validUntil)
+          : "",
       }
     : protectedDraft;
   return `manual:${createHash("sha256").update(JSON.stringify(payload)).digest("hex")}`;
@@ -188,7 +191,6 @@ function protectNoteText<T extends {
 }>(draft: T): T {
   return {
     ...draft,
-    key: maskSecretsForStorage(draft.key),
     description: maskSecretsForStorage(draft.description),
     content: maskSecretsForStorage(draft.content),
     ...(draft.category === undefined

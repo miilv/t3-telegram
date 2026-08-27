@@ -313,6 +313,8 @@ export interface TelegramTransport {
     options?: TelegramSendOptions,
     progress?: TelegramSendProgress,
   ): Promise<SentMessage[]>;
+  /** Delivers the one intentional secret-bearing link without generic prose redaction. */
+  sendDashboardCapability(chatId: number, url: string, options?: TelegramDestination): Promise<SentMessage>;
   /**
    * Best-effort out-of-band notice: one attempt, no per-chat lock and no
    * inline flood wait, resolving to `undefined` when it does not get through.

@@ -248,7 +248,9 @@ CREATE UNIQUE INDEX operator_notes_key ON operator_notes(key)
   версии — агент запоминает тип своей ошибки, не только факт.
 - **valid_until**: просроченный факт в выдаче поиска и в `memory.get`
   помечается `[not verified since <date> — treat as hypothesis]`; секретарь
-  раз в месяц собирает просроченные в один вопрос владельцу.
+  раз в месяц собирает просроченные в один вопрос владельцу. Принятый RFC 3339
+  instant канонизируется в UTC на каждой записи/миграции; stale-сравнение и
+  порядок делаются по instant, а не лексически по строке с offset.
 - **Индекс-карта в push**: только `description → key` активных заметок,
   ранжирование полного active-набора по recency+usage до применения бюджета,
   бюджет 3000 символов, хвост —
@@ -271,6 +273,11 @@ CREATE UNIQUE INDEX operator_notes_key ON operator_notes(key)
   без редакции — закрыть). Легаси-заметки, уже искалеченные старой редакцией,
   помечаются поиском `[REDACTED` → категория `legacy-redacted` (verified_at
   недостаточно — после ALTER он NULL у всех).
+- **Операционные идентификаторы не являются прозой.** Нормализованный key
+  валидируется до записи и затем остаётся byte-stable в embedding, replay,
+  proposal, evidence и самой заметке; маскирование применяется только к
+  description/content/category. Аналогично typed-результаты сохраняют пути,
+  id и hashes, редактируя только видимые имена и пояснения.
 
 ### 2.4 Журнал
 
@@ -331,8 +338,8 @@ kind, thread_ref, origin_job, create_seq, created_at)`** — нарратив; �
 - Анти-луп: дистиллятор не читает свои заметки как вход, только переписку.
 - Заметка/предложение и её evidence-sequences фиксируются до cursor CAS.
   Stable replay key включает только неизменяемые факты операции: consumer,
-  owner, начало страницы, нормализованный key и evidence sequences (не
-  run-wide high-water); поэтому append между крэшем и replay не меняет identity,
+  owner, нормализованный key и evidence sequences (ни границы страницы, ни
+  run-wide high-water); поэтому append/repagination между крэшем и replay не меняет identity,
   не дублирует версию/предложение,
   а проигранный CAS не затирает чужой прогресс.
 - **Судьба `maintainStructuredMemory`**: упраздняется как отдельный механизм;
@@ -341,7 +348,12 @@ kind, thread_ref, origin_job, create_seq, created_at)`** — нарратив; �
 
 ### 2.6 Ретрив
 
-FTS5 + гибридный скоринг остаются. Замена `localMemoryVector` (хеш-триграммы
+FTS5 + гибридный скоринг остаются. Совместимые active-вектора выбранной
+model/dimension/input-hash группы рассматриваются полностью: newest-500/2000
+не являются скрытой границей ни дедупа, ни retrieval. Display limit применяется
+только после ранжирования. Публичный успешный `memory.get`/search увеличивает
+usage один раз на возвращённую заметку за invocation; miss и внутренние
+push/list/distillation scans usage не меняют. Замена `localMemoryVector` (хеш-триграммы
 128d) на локальную ONNX `paraphrase-multilingual-MiniLM-L12-v2` (384d) — с
 фолбэком на хеш при недоступности рантайма/весов. Веса лежат в заданном
 оператором `NOTE_EMBEDDING_MODEL_ROOT`; Transformers.js получает

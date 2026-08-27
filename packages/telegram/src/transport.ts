@@ -4,7 +4,10 @@ import { createHash } from "node:crypto";
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Logger } from "pino";
 import { metrics } from "../../observability/src/index.js";
-import { redactSecretsForOutput } from "../../shared/src/index.js";
+import {
+  isLoopbackDashboardCapability,
+  redactSecretsForOutput,
+} from "../../shared/src/index.js";
 import { AsyncInputQueue, delay, TelegramOutboundQueue } from "./queues.js";
 import {
   markdownToTelegramHtml,
@@ -367,6 +370,25 @@ export class TelegramBotTransport implements TelegramTransport {
       progress?.onChunkSent?.(index + 1, chunkSent);
     }
     return sent;
+  }
+
+  async sendDashboardCapability(
+    chatId: number,
+    url: string,
+    options: TelegramDestination = {},
+  ): Promise<SentMessage> {
+    if (!isLoopbackDashboardCapability({ kind: "loopback-dashboard", url })) {
+      throw new Error("invalid loopback dashboard capability");
+    }
+    const message = await this.outbound(chatId, () => this.bot.api.sendMessage(
+      chatId,
+      `Локальная панель: ${url}\n\nСсылка работает только на машине демона и содержит временный ключ доступа.`,
+      {
+        ...destinationOptions(options),
+        link_preview_options: { is_disabled: true },
+      },
+    ));
+    return sentMessage(chatId, message.message_id, options);
   }
 
   /**

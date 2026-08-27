@@ -35,21 +35,57 @@ export type {
 export function privacyGuardT3Broker(broker: T3Broker): T3Broker {
   return new Proxy(broker, {
     get(target, property) {
-      if (property === "sendTurn") {
-        return (input: SendThreadTurnInput) => target.sendTurn({
-          ...input,
-          text: redactSecretsForOutput(input.text),
-          ...(input.artifacts
-            ? {
-                artifacts: input.artifacts.map((artifact) => ({
-                  ...artifact,
-                  ...(artifact.filename !== undefined
-                    ? { filename: redactSecretsForOutput(artifact.filename) }
-                    : {}),
-                })),
-              }
-            : {}),
-        });
+      switch (property) {
+        case "createProject":
+          return (input: CreateProjectInput) => target.createProject({
+            ...input,
+            name: redactSecretsForOutput(input.name),
+          });
+        case "renameProject":
+          return (projectId: string, name: string) =>
+            target.renameProject(projectId, redactSecretsForOutput(name));
+        case "searchThreads":
+          return (input: { query: string; projectId?: string; limit?: number }) =>
+            target.searchThreads({ ...input, query: redactSecretsForOutput(input.query) });
+        case "createThread":
+          return (input: CreateThreadInput) => target.createThread({
+            ...input,
+            title: redactSecretsForOutput(input.title),
+          });
+        case "sendTurn":
+          return (input: SendThreadTurnInput) => target.sendTurn({
+            ...input,
+            text: redactSecretsForOutput(input.text),
+            ...(input.artifacts
+              ? {
+                  artifacts: input.artifacts.map((artifact) => ({
+                    ...artifact,
+                    ...(artifact.filename !== undefined
+                      ? { filename: redactSecretsForOutput(artifact.filename) }
+                      : {}),
+                  })),
+                }
+              : {}),
+          });
+        case "respondApproval":
+          return (input: ApprovalDecision) => target.respondApproval({
+            ...input,
+            ...(input.reason !== undefined
+              ? { reason: redactSecretsForOutput(input.reason) }
+              : {}),
+          });
+        case "respondUserInput":
+          return (input: UserInputDecision) => target.respondUserInput({
+            ...input,
+            answers: Object.fromEntries(
+              Object.entries(input.answers).map(([questionId, answer]) => [
+                questionId,
+                Array.isArray(answer)
+                  ? answer.map(redactSecretsForOutput)
+                  : redactSecretsForOutput(answer),
+              ]),
+            ),
+          });
       }
       const value = Reflect.get(target, property, target) as unknown;
       return typeof value === "function" ? value.bind(target) : value;

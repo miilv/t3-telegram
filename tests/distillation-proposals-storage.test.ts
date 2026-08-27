@@ -22,7 +22,7 @@ describe("durable distillation merge proposals", () => {
     const input = {
       replayKey: "distill:stable-candidate",
       ownerId: "42",
-      candidateKey: "warehouse-contact",
+      candidateKey: "sk-abcdefghijklmnop",
       description: "when warehouse contact matters → token=proposal-description-secret",
       content: "Dan is the warehouse contact token=proposal-content-secret",
       category: "people",
@@ -40,7 +40,7 @@ describe("durable distillation merge proposals", () => {
     expect(first).toMatchObject({
       replayKey: input.replayKey,
       ownerId: "42",
-      candidateKey: "warehouse-contact",
+      candidateKey: "sk-abcdefghijklmnop",
       evidenceSeqs: [3, 7],
       matchingNote: { id: existing.id, key: existing.key },
       reason: "semantic",

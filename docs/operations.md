@@ -16,7 +16,10 @@ message, the work behind it (dialogue-flow §4).
   `/operator switch <provider>` performs a durable summary/snapshot handoff.
 - `/automation` — timezone-aware `once`, `every`, and `daily` proactive work.
 - `/policy` — live approval, concurrency, progress, and routing controls.
-- `/dashboard` — owner/admin-only link to the loopback operations cockpit.
+- `/dashboard` — owner/admin-only link to the loopback operations cockpit. Its
+  capability travels in a discriminated durable outbox field and a dedicated
+  Telegram send boundary; generic messages/events/logs still redact it, replay
+  dedupes by the inbound command, and ambiguous in-flight sends are quarantined.
 - `/team` — owner/admin team roster; `/team set <id> <role>` changes a role for
   an ID already present in `TELEGRAM_ALLOWED_USERS` (only owner may appoint
   owner/admin).
@@ -162,7 +165,7 @@ One caveat worth knowing before an incident: the maintenance tick is coalescing 
 
 Thread memory stores purpose, current state, important decisions, files, open issues, and next actions. Worker completion normalization updates it; handoff packets consume it. Full T3 transcripts and tool histories remain in T3. After Claude context compaction, the daemon injects a bounded, secret-redacted snapshot containing focus, project/thread references, active work, pending interactions, open loops, and active notes.
 
-Natural-language forms such as “запомни, что …” / “remember that …” and “что ты помнишь про …?” / “what do you remember about …?” use the same durable active-only store. Keyed writes return structured written/merge-proposal/cross-link outcomes. A past `valid_until` stays visible in push/search/get/list but carries `[not verified … treat as hypothesis]`; the monthly owner turn asks one bounded verification question and never obsoletes it automatically. Search combines FTS with selected-model local vectors; no note text leaves the process for embedding.
+Natural-language forms such as “запомни, что …” / “remember that …” and “что ты помнишь про …?” / “what do you remember about …?” use the same durable active-only store. Keyed writes return structured written/merge-proposal/cross-link outcomes. A past `valid_until` stays visible in push/search/get/list but carries `[not verified … treat as hypothesis]`; accepted offsets are canonicalized to UTC and the monthly owner turn asks one bounded verification question without automatically obsoleting it. Search combines FTS with the complete compatible active set for the selected local vector model; both `/memory search` and natural recall use that async path. Successful public get/search reads increment usage, while misses and internal push/list/distillation scans do not. No note text leaves the process for embedding.
 
 Keyed human-turn writes persist the complete original structured outcome, including proposals and cross-links, so replay is stable after later note mutations. Scheduled app turns cannot call the legacy unkeyed `memory.remember` path; their replay-safe capability fails closed with zero note side effects.
 

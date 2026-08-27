@@ -21,6 +21,64 @@ function unit(first: number, second = Math.sqrt(1 - first * first)): number[] {
 }
 
 describe("OperatorNoteWriter", () => {
+  it("finds the oldest exact MiniLM match beyond 500 active vectors", async () => {
+    const store = tempStore();
+    const insertNote = store.db.prepare(`
+      INSERT INTO operator_notes(
+        id,key,category,content,status,source,description,input_hash,created_at,updated_at
+      ) VALUES (?,?,'people',?,'active','manual',?,?,?,?)
+    `);
+    const insertVector = store.db.prepare(`
+      INSERT INTO operator_note_vectors(note_id,model,dimensions,input_hash,vector_json,updated_at)
+      VALUES (?,?,?,?,?,?)
+    `);
+    const exactVector = JSON.stringify(unit(1, 0));
+    const farVector = JSON.stringify(unit(0, 1));
+    store.db.exec("BEGIN");
+    try {
+      for (let index = 0; index < 501; index += 1) {
+        const id = `complete-dedupe-${String(index).padStart(3, "0")}`;
+        const key = index === 0 ? "oldest-exact" : `newer-far-${String(index).padStart(3, "0")}`;
+        const hash = `complete-dedupe-hash-${index}`;
+        const updatedAt = index === 0
+          ? "2020-01-01T00:00:00.000Z"
+          : "2026-08-27T00:00:00.000Z";
+        insertNote.run(id, key, `${key} fact`, `when ${key} matters → read it`, hash, updatedAt, updatedAt);
+        insertVector.run(
+          id,
+          MINILM_NOTE_EMBEDDING_MODEL,
+          NOTE_EMBEDDING_DIMENSIONS,
+          hash,
+          index === 0 ? exactVector : farVector,
+          updatedAt,
+        );
+      }
+      store.db.exec("COMMIT");
+    } catch (error) {
+      store.db.exec("ROLLBACK");
+      throw error;
+    }
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => true,
+      embed: async (input) => vector(input, unit(1, 0)),
+    });
+
+    await expect(writer.write({
+      key: "candidate-exact",
+      description: "when the complete vector set matters → use the old fact",
+      content: "candidate fact",
+      category: "people",
+      source: "manual",
+      operationKey: "manual:complete-vector-dedupe",
+    })).resolves.toMatchObject({
+      ok: true,
+      kind: "merge-proposal",
+      mergeProposal: { note: { key: "oldest-exact" }, score: 1 },
+    });
+    expect(store.notes.getActive("candidate-exact")).toBeUndefined();
+    store.close();
+  });
+
   it("applies the canonical storage mask before embedding and persisting a keyed note", async () => {
     const store = tempStore();
     let embeddedContent = "";
@@ -47,6 +105,48 @@ describe("OperatorNoteWriter", () => {
     expect(stored.description).toMatch(/token=(?:\[MASKED:\d+\]|\S+…\[\d+\])/u);
     expect(JSON.stringify(stored)).not.toContain("content-secret");
     expect(JSON.stringify(stored)).not.toContain("description-secret");
+    store.close();
+  });
+
+  it("preserves a validated secret-shaped key across embedding, evidence, and replay", async () => {
+    const store = tempStore();
+    const embeddedKeys: Array<string | undefined> = [];
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => false,
+      embed: async (input) => {
+        embeddedKeys.push(input.key);
+        return vector(input, unit(1, 0));
+      },
+    });
+    const draft = {
+      key: "sk-abcdefghijklmnop",
+      description: "when key-shaped memory matters → read token=description-secret",
+      content: "The stable label is api_key=content-secret",
+      category: "people",
+      source: "distilled" as const,
+      operationKey: "distilled:stable-secret-shaped-key",
+      evidence: { ownerId: "42", sequences: [17] },
+    };
+
+    const first = await writer.write(draft);
+    const replay = await writer.write({ ...draft, content: "must not replace the settled write" });
+
+    expect(first).toMatchObject({
+      ok: true,
+      kind: "written",
+      write: { applied: true, note: { key: draft.key } },
+    });
+    expect(replay).toMatchObject({
+      ok: true,
+      kind: "written",
+      write: { applied: true, note: { key: draft.key } },
+    });
+    expect(embeddedKeys).toEqual([draft.key]);
+    const stored = store.notes.getActive(draft.key)!;
+    expect(stored.key).toBe(draft.key);
+    expect(store.notes.evidenceForVersion(stored.id)).toEqual({ ownerId: "42", sequences: [17] });
+    expect(JSON.stringify(stored)).not.toContain("description-secret");
+    expect(JSON.stringify(stored)).not.toContain("content-secret");
     store.close();
   });
 

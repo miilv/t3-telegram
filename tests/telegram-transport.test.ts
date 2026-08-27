@@ -21,6 +21,44 @@ afterEach(() => {
 });
 
 describe("grammY Telegram transport", () => {
+  it("preserves only a validated loopback dashboard capability at the final API boundary", async () => {
+    const calls: ApiCall[] = [];
+    vi.stubGlobal("fetch", successfulTelegramFetch(calls));
+    const transport = new TelegramBotTransport("test-token", 42, 1, logger);
+    const link = `http://127.0.0.1:43127/#token=${"a".repeat(43)}`;
+
+    await expect(transport.sendDashboardCapability(7, link, { messageThreadId: 19 }))
+      .resolves.toMatchObject({ chatId: 7, messageId: 100, messageThreadId: 19 });
+    expect(calls[0]).toMatchObject({
+      method: "sendMessage",
+      body: {
+        chat_id: 7,
+        message_thread_id: 19,
+        link_preview_options: { is_disabled: true },
+      },
+    });
+    expect(calls[0]!.body.text).toContain(link);
+    const callCount = calls.length;
+    await expect(transport.sendDashboardCapability(
+      7,
+      `https://example.com/#token=${"a".repeat(43)}`,
+    )).rejects.toThrow("invalid loopback dashboard capability");
+    await expect(transport.sendDashboardCapability(
+      7,
+      "http://127.0.0.1:43127/#token=too-short",
+    )).rejects.toThrow("invalid loopback dashboard capability");
+    expect(calls).toHaveLength(callCount);
+
+    await transport.sendAlert(7, "Generic token=must-stay-redacted");
+    expect(calls.at(-1)).toMatchObject({
+      method: "sendMessage",
+      body: {
+        text: "Generic token=[REDACTED]",
+        link_preview_options: { is_disabled: true },
+      },
+    });
+  });
+
   it("redacts visible text and button labels at the last mile without mutating callback ids", async () => {
     const calls: ApiCall[] = [];
     vi.stubGlobal("fetch", successfulTelegramFetch(calls));
