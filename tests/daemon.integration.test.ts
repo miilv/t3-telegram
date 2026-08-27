@@ -3710,7 +3710,7 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("maintains structured thread memory, durable notes, and daily compaction restoration", async () => {
+  it("maintains structured thread memory, owner-authored notes, and bounded compaction restoration", async () => {
     const home = tempDirectory("daemon-memory-");
     const store = tempStore();
     const runtime = new DelegatingRuntime(
@@ -3789,10 +3789,12 @@ describe("OperatorDaemon product flow", () => {
     await daemon.maintain("test daily maintenance");
     expect(runtime.compactReasons).toContain("test daily maintenance");
     expect(store.listCompactions(1)[0]?.reason).toBe("test daily maintenance");
+    // Package 3.2 removes the LLM note-maintenance pass. Compaction restores a
+    // bounded push snapshot; it cannot invent or mutate durable notes.
     expect(
       runtime.prompts.some((prompt) => prompt.includes("Prepare durable memory maintenance")),
-    ).toBe(true);
-    expect(store.searchOperatorNotes("durable focus")).toHaveLength(1);
+    ).toBe(false);
+    expect(store.searchOperatorNotes("durable focus")).toHaveLength(0);
     expect(
       runtime.prompts.some((prompt) =>
         prompt.includes("Restore the Operator's compact operational context"),
@@ -7465,10 +7467,10 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
-  it("protects user notes from LLM maintenance and restores wrongly obsoleted ones (bug №42)", async () => {
+  it("never lets scheduled maintenance obsolete notes and keeps explicit forget/restore", async () => {
     const home = tempDirectory("daemon-memory-protect-");
     const store = tempStore();
-    const runtime = new MemoryPlanRuntime();
+    const runtime = new FakeRuntime();
     const broker = new FakeBroker();
     const telegram = new FakeTelegram();
     const logger = pino({ enabled: false });
@@ -7497,28 +7499,23 @@ describe("OperatorDaemon product flow", () => {
       content: "Temporary migration flag is enabled",
       source: "maintenance",
     });
-    runtime.obsoleteNoteIds = [userNote.id, systemNote.id];
-
     store.setRuntimeState("last_compaction_at", "2020-01-01T00:00:00.000Z");
     await daemon.maintain("memory maintenance test");
 
-    // The user's own note survives; only the system note was obsoleted, loudly.
+    // Package 3.2 removes automatic note expiry and LLM note maintenance, so
+    // the scheduled pass cannot mutate either note.
     expect(store.getOperatorNote(userNote.id)?.status).toBe("active");
-    expect(store.getOperatorNoteVersion(systemNote.id)?.status).toBe("obsolete");
+    expect(store.getOperatorNote(systemNote.id)?.status).toBe("active");
     const journal = store.db
       .prepare("SELECT payload_json FROM daemon_events WHERE event_type='memory.notes.obsoleted'")
-      .get() as { payload_json: string };
-    expect(JSON.parse(journal.payload_json)).toMatchObject({
-      noteIds: [systemNote.id],
-      protectedUserNoteIds: [userNote.id],
-      restoreHint: `/memory restore ${systemNote.id}`,
-    });
+      .get();
+    expect(journal).toBeUndefined();
 
-    // An explicit user "забудь" still works for user notes.
-    telegram.push(message(1, `/memory forget ${userNote.id}`));
-    await waitFor(() => store.getOperatorNoteVersion(userNote.id)?.status === "obsolete");
+    // An explicit owner "забудь" remains the only retirement path.
+    telegram.push(message(1, `/memory forget ${systemNote.id}`));
+    await waitFor(() => store.getOperatorNoteVersion(systemNote.id)?.status === "obsolete");
 
-    // /memory restore reactivates a wrongly obsoleted note, searchably.
+    // /memory restore reactivates an explicitly retired note, searchably.
     telegram.push(message(2, `/memory restore ${systemNote.id}`));
     await waitFor(() => store.getOperatorNote(systemNote.id)?.status === "active");
     expect(telegram.sent.some((entry) => entry.text.includes("снова активна"))).toBe(true);
@@ -10188,19 +10185,7 @@ class FakeRuntime implements OperatorRuntime {
     this.prompts.push(input.prompt);
     if (input.toolAccess) this.toolAccesses.push(input.toolAccess);
     const relay = threadEventRelay(input.prompt);
-    const text = relay !== undefined
-      ? relay
-      : input.prompt.includes("Prepare durable memory maintenance")
-        ? JSON.stringify({
-            notes: [
-              {
-                category: "decision",
-                content: "Always preserve durable focus after compaction.",
-              },
-            ],
-            obsoleteNoteIds: [],
-          })
-        : "Париж.";
+    const text = relay !== undefined ? relay : "Париж.";
     yield { type: "text_delta", text };
     yield { type: "result", text, sessionId: input.sessionId };
   }
@@ -10295,33 +10280,14 @@ class FailingCompactRuntime extends FakeRuntime {
   }
 }
 
-/** Maintenance answers propose obsoleting exactly the configured note ids (bug №42). */
-class MemoryPlanRuntime extends FakeRuntime {
-  obsoleteNoteIds: string[] = [];
-
-  override async *stream(input: {
-    sessionId: string;
-    prompt: string;
-    toolAccess?: OperatorToolAccess;
-  }): AsyncIterable<OperatorEvent> {
-    if (!input.prompt.includes("Prepare durable memory maintenance")) {
-      yield* super.stream(input);
-      return;
-    }
-    this.prompts.push(input.prompt);
-    const text = JSON.stringify({ notes: [], obsoleteNoteIds: this.obsoleteNoteIds });
-    yield { type: "result", text, sessionId: input.sessionId };
-  }
-}
-
 type ToolCall = (name: string, args: Record<string, unknown>) => Promise<unknown>;
 type OperatorScript = (envelope: string, call: ToolCall) => Promise<string>;
 
 /**
  * Plays the Operator agent: on a user-facing envelope it connects to the
  * per-turn MCP capability and routes work with the same t3.* tools the real
- * CLI would use. Non-envelope prompts (normalization, maintenance) fall back
- * to the scripted FakeRuntime answers.
+ * CLI would use. Non-envelope prompts fall back to the scripted FakeRuntime
+ * answers.
  */
 class DelegatingRuntime extends FakeRuntime {
   constructor(private readonly script: OperatorScript) {

@@ -1,8 +1,64 @@
 import { DatabaseSync } from "node:sqlite";
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { migrateOperatorNotesV2 } from "../packages/storage/src/migrations.js";
+import { OperatorStore } from "../packages/storage/src/index.js";
+import { tempDirectory } from "./helpers.js";
 
 describe("operator notes v2 migration", () => {
+  it("upgrades the exact package base twice without losing legacy rows or owner cursor progress", () => {
+    const path = join(tempDirectory("memory-v2-upgrade-"), "operator.db");
+    const baseSql = execFileSync(
+      "git",
+      ["show", "744c2d7204be01a8067f33e4d4d456fe496e094e:migrations/001_initial.sql"],
+      { encoding: "utf8" },
+    );
+    const legacy = new DatabaseSync(path);
+    legacy.exec(baseSql);
+    legacy.exec(`
+      INSERT INTO operator_notes(id,category,content,status,source,created_at,updated_at)
+      VALUES ('legacy-note','general','legacy fact','active','manual','2026-07-01','2026-07-01');
+      INSERT INTO now_items(id,owner_id,section,content,source,status,created_at,updated_at)
+      VALUES ('legacy-now','owner-1','active','legacy work','agent','open','2026-07-01','2026-07-01');
+      INSERT INTO automations(
+        id,owner_id,name,prompt,schedule_json,chat_id,status,kind,escalate,created_at,updated_at
+      ) VALUES (
+        'legacy-automation','owner-1','daily','run it','{"kind":"daily","time":"09:00"}',1,
+        'active','automation',0,'2026-07-01','2026-07-01'
+      );
+      INSERT INTO journal_entries(slug,day,body,source,kind,created_at)
+      VALUES ('legacy-journal','2026-07-01','legacy narrative','agent','entry','2026-07-01');
+    `);
+    legacy.close();
+
+    const store = new OperatorStore(path);
+    store.migrate();
+    const evidence = store.conversation.appendOwnerIngress({
+      ownerId: "owner-1",
+      conversationKey: "telegram:1",
+      text: "Dan owns the warehouse",
+      evidenceText: "Dan owns the warehouse",
+      sourceKey: "telegram:1:1",
+      ingressJobId: "job:1",
+    });
+    expect(evidence.seq).toBeTypeOf("number");
+    expect(store.conversation.advanceCursor("night-scribe-distillation", "owner-1", 0, evidence.seq!)).toBe(true);
+
+    store.migrate();
+
+    expect(store.db.prepare("SELECT content FROM operator_notes WHERE id='legacy-note'").get())
+      .toMatchObject({ content: "legacy fact" });
+    expect(store.db.prepare("SELECT content FROM now_items WHERE id='legacy-now'").get())
+      .toMatchObject({ content: "legacy work" });
+    expect(store.db.prepare("SELECT name FROM automations WHERE id='legacy-automation'").get())
+      .toMatchObject({ name: "daily" });
+    expect(store.db.prepare("SELECT body FROM journal_entries WHERE slug='legacy-journal'").get())
+      .toMatchObject({ body: "legacy narrative" });
+    expect(store.conversation.cursor("night-scribe-distillation", "owner-1")).toBe(evidence.seq);
+    store.close();
+  });
+
   it("migrates an upgraded legacy schema twice without losing its note or replay table", () => {
     const db = new DatabaseSync(":memory:");
     db.exec(`

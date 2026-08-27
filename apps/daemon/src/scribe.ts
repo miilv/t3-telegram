@@ -13,6 +13,7 @@ import {
   type UnfiledWork,
   SCRIBE_LAST_DAY_KEY,
   SCRIBE_LAST_ROLLUP_KEY,
+  SCRIBE_LAST_STALE_VERIFICATION_KEY,
   SCRIBE_ONESHOT_TIMEOUT_MS,
   SCRIBE_RECOVERY_RUN_KEY,
   SCRIBE_WINDOW_FROM_HOUR,
@@ -20,6 +21,7 @@ import {
   SCRIBE_WORK_EVENT_PREFIXES,
   buildDailySummaryPrompt,
   buildDescriptionPrompt,
+  buildDistillationMergeProposalPrompt,
   buildMonthlyProposalPrompt,
   buildRollupPrompt,
   firstDayOfMonth,
@@ -38,13 +40,24 @@ import type { OperatorStore } from "../../../packages/storage/src/index.js";
 import { ScribeFinalizer, type ScribeProgress } from "./scribe-finalization.js";
 import type { ScribeRunOutcome } from "./scribe-finalization.js";
 import { ScribeReconciler } from "./scribe-reconciler.js";
+import {
+  ConversationDistillationCoordinator,
+  DISTILLATION_CONSUMER,
+} from "./distillation-coordinator.js";
 
 export type { ScribeRunOutcome, ScribeRunStatus } from "./scribe-finalization.js";
+export {
+  ConversationDistillationCoordinator,
+  DISTILLATION_CONSUMER,
+  DISTILLATION_MAX_BATCHES_PER_RUN,
+  distillationCandidateReplayKey,
+} from "./distillation-coordinator.js";
+export type { DistillationRunOutcome } from "./distillation-coordinator.js";
 
 const TTL_BATCH = 50;
 const DESCRIPTION_BATCH = 10;
 const ROLLUP_ENTRY_LIMIT = 300;
-const EXPIRED_FACT_LIMIT = 10;
+const STALE_FACT_LIMIT = 10;
 const CATCHUP_DAY_LIMIT = 3;
 
 export interface NightScribeDeps {
@@ -66,10 +79,15 @@ class ScribeChannelUnavailable extends Error {}
 export class NightScribe {
   private readonly finalizer: ScribeFinalizer;
   private readonly reconciler: ScribeReconciler;
+  private readonly distiller: ConversationDistillationCoordinator;
 
   constructor(private readonly deps: NightScribeDeps) {
     this.finalizer = new ScribeFinalizer(deps);
     this.reconciler = new ScribeReconciler(deps);
+    this.distiller = new ConversationDistillationCoordinator({
+      store: deps.store,
+      oneShot: (prompt) => this.oneShot(prompt),
+    });
   }
 
   private now(): Date {
@@ -82,7 +100,7 @@ export class NightScribe {
     if (!options.force && !isWithinLocalWindow(at, timeZone, SCRIBE_WINDOW_FROM_HOUR, SCRIBE_WINDOW_TO_HOUR)) {
       return this.finalizer.idle("outside-window", ownerLogicalDay(at, timeZone));
     }
-    this.finalizer.flushPendingOwnerTurns();
+    this.flushProposalNotifications();
     if (!this.deps.backgroundOneShot) {
       return this.finalizer.idle("no-channel", ownerLogicalDay(at, timeZone));
     }
@@ -95,11 +113,27 @@ export class NightScribe {
     }
 
     const store = this.deps.store;
-    const progress: ScribeProgress = { reasons: [], llmCalls: 0, recovered: 0, expired: 0, described: 0 };
+    const progress: ScribeProgress = {
+      reasons: [],
+      llmCalls: 0,
+      recovered: 0,
+      expired: 0,
+      described: 0,
+      distilled: 0,
+      proposals: 0,
+    };
     try {
       const cursor = this.reconciler.cursor(at);
       const recoverySince = this.reconciler.recoveryCursor(cursor.since);
       const ownerId = this.deps.ownerId();
+      const staleVerificationMonth = day.slice(0, 7);
+      const staleFacts = store.getRuntimeState(SCRIBE_LAST_STALE_VERIFICATION_KEY) === staleVerificationMonth
+        ? []
+        : store.notes.listStale(at.toISOString(), STALE_FACT_LIMIT);
+      const distillationRows = store.conversation.countEligibleAfter(
+        ownerId,
+        store.conversation.cursor(DISTILLATION_CONSUMER, ownerId),
+      );
       const expiredItems = store.listExpiredNowItems({ ownerId, at: at.toISOString(), limit: TTL_BATCH });
       const notesToDescribe = store.listNotesMissingDescription(DESCRIPTION_BATCH);
       const rollupMonth = this.dueRollupMonth(day);
@@ -107,10 +141,11 @@ export class NightScribe {
       const pendingRecovery = this.reconciler.pendingRecovery(recoverySince);
       const verdict: ScribeWorkVerdict = hasScribeWork({
         events: store.countDaemonEventsSince(cursor.since, SCRIBE_WORK_EVENT_PREFIXES),
-        messages: store.countTelegramMessagesSince(cursor.since),
+        distillationRows,
         expiredItems: expiredItems.length,
         changedItems: store.countNowItemsUpdatedSince(ownerId, cursor.since),
         notesMissingDescription: notesToDescribe.length,
+        staleFacts: staleFacts.length,
         rollupDue: Boolean(rollupMonth),
         summariesDue: summaryDays.length,
         recoveryDue: pendingRecovery.work.length,
@@ -127,12 +162,34 @@ export class NightScribe {
       progress.recovered = recovered.length;
       store.setRuntimeState(SCRIBE_RECOVERY_RUN_KEY, pendingRecovery.hasMore ? recoverySince : at.toISOString());
 
+      if (distillationRows > 0) {
+        const distillation = await this.distiller.run(ownerId);
+        progress.llmCalls += distillation.llmCalls;
+        progress.distilled += distillation.written;
+        progress.proposals += distillation.proposals;
+        if (distillation.status === "failed" || distillation.status === "degraded") {
+          const detail = distillation.detail ?? "conversation distillation did not settle";
+          if (distillation.providerUnavailable && progress.llmCalls === 0) {
+            throw new ScribeChannelUnavailable(detail);
+          }
+          throw new Error(detail);
+        }
+        this.flushProposalNotifications();
+      }
+
       for (const summary of this.dailySummaryInputs({ day, summaryDays, timeZone, expired, recovered })) {
         progress.llmCalls += await this.writeDailySummary(summary);
       }
       if (rollupMonth) {
-        progress.llmCalls += await this.writeRollup(rollupMonth, day);
+        progress.llmCalls += await this.writeRollup({
+          month: rollupMonth,
+          day,
+          staleFacts,
+          staleVerificationMonth,
+        });
         progress.rollupMonth = rollupMonth;
+      } else if (staleFacts.length) {
+        this.persistStaleVerification(staleVerificationMonth, staleFacts);
       }
       const descriptionResult = await this.describeLegacyNotes(notesToDescribe);
       progress.llmCalls += descriptionResult.calls;
@@ -162,6 +219,35 @@ export class NightScribe {
       return undefined;
     }
     return month;
+  }
+
+  private flushProposalNotifications(): void {
+    const pending = this.deps.store.distillationProposals.listPending(50, this.deps.ownerId());
+    const intents = pending.map((proposal) => {
+      const dedupeKey = `scribe-merge-proposal:${proposal.replayKey}`;
+      const stateKey = this.finalizer.persistOwnerTurn({
+        dedupeKey,
+        prompt: buildDistillationMergeProposalPrompt({
+          candidateKey: proposal.candidateKey,
+          description: proposal.description,
+          evidenceSeqs: proposal.evidenceSeqs,
+          matchingNote: {
+            id: proposal.matchingNote.id,
+            ...(proposal.matchingNote.key ? { key: proposal.matchingNote.key } : {}),
+            ...(proposal.matchingNote.description
+              ? { description: proposal.matchingNote.description }
+              : {}),
+          },
+        }),
+      });
+      return { proposal, stateKey };
+    });
+    this.finalizer.flushPendingOwnerTurns();
+    for (const { proposal, stateKey } of intents) {
+      if (this.deps.store.getRuntimeState(stateKey) === undefined) {
+        this.deps.store.distillationProposals.markNotificationEnqueued(proposal.id);
+      }
+    }
   }
 
   private rollupInputEntries(month: string, limit = ROLLUP_ENTRY_LIMIT): JournalEntry[] {
@@ -248,21 +334,27 @@ export class NightScribe {
     return 1;
   }
 
-  private async writeRollup(month: string, day: string): Promise<number> {
+  private async writeRollup(input: {
+    month: string;
+    day: string;
+    staleFacts: readonly OperatorNote[];
+    staleVerificationMonth: string;
+  }): Promise<number> {
     const store = this.deps.store;
-    const entries = this.rollupInputEntries(month);
+    const entries = this.rollupInputEntries(input.month);
     const parsed = parseRollup(
       await this.oneShot(
-        buildRollupPrompt({ month, language: this.deps.language(), entries }),
+        buildRollupPrompt({ month: input.month, language: this.deps.language(), entries }),
       ),
     );
-    const expiredFacts = store
-      .listNotesExpiredBetween(firstDayOfMonth(month), `${lastDayOfMonth(month)}T23:59:59.999Z`, EXPIRED_FACT_LIMIT)
-      .map((note) => note.content);
-    const turn = parsed.proposals.length || expiredFacts.length
+    const turn = parsed.proposals.length || input.staleFacts.length
       ? {
-          dedupeKey: `scribe-monthly:${month}`,
-          prompt: buildMonthlyProposalPrompt({ month, proposals: parsed.proposals, expiredFacts }),
+          dedupeKey: `scribe-monthly:${input.month}`,
+          prompt: buildMonthlyProposalPrompt({
+            month: input.month,
+            proposals: parsed.proposals,
+            staleFacts: input.staleFacts.map((note) => note.content),
+          }),
         }
       : undefined;
     // The rollup, its settlement marker, the event and the retryable owner-turn
@@ -270,20 +362,50 @@ export class NightScribe {
     // immediately because the narrative it refers to is guaranteed to exist.
     store.transaction(() => {
       store.journal.insertUnique({
-        slug: rollupSlug(month),
-        day: firstDayOfMonth(month),
+        slug: rollupSlug(input.month),
+        day: firstDayOfMonth(input.month),
         body: parsed.body,
         source: "scribe",
         kind: "rollup",
       });
       if (turn) this.finalizer.persistOwnerTurn(turn);
-      store.setRuntimeState(SCRIBE_LAST_ROLLUP_KEY, month);
+      if (input.staleFacts.length) {
+        store.setRuntimeState(SCRIBE_LAST_STALE_VERIFICATION_KEY, input.staleVerificationMonth);
+      }
+      store.setRuntimeState(SCRIBE_LAST_ROLLUP_KEY, input.month);
       store.appendEvent("memory.scribe.rollup", {
-        payload: { month, day, entries: entries.length, proposals: parsed.proposals.length },
+        payload: {
+          month: input.month,
+          day: input.day,
+          entries: entries.length,
+          proposals: parsed.proposals.length,
+          staleFacts: input.staleFacts.length,
+        },
       });
     });
     if (turn) this.finalizer.flushPendingOwnerTurns();
     return 1;
+  }
+
+  private persistStaleVerification(month: string, staleFacts: readonly OperatorNote[]): void {
+    const store = this.deps.store;
+    const turn = {
+      dedupeKey: `scribe-stale-facts:${month}`,
+      prompt: buildMonthlyProposalPrompt({
+        month,
+        proposals: [],
+        staleFacts: staleFacts.map((note) => note.content),
+        rollupRecorded: false,
+      }),
+    };
+    store.transaction(() => {
+      this.finalizer.persistOwnerTurn(turn);
+      store.setRuntimeState(SCRIBE_LAST_STALE_VERIFICATION_KEY, month);
+      store.appendEvent("memory.scribe.stale_verification", {
+        payload: { month, facts: staleFacts.length },
+      });
+    });
+    this.finalizer.flushPendingOwnerTurns();
   }
 
   /** The lazy legacy-description pass (§6.4). */

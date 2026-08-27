@@ -20,6 +20,7 @@ export interface OperatorNoteVersionInput {
   verifiedAt?: string;
   validUntil?: string;
   operationKey: string;
+  evidence?: { ownerId: string; sequences: readonly number[] };
   vectors?: readonly PreparedNoteVector[];
 }
 
@@ -47,6 +48,7 @@ export class OperatorNoteRepository {
   ) {}
 
   writeVersion(input: OperatorNoteVersionInput): OperatorNoteWriteResult {
+    const evidence = validateNoteEvidence(input);
     return this.transaction(() => {
       const replay = this.db
         .prepare(`
@@ -63,7 +65,7 @@ export class OperatorNoteRepository {
       // This guard lives at the transaction boundary, after replay resolution
       // and the current-row read. A writer may await local embedding while a
       // curator writes the same key, so a stale preflight cannot enforce it.
-      if (current && input.source === "distilled" && String(current.source) !== "distilled") {
+      if (current && input.source === "distilled") {
         return { note: rowToOperatorNote(current), applied: false, curatedCollision: true };
       }
       if (current && samePayload(current, input)) {
@@ -107,6 +109,7 @@ export class OperatorNoteRepository {
       }
       this.reindex(id, input.key, input.description, input.category, input.content);
       for (const vector of input.vectors ?? []) this.savePreparedVectorUnwrapped(id, inputHash, vector, at);
+      if (evidence) this.saveEvidence(id, evidence);
       this.recordOperation(input.operationKey, id);
       const note = this.getVersion(id);
       if (!note) throw new Error("operator note write did not persist");
@@ -127,6 +130,20 @@ export class OperatorNoteRepository {
       `)
       .get(operationKey) as Row | undefined;
     return row ? rowToOperatorNote(row) : undefined;
+  }
+
+  evidenceForVersion(noteId: string): { ownerId: string; sequences: number[] } | undefined {
+    const rows = this.db
+      .prepare(`
+        SELECT owner_id,evidence_seq FROM operator_note_evidence
+        WHERE note_id=? ORDER BY evidence_seq
+      `)
+      .all(noteId) as Row[];
+    if (!rows.length) return undefined;
+    return {
+      ownerId: String(rows[0]!.owner_id),
+      sequences: rows.map((row) => Number(row.evidence_seq)),
+    };
   }
 
   getActive(reference: string): OperatorNote | undefined {
@@ -345,6 +362,16 @@ export class OperatorNoteRepository {
       .run(operationKey, noteId, nowIso());
   }
 
+  private saveEvidence(
+    noteId: string,
+    evidence: { ownerId: string; sequences: readonly number[] },
+  ): void {
+    const statement = this.db.prepare(`
+      INSERT INTO operator_note_evidence(note_id,owner_id,evidence_seq) VALUES (?,?,?)
+    `);
+    for (const sequence of evidence.sequences) statement.run(noteId, evidence.ownerId, sequence);
+  }
+
   private reindex(id: string, key: string, description: string, category: string, content: string): void {
     this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
     this.db
@@ -430,6 +457,24 @@ function samePayload(row: Row, input: OperatorNoteVersionInput): boolean {
     String(row.verified_at ?? "") === (input.verifiedAt ?? "") &&
     String(row.valid_until ?? "") === (input.validUntil ?? "")
   );
+}
+
+function validateNoteEvidence(
+  input: OperatorNoteVersionInput,
+): { ownerId: string; sequences: number[] } | undefined {
+  if (!input.evidence) return undefined;
+  const ownerId = input.evidence.ownerId.trim();
+  const sequences = [...input.evidence.sequences];
+  if (input.source !== "distilled" || !ownerId || !sequences.length) {
+    throw new Error("only distilled notes may carry nonempty owner evidence");
+  }
+  if (sequences.some((sequence) => !Number.isSafeInteger(sequence) || sequence < 1)) {
+    throw new Error("note evidence sequence must be a positive safe integer");
+  }
+  if (new Set(sequences).size !== sequences.length) {
+    throw new Error("note evidence sequences must be unique");
+  }
+  return { ownerId, sequences: sequences.sort((left, right) => left - right) };
 }
 
 function parseVector(value: unknown, dimensions: number): number[] | undefined {

@@ -16,7 +16,6 @@ export {
   ANTI_REDISCOVERY_EMPTY,
   ANTI_REDISCOVERY_HEADER,
   LEGACY_INDEX_EXCERPT_CHARS,
-  MAINTENANCE_INDEX_BUDGET_CHARS,
   MEMORY_INDEX_BUDGET_CHARS,
   MEMORY_INDEX_EMPTY,
   MEMORY_INDEX_HEADER,
@@ -85,6 +84,23 @@ export {
 } from "./operator-notes.js";
 export type { NoteDraftValidation } from "./operator-notes.js";
 export {
+  DISTILLATION_BATCH_MAX_CODE_POINTS,
+  DISTILLATION_BATCH_MAX_ROWS,
+  DISTILLATION_MAX_CANDIDATES,
+  DISTILLATION_PROMPT_MAX_CHARS,
+  buildDistillationMergeProposalPrompt,
+  buildDistillationPrompt,
+  parseDistillationResponse,
+} from "./distillation.js";
+export type {
+  DistillationParseResult,
+  DistillationPrompt,
+  DistillationPromptInput,
+  DistillationPromptRow,
+  DistillationMergeProposalPromptInput,
+  DistilledNoteCandidate,
+} from "./distillation.js";
+export {
   LOGICAL_DAY_BOUNDARY_HOUR,
   PAUSE_COLD_AFTER_MS,
   PAUSE_LIGHT_AFTER_MS,
@@ -105,6 +121,7 @@ export {
   SCRIBE_LAST_DAY_KEY,
   SCRIBE_LAST_ROLLUP_KEY,
   SCRIBE_LAST_RUN_KEY,
+  SCRIBE_LAST_STALE_VERIFICATION_KEY,
   SCRIBE_MISS_ALERT_KEY,
   SCRIBE_PENDING_TURN_PREFIX,
   SCRIBE_MISS_ALERT_THRESHOLD,

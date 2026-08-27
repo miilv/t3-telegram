@@ -119,7 +119,6 @@ import {
   buildOperatorSystemPrompt,
   classifyPause,
   decidePushMode,
-  MAINTENANCE_INDEX_BUDGET_CHARS,
   NOW_ITEM_CONTENT_CHARS,
   deriveFocusThreadRef,
   diffNowItems,
@@ -128,14 +127,16 @@ import {
   parsePushBaseline,
   readOperatorPolicy,
   reconcileDaemonSection,
+  rankOperatorNotesForPush,
   renderClosedItemJournalBody,
   renderGapLine,
-  renderMemoryIndex,
+  operatorNotePushScore,
   renderNowDiff,
   renderPersonaDigest,
   renderStateLayers,
   selectNowItemsForRender,
   serializePushBaseline,
+  staleOperatorNoteWarning,
   updateOperatorPolicy,
 } from "../../../packages/policy/src/index.js";
 import type {
@@ -1209,7 +1210,6 @@ export class OperatorDaemon {
   async compact(reason = "daily maintenance"): Promise<void> {
     this.notifyOwnerAboutCompaction();
     this.refreshStructuredThreadSummaries();
-    await this.maintainStructuredMemory(this.buildOperatorMemorySnapshot());
     const snapshot = this.buildOperatorMemorySnapshot();
     const result = await this.operatorRuntimeQueue.run(() =>
       this.withRuntimeDeadline("compaction", () => this.runtime.compact(reason)),
@@ -1312,7 +1312,15 @@ export class OperatorDaemon {
     const expiredApprovals = await this.sweepExpiredApprovals();
     await this.flushTelegramOutbox();
     await this.drainT3Dispatches();
-    const expiredNotes = this.store.expireOperatorNotes();
+    // Explicit, bounded maintenance only. Startup must neither scan notes nor
+    // initialize the local model runtime; each later tick advances at most one
+    // 25-note page and missing weights fall back inside the embedding service.
+    const noteEmbeddingBackfill = reason === "startup"
+      ? undefined
+      : await this.store.backfillOperatorNoteEmbeddings(25).catch((error) => {
+          this.logger.warn({ err: error }, "Operator note embedding backfill failed");
+          return undefined;
+        });
     await this.media?.stopIdleDocling?.();
     const expiredArtifacts = await this.artifacts.cleanupExpired().catch((error) => {
       this.logger.warn({ err: error }, "Expired artifact cleanup failed");
@@ -1372,13 +1380,13 @@ export class OperatorDaemon {
     this.store.appendEvent("maintenance.completed", {
       payload: {
         reason,
-        expiredNotes,
         expiredApprovals,
         expiredArtifacts,
         prunedLocalFiles: prunedLocalFiles.removedFiles,
         freedLocalBytes: prunedLocalFiles.freedBytes,
         scheduledAutomations,
         escalatedReminders,
+        ...(noteEmbeddingBackfill ? { noteEmbeddingBackfill } : {}),
         // Only when the night actually did something: a `scribe: "already-ran"`
         // field on every tick of the day would be sixty rows of noise an hour
         // in the one table the secretary itself has to read back.
@@ -5545,19 +5553,26 @@ export class OperatorDaemon {
    * spend the index budget on the one category that already has room.
    */
   private currentMemoryNotes(): { index: MemoryIndexNote[]; antiRediscovery: MemoryIndexNote[] } {
-    const notes: MemoryIndexNote[] = this.store
-      .listOperatorNotes({ status: "active", limit: 200 })
-      .map((note) => ({
-        id: note.id,
-        content: defangMarkers(note.content),
-        updatedAt: note.updatedAt,
-        category: note.category,
-        // Package 3.1: once the night secretary has described a legacy note,
-        // the index line stops being "first 100 characters of the content" and
-        // becomes the trigger form of §2.3. Defanged like the content, because
-        // it is derived FROM the content and inherits its trust level.
-        ...(note.description ? { description: defangMarkers(note.description) } : {}),
-      }));
+    const notes: MemoryIndexNote[] = rankOperatorNotesForPush(
+      this.store.listOperatorNotes({ status: "active", limit: 200 }),
+    )
+      .map((note) => {
+        const warning = staleOperatorNoteWarning(note);
+        return {
+          id: note.id,
+          content: defangMarkers(note.content),
+          updatedAt: note.updatedAt,
+          category: note.category,
+          pushScore: operatorNotePushScore(note),
+          ...(note.key ? { key: note.key } : {}),
+          ...(warning ? { warning } : {}),
+          // Package 3.1: once the night secretary has described a legacy note,
+          // the index line stops being "first 100 characters of the content" and
+          // becomes the trigger form of §2.3. Defanged like the content, because
+          // it is derived FROM the content and inherits its trust level.
+          ...(note.description ? { description: defangMarkers(note.description) } : {}),
+        };
+      });
     return {
       index: notes.filter((note) => note.category !== ANTI_REDISCOVERY_CATEGORY),
       antiRediscovery: notes.filter((note) => note.category === ANTI_REDISCOVERY_CATEGORY),
@@ -6444,7 +6459,6 @@ export class OperatorDaemon {
     }
     try {
       this.refreshStructuredThreadSummaries();
-      await this.maintainStructuredMemory(this.buildOperatorMemorySnapshot());
       const snapshot = this.buildOperatorMemorySnapshot();
       const handoff = await this.operatorRuntimeQueue.run(() =>
         this.withRuntimeDeadline("provider-switch handoff", () =>
@@ -8012,85 +8026,6 @@ export class OperatorDaemon {
     }
   }
 
-  private async maintainStructuredMemory(snapshot: Record<string, unknown>): Promise<void> {
-    // Package 2.1: `obsoleteNoteIds` is a decision about notes, and the snapshot
-    // JSON no longer lists them — the memory index does, and every one of its
-    // lines ends in the id this call has to name. This is the one-shot's own
-    // DATA, not a state push: it carries no push handle, so it neither moves
-    // the diff baseline nor counts as a turn of the epoch (§4).
-    //
-    // Two differences from the pushed index, both deliberate: anti-rediscovery
-    // notes are folded back IN (they are excluded from the pushed index because
-    // they have their own block — excluding them here would make them the one
-    // category this mechanism could never retire), and the budget is the
-    // one-shot's own, not the envelope's 3 000 — see
-    // MAINTENANCE_INDEX_BUDGET_CHARS. A maintenance pass that sees a third of
-    // the notes would obsolete from a third of the picture.
-    const notes = this.currentMemoryNotes();
-    const maintenanceIndex = renderMemoryIndex([...notes.index, ...notes.antiRediscovery], {
-      budget: MAINTENANCE_INDEX_BUDGET_CHARS,
-    });
-    const response = await this.askOperator(
-      [
-        "Prepare durable memory maintenance before context compaction.",
-        "Use the current Operator conversation plus the bounded authoritative state below.",
-        "Return ONLY JSON with notes (array of {category,content,expiresAt?}) and obsoleteNoteIds (string[]).",
-        "Keep only stable preferences, decisions, open loops, and cross-session facts. Never store credentials, secrets, raw transcripts, or temporary chatter. Merge duplicates conceptually and return no more than 20 notes.",
-        "Existing notes are listed below as `trigger → id`; an id from that list is the only thing obsoleteNoteIds may contain.",
-        maintenanceIndex,
-        `Live work (context only — these are not notes and their ids are NOT note ids):\n${this.buildStateLayers().now}`,
-        `State JSON:\n${serializeBoundedJson(snapshot, 20_000)}`,
-      ].join("\n\n"),
-    ).catch(() => "");
-    const plan = parseMemoryMaintenancePlan(response);
-    if (!plan) return;
-    let remembered = 0;
-    let obsoleted = 0;
-    for (const note of plan.notes.slice(0, 20)) {
-      try {
-        this.store.rememberOperatorNote({
-          category: note.category,
-          content: note.content,
-          source: "maintenance",
-          ...(note.expiresAt ? { expiresAt: note.expiresAt } : {}),
-        });
-        remembered += 1;
-      } catch {
-        // Invalid or secret-only note is intentionally skipped.
-      }
-    }
-    // Bug №42: LLM maintenance must never silently erase what the owner
-    // explicitly asked to remember. Notes in the `user` category are only
-    // obsoleted by an explicit "forget"; everything else is journaled with its
-    // ids so `/memory restore <id>` can undo a wrong call.
-    const obsoletedNoteIds: string[] = [];
-    const protectedNoteIds: string[] = [];
-    for (const id of plan.obsoleteNoteIds.slice(0, 50)) {
-      if (this.store.getOperatorNoteVersion(id)?.category === "user") {
-        protectedNoteIds.push(id);
-        continue;
-      }
-      if (this.store.markOperatorNoteObsolete(id)) {
-        obsoleted += 1;
-        obsoletedNoteIds.push(id);
-      }
-    }
-    if (obsoletedNoteIds.length || protectedNoteIds.length) {
-      this.store.appendEvent("memory.notes.obsoleted", {
-        payload: {
-          noteIds: obsoletedNoteIds,
-          protectedUserNoteIds: protectedNoteIds,
-          restoreHint: obsoletedNoteIds.length
-            ? `/memory restore ${obsoletedNoteIds[0]}`
-            : undefined,
-        },
-      });
-    }
-    this.store.appendEvent("memory.maintained", {
-      payload: { remembered, obsoleted },
-    });
-  }
-
   private bindInboundToThreads(
     update: Extract<TelegramInbound, { type: "message" }>,
     projectId: string,
@@ -8660,42 +8595,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function parseMemoryMaintenancePlan(value: string):
-  | {
-      notes: Array<{ category: string; content: string; expiresAt?: string }>;
-      obsoleteNoteIds: string[];
-    }
-  | undefined {
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/iu.exec(value)?.[1];
-  const candidate = fenced ?? value.slice(value.indexOf("{"), value.lastIndexOf("}") + 1);
-  if (!candidate) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(candidate);
-    if (!isRecord(parsed)) return undefined;
-    const notes = Array.isArray(parsed.notes)
-      ? parsed.notes.flatMap((entry) => {
-          if (!isRecord(entry) || typeof entry.content !== "string" || !entry.content.trim()) return [];
-          const expiresAt = typeof entry.expiresAt === "string" && Number.isFinite(Date.parse(entry.expiresAt))
-            ? entry.expiresAt
-            : undefined;
-          return [{
-            category: typeof entry.category === "string" ? safeExcerpt(entry.category.trim(), 80) : "general",
-            content: safeExcerpt(entry.content.trim(), 8_000),
-            ...(expiresAt ? { expiresAt } : {}),
-          }];
-        })
-      : [];
-    const obsoleteNoteIds = Array.isArray(parsed.obsoleteNoteIds)
-      ? parsed.obsoleteNoteIds
-          .filter((entry): entry is string => typeof entry === "string")
-          .map((entry) => entry.slice(0, 200))
-      : [];
-    return { notes, obsoleteNoteIds };
-  } catch {
-    return undefined;
-  }
-}
-
 /**
  * Roadmap 0.5 (B2): thread titles and summaries are worker prose — the worker
  * wrote them, and a worker can itself have been fed hostile input. They ride
@@ -8725,7 +8624,8 @@ function compactThreadSummary(
 }
 
 function renderOperatorNote(note: OperatorNote): string {
-  return `- **${escapeMarkdownText(note.category)}** · ${escapeMarkdownText(note.id)} — ${escapeMarkdownText(safeExcerpt(note.content, 700))}`;
+  const warning = staleOperatorNoteWarning(note);
+  return `- **${escapeMarkdownText(note.category)}** · ${escapeMarkdownText(note.id)} — ${escapeMarkdownText(safeExcerpt(note.content, 700))}${warning ? `\n  ${escapeMarkdownText(warning)}` : ""}`;
 }
 
 /**

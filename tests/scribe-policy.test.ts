@@ -73,10 +73,11 @@ import {
 describe("has_work() gate (memory-design §5)", () => {
   const quiet = {
     events: 0,
-    messages: 0,
+    distillationRows: 0,
     expiredItems: 0,
     changedItems: 0,
     notesMissingDescription: 0,
+    staleFacts: 0,
     rollupDue: false,
     summariesDue: 0,
   };
@@ -87,12 +88,19 @@ describe("has_work() gate (memory-design §5)", () => {
 
   it("fires on each signal on its own, and names which one", () => {
     expect(hasScribeWork({ ...quiet, events: 3 })).toEqual({ work: true, reasons: ["events:3"] });
-    expect(hasScribeWork({ ...quiet, messages: 1 })).toEqual({ work: true, reasons: ["messages:1"] });
+    expect(hasScribeWork({ ...quiet, distillationRows: 1 })).toEqual({
+      work: true,
+      reasons: ["distillation:1"],
+    });
     expect(hasScribeWork({ ...quiet, expiredItems: 2 })).toEqual({ work: true, reasons: ["expired:2"] });
     expect(hasScribeWork({ ...quiet, changedItems: 1 })).toEqual({ work: true, reasons: ["ledger:1"] });
     expect(hasScribeWork({ ...quiet, notesMissingDescription: 4 })).toEqual({
       work: true,
       reasons: ["descriptions:4"],
+    });
+    expect(hasScribeWork({ ...quiet, staleFacts: 2 })).toEqual({
+      work: true,
+      reasons: ["stale-facts:2"],
     });
     expect(hasScribeWork({ ...quiet, rollupDue: true })).toEqual({ work: true, reasons: ["rollup"] });
     expect(hasScribeWork({ ...quiet, summariesDue: 2 })).toEqual({

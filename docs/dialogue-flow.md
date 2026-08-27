@@ -253,11 +253,11 @@ yet.`) — the structure must not wobble.
 
 Budgets are in **characters**, enforced by the render through ranking plus an
 overflow tail, never by refusing a write: now-state 3000 (pinned daemon items
-first, then by recency), memory index 3000 (`trigger → reference`, newest
-first), do-not-reopen 1000. Until package 3.2 fills in `key`/`description`, a
-legacy note is indexed by the temporary format of memory-design §6.4 — the first
-~100 characters of its content pointing at its id, which `memory.get` accepts as
-a reference.
+first, then by recency), memory index 3000 (`trigger → reference`, canonical v2
+push score then recency), do-not-reopen 1000. A keyless pre-package-3.2 note is
+indexed by the temporary format of memory-design §6.4 — the first ~100
+characters of its content pointing at its id, which `memory.get` accepts as a
+reference.
 
 The now-state source is the **`now_items` ledger** (package 2.2, memory-design
 §2.2). Its overflow tail names `now.get`, which returns the complete list.
@@ -1601,22 +1601,26 @@ retelling instead of `PROVIDER_FAILED`.
 
 ## 15. Storage and retention
 
-31 tables plus 2 FTS5 indexes, WAL, `foreign_keys = ON`, `busy_timeout = 5000`.
-(The count was stale at 26 — `now_items` and `journal_entries` arrived with
-packages 2.2 and 3.1 and nobody re-counted.)
+SQLite uses WAL, `foreign_keys = ON` and `busy_timeout = 5000`. The merged
+schema includes versioned notes/operations/evidence, append-only logical
+conversation rows plus a delivered stream and owner-partitioned cursors, and
+durable merge proposals. `migrate()` is repeatable from the exact package base;
+the notes-v2 migration is version-gated and rebuilds FTS without losing legacy
+note/now/automation/journal rows or per-owner cursor progress.
 
-**Every boot re-runs the whole schema file and re-embeds every active note.**
-`migrate()` has no version gate — `schema_migrations` is written with
-`INSERT OR IGNORE` and never read. `001_initial.sql` ends by clearing and
-rebuilding the notes FTS index, and `migrate()` then loops every active note
-through `upsertNoteVector`. Startup is O(notes).
+Boot does not scan or embed notes and never initializes the model runtime.
+Embedding repair is an explicit non-startup maintenance page capped at 25
+notes. The Transformers runtime is pinned and forced offline before pipeline
+construction; absent or corrupt operator-provisioned weights select the
+deterministic 384d hash retriever.
 
 Silent write failures worth knowing:
 
 - `enqueueBackgroundJob` uses `ON CONFLICT DO NOTHING` and returns the requested
   id — a dedupe collision drops the payload with no signal to the caller.
-- `expireOperatorNotes` deletes the FTS row but **not** the vector row, so
-  `operator_note_vectors` accumulates stale rows forever.
+- Note `valid_until` is freshness metadata, not deletion: stale notes remain
+  active/searchable and are marked as hypotheses. Only explicit obsolete or
+  supersede transitions remove their FTS/vector rows.
 - `registerOutbound` artifacts get no `expiresAt` and are therefore never
   eligible for cleanup — those rows are immortal.
 - `updateThreadStatus`, `resolveApproval`, `updateApprovalMessage` and
@@ -1765,10 +1769,13 @@ any failure is `logger.error("Scheduled maintenance failed")` and nothing more.
 
 The front of the tick dispatches due automations, reserves eligible reminder
 escalations, expires approvals, then flushes the outbox. It continues with T3
-dispatches, note/artifact/media cleanup, structured summaries, compaction and
+dispatches, bounded note-embedding repair, artifact/media cleanup, structured summaries, compaction and
 journal-retention gates, worker recovery (unless startup), and one completion
 event. App-turn failures throw back to durable ingress retry instead of being
 converted into an ordinary owner-turn error and consuming the scheduled run.
+
+The note step is one explicit embedding-repair page capped at 25 outside
+startup. It never expires notes and never initializes the local model on boot.
 
 Last in that tick, after worker recovery, is **the night secretary**.
 
@@ -1786,18 +1793,25 @@ ATTEMPT per night, succeed or skip — the per-minute tick would otherwise re-en
 a failing run a hundred times before dawn.
 
 Before any of it, a deterministic `has_work()`: the delta of work events,
-correspondence, expired deadlines, ledger changes, undescribed notes, and whether
-a month owes a rollup. The event half reads an ALLOW list of types, because the
-tick's own `maintenance.completed` lands every sixty seconds and would otherwise
-report a busy night on a machine nobody touched. A quiet night makes zero LLM
-calls and still moves the cursor.
+logical owner-ledger rows beyond the independent distillation cursor, expired
+deadlines, now-ledger changes, undescribed notes, stale facts due their monthly
+verification, and whether a month owes a rollup. The event half reads an ALLOW
+list of types, because the tick's own `maintenance.completed` lands every sixty
+seconds and would otherwise report a busy night on a machine nobody touched. A
+night with no work makes zero LLM calls and still moves the narrative cursor. A
+ledger page that yields strict `NOTHING` is different: it is one successful call
+and advances only the owner-partitioned distillation cursor.
 
 Then the deterministic half — the projection is reconciled, items past
 `valid_until` are closed and archived, and work the event log shows finishing
 with no entry anywhere is written up and marked «(восстановлено по event-логу)».
 Then the model half on the **Claude branch**, whatever the main session is
-running: the day's summary, the previous month's rollup, and a small batch of
-missing note descriptions.
+running: up to three frozen ledger pages (200 rows/64,000 code points each), the
+day's summary, the previous month's rollup, and a small batch of missing note
+descriptions. Only nonempty owner assertions can support distilled facts;
+provider/parse failures leave the failed page pending. Every accepted fact goes
+through the Notes-v2 writer with evidence sequences. Exact-key or MiniLM ≥0.85
+collisions become durable proposals, never silent merges.
 
 **The summary is built against the ledger, not by retelling the journal.** A
 reopened item clears its `journal_ref` while the archive of its earlier close
@@ -1813,7 +1827,8 @@ the 21st terminal survives both the next night and a daemon restart. A catch-up
 that writes one summary and then loses the channel is `degraded`; completed
 calls survive and it does not pretend the provider missed the whole night.
 
-Both owner-facing outputs — that alert and the monthly proposal batch — are
+Owner-facing outputs — that alert, the monthly proposal/stale-verification
+batch, and distilled merge proposals — are
 persisted as pending synthetic background-lane turns before their once-only
 markers settle, then removed only after durable enqueue is confirmed. No known
 owner chat or an enqueue exception therefore retries later rather than losing

@@ -40,6 +40,8 @@ export const SCRIBE_MISS_ALERT_KEY = "scribe_miss_alert_day";
 export const SCRIBE_PENDING_TURN_PREFIX = "scribe_pending_owner_turn:";
 /** Last month a rollup was settled (`YYYY-MM`), empty months included. */
 export const SCRIBE_LAST_ROLLUP_KEY = "last_scribe_rollup_month";
+/** Last owner-local month whose stale facts were durably offered for verification. */
+export const SCRIBE_LAST_STALE_VERIFICATION_KEY = "last_scribe_stale_verification_month";
 
 /**
  * Event types that count as "something happened" for the gate.
@@ -82,14 +84,16 @@ export const SCRIBE_WORK_EVENT_PREFIXES = [
 export interface ScribeWorkSignals {
   /** Daemon events since the cursor. */
   events: number;
-  /** Telegram messages since the cursor, both directions (§2.5). */
-  messages: number;
+  /** Logical conversation rows after the independent distillation cursor (§2.5). */
+  distillationRows: number;
   /** Open now items past `valid_until`, waiting to be filed (§2.2). */
   expiredItems: number;
   /** Ledger rows touched since the cursor, closed ones included. */
   changedItems: number;
   /** Active notes still without the §2.3 index line (§6.4). */
   notesMissingDescription: number;
+  /** Active facts due for this month's bounded stale verification turn. */
+  staleFacts: number;
   /** A month with entries and no rollup yet (§2.4). */
   rollupDue: boolean;
   /**
@@ -124,12 +128,13 @@ export interface ScribeWorkVerdict {
 export function hasScribeWork(signals: ScribeWorkSignals): ScribeWorkVerdict {
   const reasons: string[] = [];
   if (signals.events > 0) reasons.push(`events:${signals.events}`);
-  if (signals.messages > 0) reasons.push(`messages:${signals.messages}`);
+  if (signals.distillationRows > 0) reasons.push(`distillation:${signals.distillationRows}`);
   if (signals.expiredItems > 0) reasons.push(`expired:${signals.expiredItems}`);
   if (signals.changedItems > 0) reasons.push(`ledger:${signals.changedItems}`);
   if (signals.notesMissingDescription > 0) {
     reasons.push(`descriptions:${signals.notesMissingDescription}`);
   }
+  if (signals.staleFacts > 0) reasons.push(`stale-facts:${signals.staleFacts}`);
   if (signals.rollupDue) reasons.push("rollup");
   if (signals.summariesDue > 0) reasons.push(`summaries:${signals.summariesDue}`);
   if ((signals.recoveryDue ?? 0) > 0) reasons.push(`recovery:${signals.recoveryDue}`);

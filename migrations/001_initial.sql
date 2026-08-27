@@ -158,6 +158,34 @@ CREATE TABLE IF NOT EXISTS operator_note_operations (
   FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS operator_note_evidence (
+  note_id TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  evidence_seq INTEGER NOT NULL CHECK (evidence_seq > 0),
+  PRIMARY KEY (note_id, evidence_seq),
+  FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS memory_merge_proposals (
+  id TEXT PRIMARY KEY,
+  replay_key TEXT NOT NULL UNIQUE,
+  owner_id TEXT NOT NULL,
+  candidate_key TEXT NOT NULL,
+  description TEXT NOT NULL,
+  content TEXT NOT NULL,
+  category TEXT NOT NULL,
+  valid_until TEXT,
+  evidence_seqs_json TEXT NOT NULL CHECK (json_valid(evidence_seqs_json)),
+  matching_note_id TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN ('exact-key','semantic')),
+  score REAL NOT NULL,
+  notification_status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (notification_status IN ('pending','enqueued')),
+  created_at TEXT NOT NULL,
+  notified_at TEXT,
+  FOREIGN KEY (matching_note_id) REFERENCES operator_notes(id) ON DELETE RESTRICT
+);
+
 CREATE TABLE IF NOT EXISTS conversation_compactions (
   id TEXT PRIMARY KEY,
   operator_session_id TEXT,
@@ -592,6 +620,8 @@ CREATE INDEX IF NOT EXISTS idx_events_correlation
 CREATE INDEX IF NOT EXISTS idx_operator_notes_status ON operator_notes(status, updated_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_notes_active_key
   ON operator_notes(key) WHERE status='active' AND key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_merge_proposals_pending
+  ON memory_merge_proposals(notification_status,created_at,id);
 CREATE INDEX IF NOT EXISTS idx_telegram_outbox_delivery
   ON telegram_outbox(status, next_attempt_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_conversation_ledger_owner_id

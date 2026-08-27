@@ -23,4 +23,13 @@ describe("operator mutation replay keys", () => {
     const replay = new TurnReplayKeys("telegram-ingress:42");
     expect(replay.nextAutomationMutation("create")).toBe(first);
   });
+
+  it("reuses memory write ordinals on crash replay but separates two live writes", () => {
+    const attempt = new TurnReplayKeys("telegram-ingress:42");
+    const first = attempt.nextMemoryWrite();
+    expect(attempt.nextMemoryWrite()).not.toBe(first);
+
+    const replay = new TurnReplayKeys("telegram-ingress:42");
+    expect(replay.nextMemoryWrite()).toBe(first);
+  });
 });

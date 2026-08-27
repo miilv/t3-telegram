@@ -318,14 +318,33 @@ describe("OperatorToolServer", () => {
       expect(JSON.stringify(memory)).not.toContain("super-…");
       // Package 2.1 (memory-design §2.2 pull layer): the pushed index carries
       // only a trigger and a reference; this is the tool that turns the
-      // reference back into the note. Until package 3.2 adds the `key` column,
-      // the reference printed by the legacy index (§6.4) is the note id.
+      // reference back into the note. Keyless pre-package-3.2 notes retain the
+      // legacy id reference (§6.4).
       expect(await callJson(client, "memory.get", { key: noteWritten.id })).toMatchObject({
         ok: true,
         note: {
           id: noteWritten.id,
           content: "Use MCP capabilities authorization=[REDACTED]",
         },
+      });
+      const staleWrite = await callJson(client, "memory.remember", {
+        key: "warehouse-owner",
+        description: "when warehouse ownership matters → read this fact",
+        category: "people",
+        content: "Dan owns the warehouse",
+        validUntil: "2020-01-01T00:00:00.000Z",
+      });
+      expect(staleWrite).toMatchObject({
+        ok: true,
+        kind: "written",
+        write: { note: { key: "warehouse-owner", status: "active" } },
+      });
+      expect(await callJson(client, "memory.get", { key: "warehouse-owner" })).toMatchObject({
+        ok: true,
+        note: { status: "active", warning: expect.stringContaining("treat as hypothesis") },
+      });
+      expect(await callJson(client, "memory.search", { query: "warehouse owner" })).toMatchObject({
+        notes: [{ status: "active", warning: expect.stringContaining("treat as hypothesis") }],
       });
       await callJson(client, "journal.note", {
         day: "2026-08-21",

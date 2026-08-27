@@ -407,6 +407,33 @@ describe("TTL transfers (memory-design §2.2, §5)", () => {
 // ---------------------------------------------------------------------------
 
 describe("the monthly rollup (memory-design §2.4)", () => {
+  it("asks one bounded owner question about stale valid-until facts without retiring them", async () => {
+    const store = tempStore();
+    const stale = store.notes.writeVersion({
+      key: "warehouse-owner",
+      category: "people",
+      description: "when warehouse ownership matters → verify the owner",
+      content: "Dan owns the warehouse",
+      source: "manual",
+      validUntil: "2026-07-31T00:00:00.000Z",
+      operationKey: "seed:stale-owner",
+    });
+    const turns: Array<{ dedupeKey: string; prompt: string }> = [];
+    const scribe = new NightScribe({
+      ...baseDeps(store, [], () => "Июль: обновили склад."),
+      requestOwnerTurn: (input) => { turns.push(input); return true; },
+      now: () => NIGHT,
+    });
+
+    const outcome = await scribe.run({ force: true });
+
+    expect(outcome.llmCalls).toBe(0);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.prompt).toContain("Dan owns the warehouse");
+    expect(turns[0]!.prompt).toContain("гипотез");
+    expect(store.getOperatorNote(stale.note.id)?.status).toBe("active");
+  });
+
   it("builds from journal_entries — and still works with the event log emptied", async () => {
     const store = tempStore();
     const prompts: string[] = [];

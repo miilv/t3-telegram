@@ -31,6 +31,8 @@ export interface ScribeRunOutcome {
   recovered: number;
   expired: number;
   described: number;
+  distilled: number;
+  proposals: number;
   rollupMonth?: string;
   misses?: number;
   detail?: string;
@@ -43,6 +45,8 @@ export interface ScribeProgress {
   recovered: number;
   expired: number;
   described: number;
+  distilled: number;
+  proposals: number;
   rollupMonth?: string;
   truncated?: boolean;
 }
@@ -57,7 +61,17 @@ export class ScribeFinalizer {
   constructor(private readonly deps: FinalizerDeps) {}
 
   idle(status: ScribeRunStatus, day: string): ScribeRunOutcome {
-    return { status, day, reasons: [], llmCalls: 0, recovered: 0, expired: 0, described: 0 };
+    return {
+      status,
+      day,
+      reasons: [],
+      llmCalls: 0,
+      recovered: 0,
+      expired: 0,
+      described: 0,
+      distilled: 0,
+      proposals: 0,
+    };
   }
 
   noWork(input: { day: string; at: Date; since: string; reasons: string[] }): ScribeRunOutcome {

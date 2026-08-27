@@ -396,11 +396,14 @@ export function buildMissAlertPrompt(input: {
 export function buildMonthlyProposalPrompt(input: {
   month: string;
   proposals: readonly RollupProposal[];
-  expiredFacts: readonly string[];
+  staleFacts: readonly string[];
+  rollupRecorded?: boolean;
 }): string {
   const lines = [
     "[Служебный вход от демона: месячная гигиена памяти]",
-    `Сводка за ${input.month} записана в журнал (journal.read, kind=rollup).`,
+    input.rollupRecorded === false
+      ? `Наступила ежемесячная перепроверка фактов за ${input.month}.`
+      : `Сводка за ${input.month} записана в журнал (journal.read, kind=rollup).`,
     // This prompt enters the MAIN session, and its lists are the least trusted
     // strings in the package: the proposals were written by a background model
     // that had just read a month of journal bodies, and the facts are note
@@ -423,10 +426,11 @@ export function buildMonthlyProposalPrompt(input: {
       "",
     );
   }
-  if (input.expiredFacts.length) {
+  if (input.staleFacts.length) {
     lines.push(
-      "Просроченные факты — спроси одним вопросом, что из этого ещё верно:",
-      fenceUntrusted(input.expiredFacts.map((fact) => `- ${asData(fact, 200)}`).join("\n"), "worker"),
+      "Факты с истёкшим valid_until остаются активными, но считаются гипотезами.",
+      "Одним вопросом попроси владельца подтвердить или исправить их; сам ничего не удаляй:",
+      fenceUntrusted(input.staleFacts.map((fact) => `- ${asData(fact, 200)}`).join("\n"), "worker"),
       "",
     );
   }

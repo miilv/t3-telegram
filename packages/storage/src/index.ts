@@ -70,12 +70,17 @@ import {
   rowToOperatorNote as rowToOperatorNoteV2,
 } from "./operator-notes.js";
 import { migrateOperatorNotesV2 } from "./migrations.js";
-import { LocalNoteEmbeddingService, type NoteQueryVector } from "./note-embeddings.js";
+import {
+  LocalNoteEmbeddingService,
+  NOTE_EMBEDDING_BACKFILL_MAX,
+  type NoteQueryVector,
+} from "./note-embeddings.js";
 import {
   automaticOperatorNoteOperationKey,
   OperatorNoteWriter,
   type KeyedOperatorNoteDraft,
 } from "./operator-note-writer.js";
+import { DistillationProposalRepository } from "./distillation-proposals.js";
 
 export { JournalRepository } from "./journal.js";
 export type { JournalEntryInput, JournalFilter, JournalSelection } from "./journal.js";
@@ -84,6 +89,7 @@ export {
   HASH_NOTE_EMBEDDING_MODEL,
   LocalNoteEmbeddingService,
   MINILM_NOTE_EMBEDDING_MODEL,
+  NOTE_EMBEDDING_BACKFILL_MAX,
   NOTE_EMBEDDING_DIMENSIONS,
 } from "./note-embeddings.js";
 export {
@@ -104,6 +110,13 @@ export type {
   NoteSimilarity,
 } from "./operator-note-writer.js";
 export type { NoteEmbeddingBackfillResult } from "./note-embeddings.js";
+export { DistillationProposalRepository } from "./distillation-proposals.js";
+export type {
+  DistillationMergeProposal,
+  DistillationMergeProposalInput,
+  MergeProposalNotificationStatus,
+  MergeProposalReason,
+} from "./distillation-proposals.js";
 export { ConversationLedgerRepository } from "./conversation-ledger.js";
 export type {
   ConversationBatch,
@@ -219,6 +232,7 @@ export class OperatorStore {
   readonly noteEmbeddings: LocalNoteEmbeddingService;
   readonly noteWriter: OperatorNoteWriter;
   readonly conversation: ConversationLedgerRepository;
+  readonly distillationProposals: DistillationProposalRepository;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -239,6 +253,10 @@ export class OperatorStore {
     this.noteEmbeddings = new LocalNoteEmbeddingService();
     this.noteWriter = new OperatorNoteWriter(this.notes, this.noteEmbeddings);
     this.conversation = new ConversationLedgerRepository(
+      this.db,
+      (work) => this.transaction(work),
+    );
+    this.distillationProposals = new DistillationProposalRepository(
       this.db,
       (work) => this.transaction(work),
     );
@@ -1213,7 +1231,7 @@ export class OperatorStore {
 
   /** Explicit bounded maintenance operation; it is intentionally not a boot path. */
   async backfillOperatorNoteEmbeddings(limit = 25) {
-    return this.noteEmbeddings.backfill(this.notes, limit);
+    return this.noteEmbeddings.backfill(this.notes, Math.min(limit, NOTE_EMBEDDING_BACKFILL_MAX));
   }
 
   getOperatorNote(id: string): OperatorNote | undefined {
@@ -1377,26 +1395,6 @@ export class OperatorStore {
       this.reindexNoteSearch(id, category, content, description, key);
       this.upsertNoteVector(id, `${category} ${content}`, inputHash, now);
       return true;
-    });
-  }
-
-  expireOperatorNotes(at = nowIso()): number {
-    return this.transaction(() => {
-      const rows = this.db
-        .prepare(`
-          SELECT id FROM operator_notes
-          WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?
-        `)
-        .all(at) as Row[];
-      if (!rows.length) return 0;
-      const ids = rows.map((row) => String(row.id));
-      for (const id of ids) {
-        this.db
-          .prepare("UPDATE operator_notes SET status='obsolete',updated_at=? WHERE id=?")
-          .run(at, id);
-        this.db.prepare("DELETE FROM operator_note_search WHERE id=?").run(id);
-      }
-      return ids.length;
     });
   }
 
@@ -1856,25 +1854,6 @@ export class OperatorStore {
     this.transaction(() => {
       for (const id of ids) statement.run(id);
     });
-  }
-
-  /**
-   * Facts whose `expires_at` fell inside a period (§5, "перепроверка фактов").
-   *
-   * Reads notes the per-minute sweep has already retired, and does not
-   * un-retire them: the monthly batch asks the owner what is still true, and
-   * an answer of "that one still holds" is a `memory.remember`, not a
-   * resurrection behind their back.
-   */
-  listNotesExpiredBetween(from: string, to: string, limit = 10): OperatorNote[] {
-    const rows = this.db
-      .prepare(`
-        SELECT * FROM operator_notes
-        WHERE status='obsolete' AND expires_at IS NOT NULL AND expires_at>=? AND expires_at<=?
-        ORDER BY expires_at DESC LIMIT ?
-      `)
-      .all(from, to, Math.max(1, Math.min(limit, 50))) as Row[];
-    return rows.map(rowToOperatorNote);
   }
 
   /**

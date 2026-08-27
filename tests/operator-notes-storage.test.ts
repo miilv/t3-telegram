@@ -64,6 +64,30 @@ describe("OperatorNoteRepository version transactions", () => {
     store.close();
   });
 
+  it("persists distilled owner evidence with the version and replays it without duplicates", () => {
+    const store = tempStore();
+    const input = {
+      ...writeInput("distilled:batch-1:warehouse"),
+      source: "distilled" as const,
+      evidence: { ownerId: "42", sequences: [3, 7] },
+    };
+    const first = store.notes.writeVersion(input);
+    const replay = store.notes.writeVersion(input);
+    const evidenceForVersion = (store.notes as unknown as {
+      evidenceForVersion?: (noteId: string) => { ownerId: string; sequences: number[] } | undefined;
+    }).evidenceForVersion;
+
+    expect(typeof evidenceForVersion).toBe("function");
+    expect(evidenceForVersion!.call(store.notes, first.note.id)).toEqual({
+      ownerId: "42",
+      sequences: [3, 7],
+    });
+    expect(replay).toMatchObject({ applied: false, note: { id: first.note.id } });
+    expect(store.db.prepare("SELECT COUNT(*) AS count FROM operator_note_evidence").get())
+      .toMatchObject({ count: 2 });
+    store.close();
+  });
+
   it("records an identical keyed payload as a durable no-op", () => {
     const store = tempStore();
     const first = store.notes.writeVersion(writeInput("job:a:0"));

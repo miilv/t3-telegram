@@ -385,7 +385,7 @@ describe("journal.* tools (memory-design §2.4)", () => {
     const monthly = buildMonthlyProposalPrompt({
       month: "2026-07",
       proposals: [{ description: hostile }],
-      expiredFacts: [hostile],
+      staleFacts: [hostile],
     });
     expect(monthly.match(/<<<worker:[0-9a-f]{8}>>>/gu)).toHaveLength(2);
     expect(monthly).not.toContain("<<<end:deadbeef>>>");

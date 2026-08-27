@@ -16,7 +16,10 @@ export function migrateOperatorNotesV2(
     .every((column) => searchColumns.has(column));
   const exactVectors = ["note_id", "model", "dimensions", "input_hash", "vector_json", "updated_at"]
     .every((column) => vectorColumns.has(column)) && hasCompositeVectorPrimaryKey(db);
-  if (applied && exactSearch && exactVectors) return;
+  const evidenceTable = tableColumns(db, "operator_note_evidence");
+  const exactEvidence = ["note_id", "owner_id", "evidence_seq"]
+    .every((column) => evidenceTable.has(column));
+  if (applied && exactSearch && exactVectors && exactEvidence) return;
 
   transaction(() => {
     db.prepare("UPDATE operator_notes SET valid_until=expires_at WHERE valid_until IS NULL AND expires_at IS NOT NULL").run();
@@ -75,6 +78,13 @@ export function migrateOperatorNotesV2(
         operation_key TEXT PRIMARY KEY,
         note_id TEXT NOT NULL,
         created_at TEXT NOT NULL,
+        FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS operator_note_evidence (
+        note_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        evidence_seq INTEGER NOT NULL CHECK (evidence_seq > 0),
+        PRIMARY KEY (note_id,evidence_seq),
         FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_notes_active_key

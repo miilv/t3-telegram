@@ -32,8 +32,7 @@ import type {
   PauseAssessment,
   PushBaseline,
 } from "../packages/policy/src/index.js";
-import { MAINTENANCE_INDEX_BUDGET_CHARS } from "../packages/policy/src/index.js";
-import { newId, ownerLogicalDay } from "../packages/shared/src/index.js";
+import { ownerLogicalDay } from "../packages/shared/src/index.js";
 
 const ZONE = "Europe/Moscow"; // UTC+3, no DST — arithmetic in the tests stays readable.
 
@@ -333,30 +332,6 @@ describe("layer renderers and their budgets", () => {
     for (const item of items) expect(tight).toContain(item.content);
   });
 
-  /**
-   * Package 2.1 backlog: 20 000 → 32 000 for the maintenance one-shot.
-   *
-   * The pass names the note ids it wants to retire, so a note it never saw is a
-   * note this mechanism can never retire — and the render says so with a tail
-   * rather than an error, which is precisely why the shortfall was invisible.
-   */
-  it("shows the maintenance one-shot every note it may retire", () => {
-    // The real shape: 200 notes (the store's ceiling) indexed by the temporary
-    // §6.4 format, whose reference is a 41-character `note_<uuid>` id.
-    const notes = Array.from({ length: 200 }, (_, index) =>
-      note(newId("note"), {
-        content: `Заметка ${index}: ${"содержимое ".repeat(12)}`,
-        updatedAt: new Date(Date.UTC(2026, 7, 26, 12, 0, index)).toISOString(),
-      }),
-    );
-    expect(notes[0]!.id).toHaveLength(41);
-    const rendered = renderMemoryIndex(notes, { budget: MAINTENANCE_INDEX_BUDGET_CHARS });
-    expect(rendered).not.toContain("(+");
-    for (const item of notes) expect(rendered).toContain(item.id);
-    // …and the old number genuinely did not, so the raise is not decoration.
-    expect(renderMemoryIndex(notes, { budget: 20_000 })).toContain("(+");
-  });
-
   it("cuts an over-long item by code point, never through an emoji", () => {
     // Titles are worker-written and now-items are agent-written, so an emoji in
     // one is ordinary. `String.slice` cuts by UTF-16 unit and would drop a lone
@@ -389,6 +364,34 @@ describe("layer renderers and their budgets", () => {
       }),
     ]);
     expect(rendered).toContain("отчёты для Дани → формат и канал → dania-reports");
+  });
+
+  it("uses the canonical v2 push score before recency for the bounded index", () => {
+    const rendered = renderMemoryIndex([
+      note("newer", {
+        content: "newer",
+        updatedAt: "2026-08-26T10:00:00.000Z",
+        pushScore: 0.1,
+      }),
+      note("older-important", {
+        content: "older important",
+        updatedAt: "2026-01-01T10:00:00.000Z",
+        pushScore: 0.9,
+      }),
+    ]);
+    expect(rendered.indexOf("older-important")).toBeLessThan(rendered.indexOf("newer"));
+  });
+
+  it("keeps stale facts visible in push but marks them as hypotheses", () => {
+    const rendered = renderMemoryIndex([
+      note("stale", {
+        key: "warehouse-owner",
+        description: "when warehouse ownership matters → read this",
+        warning: "[not verified since 2026-08-01 — treat as hypothesis]",
+      }),
+    ]);
+    expect(rendered).toContain("warehouse-owner");
+    expect(rendered).toContain("treat as hypothesis");
   });
 
   it("keeps the memory index inside 3000 characters, newest notes first", () => {

@@ -77,6 +77,8 @@ describe("scribe terminal-state transactions", () => {
     recovered: 0,
     expired: 0,
     described: 0,
+    distilled: 0,
+    proposals: 0,
   };
 
   it.each(["no-work", "complete", "failure"] as const)(
@@ -278,7 +280,7 @@ describe("a night the background channel is down (memory-design §5)", () => {
   });
 
   it.each([
-    ["a gate query", "countTelegramMessagesSince"],
+    ["a gate query", "countEligibleAfter"],
     ["the ledger projection", "reconcileNowItems"],
   ] as const)("finalizes a pre-model failure in %s without burning an outage miss", async (_label, failure) => {
     const store = tempStore();
@@ -286,8 +288,20 @@ describe("a night the background channel is down (memory-design §5)", () => {
     store.rememberOperatorNote({ content: "работа, которая opens the gate" });
     const brokenStore = new Proxy(store, {
       get(target, property, receiver) {
-        if (failure === "countTelegramMessagesSince" && property === failure) {
-          return () => { throw new Error("gate query exploded"); };
+        if (failure === "countEligibleAfter" && property === "conversation") {
+          return new Proxy(target.conversation, {
+            get(conversation, conversationProperty, conversationReceiver) {
+              if (conversationProperty === failure) {
+                return () => { throw new Error("gate query exploded"); };
+              }
+              const nested = Reflect.get(
+                conversation,
+                conversationProperty,
+                conversationReceiver,
+              ) as unknown;
+              return typeof nested === "function" ? nested.bind(conversation) : nested;
+            },
+          });
         }
         const value = Reflect.get(target, property, receiver) as unknown;
         return typeof value === "function" ? value.bind(target) : value;

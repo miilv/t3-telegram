@@ -3,6 +3,7 @@ import {
 } from "../../policy/src/operator-notes.js";
 import { createHash } from "node:crypto";
 import type { OperatorNote, OperatorNoteSource, PreparedNoteVector } from "../../shared/src/index.js";
+import { maskSecretsForStorage } from "../../shared/src/index.js";
 import {
   MINILM_NOTE_EMBEDDING_MODEL,
   NOTE_EMBEDDING_DIMENSIONS,
@@ -34,6 +35,7 @@ export interface KeyedOperatorNoteDraft {
   verifiedAt?: string;
   validUntil?: string;
   operationKey: string;
+  evidence?: { ownerId: string; sequences: readonly number[] };
 }
 
 export type KeyedOperatorNoteWriteResult =
@@ -58,18 +60,19 @@ export interface NoteSimilarity {
 export function automaticOperatorNoteOperationKey(
   draft: Omit<KeyedOperatorNoteDraft, "operationKey">,
 ): string {
-  const validated = validateOperatorNoteDraft(draft);
+  const protectedDraft = protectNoteText(draft);
+  const validated = validateOperatorNoteDraft(protectedDraft);
   const payload = validated.ok
     ? {
         key: validated.key,
         description: validated.description,
         category: validated.category,
         content: validated.content,
-        source: draft.source,
-        verifiedAt: draft.verifiedAt ?? "",
-        validUntil: draft.validUntil ?? "",
+        source: protectedDraft.source,
+        verifiedAt: protectedDraft.verifiedAt ?? "",
+        validUntil: protectedDraft.validUntil ?? "",
       }
-    : draft;
+    : protectedDraft;
   return `manual:${createHash("sha256").update(JSON.stringify(payload)).digest("hex")}`;
 }
 
@@ -84,7 +87,8 @@ export class OperatorNoteWriter {
   ) {}
 
   async write(draft: KeyedOperatorNoteDraft): Promise<KeyedOperatorNoteWriteResult> {
-    const validated = validateOperatorNoteDraft(draft);
+    const protectedDraft = protectNoteText(draft);
+    const validated = validateOperatorNoteDraft(protectedDraft);
     if (!validated.ok) return validated;
     if (!draft.operationKey.trim()) return { ok: false, hint: "A durable operation key is required." };
 
@@ -99,7 +103,14 @@ export class OperatorNoteWriter {
       category: validated.category,
       content: validated.content,
     };
-    const exactKeyAtStart = Boolean(this.repository.getActive(input.key));
+    const exactKeyAtStart = this.repository.getActive(input.key);
+    if (draft.source === "distilled" && exactKeyAtStart) {
+      return {
+        ok: true,
+        kind: "merge-proposal",
+        mergeProposal: { note: exactKeyAtStart, score: 1 },
+      };
+    }
     const vector = await this.embeddings.embed(input);
     // Exact-key writes are authorized version changes. Semantic dedupe is only
     // for cross-key matches, never a way to block the key's current editor.
@@ -116,6 +127,7 @@ export class OperatorNoteWriter {
       source: draft.source,
       ...(draft.verifiedAt ? { verifiedAt: draft.verifiedAt } : {}),
       ...(draft.validUntil ? { validUntil: draft.validUntil } : {}),
+      ...(draft.evidence ? { evidence: draft.evidence } : {}),
       operationKey: draft.operationKey,
       vectors: [vector],
     });
@@ -138,6 +150,23 @@ export class OperatorNoteWriter {
       .filter((candidate) => Number.isFinite(candidate.score))
       .sort((left, right) => right.score - left.score || left.note.id.localeCompare(right.note.id));
   }
+}
+
+function protectNoteText<T extends {
+  key: string;
+  description: string;
+  content: string;
+  category?: string;
+}>(draft: T): T {
+  return {
+    ...draft,
+    key: maskSecretsForStorage(draft.key),
+    description: maskSecretsForStorage(draft.description),
+    content: maskSecretsForStorage(draft.content),
+    ...(draft.category === undefined
+      ? {}
+      : { category: maskSecretsForStorage(draft.category) }),
+  };
 }
 
 function cosineSimilarity(left: readonly number[], right: readonly number[]): number {

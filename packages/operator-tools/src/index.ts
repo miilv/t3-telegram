@@ -88,7 +88,7 @@ import {
   resumeAutomationRun,
   updateAutomation,
 } from "../../automations/src/index.js";
-import { replayIdentity, TurnReplayKeys } from "./replay.js";
+import { TurnReplayKeys } from "./replay.js";
 import { TurnConversationOutputs } from "./conversation-output.js";
 import { registerAutomationAndCalendarTools } from "./automation-tools.js";
 
@@ -192,6 +192,7 @@ export const APP_TURN_REPLAY_SAFE_TOOL_NAMES: readonly OperatorMcpToolName[] = [
   "t3.get_thread_summary",
   "memory.search",
   "memory.get",
+  "memory.remember",
   "memory.journal",
   "journal.note",
   "journal.read",
@@ -867,10 +868,9 @@ export class OperatorToolServer {
     // the territory is pulled. Every line of the pushed memory index ends in a
     // reference; this is the tool that turns one into the note itself.
     //
-    // `key` is the durable slug of package 3.2. No note has one yet, so a key
-    // that matches nothing falls back to an id lookup — which is exactly the
-    // reference the temporary legacy index (§6.4) prints today. When the column
-    // lands, the same call keeps working and the fallback quietly stops firing.
+    // `key` is the durable slug of package 3.2. Keyless pre-upgrade notes still
+    // use their id as the temporary legacy index reference (§6.4), so this one
+    // lookup boundary intentionally accepts either form.
     this.addTool(server, token, {
       name: "memory.get",
       description:
@@ -912,6 +912,7 @@ export class OperatorToolServer {
             ...(input.category ? { category: input.category } : {}),
             ...(input.validUntil ? { validUntil: input.validUntil } : {}),
             source: "manual",
+            operationKey: capability.replayKeys.nextMemoryWrite(),
           });
         }
         return this.options.store.rememberOperatorNote({
@@ -2150,7 +2151,10 @@ export class OperatorToolServer {
 
 function noteForMemoryRead<T extends { validUntil?: string }>(note: T): T & { warning?: string } {
   const warning = staleOperatorNoteWarning(note as unknown as Parameters<typeof staleOperatorNoteWarning>[0]);
-  return warning ? { ...note, warning } : note;
+  // The canonical freshness marker is bracketed. Prefix it at this JSON output
+  // boundary so the fail-closed redactor cannot mistake the human-readable
+  // marker for malformed serialized JSON and hide the warning entirely.
+  return warning ? { ...note, warning: `Freshness warning: ${warning}` } : note;
 }
 
 

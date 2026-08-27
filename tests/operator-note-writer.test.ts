@@ -21,6 +21,35 @@ function unit(first: number, second = Math.sqrt(1 - first * first)): number[] {
 }
 
 describe("OperatorNoteWriter", () => {
+  it("applies the canonical storage mask before embedding and persisting a keyed note", async () => {
+    const store = tempStore();
+    let embeddedContent = "";
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => false,
+      embed: async (input) => {
+        embeddedContent = input.content;
+        return vector(input, unit(1, 0));
+      },
+    });
+
+    await writer.write({
+      key: "deployment-owner",
+      description: "when deployment ownership matters → read token=description-secret",
+      content: "Dan deploys with token=content-secret",
+      category: "people",
+      source: "manual",
+      operationKey: "manual:masked",
+    });
+
+    const stored = store.notes.getActive("deployment-owner")!;
+    expect(embeddedContent).toMatch(/token=(?:\[MASKED:\d+\]|\S+…\[\d+\])/u);
+    expect(stored.content).toMatch(/token=(?:\[MASKED:\d+\]|\S+…\[\d+\])/u);
+    expect(stored.description).toMatch(/token=(?:\[MASKED:\d+\]|\S+…\[\d+\])/u);
+    expect(JSON.stringify(stored)).not.toContain("content-secret");
+    expect(JSON.stringify(stored)).not.toContain("description-secret");
+    store.close();
+  });
+
   it("rejects invalid drafts before the embedding or version transaction boundary", async () => {
     const store = tempStore();
     let embedded = 0;
@@ -206,6 +235,39 @@ describe("OperatorNoteWriter", () => {
       operationKey: "distilled:1",
     })).resolves.toMatchObject({ ok: true, kind: "merge-proposal", mergeProposal: { note: { key: curated.key } } });
     expect(store.notes.getActive(curated.key)?.content).toBe(curated.content);
+    store.close();
+  });
+
+  it("proposes instead of overwriting an existing distilled key", async () => {
+    const store = tempStore();
+    const existing = {
+      key: "warehouse-contact",
+      category: "people",
+      description: "when warehouse contact matters → use Dan",
+      content: "Dan is the warehouse contact",
+    };
+    store.notes.writeVersion({ ...existing, source: "distilled", operationKey: "distilled:first" });
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => false,
+      embed: async (input) => ({
+        model: "local-hash-v4",
+        dimensions: NOTE_EMBEDDING_DIMENSIONS,
+        inputHash: operatorNoteInputHash(input),
+        values: unit(1, 0),
+      }),
+    });
+
+    await expect(writer.write({
+      ...existing,
+      content: "Dan and Ira now share the warehouse contact role",
+      source: "distilled",
+      operationKey: "distilled:second",
+    })).resolves.toMatchObject({
+      ok: true,
+      kind: "merge-proposal",
+      mergeProposal: { note: { content: existing.content, source: "distilled" } },
+    });
+    expect(store.notes.getActive(existing.key)?.content).toBe(existing.content);
     store.close();
   });
 

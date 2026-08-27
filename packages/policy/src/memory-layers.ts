@@ -30,20 +30,6 @@ export const NOW_STATE_BUDGET_CHARS = 3_000;
 export const MEMORY_INDEX_BUDGET_CHARS = 3_000;
 /** memory-design §2.3 — anti-rediscovery descriptions render budget. */
 export const ANTI_REDISCOVERY_BUDGET_CHARS = 1_000;
-/**
- * The memory index rendered for the memory-maintenance one-shot — its own
- * budget, not the envelope's, because that pass names the ids it wants to
- * retire and can only retire what it was shown.
- *
- * 32 000, raised from 20 000 (package 2.1 backlog). The reference at the end of
- * a legacy §6.4 index line is a 41-character note id, so at the 200-note
- * ceiling the store returns, 20 000 characters silently cut roughly 65 of them
- * — silently, because the render's answer to overflow is a tail, not an error.
- * The number is a function of that temporary format and shrinks again when
- * package 3.2 replaces ids with short keys.
- */
-export const MAINTENANCE_INDEX_BUDGET_CHARS = 32_000;
-
 /** Per-item cap from §2.2; enforced at write time in package 2.2, defensively here. */
 export const NOW_ITEM_CONTENT_CHARS = 200;
 /** §6.4 — the temporary legacy index line is "first ~100 chars of content → id". */
@@ -102,6 +88,10 @@ export interface MemoryIndexNote {
   /** Package 3.2 columns; absent for every legacy note today (§6.4). */
   key?: string | null;
   description?: string | null;
+  /** Canonical package-3.2 score computed from the full persisted note. */
+  pushScore?: number;
+  /** Machine-authored freshness marker; stale facts remain routable. */
+  warning?: string;
 }
 
 export interface RenderOptions {
@@ -139,6 +129,16 @@ function byRecencyDesc(a: { updatedAt: string }, b: { updatedAt: string }): numb
   const left = Date.parse(a.updatedAt);
   const right = Date.parse(b.updatedAt);
   return (Number.isNaN(right) ? 0 : right) - (Number.isNaN(left) ? 0 : left);
+}
+
+function byPushScoreThenRecency(a: MemoryIndexNote, b: MemoryIndexNote): number {
+  const left = Number.isFinite(a.pushScore) ? a.pushScore! : undefined;
+  const right = Number.isFinite(b.pushScore) ? b.pushScore! : undefined;
+  if (left !== undefined || right !== undefined) {
+    const scoreDifference = (right ?? Number.NEGATIVE_INFINITY) - (left ?? Number.NEGATIVE_INFINITY);
+    if (scoreDifference) return scoreDifference;
+  }
+  return byRecencyDesc(a, b) || a.id.localeCompare(b.id);
 }
 
 /**
@@ -284,9 +284,9 @@ export function renderNowState(
  * The memory index (§2.3): "when do I read this" → where it lives. Never the
  * content itself — a map that carries the territory is not a map.
  *
- * Until package 3.2 adds key/description columns, a legacy note is indexed by
- * the temporary format of §6.4: the first ~100 characters of its content
- * pointing at its id, ranked by updated_at.
+ * A keyless pre-package-3.2 note is indexed by the temporary format of §6.4:
+ * the first ~100 characters of its content pointing at its id. Keyed notes use
+ * their trigger description and canonical push score.
  */
 export function renderMemoryIndex(
   notes: readonly MemoryIndexNote[],
@@ -295,7 +295,7 @@ export function renderMemoryIndex(
   const budget = options.budget ?? MEMORY_INDEX_BUDGET_CHARS;
   const overflowTool = options.overflowTool ?? "memory.search";
   if (notes.length === 0) return `${MEMORY_INDEX_HEADER}\n${MEMORY_INDEX_EMPTY}`;
-  const ranked = [...notes].sort(byRecencyDesc);
+  const ranked = [...notes].sort(byPushScoreThenRecency);
   return fitToBudget(ranked, budget, (selected, omitted) => {
     const lines = [MEMORY_INDEX_HEADER];
     if (selected.length > 0) {
@@ -311,7 +311,8 @@ function indexLine(note: MemoryIndexNote): string {
     ? clean(redactSecretsForOutput(note.description), 120)
     : clean(redactSecretsForOutput(note.content), LEGACY_INDEX_EXCERPT_CHARS);
   const reference = note.key?.trim() ? note.key.trim() : note.id;
-  return `- ${trigger} → ${reference}`;
+  const warning = note.warning?.trim() ? ` ${clean(note.warning, 100)}` : "";
+  return `- ${trigger} → ${reference}${warning}`;
 }
 
 /**
@@ -326,7 +327,7 @@ export function renderAntiRediscovery(
   const budget = options.budget ?? ANTI_REDISCOVERY_BUDGET_CHARS;
   const overflowTool = options.overflowTool ?? "memory.search";
   if (notes.length === 0) return `${ANTI_REDISCOVERY_HEADER}\n${ANTI_REDISCOVERY_EMPTY}`;
-  const ranked = [...notes].sort(byRecencyDesc);
+  const ranked = [...notes].sort(byPushScoreThenRecency);
   return fitToBudget(ranked, budget, (selected, omitted) => {
     const lines = [ANTI_REDISCOVERY_HEADER];
     if (selected.length > 0) {

@@ -732,10 +732,10 @@ describe("OperatorStore", () => {
     });
     expect(duplicate.id).toBe(expired.id);
     expect(store.searchOperatorNotes("authentication regression")[0]?.id).toBe(expired.id);
-    expect(store.expireOperatorNotes("2021-01-01T00:00:00.000Z")).toBe(1);
-    expect(store.searchOperatorNotes("authentication regression")).toHaveLength(0);
-    expect(store.getOperatorNote(expired.id)).toBeUndefined();
-    expect(store.getOperatorNoteVersion(expired.id)?.status).toBe("obsolete");
+    // Past legacy expiry is now freshness metadata (`valid_until`), never an
+    // automatic delete/obsolete instruction.
+    expect(store.searchOperatorNotes("authentication regression")[0]?.id).toBe(expired.id);
+    expect(store.getOperatorNote(expired.id)?.status).toBe("active");
     const redacted = store.rememberOperatorNote({
       content: "authorization=sensitive-value-that-must-not-persist",
     });

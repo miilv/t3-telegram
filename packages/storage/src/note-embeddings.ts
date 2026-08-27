@@ -7,6 +7,7 @@ export const MINILM_NOTE_EMBEDDING_MODEL = "Xenova/paraphrase-multilingual-MiniL
 /** Current locality-sensitive 384d fallback. Earlier hash models stay distinct. */
 export const HASH_NOTE_EMBEDDING_MODEL = "local-hash-v4";
 export const NOTE_EMBEDDING_DIMENSIONS = 384;
+export const NOTE_EMBEDDING_BACKFILL_MAX = 25;
 
 type RuntimeEnvironment = {
   allowRemoteModels: boolean;
@@ -27,6 +28,9 @@ type TransformersRuntime = {
 export interface LocalNoteEmbeddingOptions {
   /** Test seam; production dynamically loads the pinned Transformers.js runtime. */
   loadRuntime?: () => Promise<TransformersRuntime>;
+  /** Root containing operator-provisioned model files; weights are never fetched. */
+  localModelRoot?: string;
+  /** Test/observability hook called after the mandatory offline policy. */
   configureRuntime?: (runtime: TransformersRuntime) => void;
 }
 
@@ -105,7 +109,8 @@ export class LocalNoteEmbeddingService {
   async backfill(repository: OperatorNoteRepository, limit = 25): Promise<NoteEmbeddingBackfillResult> {
     await this.initialize();
     const model = this.semantic ? MINILM_NOTE_EMBEDDING_MODEL : HASH_NOTE_EMBEDDING_MODEL;
-    const notes = repository.notesNeedingVector(model, NOTE_EMBEDDING_DIMENSIONS, limit);
+    const boundedLimit = Math.max(1, Math.min(Math.trunc(limit), NOTE_EMBEDDING_BACKFILL_MAX));
+    const notes = repository.notesNeedingVector(model, NOTE_EMBEDDING_DIMENSIONS, boundedLimit);
     let saved = 0;
     for (const note of notes) {
       const vector = await this.embed(note);
@@ -122,7 +127,11 @@ export class LocalNoteEmbeddingService {
   private async initializeOnce(): Promise<void> {
     try {
       const runtime = await (this.options.loadRuntime ?? loadPinnedTransformersRuntime)();
-      (this.options.configureRuntime ?? configureOfflineRuntime)(runtime);
+      configureOfflineRuntime(
+        runtime,
+        this.options.localModelRoot ?? process.env.NOTE_EMBEDDING_MODEL_ROOT,
+      );
+      this.options.configureRuntime?.(runtime);
       this.extractor = await runtime.pipeline("feature-extraction", MINILM_NOTE_EMBEDDING_MODEL, {
         local_files_only: true,
       });
@@ -139,9 +148,11 @@ async function loadPinnedTransformersRuntime(): Promise<TransformersRuntime> {
   return runtime as unknown as TransformersRuntime;
 }
 
-function configureOfflineRuntime(runtime: TransformersRuntime): void {
+function configureOfflineRuntime(runtime: TransformersRuntime, localModelRoot?: string): void {
   runtime.env.allowRemoteModels = false;
   runtime.env.allowLocalModels = true;
+  const root = localModelRoot?.trim();
+  if (root) runtime.env.localModelPath = root;
 }
 
 function vectorFromRuntimeResult(result: unknown): number[] {

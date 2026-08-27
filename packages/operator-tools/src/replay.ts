@@ -18,6 +18,7 @@ export function replayIdentity(prefix: string, ...parts: string[]): string {
 export class TurnReplayKeys {
   private automationOrdinal = 0;
   private calendarOrdinal = 0;
+  private memoryOrdinal = 0;
   private readonly pendingCalendar = new Map<string, string>();
 
   constructor(private readonly turnSeed: string) {}
@@ -25,6 +26,11 @@ export class TurnReplayKeys {
   nextAutomationMutation(action: string): string {
     this.automationOrdinal += 1;
     return replayIdentity("automationop", this.turnSeed, String(this.automationOrdinal), action);
+  }
+
+  nextMemoryWrite(): string {
+    this.memoryOrdinal += 1;
+    return replayIdentity("memoryop", this.turnSeed, String(this.memoryOrdinal));
   }
 
   beginCalendarCreate(fingerprint: string): string {
