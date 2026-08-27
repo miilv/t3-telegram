@@ -105,9 +105,6 @@ export class ConversationDistillationCoordinator {
         try {
           const applied = await this.applyCandidates({
             ownerId,
-            afterSeq,
-            throughSeq: batch.throughSeq,
-            highWaterSeq: frozenHighWater,
             candidates: parsed.candidates,
           });
           written += applied.written;
@@ -160,9 +157,6 @@ export class ConversationDistillationCoordinator {
 
   private async applyCandidates(input: {
     ownerId: string;
-    afterSeq: number;
-    throughSeq: number;
-    highWaterSeq: number;
     candidates: readonly DistilledNoteCandidate[];
   }): Promise<{ written: number; proposals: number; crossLinks: number }> {
     let written = 0;
@@ -171,7 +165,6 @@ export class ConversationDistillationCoordinator {
     for (const candidate of input.candidates) {
       const replayKey = distillationCandidateReplayKey({
         ownerId: input.ownerId,
-        afterSeq: input.afterSeq,
         candidate,
       });
       if (this.deps.store.distillationProposals.getByReplayKey(replayKey)) {
@@ -273,16 +266,15 @@ function isPromptHardBound(error: unknown): boolean {
   return error instanceof Error && error.message === "distillation prompt exceeded its hard bound";
 }
 
+/** Stable across retry repagination: ledger evidence + validated key identify the logical fact. */
 export function distillationCandidateReplayKey(input: {
   ownerId: string;
-  afterSeq: number;
   candidate: Pick<DistilledNoteCandidate, "key" | "evidenceSeqs">;
   consumer?: string;
 }): string {
   const payload = JSON.stringify({
     consumer: input.consumer ?? DISTILLATION_CONSUMER,
     ownerId: input.ownerId,
-    afterSeq: input.afterSeq,
     candidateKey: input.candidate.key,
     evidenceSeqs: [...input.candidate.evidenceSeqs].sort((left, right) => left - right),
   });
