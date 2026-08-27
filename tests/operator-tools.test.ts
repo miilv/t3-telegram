@@ -639,6 +639,7 @@ describe("OperatorToolServer", () => {
       });
       expect(appLease.access.toolNames).toContain("calendar.create_event");
       expect(appLease.access.toolNames).toContain("now.update");
+      expect(appLease.access.toolNames).not.toContain("memory.remember");
       expect(appLease.access.toolNames).not.toContain("email.send");
       expect(appLease.access.toolNames).not.toContain("telegram.send_message");
       expect(appLease.access.toolNames).not.toContain("t3.send_turn");
@@ -664,6 +665,14 @@ describe("OperatorToolServer", () => {
         });
         expect(deniedTelegram.isError).toBe(true);
         expect(telegram.rich.some((message) => message.text === "duplicate me")).toBe(false);
+        const notesBeforeDeniedWrite = store.listOperatorNotes({ status: "active" });
+        const deniedMemory = await appClient.callTool({
+          name: "memory.remember",
+          arguments: { content: "legacy app write must not land" },
+        });
+        expect(deniedMemory.isError).toBe(true);
+        expect(textResult(deniedMemory)).toContain("no crash-safe idempotency boundary");
+        expect(store.listOperatorNotes({ status: "active" })).toEqual(notesBeforeDeniedWrite);
         expect(await callJson(appClient, "calendar.list_events", {
           timeMin: "2026-08-21T09:00:00Z",
         })).toMatchObject({ skipped: 0 });

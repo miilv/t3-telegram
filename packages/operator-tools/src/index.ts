@@ -192,7 +192,6 @@ export const APP_TURN_REPLAY_SAFE_TOOL_NAMES: readonly OperatorMcpToolName[] = [
   "t3.get_thread_summary",
   "memory.search",
   "memory.get",
-  "memory.remember",
   "memory.journal",
   "journal.note",
   "journal.read",

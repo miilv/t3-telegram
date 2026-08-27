@@ -22,6 +22,8 @@ export interface OperatorNoteVersionInput {
   operationKey: string;
   evidence?: { ownerId: string; sequences: readonly number[] };
   vectors?: readonly PreparedNoteVector[];
+  /** Semantic links computed before entering the atomic version transaction. */
+  operationCrossLinks?: readonly OperatorNoteOperationSimilarity[];
 }
 
 export interface OperatorNoteWriteResult {
@@ -31,6 +33,20 @@ export interface OperatorNoteWriteResult {
   /** A distilled write was refused by the transaction's curated-key guard. */
   curatedCollision?: boolean;
 }
+
+export interface OperatorNoteOperationSimilarity {
+  note: OperatorNote;
+  score: number;
+}
+
+/** Complete replay value retained for the keyed writer boundary. */
+export type OperatorNoteWriterOutcome =
+  | { kind: "merge-proposal"; mergeProposal: OperatorNoteOperationSimilarity }
+  | {
+      kind: "written";
+      write: OperatorNoteWriteResult;
+      crossLinks: OperatorNoteOperationSimilarity[];
+    };
 
 export interface StoredNoteVector {
   note: OperatorNote;
@@ -69,8 +85,13 @@ export class OperatorNoteRepository {
         return { note: rowToOperatorNote(current), applied: false, curatedCollision: true };
       }
       if (current && samePayload(current, input)) {
-        this.recordOperation(input.operationKey, String(current.id));
-        return { note: rowToOperatorNote(current), applied: false };
+        const write = { note: rowToOperatorNote(current), applied: false };
+        this.recordOperation(input.operationKey, String(current.id), {
+          kind: "written",
+          write,
+          crossLinks: [...(input.operationCrossLinks ?? [])],
+        });
+        return write;
       }
 
       const at = nowIso();
@@ -110,14 +131,19 @@ export class OperatorNoteRepository {
       this.reindex(id, input.key, input.description, input.category, input.content);
       for (const vector of input.vectors ?? []) this.savePreparedVectorUnwrapped(id, inputHash, vector, at);
       if (evidence) this.saveEvidence(id, evidence);
-      this.recordOperation(input.operationKey, id);
       const note = this.getVersion(id);
       if (!note) throw new Error("operator note write did not persist");
-      return {
+      const write = {
         note,
         applied: true,
         ...(current ? { supersededId: String(current.id) } : {}),
       };
+      this.recordOperation(input.operationKey, id, {
+        kind: "written",
+        write,
+        crossLinks: [...(input.operationCrossLinks ?? [])],
+      });
+      return write;
     });
   }
 
@@ -130,6 +156,27 @@ export class OperatorNoteRepository {
       `)
       .get(operationKey) as Row | undefined;
     return row ? rowToOperatorNote(row) : undefined;
+  }
+
+  writerOperationReplay(operationKey: string): OperatorNoteWriterOutcome | undefined {
+    const row = this.db
+      .prepare("SELECT outcome_json FROM operator_note_operations WHERE operation_key=?")
+      .get(operationKey) as Row | undefined;
+    if (!row || row.outcome_json === null || row.outcome_json === undefined) return undefined;
+    return parseWriterOutcome(String(row.outcome_json));
+  }
+
+  recordWriterOperationOutcome(
+    operationKey: string,
+    noteId: string,
+    outcome: OperatorNoteWriterOutcome,
+  ): OperatorNoteWriterOutcome {
+    return this.transaction(() => {
+      const replay = this.writerOperationReplay(operationKey);
+      if (replay) return replay;
+      this.recordOperation(operationKey, noteId, outcome);
+      return outcome;
+    });
   }
 
   evidenceForVersion(noteId: string): { ownerId: string; sequences: number[] } | undefined {
@@ -163,6 +210,14 @@ export class OperatorNoteRepository {
     const rows = this.db
       .prepare("SELECT * FROM operator_notes WHERE status='active' ORDER BY updated_at DESC,id LIMIT ?")
       .all(bounded(limit, 1, 500)) as Row[];
+    return rows.map(rowToOperatorNote);
+  }
+
+  /** Internal push candidate scan. The renderer, not storage recency, owns selection. */
+  listAllActiveForPush(): OperatorNote[] {
+    const rows = this.db
+      .prepare("SELECT * FROM operator_notes WHERE status='active'")
+      .all() as Row[];
     return rows.map(rowToOperatorNote);
   }
 
@@ -356,10 +411,17 @@ export class OperatorNoteRepository {
     return rows.map(rowToOperatorNote);
   }
 
-  private recordOperation(operationKey: string, noteId: string): void {
+  private recordOperation(
+    operationKey: string,
+    noteId: string,
+    outcome?: OperatorNoteWriterOutcome,
+  ): void {
     this.db
-      .prepare("INSERT INTO operator_note_operations(operation_key,note_id,created_at) VALUES (?,?,?)")
-      .run(operationKey, noteId, nowIso());
+      .prepare(`
+        INSERT INTO operator_note_operations(operation_key,note_id,outcome_json,created_at)
+        VALUES (?,?,?,?)
+      `)
+      .run(operationKey, noteId, outcome ? JSON.stringify(outcome) : null, nowIso());
   }
 
   private saveEvidence(
@@ -497,6 +559,52 @@ function validVector(values: readonly unknown[], dimensions: number): values is 
     norm += value * value;
   }
   return norm > 0;
+}
+
+function parseWriterOutcome(value: string): OperatorNoteWriterOutcome {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("stored operator note operation outcome is invalid JSON");
+  }
+  if (!isRecord(parsed)) throw new Error("stored operator note operation outcome is invalid");
+  if (parsed.kind === "merge-proposal" && validSimilarity(parsed.mergeProposal)) {
+    return parsed as unknown as OperatorNoteWriterOutcome;
+  }
+  if (
+    parsed.kind === "written" &&
+    isRecord(parsed.write) &&
+    validOperatorNote(parsed.write.note) &&
+    typeof parsed.write.applied === "boolean" &&
+    (parsed.write.supersededId === undefined || typeof parsed.write.supersededId === "string") &&
+    (parsed.write.curatedCollision === undefined || typeof parsed.write.curatedCollision === "boolean") &&
+    Array.isArray(parsed.crossLinks) &&
+    parsed.crossLinks.every(validSimilarity)
+  ) {
+    return parsed as unknown as OperatorNoteWriterOutcome;
+  }
+  throw new Error("stored operator note operation outcome is invalid");
+}
+
+function validSimilarity(value: unknown): boolean {
+  return isRecord(value) && validOperatorNote(value.note) &&
+    typeof value.score === "number" && Number.isFinite(value.score);
+}
+
+function validOperatorNote(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.category === "string" &&
+    typeof value.content === "string" &&
+    typeof value.status === "string" &&
+    typeof value.source === "string" &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function bounded(value: number, minimum: number, maximum: number): number {

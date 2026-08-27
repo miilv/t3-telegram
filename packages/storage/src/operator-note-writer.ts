@@ -10,6 +10,7 @@ import {
 } from "./note-embeddings.js";
 import {
   OperatorNoteRepository,
+  type OperatorNoteWriterOutcome,
   type OperatorNoteWriteResult,
 } from "./operator-notes.js";
 
@@ -92,6 +93,8 @@ export class OperatorNoteWriter {
     if (!validated.ok) return validated;
     if (!draft.operationKey.trim()) return { ok: false, hint: "A durable operation key is required." };
 
+    const writerReplay = this.repository.writerOperationReplay(draft.operationKey);
+    if (writerReplay) return { ok: true, ...writerReplay };
     const replay = this.repository.operationReplay(draft.operationKey);
     if (replay) {
       return { ok: true, kind: "written", write: { note: replay, applied: false }, crossLinks: [] };
@@ -105,11 +108,15 @@ export class OperatorNoteWriter {
     };
     const exactKeyAtStart = this.repository.getActive(input.key);
     if (draft.source === "distilled" && exactKeyAtStart) {
-      return {
-        ok: true,
+      const outcome = this.repository.recordWriterOperationOutcome(
+        draft.operationKey,
+        exactKeyAtStart.id,
+        {
         kind: "merge-proposal",
         mergeProposal: { note: exactKeyAtStart, score: 1 },
-      };
+        },
+      );
+      return { ok: true, ...outcome };
     }
     const vector = await this.embeddings.embed(input);
     // Exact-key writes are authorized version changes. Semantic dedupe is only
@@ -120,7 +127,16 @@ export class OperatorNoteWriter {
     const matches = semantic ? this.findSemanticMatches(vector, input.key) : [];
     const mergeProposal = matches.find((match) => match.score >= MINILM_MERGE_PROPOSAL_THRESHOLD);
     // Curated notes (and every other source) are never silently merged.
-    if (mergeProposal) return { ok: true, kind: "merge-proposal", mergeProposal };
+    if (mergeProposal) {
+      const outcome = this.repository.recordWriterOperationOutcome(
+        draft.operationKey,
+        mergeProposal.note.id,
+        { kind: "merge-proposal", mergeProposal },
+      );
+      return { ok: true, ...outcome };
+    }
+
+    const crossLinks = matches.filter((match) => match.score >= MINILM_CROSS_LINK_THRESHOLD);
 
     const write = this.repository.writeVersion({
       ...input,
@@ -130,15 +146,27 @@ export class OperatorNoteWriter {
       ...(draft.evidence ? { evidence: draft.evidence } : {}),
       operationKey: draft.operationKey,
       vectors: [vector],
+      operationCrossLinks: crossLinks,
     });
     if (write.curatedCollision) {
-      return { ok: true, kind: "merge-proposal", mergeProposal: { note: write.note, score: 1 } };
+      const outcome: OperatorNoteWriterOutcome = {
+        kind: "merge-proposal",
+        mergeProposal: { note: write.note, score: 1 },
+      };
+      return {
+        ok: true,
+        ...this.repository.recordWriterOperationOutcome(
+          draft.operationKey,
+          write.note.id,
+          outcome,
+        ),
+      };
     }
     return {
       ok: true,
       kind: "written",
       write,
-      crossLinks: matches.filter((match) => match.score >= MINILM_CROSS_LINK_THRESHOLD),
+      crossLinks,
     };
   }
 

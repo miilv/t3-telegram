@@ -19,7 +19,9 @@ export function migrateOperatorNotesV2(
   const evidenceTable = tableColumns(db, "operator_note_evidence");
   const exactEvidence = ["note_id", "owner_id", "evidence_seq"]
     .every((column) => evidenceTable.has(column));
-  if (applied && exactSearch && exactVectors && exactEvidence) return;
+  const operationColumns = tableColumns(db, "operator_note_operations");
+  const exactOperationOutcome = operationColumns.has("outcome_json");
+  if (applied && exactSearch && exactVectors && exactEvidence && exactOperationOutcome) return;
 
   transaction(() => {
     db.prepare("UPDATE operator_notes SET valid_until=expires_at WHERE valid_until IS NULL AND expires_at IS NOT NULL").run();
@@ -73,10 +75,17 @@ export function migrateOperatorNotesV2(
         )
       `);
     }
+    if (operationColumns.size && !exactOperationOutcome) {
+      db.exec(`
+        ALTER TABLE operator_note_operations ADD COLUMN outcome_json TEXT
+          CHECK (outcome_json IS NULL OR json_valid(outcome_json))
+      `);
+    }
     db.exec(`
       CREATE TABLE IF NOT EXISTS operator_note_operations (
         operation_key TEXT PRIMARY KEY,
         note_id TEXT NOT NULL,
+        outcome_json TEXT CHECK (outcome_json IS NULL OR json_valid(outcome_json)),
         created_at TEXT NOT NULL,
         FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
       );

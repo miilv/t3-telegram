@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS operator_note_vectors (
 CREATE TABLE IF NOT EXISTS operator_note_operations (
   operation_key TEXT PRIMARY KEY,
   note_id TEXT NOT NULL,
+  outcome_json TEXT CHECK (outcome_json IS NULL OR json_valid(outcome_json)),
   created_at TEXT NOT NULL,
   FOREIGN KEY (note_id) REFERENCES operator_notes(id) ON DELETE CASCADE
 );

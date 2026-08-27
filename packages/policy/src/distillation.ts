@@ -36,6 +36,11 @@ export interface DistillationPromptRow {
   evidenceRole: "owner_assertion" | "context_only";
   text: string;
   evidenceText?: string;
+  projection?: {
+    truncated: true;
+    text: { originalCodePoints: number; projectedCodePoints: number };
+    evidenceText?: { originalCodePoints: number; projectedCodePoints: number };
+  };
 }
 
 export interface DistillationPromptInput {
@@ -147,6 +152,7 @@ export function buildDistillationPrompt(input: DistillationPromptInput): Distill
       evidenceRole: evidenceText ? "owner_assertion" : "context_only",
       contextText,
       ownerEvidenceText: evidenceText ?? null,
+      projection: entry.projection ?? null,
     };
   });
   if (contextPoints > DISTILLATION_BATCH_MAX_CODE_POINTS) {

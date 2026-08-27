@@ -1,10 +1,37 @@
 import { describe, expect, it } from "vitest";
 import { NightScribe } from "../apps/daemon/src/scribe.js";
+import { SCRIBE_MISS_COUNT_KEY } from "../packages/policy/src/index.js";
 import { nowIso } from "../packages/shared/src/index.js";
 import { baseDeps, NIGHT, OWNER } from "./scribe-fixtures.js";
 import { tempStore } from "./helpers.js";
 
 describe("Night Scribe conversation distillation collaboration", () => {
+  it("counts a completed whitespace distillation call as invalid rather than an outage", async () => {
+    const store = tempStore();
+    store.setRuntimeState(SCRIBE_MISS_COUNT_KEY, "2");
+    store.conversation.appendOwnerIngress({
+      ownerId: OWNER,
+      conversationKey: "7:42:0:0",
+      text: "remember this durable preference",
+      evidenceText: "remember this durable preference",
+      sourceKey: "scribe-whitespace:1",
+      ingressJobId: "scribe-whitespace:1",
+    });
+
+    const outcome = await new NightScribe({
+      ...baseDeps(store, [], () => " \n\t "),
+      now: () => NIGHT,
+    }).run({ force: true });
+
+    expect(outcome).toMatchObject({ status: "degraded", llmCalls: 1, misses: 2 });
+    expect(outcome.detail).toContain("expected NOTHING or a JSON array");
+    expect(store.conversation.cursor("night-scribe-distillation", OWNER)).toBe(0);
+    expect(store.getRuntimeState(SCRIBE_MISS_COUNT_KEY)).toBe("2");
+    expect(store.listDaemonEvents({ typePrefixes: ["memory.scribe.skipped"] })[0]!.payload)
+      .toMatchObject({ channelDown: false });
+    store.close();
+  });
+
   it("opens work on logical ledger delta and counts a quiet NOTHING call", async () => {
     const store = tempStore();
     const row = store.conversation.appendOwnerIngress({

@@ -71,8 +71,13 @@ describe("operator notes v2 migration", () => {
       );
       CREATE VIRTUAL TABLE operator_note_search USING fts5(id UNINDEXED,category,content);
       CREATE TABLE operator_note_vectors(note_id TEXT PRIMARY KEY,model TEXT NOT NULL,dimensions INTEGER NOT NULL,vector_json TEXT NOT NULL,updated_at TEXT NOT NULL);
+      CREATE TABLE operator_note_operations(
+        operation_key TEXT PRIMARY KEY,note_id TEXT NOT NULL,created_at TEXT NOT NULL
+      );
       INSERT INTO operator_notes(id,category,content,status,source,created_at,updated_at)
         VALUES ('legacy-1','general','legacy note','active','manual','2026-01-01','2026-01-01');
+      INSERT INTO operator_note_operations(operation_key,note_id,created_at)
+        VALUES ('legacy-operation','legacy-1','2026-01-01');
     `);
     const transaction = <T>(work: () => T): T => {
       db.exec("BEGIN");
@@ -84,7 +89,10 @@ describe("operator notes v2 migration", () => {
     migrateOperatorNotesV2(db, transaction);
 
     expect(db.prepare("SELECT content FROM operator_notes WHERE id='legacy-1'").get()).toMatchObject({ content: "legacy note" });
-    expect(db.prepare("SELECT 1 FROM operator_note_operations").all()).toEqual([]);
+    expect(db.prepare("SELECT operation_key,outcome_json FROM operator_note_operations").all())
+      .toEqual([{ operation_key: "legacy-operation", outcome_json: null }]);
+    expect((db.prepare("PRAGMA table_info(operator_note_operations)").all() as Array<{ name: string }>)
+      .map((column) => column.name)).toContain("outcome_json");
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=2").get()).toMatchObject({ count: 1 });
     db.close();
   });

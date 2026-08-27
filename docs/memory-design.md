@@ -250,7 +250,8 @@ CREATE UNIQUE INDEX operator_notes_key ON operator_notes(key)
   помечается `[not verified since <date> — treat as hypothesis]`; секретарь
   раз в месяц собирает просроченные в один вопрос владельцу.
 - **Индекс-карта в push**: только `description → key` активных заметок,
-  ранжирование recency+usage, бюджет 3000 символов, хвост —
+  ранжирование полного active-набора по recency+usage до применения бюджета,
+  бюджет 3000 символов, хвост —
   `(+K notes — memory.search)`. Полные тела — pull. **Anti-rediscovery — не
   исключение**: в push идут только description'ы этой категории (отдельным
   блоком, 1000 символов), тела — через `memory.get`. Противоречие ревизии 1
@@ -317,7 +318,9 @@ kind, thread_ref, origin_job, create_seq, created_at)`** — нарратив; �
   `(consumer, owner_id)` cursor, а не timestamp/`last_scribe_at` и не счётчик
   физических Telegram-строк. Пачка замораживает high-water, ограничена
   200 логическими строками/64 000 code points; за ночь не более трёх
-  пачек. Факты могут опираться только на непустую owner-assertion
+  пачек. Первая строка больше лимита получает детерминированную bounded-
+  проекцию с явной меткой усечения; исходная ledger-строка не меняется и
+  cursor может её урегулировать. Факты могут опираться только на непустую owner-assertion
   evidence; исходящее, forwarded, placeholder и control — только контекст.
 - Результат — заметки `source='distilled'` с предложенным key/description,
   `verified_at=NULL` (не подтверждено!). Автомат **не пишет** в курируемые
@@ -327,8 +330,10 @@ kind, thread_ref, origin_job, create_seq, created_at)`** — нарратив; �
   с обрезкой контекста не масштабируется.
 - Анти-луп: дистиллятор не читает свои заметки как вход, только переписку.
 - Заметка/предложение и её evidence-sequences фиксируются до cursor CAS.
-  Stable replay key включает consumer, owner, frozen range/high-water, key и
-  evidence sequences; поэтому крэш после записи не дублирует версию,
+  Stable replay key включает только неизменяемые факты операции: consumer,
+  owner, начало страницы, нормализованный key и evidence sequences (не
+  run-wide high-water); поэтому append между крэшем и replay не меняет identity,
+  не дублирует версию/предложение,
   а проигранный CAS не затирает чужой прогресс.
 - **Судьба `maintainStructuredMemory`**: упраздняется как отдельный механизм;
   его роль (извлечение перед компакцией) перешла дистиллятору секретаря +

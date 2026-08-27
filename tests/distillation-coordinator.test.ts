@@ -105,9 +105,19 @@ describe("ledger-driven conversation distillation", () => {
       UPDATE conversation_ledger_cursors SET last_seq=0
       WHERE consumer='night-scribe-distillation' AND owner_id='42'
     `).run();
+    const appended = store.conversation.appendOwnerIngress({
+      ownerId: "42",
+      conversationKey: "7:42:0:0",
+      text: "This arrived after the durable note but before cursor recovery",
+      evidenceText: "This arrived after the durable note but before cursor recovery",
+      sourceKey: "ingress:fact:after-crash",
+      ingressJobId: "ingress:fact:after-crash",
+    });
     await expect(coordinator.run("42")).resolves.toMatchObject({ status: "completed" });
     expect(store.notes.listVersions()).toHaveLength(1);
     expect(store.notes.getActive("warehouse-owner")?.id).toBe(note.id);
+    expect(store.distillationProposals.listPending()).toEqual([]);
+    expect(store.conversation.cursor("night-scribe-distillation", "42")).toBe(appended.seq);
     expect(store.db.prepare("SELECT COUNT(*) AS count FROM operator_note_evidence").get())
       .toMatchObject({ count: 1 });
     store.close();
@@ -141,6 +151,45 @@ describe("ledger-driven conversation distillation", () => {
     expect(calls).toBe(3);
     expect(store.conversation.cursor("night-scribe-distillation", "42")).toBe(rows[2]!.seq);
     expect(store.conversation.countEligibleAfter("42", rows[2]!.seq!)).toBe(1);
+    store.close();
+  });
+
+  it("projects a 64,001-code-point first row explicitly and still settles its evidence", async () => {
+    const store = tempStore();
+    const sourceText = `${"x".repeat(64_000)}Z`;
+    const row = store.conversation.appendOwnerIngress({
+      ownerId: "42",
+      conversationKey: "7:42:0:0",
+      text: sourceText,
+      evidenceText: sourceText,
+      sourceKey: "ingress:oversized:1",
+      ingressJobId: "ingress:oversized:1",
+    });
+    let prompt = "";
+    const coordinator = new scribe.ConversationDistillationCoordinator({
+      store,
+      oneShot: async (value) => {
+        prompt = value;
+        return candidateResponse({
+          key: "oversized-owner-fact",
+          content: "The owner supplied an oversized durable fact",
+          evidenceSeq: row.seq!,
+        });
+      },
+    });
+
+    await expect(coordinator.run("42")).resolves.toMatchObject({
+      status: "completed",
+      llmCalls: 1,
+      written: 1,
+    });
+    expect(prompt).toContain('"truncated":true');
+    expect(prompt).toContain("TRUNCATED: oversized ledger text omitted");
+    expect(store.conversation.getBySource("telegram_ingress", "ingress:oversized:1")?.text)
+      .toBe(sourceText);
+    const note = store.notes.getActive("oversized-owner-fact")!;
+    expect(store.notes.evidenceForVersion(note.id)).toEqual({ ownerId: "42", sequences: [row.seq] });
+    expect(store.conversation.cursor("night-scribe-distillation", "42")).toBe(row.seq);
     store.close();
   });
 
@@ -179,6 +228,14 @@ describe("ledger-driven conversation distillation", () => {
     expect(store.distillationProposals.listPending()).toHaveLength(1);
     expect(store.conversation.cursor("night-scribe-distillation", "42")).toBe(0);
 
+    const appended = store.conversation.appendOwnerIngress({
+      ownerId: "42",
+      conversationKey: "7:42:0:0",
+      text: "New context appended while the cursor was unsettled",
+      evidenceText: "New context appended while the cursor was unsettled",
+      sourceKey: "ingress:proposal:after-crash",
+      ingressJobId: "ingress:proposal:after-crash",
+    });
     store.conversation.advanceCursor = advance;
     await expect(coordinator.run("42")).resolves.toMatchObject({
       status: "completed",
@@ -186,6 +243,7 @@ describe("ledger-driven conversation distillation", () => {
     });
     expect(store.distillationProposals.listPending()).toHaveLength(1);
     expect(store.notes.getActive("warehouse-owner")?.content).toBe("Dan owns the warehouse");
+    expect(store.conversation.cursor("night-scribe-distillation", "42")).toBe(appended.seq);
     store.close();
   });
 

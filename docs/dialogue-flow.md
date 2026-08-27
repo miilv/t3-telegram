@@ -1809,7 +1809,10 @@ Then the model half on the **Claude branch**, whatever the main session is
 running: up to three frozen ledger pages (200 rows/64,000 code points each), the
 day's summary, the previous month's rollup, and a small batch of missing note
 descriptions. Only nonempty owner assertions can support distilled facts;
-provider/parse failures leave the failed page pending. Every accepted fact goes
+an oversized first row is projected to the bound with explicit truncation
+metadata while the durable source row remains byte-for-byte unchanged.
+Provider/parse failures leave the failed page pending; a completed whitespace
+response counts one call and is an invalid/degraded pass, not a provider outage. Every accepted fact goes
 through the Notes-v2 writer with evidence sequences. Exact-key or MiniLM ≥0.85
 collisions become durable proposals, never silent merges.
 

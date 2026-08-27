@@ -171,6 +171,7 @@ describe("OperatorNoteWriter", () => {
 
   it("replays a completed write before semantic matching can propose the note itself", async () => {
     const store = tempStore();
+    let embeddings = 0;
     const input = {
       key: "warehouse-contact",
       category: "people",
@@ -179,13 +180,122 @@ describe("OperatorNoteWriter", () => {
     };
     const writer = new OperatorNoteWriter(store.notes, {
       isSemanticDedupeAvailable: () => true,
-      embed: async (draft) => vector(draft, unit(1, 0)),
+      embed: async (draft) => {
+        embeddings += 1;
+        return vector(draft, unit(1, 0));
+      },
     });
 
-    await expect(writer.write({ ...input, source: "manual", operationKey: "manual:1" }))
-      .resolves.toMatchObject({ ok: true, kind: "written", write: { applied: true } });
-    await expect(writer.write({ ...input, source: "manual", operationKey: "manual:1" }))
-      .resolves.toMatchObject({ ok: true, kind: "written", write: { applied: false } });
+    const first = await writer.write({ ...input, source: "manual", operationKey: "manual:1" });
+    store.notes.writeVersion({
+      ...input,
+      content: "A later curator changed the contact",
+      source: "manual",
+      operationKey: "manual:later-write",
+    });
+    const replay = await writer.write({ ...input, source: "manual", operationKey: "manual:1" });
+
+    expect(first).toMatchObject({ ok: true, kind: "written", write: { applied: true } });
+    expect(replay).toEqual(first);
+    expect(embeddings).toBe(1);
+    store.close();
+  });
+
+  it("replays the original semantic proposal without embedding or writing", async () => {
+    const store = tempStore();
+    const existing = {
+      key: "warehouse-owner",
+      category: "people",
+      description: "when warehouse ownership matters → read Dan",
+      content: "Dan owns the warehouse",
+    };
+    store.notes.writeVersion({
+      ...existing,
+      source: "manual",
+      operationKey: "seed:proposal-replay",
+      vectors: [vector(existing, unit(1, 0))],
+    });
+    let embeddings = 0;
+    const candidate = {
+      key: "warehouse-contact",
+      category: "people",
+      description: "when warehouse contact matters → read Dan",
+      content: "Dan is the warehouse contact",
+      source: "manual" as const,
+      operationKey: "manual:proposal-replay",
+    };
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => true,
+      embed: async (input) => {
+        embeddings += 1;
+        return vector(input, unit(1, 0));
+      },
+    });
+
+    const first = await writer.write(candidate);
+    store.notes.writeVersion({
+      ...existing,
+      content: "The matching note changed after the proposal",
+      source: "manual",
+      operationKey: "seed:proposal-replay:later",
+    });
+    const replay = await writer.write(candidate);
+
+    expect(first).toMatchObject({ ok: true, kind: "merge-proposal", mergeProposal: { score: 1 } });
+    expect(replay).toEqual(first);
+    expect(embeddings).toBe(1);
+    expect(store.notes.getActive(candidate.key)).toBeUndefined();
+    store.close();
+  });
+
+  it("replays the original written cross-links instead of dropping them", async () => {
+    const store = tempStore();
+    const existing = {
+      key: "warehouse-owner",
+      category: "people",
+      description: "when warehouse ownership matters → read Dan",
+      content: "Dan owns the warehouse",
+    };
+    store.notes.writeVersion({
+      ...existing,
+      source: "manual",
+      operationKey: "seed:cross-link-replay",
+      vectors: [vector(existing, unit(1, 0))],
+    });
+    let embeddings = 0;
+    const candidate = {
+      key: "warehouse-contact",
+      category: "people",
+      description: "when warehouse contact matters → read Dan",
+      content: "Dan is the warehouse contact",
+      source: "manual" as const,
+      operationKey: "manual:cross-link-replay",
+    };
+    const writer = new OperatorNoteWriter(store.notes, {
+      isSemanticDedupeAvailable: () => true,
+      embed: async (input) => {
+        embeddings += 1;
+        return vector(input, unit(0.75));
+      },
+    });
+
+    const first = await writer.write(candidate);
+    store.notes.writeVersion({
+      ...existing,
+      content: "The linked note changed after the write",
+      source: "manual",
+      operationKey: "seed:cross-link-replay:later",
+    });
+    const replay = await writer.write(candidate);
+
+    expect(first).toMatchObject({
+      ok: true,
+      kind: "written",
+      write: { applied: true },
+      crossLinks: [{ note: { key: existing.key } }],
+    });
+    expect(replay).toEqual(first);
+    expect(embeddings).toBe(1);
     store.close();
   });
 

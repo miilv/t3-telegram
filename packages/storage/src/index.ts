@@ -99,7 +99,9 @@ export {
   OperatorNoteWriter,
 } from "./operator-note-writer.js";
 export type {
+  OperatorNoteOperationSimilarity,
   OperatorNoteVersionInput,
+  OperatorNoteWriterOutcome,
   OperatorNoteWriteResult,
   StoredNoteVector,
 } from "./operator-notes.js";

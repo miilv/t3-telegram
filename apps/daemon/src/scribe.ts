@@ -86,7 +86,10 @@ export class NightScribe {
     this.reconciler = new ScribeReconciler(deps);
     this.distiller = new ConversationDistillationCoordinator({
       store: deps.store,
-      oneShot: (prompt) => this.oneShot(prompt),
+      // A completed provider call belongs to the distiller's strict grammar
+      // even when the response is blank; it must be billed and classified as
+      // invalid, not mistaken for an unavailable channel.
+      oneShot: (prompt) => this.oneShot(prompt, true),
     });
   }
 
@@ -447,7 +450,7 @@ export class NightScribe {
    * a word to the owner. Distinguishing them here would only produce branches
    * that all end in the same place.
    */
-  private async oneShot(prompt: string): Promise<string> {
+  private async oneShot(prompt: string, allowBlank = false): Promise<string> {
     // `run` refuses to start without one, so this is only the type narrowing.
     const call = this.deps.backgroundOneShot;
     if (!call) throw new ScribeChannelUnavailable("no background one-shot channel is configured");
@@ -465,7 +468,7 @@ export class NightScribe {
         }),
       ]);
       const text = response.trim();
-      if (!text) throw new ScribeChannelUnavailable("background pass returned nothing");
+      if (!text && !allowBlank) throw new ScribeChannelUnavailable("background pass returned nothing");
       return text;
     } catch (error) {
       throw error instanceof ScribeChannelUnavailable

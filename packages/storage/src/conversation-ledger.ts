@@ -50,10 +50,19 @@ export interface OperatorConversationOutbound {
 }
 
 export interface ConversationBatch {
-  entries: Array<ConversationLedgerRow & { seq: number }>;
+  entries: Array<ConversationLedgerRow & {
+    seq: number;
+    projection?: ConversationBatchProjection;
+  }>;
   highWaterSeq: number;
   throughSeq: number;
   hasMore: boolean;
+}
+
+export interface ConversationBatchProjection {
+  truncated: true;
+  text: { originalCodePoints: number; projectedCodePoints: number };
+  evidenceText?: { originalCodePoints: number; projectedCodePoints: number };
 }
 
 /** Storage boundary for logical correspondence and its monotonic consumers. */
@@ -247,12 +256,52 @@ export class ConversationLedgerRepository {
     `).all(input.ownerId, afterSeq, highWaterSeq, limit + 1) as Row[];
     const candidates = rows.slice(0, limit).map(rowToReadyConversation);
     const characterLimit = Math.max(1, input.characterLimit ?? 64_000);
-    const entries: Array<ConversationLedgerRow & { seq: number }> = [];
+    const entries: ConversationBatch["entries"] = [];
     let characters = 0;
     for (const candidate of candidates) {
-      const next = [...candidate.text].length;
+      const originalTextPoints = [...candidate.text].length;
+      const originalEvidencePoints = candidate.evidenceText === undefined
+        ? undefined
+        : [...candidate.evidenceText].length;
+      // Evidence is a projection of the row, so its batch contribution can
+      // never exceed that row's bounded context contribution. This preserves
+      // the prompt's documented worst-case context+evidence hard bound even
+      // for malformed legacy rows whose evidence slice is longer than text.
+      const evidenceProjectionLimit = Math.min(characterLimit, originalTextPoints);
+      const oversized = originalTextPoints > characterLimit ||
+        (originalEvidencePoints !== undefined && originalEvidencePoints > evidenceProjectionLimit);
+      const projected = oversized
+        ? {
+            ...candidate,
+            text: boundedLedgerProjection(candidate.text, characterLimit),
+            ...(candidate.evidenceText === undefined
+              ? {}
+              : {
+                  evidenceText: boundedLedgerProjection(
+                    candidate.evidenceText,
+                    evidenceProjectionLimit,
+                  ),
+                }),
+            projection: {
+              truncated: true as const,
+              text: {
+                originalCodePoints: originalTextPoints,
+                projectedCodePoints: Math.min(originalTextPoints, characterLimit),
+              },
+              ...(originalEvidencePoints === undefined
+                ? {}
+                : {
+                    evidenceText: {
+                      originalCodePoints: originalEvidencePoints,
+                      projectedCodePoints: Math.min(originalEvidencePoints, evidenceProjectionLimit),
+                    },
+                  }),
+            },
+          }
+        : candidate;
+      const next = [...projected.text].length;
       if (entries.length && characters + next > characterLimit) break;
-      entries.push(candidate);
+      entries.push(projected);
       characters += next;
     }
     const throughSeq = entries.at(-1)?.seq ?? afterSeq;
@@ -304,6 +353,16 @@ export class ConversationLedgerRepository {
     if (!row) throw new Error(`conversation ledger row was not persisted: ${sourceKind}:${sourceKey}`);
     return row;
   }
+}
+
+const OVERSIZED_LEDGER_MARKER = "\n[TRUNCATED: oversized ledger text omitted]";
+
+function boundedLedgerProjection(value: string, limit: number): string {
+  const points = [...value];
+  if (points.length <= limit) return value;
+  const marker = [...OVERSIZED_LEDGER_MARKER];
+  if (marker.length >= limit) return marker.slice(0, limit).join("");
+  return `${points.slice(0, limit - marker.length).join("")}${OVERSIZED_LEDGER_MARKER}`;
 }
 
 function boundedSequence(value: number): number {

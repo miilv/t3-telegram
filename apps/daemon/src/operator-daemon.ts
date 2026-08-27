@@ -115,7 +115,6 @@ import {
   pruneLocalBotApiFiles,
 } from "../../../packages/telegram/src/index.js";
 import {
-  ANTI_REDISCOVERY_CATEGORY,
   buildOperatorSystemPrompt,
   classifyPause,
   decidePushMode,
@@ -127,10 +126,8 @@ import {
   parsePushBaseline,
   readOperatorPolicy,
   reconcileDaemonSection,
-  rankOperatorNotesForPush,
   renderClosedItemJournalBody,
   renderGapLine,
-  operatorNotePushScore,
   renderNowDiff,
   renderPersonaDigest,
   renderStateLayers,
@@ -140,12 +137,12 @@ import {
   updateOperatorPolicy,
 } from "../../../packages/policy/src/index.js";
 import type {
-  MemoryIndexNote,
   NowStateItem,
   PauseAssessment,
   PushMode,
   RenderedStateLayers,
 } from "../../../packages/policy/src/index.js";
+import { currentMemoryNotesForPush } from "./operator-memory-index.js";
 import {
   assertAutomationLifecycleTransition,
   automationScheduleLabel,
@@ -5552,31 +5549,8 @@ export class OperatorDaemon {
    * they get their own block with its own budget, and listing them twice would
    * spend the index budget on the one category that already has room.
    */
-  private currentMemoryNotes(): { index: MemoryIndexNote[]; antiRediscovery: MemoryIndexNote[] } {
-    const notes: MemoryIndexNote[] = rankOperatorNotesForPush(
-      this.store.listOperatorNotes({ status: "active", limit: 200 }),
-    )
-      .map((note) => {
-        const warning = staleOperatorNoteWarning(note);
-        return {
-          id: note.id,
-          content: defangMarkers(note.content),
-          updatedAt: note.updatedAt,
-          category: note.category,
-          pushScore: operatorNotePushScore(note),
-          ...(note.key ? { key: note.key } : {}),
-          ...(warning ? { warning } : {}),
-          // Package 3.1: once the night secretary has described a legacy note,
-          // the index line stops being "first 100 characters of the content" and
-          // becomes the trigger form of §2.3. Defanged like the content, because
-          // it is derived FROM the content and inherits its trust level.
-          ...(note.description ? { description: defangMarkers(note.description) } : {}),
-        };
-      });
-    return {
-      index: notes.filter((note) => note.category !== ANTI_REDISCOVERY_CATEGORY),
-      antiRediscovery: notes.filter((note) => note.category === ANTI_REDISCOVERY_CATEGORY),
-    };
+  private currentMemoryNotes() {
+    return currentMemoryNotesForPush(this.store);
   }
 
   /** The three push layers, rendered once for a turn (data here, shape in policy). */

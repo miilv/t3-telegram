@@ -5,7 +5,7 @@ import {
   LocalNoteEmbeddingService,
   MINILM_NOTE_EMBEDDING_MODEL,
 } from "../packages/storage/src/note-embeddings.js";
-import { tempStore } from "./helpers.js";
+import { tempDirectory, tempStore } from "./helpers.js";
 
 function noteInput(content: string) {
   return {
@@ -17,6 +17,40 @@ function noteInput(content: string) {
 }
 
 describe("LocalNoteEmbeddingService", () => {
+  it("uses the real default loader offline and deterministically falls back when its local root is missing", async () => {
+    const missingRoot = `${tempDirectory("missing-minilm-")}/not-provisioned`;
+    const originalFetch = globalThis.fetch;
+    const networkAttempts: string[] = [];
+    let configured: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      networkAttempts.push(String(input));
+      throw new Error("network is prohibited in the offline model probe");
+    }) as typeof fetch;
+    try {
+      const service = new LocalNoteEmbeddingService({
+        localModelRoot: missingRoot,
+        configureRuntime: (runtime) => {
+          configured = { ...runtime.env };
+        },
+      });
+      const input = noteInput("Dan owns the warehouse");
+      const first = await service.embed(input);
+      const second = await service.embed(input);
+
+      expect(configured).toMatchObject({
+        allowRemoteModels: false,
+        allowLocalModels: true,
+        localModelPath: missingRoot,
+      });
+      expect(networkAttempts).toEqual([]);
+      expect(first).toMatchObject({ model: HASH_NOTE_EMBEDDING_MODEL, dimensions: 384 });
+      expect(second).toEqual(first);
+      expect(service.isSemanticDedupeAvailable()).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("uses a deterministic hash retriever when the local MiniLM boundary is unavailable", async () => {
     const service = new LocalNoteEmbeddingService({
       loadRuntime: async () => {

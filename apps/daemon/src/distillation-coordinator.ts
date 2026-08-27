@@ -165,7 +165,11 @@ export class ConversationDistillationCoordinator {
     let proposals = 0;
     let crossLinks = 0;
     for (const candidate of input.candidates) {
-      const replayKey = distillationCandidateReplayKey({ ...input, candidate });
+      const replayKey = distillationCandidateReplayKey({
+        ownerId: input.ownerId,
+        afterSeq: input.afterSeq,
+        candidate,
+      });
       if (this.deps.store.distillationProposals.getByReplayKey(replayKey)) {
         proposals += 1;
         continue;
@@ -208,8 +212,6 @@ export class ConversationDistillationCoordinator {
 export function distillationCandidateReplayKey(input: {
   ownerId: string;
   afterSeq: number;
-  throughSeq: number;
-  highWaterSeq: number;
   candidate: Pick<DistilledNoteCandidate, "key" | "evidenceSeqs">;
   consumer?: string;
 }): string {
@@ -217,8 +219,6 @@ export function distillationCandidateReplayKey(input: {
     consumer: input.consumer ?? DISTILLATION_CONSUMER,
     ownerId: input.ownerId,
     afterSeq: input.afterSeq,
-    throughSeq: input.throughSeq,
-    highWaterSeq: input.highWaterSeq,
     candidateKey: input.candidate.key,
     evidenceSeqs: [...input.candidate.evidenceSeqs].sort((left, right) => left - right),
   });
