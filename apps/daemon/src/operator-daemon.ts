@@ -6001,6 +6001,19 @@ export class OperatorDaemon {
     } catch (error) {
       this.logger.warn({ err: error }, "Could not publish the default Telegram command menu");
     }
+    if (mode === "hidden") {
+      // Telegram resolves chat → all_private_chats → default and stops at the
+      // first scope that has a list. A menu somebody once set through BotFather
+      // or an older script lives in all_private_chats, where an emptied default
+      // never reaches it — and the button the owner asked us to remove stays.
+      // Cleared only under `hidden`: we do not own this scope, so in full and
+      // minimal it is left exactly as we found it.
+      try {
+        await this.telegram.setMyCommands([], { type: "all_private_chats" });
+      } catch (error) {
+        this.logger.warn({ err: error }, "Could not clear the all_private_chats Telegram command menu");
+      }
+    }
     const configured = new Set<number>(
       [
         this.config.telegram.allowedUserId,

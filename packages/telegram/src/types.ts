@@ -65,8 +65,16 @@ export interface TelegramBotCommand {
  * Which audience a published command list applies to. `chat` is one specific
  * chat — for a private chat the chat id equals the user id, which is how an
  * owner-only menu stays off everyone else's keyboard.
+ *
+ * `all_private_chats` sits between the two in Telegram's resolution order
+ * (chat → all_private_chats → default), so a list left there by BotFather or an
+ * older script survives an emptied `default`. The daemon writes it only to
+ * clear it: it does not own that scope and does not publish menus into it.
  */
-export type TelegramCommandScope = { type: "default" } | { type: "chat"; chatId: number };
+export type TelegramCommandScope =
+  | { type: "default" }
+  | { type: "all_private_chats" }
+  | { type: "chat"; chatId: number };
 
 export interface TelegramDestination {
   messageThreadId?: number;
