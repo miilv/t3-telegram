@@ -1115,6 +1115,18 @@ export class OperatorStore {
   }
 
   /**
+   * One stored Telegram message with its bindings — including the artifact ids
+   * ingress recorded for it, which is how a LATER turn (a quote, a
+   * supersession) finds the material of a message it did not carry itself.
+   */
+  getTelegramMessage(chatId: number, messageId: number): TelegramMessageRecord | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM telegram_messages WHERE chat_id=? AND message_id=?")
+      .get(chatId, messageId) as Row | undefined;
+    return row ? rowToTelegramMessage(row) : undefined;
+  }
+
+  /**
    * Package 1.4: a link never loses information on rewrite. A question card
    * that is re-linked as `primary` by a later delivery pass used to forget it
    * ever was a `user_input` card, and with it the envelope clause that tells
@@ -2042,6 +2054,38 @@ export class OperatorStore {
         .prepare("SELECT * FROM artifacts ORDER BY created_at DESC, id DESC LIMIT ?")
         .all(Math.max(1, Math.min(limit, 100))) as Row[]
     ).map(rowToArtifact);
+  }
+
+  /**
+   * Artifacts ingested from ONE Telegram chat, newest first, optionally
+   * narrowed to a single message. Chat-scoped on purpose: it backs the
+   * Operator's own lookup of the material of a conversation, and a query that
+   * spanned chats would hand one owner's turn the attachments of another's.
+   *
+   * Derived artifacts (OCR sidecars, keyframes) inherit neither chat nor
+   * message id, so they are reached through their parent, not through here.
+   */
+  listTelegramArtifacts(
+    chatId: number,
+    options: { telegramMessageId?: number; limit?: number } = {},
+  ): Artifact[] {
+    const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
+    const rows = (
+      options.telegramMessageId === undefined
+        ? this.db
+            .prepare(`
+              SELECT * FROM artifacts WHERE telegram_chat_id=?
+              ORDER BY created_at DESC, id DESC LIMIT ?
+            `)
+            .all(chatId, limit)
+        : this.db
+            .prepare(`
+              SELECT * FROM artifacts WHERE telegram_chat_id=? AND telegram_message_id=?
+              ORDER BY created_at DESC, id DESC LIMIT ?
+            `)
+            .all(chatId, options.telegramMessageId, limit)
+    ) as Row[];
+    return rows.map(rowToArtifact);
   }
 
   listExpiredArtifacts(at = nowIso(), limit = 100): Artifact[] {
