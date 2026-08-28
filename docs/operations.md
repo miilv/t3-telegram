@@ -33,7 +33,11 @@ message, the work behind it (dialogue-flow §4).
   only) or `hidden` (an empty list in every scope, i.e. no «Меню» button). It is
   a publication filter, not a permission: every command still dispatches when
   typed by hand, and `/help` still lists them. The menu is republished on each
-  boot, so changing the value and restarting is enough.
+  boot, so changing the value and restarting is enough. `hidden` also empties
+  the `all_private_chats` scope, where a list set once through BotFather would
+  otherwise outlive an emptied default. Do not set the variable to an empty
+  string — either leave it out or give it one of `full|minimal|hidden`; an empty
+  value fails validation at start-up, as it does for the neighbouring enums.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
 - Set `OBSERVABILITY_HASH_SALT` to a random secret so the irreversible chat
   pseudonym remains stable across restarts. Without it, a process-random salt

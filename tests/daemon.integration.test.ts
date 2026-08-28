@@ -12806,6 +12806,11 @@ describe("Operator commands (package 4.3)", () => {
       expect(published.commands).toEqual([]);
     }
     expect(hidden.telegram.menuFor({ type: "chat", chatId: 42 })).toEqual([]);
+    // Telegram resolves chat → all_private_chats → default and stops at the
+    // first scope holding a list, so a menu somebody once set through BotFather
+    // outlives an emptied default and the «Меню» button stays. hidden clears
+    // that scope too — and only hidden does, since we do not own it.
+    expect(hidden.telegram.menuFor({ type: "all_private_chats" })).toEqual([]);
     await hidden.daemon.stop();
 
     // A restart with OPERATOR_MENU flipped back, carrying the scope bookkeeping
@@ -12817,6 +12822,8 @@ describe("Operator commands (package 4.3)", () => {
     await waitFor(() => Boolean(full.telegram.menuFor({ type: "chat", chatId: 42 })?.length), 5_000);
     expect(full.telegram.menuFor({ type: "chat", chatId: 42 })).toContain("policy");
     expect(full.telegram.menuFor({ type: "chat", chatId: 11 })).toContain("automation");
+    // Not ours to publish into: full and minimal leave all_private_chats alone.
+    expect(full.telegram.menuFor({ type: "all_private_chats" })).toBeUndefined();
     await full.daemon.stop();
   });
 

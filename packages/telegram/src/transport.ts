@@ -869,7 +869,11 @@ export class TelegramBotTransport implements TelegramTransport {
     }));
     await this.outbound(scope.type === "chat" ? scope.chatId : 0, () =>
       this.bot.api.setMyCommands(safeCommands, {
-        scope: scope.type === "chat" ? { type: "chat", chat_id: scope.chatId } : { type: "default" },
+        scope: scope.type === "chat"
+          ? { type: "chat", chat_id: scope.chatId }
+          : scope.type === "all_private_chats"
+            ? { type: "all_private_chats" }
+            : { type: "default" },
       }),
     );
   }
