@@ -3200,8 +3200,13 @@ export class OperatorDaemon {
       messageType,
       ...(conversation ? { conversation } : {}),
     });
-    // The answer is durable now, so the handoff this turn carried is spent.
-    this.clearIssuedChatPending(update, turn);
+    // The answer is durable now, so the handoff this turn carried is spent —
+    // unless what just became durable is "пробую ещё раз". A retry notice is
+    // not an answer, and the replay behind it rebuilds its envelope from
+    // scratch: clearing here would hand the second attempt a turn with neither
+    // the superseded message's threads nor its attachments, which is the exact
+    // loss of 27.08 one layer down.
+    if (retryDelayMs === undefined) this.clearIssuedChatPending(update, turn);
     // …and so is the wait for a terminal event: the Operator has spoken for it.
     if (isThreadEventTurn) this.voice.settle(threadEvents);
     await this.flushTelegramOutbox();

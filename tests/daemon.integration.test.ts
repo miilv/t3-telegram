@@ -6655,6 +6655,59 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   }, 20_000);
 
+  it("keeps the inherited attachments through a provider failure and its replay", async () => {
+    const home = tempDirectory("daemon-preempt-attachment-retry-");
+    const store = tempStore();
+    let releaseOcr!: () => void;
+    const ocrHeld = new Promise<void>((resolve) => { releaseOcr = resolve; });
+    let ocrCalls = 0;
+    const media = {
+      ocrInbound: async () => {
+        ocrCalls += 1;
+        await ocrHeld;
+        return { text: "смета", provider: "docling" };
+      },
+    } as unknown as MediaProcessor;
+    // The first attempt at the replacing turn dies on the way to the provider.
+    const runtime = new FlakyProviderRuntime(new Error("fetch failed: network reset"), 1);
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools, media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(photoMessage(1));
+    await waitFor(() => ocrCalls === 1);
+    telegram.push(message(2, "а сколько там итого?"));
+    releaseOcr();
+
+    await waitFor(() => runtime.prompts.filter((prompt) => prompt.includes("а сколько там итого")).length === 2, 15_000);
+    const [failed, replayed] = runtime.prompts.filter((prompt) => prompt.includes("а сколько там итого"));
+    // A retry notice is not an answer: the handoff it was carrying must still
+    // be there for the attempt that finally speaks.
+    expect(envelopeArtifactIds(failed!)).toHaveLength(1);
+    expect(envelopeArtifactIds(replayed!)).toEqual(envelopeArtifactIds(failed!));
+    expect(replayed).toContain("carry over to this turn");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
   it("gives the quoted message's attachments ids the turn can actually open (incident 27.08)", async () => {
     const home = tempDirectory("daemon-quote-attachment-");
     const store = tempStore();
