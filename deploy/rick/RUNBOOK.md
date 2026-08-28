@@ -764,6 +764,95 @@ systemctl is-active t3code-server t3-telegram-operator   # active active — у�
 
 ---
 
+## Шаг 13. Скиллы и гейт расходов (и только потом — higgsfield)
+
+Делается после зелёного шага 11; к установке не привязан и откатывается одной
+строкой в env. Здесь важен **порядок**, и он не косметический.
+
+**Почему сначала гейт.** `higgsfield` — это платная генерация. Правило бизнеса:
+агент не тратит деньги владельца сам. Единственное, что может встать между
+агентом и платным MCP-инструментом, — `PreToolUse`-хук, а хуки приезжают только
+через `OPERATOR_CLAUDE_SETTINGS`. Если сначала включить MCP, а хук «потом», то
+между «потом» и «сейчас» лежит окно, в котором агент может сгенерировать что
+угодно на деньги Рика, и узнаем мы об этом из счёта.
+
+**Что кладёт `install.sh`** (шаг 3 внутри него, идемпотентно):
+
+| Файл на боксе | Права | Что это |
+| --- | --- | --- |
+| `/root/.operator/claude-settings.json` | 0600 root | `disableBundledSkills` + `PreToolUse` на `mcp__higgsfield__.*` |
+| `/root/.operator/hooks/higgsfield-spend-gate.py` | 0600 root | сам гейт |
+| `/root/.operator/claude-plugin/skills/` | 0700 root | пустой каталог под скиллы |
+
+Права — не формальность: демон **отказывается** подключать и настройки, и
+каталог скиллов, если владелец не root или файл доступен на запись кому-то ещё.
+Файл хуков — это список команд, которые запускает CLI, а бот работает с
+`OPERATOR_FULL_ACCESS=true`; «это писал root» — единственное, что отличает
+курируемый набор от того, который агент дописал себе сам в прошлом ходу.
+
+### 13.1. Включить настройки и скиллы (без higgsfield)
+
+```bash
+# на боксе, под root
+grep -nE 'OPERATOR_CLAUDE_SETTINGS|OPERATOR_SKILLS_DIR|OPERATOR_EXTRA_MCP_CONFIG' /root/.operator/operator.env
+# ожидаем: первые две строки заданы, OPERATOR_EXTRA_MCP_CONFIG ещё НЕТ или пуст
+ls -l /root/.operator/claude-settings.json /root/.operator/hooks/higgsfield-spend-gate.py
+stat -c '%U %a %n' /root/.operator /root/.operator/hooks /root/.operator/claude-plugin
+# root, 0700 / 0600 — иначе демон откажет и напишет warn
+systemctl restart t3-telegram-operator
+```
+
+Скиллы кладутся в `/root/.operator/claude-plugin/skills/<имя>/SKILL.md` —
+именно с промежуточным `skills/`, это формат плагина, который читает CLI.
+После добавления скилла рестарт не нужен: каталог перечитывается каждый ход.
+
+**Проверка успеха:**
+
+```bash
+sudo grep -E 'curated settings|OPERATOR_SKILLS_DIR|OPERATOR_CLAUDE_SETTINGS' /root/.operator/operator.log | tail -5
+# ожидаем "Attaching curated settings and skills to the Operator turn", без warn
+```
+
+В Telegram: `/debug` → строка `Claude settings: ok; skills: ok`. Затем попросить
+бота назвать доступные ему скиллы — в списке должны быть только положенные в
+`claude-plugin/skills`, без встроенных (`init`, `security-review`, …) и без
+чего-либо из `~/.claude` Рика.
+
+**Откат:** убрать обе строки из `operator.env`, `systemctl restart`. Бот
+возвращается ровно к нынешнему поведению.
+
+### 13.2. И только теперь — higgsfield
+
+Не раньше, чем 13.1 зелёный.
+
+```bash
+# на боксе, под root
+install -m 0600 -o root -g root /dev/null /root/.operator/extra-mcp.json
+# заполнить {"mcpServers": {"higgsfield": {...}}}
+echo 'OPERATOR_EXTRA_MCP_CONFIG=/root/.operator/extra-mcp.json' >> /root/.operator/operator.env
+systemctl restart t3-telegram-operator
+```
+
+**Проверка успеха — обязательно живым вызовом, а не чтением конфига:**
+
+1. `/debug` → `Extra MCP: higgsfield` и `Claude settings: ok`.
+2. Попросить бота сгенерировать картинку **без** упоминания цены. Ожидаемое
+   поведение: генерация **не** происходит, бот спрашивает подтверждение
+   стоимости. Если картинка приехала — гейт не работает; немедленно убрать
+   `OPERATOR_EXTRA_MCP_CONFIG` и рестартовать.
+3. Ответить «да» → генерация проходит.
+
+Гейт пропускает платный вызов только когда выполнены **оба** условия: в этом
+ходу или предыдущем был вызов `get_cost`, и в последнем сообщении владельца есть
+явное согласие («да», «генерируй», «подтверждаю»). «Хорошо» и «понял» согласием
+не считаются. Любая нештатная ситуация — блок: гейт, который открывается при
+поломке, не гейт.
+
+**Откат:** убрать `OPERATOR_EXTRA_MCP_CONFIG` из env, `systemctl restart`.
+Настройки и скиллы (13.1) при этом остаются — они самостоятельны.
+
+---
+
 ## Дежурная шпаргалка
 
 | Задача | Команда |

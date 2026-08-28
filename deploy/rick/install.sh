@@ -229,6 +229,24 @@ log "3. Runtime directories"
 install -d -m 0700 -o root -g root "$OPERATOR_HOME"
 install -d -m 0700 -o root -g root "$OPERATOR_HOME/artifacts"
 chmod 0700 "$OPERATOR_HOME"
+# The curated Claude settings and the skills the turn is allowed to see. Both
+# are refused by the daemon unless root owns them and nobody else can write
+# them: a hooks file is a list of commands the CLI runs, a plugin directory can
+# carry a hooks file of its own, and the bot runs with OPERATOR_FULL_ACCESS.
+install -d -m 0700 -o root -g root "$OPERATOR_HOME/hooks"
+install -d -m 0700 -o root -g root "$OPERATOR_HOME/claude-plugin"
+install -d -m 0700 -o root -g root "$OPERATOR_HOME/claude-plugin/skills"
+if [ -f "$SCRIPT_DIR/claude-settings.json" ]; then
+  install -m 0600 -o root -g root "$SCRIPT_DIR/claude-settings.json" "$OPERATOR_HOME/claude-settings.json"
+  ok "claude-settings.json (0600)"
+fi
+if [ -f "$SCRIPT_DIR/hooks/higgsfield-spend-gate.py" ]; then
+  # The settings file invokes it as `/usr/bin/python3 <path>`, so it is read,
+  # not executed: 0600 is enough and keeps it off anyone else's PATH.
+  install -m 0600 -o root -g root "$SCRIPT_DIR/hooks/higgsfield-spend-gate.py" \
+    "$OPERATOR_HOME/hooks/higgsfield-spend-gate.py"
+  ok "higgsfield-spend-gate.py (0600)"
+fi
 : >>"$OPERATOR_HOME/operator.log"; chmod 0600 "$OPERATOR_HOME/operator.log"
 : >>"$OPERATOR_HOME/t3code.log";   chmod 0600 "$OPERATOR_HOME/t3code.log"
 ok "$OPERATOR_HOME (0700) + logs (0600)"

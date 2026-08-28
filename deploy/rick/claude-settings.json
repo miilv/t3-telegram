@@ -1,0 +1,17 @@
+{
+  "disableBundledSkills": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__higgsfield__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 /root/.operator/hooks/higgsfield-spend-gate.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
