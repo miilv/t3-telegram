@@ -1,0 +1,39 @@
+[Unit]
+Description=T3 Code server (fork miilv/t3code-verf, source build from /root/t3code-verf)
+Documentation=file:///root/t3-telegram/deploy/rick/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+# Бот работает под root по решению владельца; Claude CLI отказывает bypassPermissions
+# под root без этого флага (тот же обход, что на стенде Маши).
+Environment=IS_SANDBOX=1
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root
+
+Environment=HOME=/root
+Environment=NODE_NO_WARNINGS=1
+# Провайдерские CLI (claude) обязаны оставаться в PATH, иначе t3code не сможет
+# запустить тред. Пинованный Node 24 — потому что монорепо требует ^24.13.1.
+Environment=PATH=/root/.local/toolchain/node-v24.13.1-linux-x64/bin:/root/.local/toolchain/global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# У нас на dev.t3.blicky.ru тут ещё HTTPS_PROXY на локальный sing-box (Cloudflare
+# режет наш IP). На боксе Рика прокси не предполагается — если провайдерский CLI
+# начнёт ловить 403 от Anthropic, добавить Environment=HTTPS_PROXY=... дроп-ином.
+
+# Слушает ТОЛЬКО loopback: 3773 — это панель управления агентами без TLS.
+# Публикация на 0.0.0.0 = раздача shell-доступа к боксу.
+ExecStart=/root/.local/toolchain/node-v24.13.1-linux-x64/bin/node /root/t3code-verf/apps/server/dist/bin.mjs serve --host 127.0.0.1 --port 3773 --no-browser
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+StandardOutput=append:/root/.operator/t3code.log
+StandardError=append:/root/.operator/t3code.log
+SyslogIdentifier=t3code
+
+[Install]
+WantedBy=multi-user.target

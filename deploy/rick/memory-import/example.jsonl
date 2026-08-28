@@ -1,0 +1,6 @@
+# Образец формата. Строки, начинающиеся с #, и пустые строки игнорируются.
+{"key":"rick-timezone","category":"owner","description":"когда планируешь время Рика → его часовой пояс","content":"Рик живёт в Тбилиси, все договорённости по времени — в Asia/Tbilisi."}
+{"key":"rick-reply-style","category":"preference","description":"когда пишешь Рику → нужная длина и тон ответа","content":"Рик просит короткие ответы по делу, без вступлений и без списков на полэкрана."}
+{"key":"client-acme-billing","category":"client","description":"когда обсуждаем деньги с Acme → сроки и предоплата","content":"Acme платит по счёту в течение 10 рабочих дней, предоплата 50%."}
+{"key":"decision-001-single-voice","category":"decision","description":"когда спорим, кто отвечает в чате → решение о единственном голосе","content":"27.08.2026 решили: в Telegram отвечает только оркестратор; воркеры наружу не пишут. Цена — задержка на длинных задачах."}
+{"key":"anti-rediscovery-sqlite-cli","category":"anti-rediscovery","description":"когда захочется sqlite3 на боксе → его там нет","content":"На боксе нет sqlite3 CLI: бэкап и запросы к operator.db делаются через node:sqlite."}

@@ -1,0 +1,45 @@
+[Unit]
+Description=T3 Telegram Operator (Rick's box)
+Documentation=file:///root/t3-telegram/deploy/rick/RUNBOOK.md
+# Локальный t3code нужен не для старта, а для работы воркеров: оператор
+# переживает мёртвый T3 (пишет warn "T3 unavailable").
+# Сознательно только After=, без Wants=t3code-server.service: юнит t3code
+# install.sh ставит и включает лишь при наличии /root/t3code-verf. Wants на
+# отсутствующий юнит даёт вечное "Unit t3code-server.service not found" в
+# журнале при каждом старте оператора. Порядок (After) при этом сохраняется,
+# а автозапуск t3code обеспечивает его собственный WantedBy=multi-user.target.
+After=network-online.target t3code-server.service
+Wants=network-online.target
+# Телега может лежать долго; без этого systemd сдаётся после 5 рестартов
+# за 10 секунд и оставляет бота мёртвым до ручного вмешательства.
+StartLimitIntervalSec=0
+
+[Service]
+# Бот работает под root по решению владельца; Claude CLI отказывает bypassPermissions
+# под root без этого флага (тот же обход, что на стенде Маши).
+Environment=IS_SANDBOX=1
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/t3-telegram
+
+Environment=HOME=/root
+Environment=NODE_NO_WARNINGS=1
+# Пинованный Node 24 первым: системный на боксе может быть 20/22, а node:sqlite
+# требует >=24.2. /usr/bin — ради claude, ffmpeg, tesseract, pdftotext.
+Environment=PATH=/root/.local/toolchain/node-v24.13.1-linux-x64/bin:/root/.local/toolchain/global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/root/.operator/operator.env
+
+ExecStart=/root/.local/toolchain/node-v24.13.1-linux-x64/bin/node --enable-source-maps /root/t3-telegram/dist/main.mjs
+
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+StandardOutput=append:/root/.operator/operator.log
+StandardError=append:/root/.operator/operator.log
+SyslogIdentifier=t3-operator
+
+[Install]
+WantedBy=multi-user.target
