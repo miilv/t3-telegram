@@ -168,6 +168,17 @@ export interface TelegramMessageInbound extends TelegramDestination {
   /** Daemon-created proactive ingress; never passed through Telegram normalization. */
   synthetic?: boolean;
   /**
+   * OPERATOR_PREEMPTION=off: this synthetic turn exists only to answer a queue
+   * of owner messages that was left without a claimant — the message behind
+   * them turned out to be a command, a stop word or a worker answer, and took a
+   * path that never reaches the provider.
+   *
+   * It carries no words of its own: every message it answers is a queue block,
+   * and `batchWatermarkId` is the newest of them, which is what makes the drain
+   * comparable to a real message wherever the daemon orders the two.
+   */
+  ownerQueueDrain?: boolean;
+  /**
    * Validated daemon-authored operational note references carried beside a
    * synthetic prompt. Telegram normalization never accepts this metadata.
    */

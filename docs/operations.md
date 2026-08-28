@@ -45,7 +45,12 @@ message, the work behind it (dialogue-flow §4).
   with its own attachments. Pick `off` for an owner who thinks in short bursts,
   where "answer only the current message" throws away most of what they said;
   keep the default where a stale half-answer is worse than a lost one. An
-  envelope carries at most 20 queued messages before it stops waiting. As with
+  envelope carries at most 20 queued messages, and at most 32 KiB of their text
+  (older blocks past that are collapsed to their first 200 characters plus the
+  message id, so an OCR'd scan cannot inflate one envelope to half a megabyte),
+  before it stops waiting. A queue whose message never reaches the model — the
+  next message was a command, a stop word, or failed outright — is answered by a
+  synthetic drain turn rather than waiting for the owner to write again. As with
   the neighbouring enums, an empty value fails validation at start-up — leave
   the variable out or give it one of `supersede|off`. Restart to apply. Full
   mechanics: `docs/dialogue-flow.md` §4.
