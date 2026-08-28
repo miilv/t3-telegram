@@ -15,3 +15,7 @@ coverage/
 .claude/
 node_modules
 deploy/rick/env
+
+# Byte-cache of the deploy hook scripts; nothing here is source.
+__pycache__/
+*.pyc
