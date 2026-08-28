@@ -86,6 +86,109 @@ describe("OperatorToolServer", () => {
     }
   });
 
+  it("finds this chat's recent attachments and makes the found ids readable for the turn", async () => {
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(
+      `${tempDirectory("operator-tools-list-recent-")}/artifacts`,
+      store,
+    );
+    await artifacts.initialize();
+    const photo = await artifacts.ingestTelegram({
+      bytes: Buffer.from("photo bytes"),
+      filename: "smeta.jpg",
+      mimeType: "image/jpeg",
+      telegramFileId: "file_photo",
+      chatId: 777,
+      messageId: 91,
+    });
+    const document = await artifacts.ingestTelegram({
+      bytes: Buffer.from("document bytes"),
+      filename: "requirements.txt",
+      mimeType: "text/plain",
+      telegramFileId: "file_document",
+      chatId: 777,
+      messageId: 92,
+    });
+    const otherChat = await artifacts.ingestTelegram({
+      bytes: Buffer.from("someone else's photo"),
+      filename: "private.jpg",
+      mimeType: "image/jpeg",
+      telegramFileId: "file_other_chat",
+      chatId: 888,
+      messageId: 5,
+    });
+    const server = new OperatorToolServer({
+      broker: { health: async () => ({ healthy: true }) } as unknown as T3Broker,
+      store,
+      telegram: new ToolTelegram() as unknown as TelegramTransport,
+      artifacts,
+      logger: pino({ enabled: false }),
+    });
+    await server.start();
+    // A member, deliberately: an unscoped inbound artifact has no project to
+    // check, so without the allowlist grant this role could list a photo and
+    // then be refused when it tried to open it.
+    const lease = server.issue({
+      chatId: 777,
+      ownerId: "43",
+      teamRole: "member",
+      originMessageId: 93,
+      operatorTurnId: "opturn_list_recent",
+      turnOrigin: "human",
+      allowedArtifactIds: [],
+    });
+    const client = new Client({ name: "artifact-list-recent-test", version: "1.0.0" });
+    try {
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(lease.access.url), {
+          requestInit: { headers: { Authorization: `Bearer ${lease.access.token}` } },
+        }),
+      );
+      // Nothing is readable yet: the turn carried no attachments of its own.
+      await expect(callJson(client, "artifacts.resolve", { artifactId: photo.id }))
+        .rejects.toThrow(/access unscoped artifacts/);
+
+      const listed = await callJson(client, "artifacts.list_recent", {}) as {
+        artifacts: Array<{ id: string; filename: string; mimeType: string; createdAt: string; telegramMessageId: number }>;
+      };
+      expect(listed.artifacts.map((entry) => entry.id).sort()).toEqual([photo.id, document.id].sort());
+      const found = listed.artifacts.find((entry) => entry.id === photo.id)!;
+      expect(found).toMatchObject({
+        filename: "smeta.jpg",
+        mimeType: "image/jpeg",
+        telegramMessageId: 91,
+      });
+      expect(typeof found.createdAt).toBe("string");
+      // The chat of the turn, and only it: another conversation's material is
+      // never listed, and asking for it by id is refused rather than silently
+      // answered with this chat's.
+      expect(listed.artifacts.some((entry) => entry.id === otherChat.id)).toBe(false);
+      await expect(callJson(client, "artifacts.list_recent", { chatId: 888 }))
+        .rejects.toThrow(/limited to this turn's own chat/);
+
+      // Narrowing to one message is how the Operator reaches the photo a quote
+      // or a superseded message points at.
+      const narrowed = await callJson(client, "artifacts.list_recent", { telegramMessageId: 92 }) as {
+        artifacts: Array<{ id: string }>;
+      };
+      expect(narrowed.artifacts.map((entry) => entry.id)).toEqual([document.id]);
+
+      // …and the listing is a grant: the id it returned is now readable.
+      const resolved = await callJson(client, "artifacts.resolve", { artifactId: photo.id }) as {
+        id: string;
+      };
+      expect(resolved.id).toBe(photo.id);
+      // The grant is scoped to what was listed; the other chat stays shut.
+      await expect(callJson(client, "artifacts.resolve", { artifactId: otherChat.id }))
+        .rejects.toThrow(/access unscoped artifacts/);
+    } finally {
+      lease.revoke();
+      await client.close().catch(() => undefined);
+      await server.stop();
+      store.close();
+    }
+  });
+
   it("accepts strict offset RFC3339 note deadlines over the real MCP boundary", async () => {
     const store = tempStore();
     const artifacts = new ArtifactRegistry(
