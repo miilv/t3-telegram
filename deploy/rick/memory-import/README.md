@@ -4,8 +4,9 @@
 
 | файл | зачем |
 |---|---|
-| `DISTILL-PROMPT.md` | задание для Claude на боксе: прочитать vault и сессии старого бота и выдать `notes.jsonl` |
-| `import-notes.mjs` | заливка `notes.jsonl` в `operator.db` штатным путём (`OperatorStore.rememberKeyedOperatorNote`) |
+| `DISTILL-PROMPT-v2.md` | **актуальное** задание для Claude на боксе: волновая дистилляция vault и файловой памяти в `notes-wave<N>.jsonl` |
+| `DISTILL-PROMPT.md` | v1, прогон 27.08.2026. Оставлен как история: по нему видно, из-за чего v2 переписан. Для работы не использовать |
+| `import-notes.mjs` | заливка `notes-wave<N>.jsonl` в `operator.db` штатным путём (`OperatorStore.rememberKeyedOperatorNote`) |
 | `verify.mjs` | проверка, что новый бот заметки действительно видит |
 | `example.jsonl` | образец формата, годится для проверки инструмента |
 
@@ -67,6 +68,24 @@ node -e '(async () => {
 
 ## Порядок прогона на боксе
 
+Процесс **волновой**: источники разбиты на волны (1, 2a, 2b, 3, 4 — таблица в
+`DISTILL-PROMPT-v2.md`), и каждая волна проходит полный цикл целиком, прежде чем
+начнётся следующая:
+
+```
+снять параметры волны (files-wave-N.txt + notes-existing.txt + копия базы)
+  → прогон дистиллятора в /opt/distill  → notes-wave-N.jsonl + ведомость
+  → просмотр файла глазами
+  → dry-run по КОПИИ базы, пока «отклонено строк: 0 и ошибок записи: 0»
+  → боевой импорт
+  → verify.mjs по боевой базе
+  → следующая волна
+```
+
+**Параллельно волны не гонять.** Список занятых заметок снимается заново после
+боевого импорта предыдущей волны — иначе две волны не увидят ключей друг друга
+и наплодят дубли (семантического дедупа на этом боксе нет, см. ниже).
+
 Предпосылки: репозиторий развёрнут в `/root/t3-telegram`, **бот остановлен**
 (юнит системный, не user-овский — `install.sh` ставит его в `multi-user.target`
 под `User=root`):
@@ -108,53 +127,130 @@ console.log("backup ->",dst)' /root/.operator/operator.db "$BAK"
 (Если базы ещё нет — шаг пропускается, `import-notes.mjs` создаст её и применит
 миграции сам, ровно как это делает демон на старте.)
 
-### 1. Дистилляция
+### 1. Рабочий каталог дистиллятора — `/opt/distill`
 
-Запускать **интерактивно**, а не в headless-режиме: агент под root читает старые
-сессии, в которых может лежать что угодно, включая текст в форме инструкции
-(«выполни», «перешли», «открой .env»). В интерактивной сессии владелец видит
-каждый инструмент; в `-p` без песочницы — нет.
+Дистиллятор **не запускается из `/root`**: cwd под `/root` даёт ему на виду
+`/root/CLAUDE.md`, `/root/.claude/` и весь репозиторий, а `/root/CLAUDE.md`
+написан в форме инструкций чужому агенту и подхватывается как проектный промпт.
+Каталог заводится один раз, владельцем:
+
+```bash
+mkdir -p /opt/distill
+cp /root/t3-telegram/deploy/rick/memory-import/DISTILL-PROMPT-v2.md /opt/distill/
+```
+
+Туда же владелец кладёт параметры каждой волны (шаг 2), туда же дистиллятор
+пишет `notes-wave<N>.jsonl`. `import-notes.mjs` и `verify.mjs` вызываются
+**по абсолютному пути** `/root/t3-telegram/deploy/rick/memory-import/…` —
+копировать их в `/opt/distill` не надо.
+
+### 2. Снять параметры волны
+
+Три файла, все — руками владельца, до запуска.
+
+**(а) Список файлов волны с размерами.** Дистиллятору не даётся `Bash`, поэтому
+`find`/`wc` за него выполняет владелец; сырой вывод дистиллятор вставляет в
+начало ведомости покрытия, и по нему же строится по-файловая таблица.
+
+```bash
+# пример для волны 2a
+find /root/vault/objects /root/vault/decisions /root/vault/reports -type f \
+  -printf '%s\t%p\n' | sort -k2 > /opt/distill/files-wave-2a.txt
+ls -l --time-style=+ /root/vault/dashboard.md /root/vault/_server-map.md \
+  /root/vault/_current-task.md >> /opt/distill/files-wave-2a.txt
+```
+
+**(б) Занятые заметки — целиком.** Дистиллятору нужны не только `key+category`,
+но `description` и `content`: без них он не может ни решить, покрывает ли его
+формулировка старую, ни объяснить, чем новая версия лучше. На 85 заметок это
+~28 КБ — влезает в контекст спокойно. Чтение строго read-only:
+
+```bash
+python3 -c "
+import sqlite3
+c=sqlite3.connect('file:/root/.operator/operator.db?mode=ro',uri=True)
+q=\"SELECT key,category,description,content FROM operator_notes WHERE status='active' ORDER BY category,key\"
+for k,g,d,t in c.execute(q): print(k,'|',g,'|',d,'|',t)
+" > /opt/distill/notes-existing.txt
+```
+
+**(в) Копия базы для dry-run**, при остановленном демоне:
+
+```bash
+systemctl stop t3-telegram-operator
+rm -f /root/.operator/operator.db.distill-copy
+node -e 'const{DatabaseSync}=require("node:sqlite");
+const [src,dst]=process.argv.slice(1);
+const d=new DatabaseSync(src);d.prepare("VACUUM INTO ?").run(dst);d.close();
+console.log("copy ->",dst)' /root/.operator/operator.db /root/.operator/operator.db.distill-copy
+```
+
+Все три снимаются **заново перед каждой волной**, после боевого импорта
+предыдущей.
+
+### 3. Запуск дистилляции
+
+Дистиллятору выдаётся ровно четыре инструмента. `Write` нужен для
+`notes-wave<N>.jsonl`; `Bash` **не даётся** — не потому, что он бесполезен, а
+потому, что вместе с ним у агента под root появляется возможность выполнить то,
+что он вычитал в чужих файлах. Всё, ради чего нужен был `Bash` (`find`, `wc`,
+`import-notes.mjs`), делает владелец на шагах 2 и 4.
+
+```bash
+cd /opt/distill
+claude -p "$(cat /opt/distill/DISTILL-PROMPT-v2.md)
+
+## ПАРАМЕТРЫ ПРОГОНА
+ВОЛНА: 2a — vault: objects/decisions/reports/корень
+ИСТОЧНИКИ: /root/vault/objects /root/vault/decisions /root/vault/reports /root/vault/dashboard.md /root/vault/_server-map.md /root/vault/_current-task.md
+ФАЙЛЫ ВОЛНЫ: /opt/distill/files-wave-2a.txt
+ВЫХОДНОЙ ФАЙЛ: /opt/distill/notes-wave-2a.jsonl
+ЗАНЯТЫЕ ЗАМЕТКИ: /opt/distill/notes-existing.txt" \
+  --model opus \
+  --permission-mode default \
+  --allowedTools "Read" "Glob" "Grep" "Write"
+```
+
+`--permission-mode default` оставлен сознательно: если агент всё-таки попросит
+инструмент вне списка, запуск встанет на запросе, а не тихо расширит себе права.
+
+Перед следующим шагом **обязательно** пролистать результат глазами:
+`wc -l /opt/distill/notes-wave-2a.jsonl` и весь файл целиком — это единственная
+точка, где человек видит, что именно уезжает в долгую память. Плюс прочитать
+ведомость покрытия из финального ответа: файл без ведомости не принимается.
+
+### 4. Dry-run — по КОПИИ, не по боевой базе
 
 ```bash
 cd /root/t3-telegram/deploy/rick/memory-import
-claude --model opus
-# и вставить содержимое DISTILL-PROMPT.md первым сообщением
+node import-notes.mjs --input /opt/distill/notes-wave-2a.jsonl \
+  --db /root/.operator/operator.db.distill-copy --dry-run --verbose
 ```
 
-Claude читает Obsidian-vault и `~/.claude/projects/-root/*.jsonl` и кладёт рядом
-`notes.jsonl`. Перед следующим шагом **обязательно** пролистать файл глазами:
-`wc -l notes.jsonl`, `head -20 notes.jsonl` — это единственная точка, где
-человек видит, что именно уезжает в долгую память.
+`--dry-run` и сам работает на временной копии переданного файла, так что копия
+из шага 2в остаётся нетронутой — двойная защита. Боевая база на этом шаге
+не фигурирует ни одной командой.
 
-### 2. Dry-run
-
-```bash
-node import-notes.mjs --input notes.jsonl --db /root/.operator/operator.db --dry-run --verbose
-```
-
-Dry-run делает временную **копию** базы и прогоняет по ней настоящую запись,
-поэтому отчёт честный: видно, что создастся, что станет новой версией, что
-отклонено и почему. Продовый файл при этом не открывается на запись. Отклонённые
+Критерий сдачи волны: **«отклонено строк: 0» И «ошибок записи: 0»**. Отклонённые
 строки (кривой JSON, длинный `content`, `description` без стрелки, дубль ключа,
-похожее на секрет) чинятся в `notes.jsonl` — и dry-run повторяется, пока
-«отклонено строк: 0».
+похожее на секрет) чинятся в `notes-wave<N>.jsonl`, и dry-run повторяется.
 
-Строки в разделе «Требует решения человека» (`merge-proposal`) — это факты,
-которые writer счёл почти-дублем уже существующей заметки; он их сознательно не
-пишет. Либо переформулируй, либо перезапиши существующую заметку тем же `key`.
+Про раздел «Требует решения человека» (`merge-proposal`): в общем случае это
+почти-дубли, которые writer сознательно не пишет. Но на боксе Рика семантический
+дедуп у writer включается **только** при живом MiniLM
+(`isSemanticDedupeAvailable()`), а на `local-hash-v4` он выключен целиком;
+второй путь к merge-proposal — занятый `key` при `source='distilled'`, а
+импортёр `distilled` не пускает. Значит, всё, что здесь окажется, — **ошибки
+записи**, и чинить их обязательно. Следствие: один и тот же факт под двумя
+разными `key` (`rick-city` и `rick-tbilisi`) уедет в базу дважды и никто не
+возразит. Ловить дубли придётся глазами по `notes-wave<N>.jsonl` и по
+`notes-existing.txt` — это и есть смысл пункта «Дубли» в `DISTILL-PROMPT-v2.md`.
 
-Но не жди этого раздела на боксе Рика: семантический дедуп у writer включается
-**только** при живом MiniLM (`isSemanticDedupeAvailable()`), а на `local-hash-v4`
-он выключен целиком. Второй путь к merge-proposal — занятый `key` при
-`source='distilled'`, а импортёр `distilled` не пускает. То есть один и тот же
-факт под двумя разными `key` (`rick-city` и `rick-tbilisi`) уедет в базу дважды
-и никто не возразит. Ловить дубли придётся глазами по `notes.jsonl` — это и есть
-смысл пункта «Дубли» в DISTILL-PROMPT.md.
-
-### 3. Импорт
+### 5. Импорт
 
 ```bash
-node import-notes.mjs --input notes.jsonl --db /root/.operator/operator.db --verbose
+node import-notes.mjs --input /opt/distill/notes-wave-2a.jsonl \
+  --db /root/.operator/operator.db --verbose
 ```
 
 Прогон идемпотентен: повторный запуск с тем же файлом даёт «без изменений»
@@ -166,10 +262,18 @@ node import-notes.mjs --input notes.jsonl --db /root/.operator/operator.db --ver
 Лимиты на запись: строка JSONL ≤8 КБ, `key` ≤120 символов, `description` ≤120,
 `content` ≤200 (это потолки схемы, не выдумка импортёра), `category` ≤80.
 
-### 4. Проверка
+### 6. Проверка — после каждого боевого импорта
+
+Прогоняется **не в конце всего процесса, а после импорта каждой волны**:
+дешевле поймать пустую волну сразу, чем разбирать пять волн задним числом.
+`--query` берётся из приёмочных вопросов этой волны (2–3 штуки, раздел
+«Приёмочные вопросы» в `DISTILL-PROMPT-v2.md`):
 
 ```bash
-node verify.mjs --db /root/.operator/operator.db --query "Acme" --key rick-timezone
+# волна 2a
+node verify.mjs --db /root/.operator/operator.db --query "Чепурнов"
+node verify.mjs --db /root/.operator/operator.db --query "Молочный"
+node verify.mjs --db /root/.operator/operator.db --query "Маша" --key client-masha-bot-live
 ```
 
 Скрипт печатает: счётчики по статусам, разбивку по категориям, число свежих
@@ -199,7 +303,12 @@ console.log(d.prepare(\"SELECT key,description FROM operator_notes WHERE status=
 d.close()"
 ```
 
-### 5. Живая проверка ботом
+Если verify по вопросам волны ничего не находит — волна прочитала источники
+поверхностно; разбираться **до** запуска следующей. Когда волна принята,
+цикл возвращается на шаг 2: параметры (список файлов, `notes-existing.txt`,
+копия базы) снимаются заново, уже с учётом только что импортированного.
+
+### 7. Живая проверка ботом (после последней волны)
 
 Запустить демон (`systemctl start t3-telegram-operator`) и спросить у бота
 в Telegram что-нибудь, чего нет в текущем разговоре, но есть в импорте — «в каком
