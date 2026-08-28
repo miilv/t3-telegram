@@ -6456,7 +6456,9 @@ describe("OperatorDaemon product flow", () => {
     // Released by DELIVERY, not by being shown: once this turn's final is
     // durable the handoff is spent.
     await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Ответ на второй вопрос")));
-    expect(store.getRuntimeState("chat_pending:7:0:0")).toBe("");
+    // …under the key that names the writer: the handoff belongs to the person
+    // who left it, not to the chat.
+    expect(store.getRuntimeState("chat_pending:7:0:0:42")).toBe("");
 
     telegram.finish();
     await run;
@@ -6648,7 +6650,9 @@ describe("OperatorDaemon product flow", () => {
     expect(envelope).toContain("carry over to this turn");
     expect(readByAgent).toEqual(ids);
     // The handoff is spent by delivery, exactly as the thread half of it is.
-    expect(store.getRuntimeState("chat_pending:7:0:0")).toBe("");
+    // …under the key that names the writer: the handoff belongs to the person
+    // who left it, not to the chat.
+    expect(store.getRuntimeState("chat_pending:7:0:0:42")).toBe("");
 
     telegram.finish();
     await run;
@@ -6702,6 +6706,243 @@ describe("OperatorDaemon product flow", () => {
     expect(envelopeArtifactIds(failed!)).toHaveLength(1);
     expect(envelopeArtifactIds(replayed!)).toEqual(envelopeArtifactIds(failed!));
     expect(replayed).toContain("carry over to this turn");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  /**
+   * Adversarial review of the 27.08 package, finding 2. The handoff a
+   * superseded message leaves was keyed by chat and topic alone, and
+   * supersession is per USER — so the next person to write in the chat
+   * collected someone else's: a "your previous message was superseded by this
+   * one" that was not about them, a "work is already running" they had not
+   * started, and (since the inheritance) that person's photo, in their
+   * envelope and in their allowlist.
+   */
+  it("keeps one user's superseded handoff out of another user's turn (review finding 2)", async () => {
+    const home = tempDirectory("daemon-preempt-handoff-owner-");
+    const store = tempStore();
+    const readByAgent: string[] = [];
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      if (!envelope.includes("вопрос")) return "Париж.";
+      for (const artifactId of envelopeArtifactIds(envelope)) {
+        readByAgent.push(((await call("artifacts.resolve", { artifactId })) as { id: string }).id);
+      }
+      return envelope.includes("свой вопрос") ? "Отвечаю второму." : "Отвечаю первому.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const base = config(home);
+    const cfg: Config = {
+      ...base,
+      telegram: { ...base.telegram, users: { 42: "owner", 43: "member" } },
+    };
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(cfg, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // The owner's photo, ingested for real, and then the handoff their
+    // superseded turn leaves behind — written in the shape and under the key
+    // `recordSupersededTurn` writes it.
+    telegram.push(photoMessage(1));
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."));
+    const photoId = store.getTelegramMessage(7, 1)!.artifactIds[0]!;
+    store.setRuntimeState(
+      "chat_pending:7:0:0:42",
+      JSON.stringify({
+        messageIds: [1],
+        threadIds: [],
+        artifactIds: [photoId],
+        attachments: 1,
+        attachmentsByBatch: { "1": 1 },
+      }),
+    );
+
+    // Another member writes next. Nothing of the owner's reaches them.
+    telegram.push(messageAs(2, "а у меня свой вопрос", 43));
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Отвечаю второму."));
+    const stranger = runtime.prompts.find((prompt) => prompt.includes("свой вопрос"))!;
+    expect(stranger).not.toContain("superseded");
+    expect(stranger).not.toContain(photoId);
+    expect(stranger).toContain("No attachments.");
+    expect(readByAgent).toEqual([]);
+    // …and it is still there, because it was never theirs to spend.
+    expect(store.getRuntimeState("chat_pending:7:0:0:42")).toContain(photoId);
+
+    // The owner comes back to their own question and gets their own material.
+    telegram.push(message(3, "так что там за вопрос по смете"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Отвечаю первому."));
+    const owner = runtime.prompts.find((prompt) => prompt.includes("что там за вопрос"))!;
+    expect(owner).toContain("previous message was superseded");
+    expect(owner).toContain("carry over to this turn");
+    expect(envelopeArtifactIds(owner)).toEqual([photoId]);
+    expect(readByAgent).toEqual([photoId]);
+    expect(store.getRuntimeState("chat_pending:7:0:0:42")).toBe("");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  /**
+   * Adversarial review of the 27.08 package, finding 3. Everything the quote
+   * names goes into the lease allowlist, and the allowlist is checked before
+   * the only role check artifacts have — so quoting a bot message that carried
+   * a project's file was a way to be handed it. Chat visibility still governs
+   * an UNSCOPED inbound attachment (the whole package rests on that); a
+   * project-scoped one is the project's, and asks the project.
+   */
+  it("does not let a quote carry a project's file to someone outside the project (review finding 3)", async () => {
+    const home = tempDirectory("daemon-quote-project-acl-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(async () => "Париж.");
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    const base = config(home);
+    const cfg: Config = {
+      ...base,
+      telegram: { ...base.telegram, users: { 42: "owner", 43: "member" } },
+    };
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(cfg, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // A file a worker produced for a project the member is not in, delivered
+    // by the bot into this chat as message 50.
+    store.upsertProject({
+      id: "prj_closed",
+      t3ProjectId: "t3_prj_closed",
+      name: "Closed",
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    const ingested = await artifacts.ingestTelegram({
+      bytes: Buffer.from("сводка по закрытому проекту"),
+      filename: "svodka.txt",
+      mimeType: "text/plain",
+      telegramFileId: "file_svodka",
+      chatId: 7,
+      messageId: 50,
+    });
+    store.saveArtifact({ ...ingested, projectId: "prj_closed", source: "worker_generated" });
+    store.saveTelegramMessage({
+      chatId: 7,
+      messageId: 50,
+      relatedThreadIds: [],
+      artifactIds: [ingested.id],
+      messageType: "operator_answer",
+      createdAt: nowIso(),
+    });
+
+    telegram.push(quotingBotFileMessage(51, 50, "что там в файле?", 43));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("что там в файле")));
+    const member = runtime.prompts.find((prompt) => prompt.includes("что там в файле"))!;
+    expect(member).not.toContain(ingested.id);
+    expect(member).not.toContain("readable by id");
+    expect(member).toContain("No attachments.");
+    // The quote still SAYS it carries a file, so the envelope says the file
+    // cannot be read here rather than pretending the quote was empty.
+    expect(member).toContain("Unavailable attachments: 1 of the quoted message's");
+
+    // The owner quoting the same message gets it: they are the project's, and
+    // `requireArtifactAccess` would have let them through too.
+    telegram.push(quotingBotFileMessage(52, 50, "а мне что там в файле?", 42));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("а мне что там в файле")));
+    const owner = runtime.prompts.find((prompt) => prompt.includes("а мне что там в файле"))!;
+    expect(owner).toContain(`readable by id: ${ingested.id}`);
+    expect(envelopeArtifactIds(owner)).toEqual([ingested.id]);
+    expect(owner).not.toContain("Unavailable attachments");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  /**
+   * Adversarial review of the 27.08 package, finding 5. The inherited
+   * attachment count was a `Math.max` over the links of the chain, so two
+   * superseded messages carrying two attachments each reported two — and the
+   * unavailable line, which exists to be exact about what the turn cannot see,
+   * undercounted by half.
+   */
+  it("adds up the attachments of a chain of superseded messages (review finding 5)", async () => {
+    const home = tempDirectory("daemon-preempt-attachment-chain-");
+    const store = tempStore();
+    const releases: Array<() => void> = [];
+    let ocrCalls = 0;
+    const media = {
+      ocrInbound: async () => {
+        ocrCalls += 1;
+        await new Promise<void>((resolve) => releases.push(resolve));
+        return { text: "смета", provider: "docling" };
+      },
+    } as unknown as MediaProcessor;
+    const runtime = new DelegatingRuntime(async (envelope) =>
+      envelope.includes("так что там") ? "Смотрю." : "Париж.",
+    );
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools, media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // Each message carries two attachments: a photo that is ingested, and a
+    // file too large for the cloud Bot API, which never becomes an artifact and
+    // is exactly the kind of material the count exists to remember.
+    telegram.push(photoWithOversizeFileMessage(1));
+    await waitFor(() => ocrCalls === 1);
+    telegram.push(photoWithOversizeFileMessage(2));
+    releases[0]!();
+    await waitFor(() => ocrCalls === 2);
+    telegram.push(message(3, "так что там по этим сметам?"));
+    releases[1]!();
+
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Смотрю."), 15_000);
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("так что там"))!;
+    // Two photos survived the chain; the two oversize files did not, and the
+    // envelope says two, not one.
+    expect(envelopeArtifactIds(envelope)).toHaveLength(2);
+    expect(envelope).toContain("Unavailable attachments: 2 attachment(s) of the superseded message");
 
     telegram.finish();
     await run;
@@ -11068,6 +11309,49 @@ function photoMessage(messageId: number): Extract<TelegramInbound, { type: "mess
         sizeBytes: 120_000,
       },
     ],
+  };
+}
+
+/**
+ * A photo that is ingested, plus a file past the cloud Bot API's 20 MB — one
+ * message, two attachments, exactly one artifact.
+ */
+function photoWithOversizeFileMessage(
+  messageId: number,
+): Extract<TelegramInbound, { type: "message" }> {
+  const photo = photoMessage(messageId);
+  return {
+    ...photo,
+    attachments: [
+      ...photo.attachments,
+      {
+        type: "document",
+        fileId: `huge_${messageId}`,
+        filename: `huge_${messageId}.pdf`,
+        mimeType: "application/pdf",
+        sizeBytes: 64 * 1024 * 1024,
+      },
+    ],
+  };
+}
+
+/** Someone replying to a file the bot itself delivered into the chat. */
+function quotingBotFileMessage(
+  messageId: number,
+  quotedMessageId: number,
+  text: string,
+  userId: number,
+): Extract<TelegramInbound, { type: "message" }> {
+  return {
+    ...messageAs(messageId, text, userId),
+    replyToMessageId: quotedMessageId,
+    reply: {
+      messageId: quotedMessageId,
+      fromBot: true,
+      attachments: [
+        { type: "document", fileId: `file_svodka`, mimeType: "text/plain" },
+      ],
+    },
   };
 }
 

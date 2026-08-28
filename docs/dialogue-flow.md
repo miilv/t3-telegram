@@ -560,9 +560,12 @@ transport.setInboundObserver(chatId, userId, messageId, edited)
 superseded turn can already have sent something through `telegram.send_message`
 or dispatched durable work before it was cut off. That is why the threads it
 started are re-keyed from `job_thread:<ingressJobId>` to
-`chat_pending:<chatId>:<topic>` and handed to the NEXT turn as one envelope
-line: the owner's previous message was superseded, work X is already running,
-answer only the current message. It is explicitly not "answer the old one too" —
+`chat_pending:<chatId>:<topic>:<userId>` and handed to that user's NEXT turn as
+one envelope line: the owner's previous message was superseded, work X is
+already running, answer only the current message. The user is part of the key
+because supersession is: only a person's own message replaces their turn, so a
+handoff belongs to whoever left it — a chat-wide key handed a member the note,
+and the material, of somebody else's superseded message. It is explicitly not "answer the old one too" —
 that would be two answers to one voice.
 
 The handoff is released by **delivery**, not by being shown. A turn that put the

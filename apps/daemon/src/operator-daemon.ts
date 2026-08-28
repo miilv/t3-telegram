@@ -653,6 +653,17 @@ interface ChatPendingHandoff {
   artifactIds: string[];
   /** How many attachments it carried, INCLUDING any that never became artifacts. */
   attachments: number;
+  /**
+   * Attachments per superseded batch, so a CHAIN of supersessions adds up
+   * (two lost photos are two, not one) while a replay of the same batch —
+   * `recordSupersededTurn` runs again for the same message ids — overwrites
+   * its own entry instead of doubling it.
+   */
+  attachmentsByBatch: Record<string, number>;
+  /** Which runtime_state key this was read from; where it is cleared. */
+  stateKey: string;
+  /** Written under the pre-user key: threads only, never material. */
+  legacy: boolean;
 }
 
 /**
@@ -1533,6 +1544,11 @@ export class OperatorDaemon {
         artifactIds: [],
         messageType: update.mediaGroupId ? "inbound_media_group" : "inbound",
         createdAt: nowIso(),
+        // The topic this arrived in, recorded at ingress because nothing else
+        // keeps it: an artifact knows its chat and its message, never its
+        // conversation, and in a direct-messages chat the conversation is the
+        // topic. `artifacts.list_recent` reads it back through this row.
+        ...destinationOfUpdate(update),
       });
     }
     // Every non-viewer may own an automation created through their turn
@@ -2221,8 +2237,30 @@ export class OperatorDaemon {
     return logicalConversationKey(scope);
   }
 
-  /** Package 1.1: the superseded-message handoff, per chat and topic. */
+  /**
+   * Package 1.1: the superseded-message handoff, per chat, topic AND user.
+   *
+   * The user is the correction. Supersession is per user — `conversationKey`
+   * above says so, and only the writer's own next message can replace their
+   * turn — so a handoff can only ever be meant for the person who left it. A
+   * key without them made it the property of whoever wrote next: a member's
+   * turn in a group was told "your previous message was superseded by this
+   * one" about someone else's message, told not to re-dispatch work it had
+   * never dispatched, and (since the attachment inheritance) handed the other
+   * person's photo as the material of its own question.
+   */
   private chatPendingKey(update: Extract<TelegramInbound, { type: "message" }>): string {
+    return `${this.legacyChatPendingKey(update)}:${update.userId}`;
+  }
+
+  /**
+   * The pre-user key. Read-only and transitional: a record written by the
+   * previous version is still worth its threads (so live work is not
+   * dispatched twice across a restart), but never its material — with no user
+   * on it there is no way to tell whose photo it is. Delete once no deployed
+   * box can still hold one.
+   */
+  private legacyChatPendingKey(update: Extract<TelegramInbound, { type: "message" }>): string {
     return `chat_pending:${update.chatId}:${update.messageThreadId ?? 0}:${update.directMessagesTopicId ?? 0}`;
   }
 
@@ -3302,7 +3340,10 @@ export class OperatorDaemon {
     const dispatched = (this.store.getRuntimeState(`job_thread:${ingressJobId}`) ?? "")
       .split(",")
       .filter(Boolean);
-    const existing = this.readChatPending(update);
+    // The writer's OWN slot only: a legacy record under the pre-user key is
+    // readable (see `readChatPending`) but never merged forward, so nothing of
+    // an unknown author's is copied into a record that now names one.
+    const existing = this.readChatPendingAt(this.chatPendingKey(update), false);
     // Two supersessions in a row must not lose the first one's threads — nor
     // may a note this turn merely *showed* be lost, since it never delivered.
     const threadIds = [
@@ -3323,14 +3364,29 @@ export class OperatorDaemon {
         ...artifacts.map((artifact) => artifact.id),
       ]),
     ];
-    const attachments = Math.max(
-      existing?.attachments ?? 0,
-      turn?.issuedPending?.attachments ?? 0,
-      update.attachments.length,
-    );
+    // Review of the 27.08 package, point 5: this used to be a `Math.max`, so a
+    // chain of two superseded messages carrying one photo each reported ONE
+    // attachment and the "unavailable" line undercounted what the owner had
+    // sent. The counts add up per batch instead — and are keyed by the batch,
+    // because `recordSupersededTurn` runs again for the same message ids (a
+    // replayed job, a second attempt) and a sum over calls would double it.
+    const attachmentsByBatch = {
+      ...(existing?.attachmentsByBatch ?? {}),
+      ...(turn?.issuedPending?.attachmentsByBatch ?? {}),
+    };
+    if (update.attachments.length) {
+      attachmentsByBatch[batchKey(update.messageIds)] = update.attachments.length;
+    }
+    const attachments = Object.values(attachmentsByBatch).reduce((total, count) => total + count, 0);
     this.store.setRuntimeState(
       this.chatPendingKey(update),
-      JSON.stringify({ messageIds: update.messageIds, threadIds, artifactIds, attachments }),
+      JSON.stringify({
+        messageIds: update.messageIds,
+        threadIds,
+        artifactIds,
+        attachments,
+        attachmentsByBatch,
+      }),
     );
   }
 
@@ -3346,7 +3402,9 @@ export class OperatorDaemon {
     const issued = turn?.issuedPending;
     if (!issued) return;
     turn.issuedPending = undefined;
-    const current = this.readChatPending(update);
+    // Cleared where it was found: a legacy record lives under the pre-user key,
+    // and clearing the new key instead would leave it to be handed out again.
+    const current = this.readChatPendingAt(issued.stateKey, issued.legacy);
     if (!current) return;
     const remaining = current.threadIds.filter((threadId) => !issued.threadIds.includes(threadId));
     const remainingArtifacts = current.artifactIds.filter((id) => !issued.artifactIds.includes(id));
@@ -3354,11 +3412,11 @@ export class OperatorDaemon {
       current.messageIds.length === issued.messageIds.length &&
       current.messageIds.every((id) => issued.messageIds.includes(id));
     if (!remaining.length && !remainingArtifacts.length && sameMessages) {
-      this.store.setRuntimeState(this.chatPendingKey(update), "");
+      this.store.setRuntimeState(issued.stateKey, "");
       return;
     }
     this.store.setRuntimeState(
-      this.chatPendingKey(update),
+      issued.stateKey,
       JSON.stringify({
         messageIds: current.messageIds,
         threadIds: remaining,
@@ -3367,14 +3425,30 @@ export class OperatorDaemon {
         // and delivered them has spent the handoff, and a record left behind
         // for other reasons must not claim media it no longer names.
         attachments: remainingArtifacts.length ? current.attachments : 0,
+        attachmentsByBatch: remainingArtifacts.length ? current.attachmentsByBatch : {},
       }),
     );
   }
 
+  /**
+   * This writer's own handoff, or — only if they have none — a record left by
+   * the version that keyed handoffs by chat and topic alone. The legacy record
+   * still carries its threads, because "work is already running, do not
+   * dispatch it twice" is true whoever reads it; it never carries material,
+   * because with no author on the record there is no way to know that the
+   * photo it names belongs to the person now asking about it.
+   */
   private readChatPending(
     update: Extract<TelegramInbound, { type: "message" }>,
   ): ChatPendingHandoff | undefined {
-    const raw = this.store.getRuntimeState(this.chatPendingKey(update));
+    return (
+      this.readChatPendingAt(this.chatPendingKey(update), false) ??
+      this.readChatPendingAt(this.legacyChatPendingKey(update), true)
+    );
+  }
+
+  private readChatPendingAt(stateKey: string, legacy: boolean): ChatPendingHandoff | undefined {
+    const raw = this.store.getRuntimeState(stateKey);
     if (!raw) return undefined;
     try {
       const parsed: unknown = JSON.parse(raw);
@@ -3383,11 +3457,30 @@ export class OperatorDaemon {
       const threadIds = Array.isArray(parsed.threadIds) ? parsed.threadIds.filter((id): id is string => typeof id === "string") : [];
       // A record written before this package has neither field; the message-id
       // fallback in `inheritedArtifacts` covers it.
-      const artifactIds = Array.isArray(parsed.artifactIds) ? parsed.artifactIds.filter((id): id is string => typeof id === "string") : [];
-      const attachments = typeof parsed.attachments === "number" && Number.isFinite(parsed.attachments)
+      const artifactIds = legacy
+        ? []
+        : Array.isArray(parsed.artifactIds) ? parsed.artifactIds.filter((id): id is string => typeof id === "string") : [];
+      const storedAttachments = typeof parsed.attachments === "number" && Number.isFinite(parsed.attachments)
         ? Math.max(0, Math.trunc(parsed.attachments))
         : 0;
-      return { messageIds, threadIds, artifactIds, attachments };
+      // A record from before the per-batch counts keeps its total under one
+      // synthetic batch key, so the sum below stays its own value and a later
+      // supersession still adds to it instead of replacing it.
+      const attachmentsByBatch = legacy
+        ? {}
+        : isRecord(parsed.attachmentsByBatch)
+          ? Object.fromEntries(
+              Object.entries(parsed.attachmentsByBatch)
+                .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]))
+                .map(([key, count]) => [key, Math.max(0, Math.trunc(count))]),
+            )
+          : storedAttachments
+            ? { [batchKey(messageIds)]: storedAttachments }
+            : {};
+      const attachments = legacy
+        ? 0
+        : Object.values(attachmentsByBatch).reduce((total, count) => total + count, 0);
+      return { messageIds, threadIds, artifactIds, attachments, attachmentsByBatch, stateKey, legacy };
     } catch {
       return undefined;
     }
@@ -3419,6 +3512,22 @@ export class OperatorDaemon {
         return thread ? `"${thread.title}" (threadId ${threadId})` : `threadId ${threadId}`;
       })
       .join(", ");
+    // A record from the pre-user key belongs to nobody in particular, so it
+    // says the one thing that is true regardless of who wrote it and stops
+    // there: no inherited material, and none of the second-person framing that
+    // would be a plain untruth if the earlier message was someone else's.
+    if (pending.legacy) {
+      return {
+        artifacts: [],
+        referenced: 0,
+        unreachable: 0,
+        ...(threads
+          ? {
+              note: `A message in this conversation was superseded before it was answered, and durable work it had already started is still running in thread(s) ${threads} — do NOT dispatch it again.`,
+            }
+          : {}),
+      };
+    }
     // Incident 27.08: the superseded message's media is inherited by whoever
     // answers next. The comment above is about the ANSWER — two answers in one
     // voice is the failure it guards against — and it still holds. An
@@ -3464,7 +3573,7 @@ export class OperatorDaemon {
     for (const messageId of pending.messageIds) {
       for (const id of this.artifactIdsForMessage(update.chatId, messageId)) ids.add(id);
     }
-    const resolved = this.resolveArtifactRefs([...ids]);
+    const resolved = this.resolveArtifactRefs([...ids], update.userId);
     // The superseded message's own attachment count is the floor, for the same
     // reason the quote's is: media that never became an artifact (a failed
     // ingest) is still media the owner sent.
@@ -3499,10 +3608,16 @@ export class OperatorDaemon {
    * row is gone (retention swept it) or whose file is gone is NOT quietly
    * dropped: the count travels to the envelope so the turn can say the material
    * is unavailable instead of improvising a reason for its own blindness.
+   *
+   * An id this reader may not have is dropped from BOTH counts, because it is
+   * not unavailable — it exists and it is simply not theirs, and an
+   * "ask for a resend" line about someone else's project file would be an
+   * answer to a question nobody asked.
    */
-  private resolveArtifactRefs(ids: string[]): InheritedAttachments {
+  private resolveArtifactRefs(ids: string[], viewerId: number): InheritedAttachments {
     const artifacts: ArtifactRef[] = [];
     let unreachable = 0;
+    let denied = 0;
     const unique = [...new Set(ids)];
     for (const id of unique) {
       const artifact = this.store.getArtifact(id);
@@ -3510,9 +3625,44 @@ export class OperatorDaemon {
         unreachable += 1;
         continue;
       }
+      if (!this.mayReadArtifact(viewerId, artifact)) {
+        denied += 1;
+        continue;
+      }
       artifacts.push(artifact);
     }
-    return { artifacts, referenced: unique.length, unreachable };
+    return { artifacts, referenced: unique.length - denied, unreachable };
+  }
+
+  /**
+   * Adversarial review of the 27.08 package, finding 3. Everything the envelope
+   * names goes into the lease allowlist, and the allowlist is checked BEFORE
+   * `requireArtifactAccess` — so a quoted message was a way around the only
+   * role check artifacts have. A member replying to a bot message that carried
+   * a worker-generated file of a project they are not in would have been handed
+   * that file, by the daemon, with an id.
+   *
+   * The rule is `requireArtifactAccess`'s own, applied one layer earlier:
+   *
+   *  - a PROJECT-scoped artifact (also one scoped through its thread) needs
+   *    project access — which owner and admin have unconditionally, so for them
+   *    nothing changes and no separate branch is needed;
+   *  - an UNSCOPED inbound attachment stays visible, deliberately. That is the
+   *    chat-visibility rule the whole package rests on: this person received
+   *    this file in this conversation, and quoting their own photo may not
+   *    require an administrative role. `requireArtifactAccess` would refuse it
+   *    — which is exactly why `artifacts.list_recent` grants through the
+   *    allowlist too, and why the conversation scope of that lookup (chat AND
+   *    topic) is what carries the weight here.
+   */
+  private mayReadArtifact(viewerId: number, artifact: ArtifactRef): boolean {
+    const role = this.roleForUser(viewerId);
+    if (role === "owner" || role === "admin") return true;
+    const projectId =
+      artifact.projectId ??
+      (artifact.threadId ? this.store.getThread(artifact.threadId)?.projectId : undefined);
+    if (!projectId) return true;
+    return Boolean(this.store.getProjectAccess(projectId, String(viewerId)));
   }
 
   /**
@@ -3532,6 +3682,7 @@ export class OperatorDaemon {
     if (!quote) return { artifacts: [], referenced: 0, unreachable: 0 };
     const resolved = this.resolveArtifactRefs(
       this.artifactIdsForMessage(update.chatId, quote.messageId),
+      update.userId,
     );
     // The quote's own attachment list is the floor: a photo Telegram reports in
     // the quote that has no artifact row at all is still an attachment the
@@ -7958,6 +8109,10 @@ export class OperatorDaemon {
         artifactIds: payload.artifactId ? [payload.artifactId] : [],
         messageType: payload.messageType,
         createdAt: nowIso(),
+        // Our own message belongs to a topic as much as the owner's does; a row
+        // without one would read as "the chat at large" to any topic-scoped
+        // lookup that later joins through it.
+        ...destinationFromOptions(payload.options),
       });
       for (const threadId of relatedThreadIds) {
         this.store.linkMessageThread(
@@ -8644,6 +8799,19 @@ function isProjectAccessRole(value: string | undefined): value is "owner" | "edi
   return value !== undefined && ["owner", "editor", "viewer"].includes(value);
 }
 
+/** The topic an inbound message belongs to, in the shape a message row keeps. */
+function destinationOfUpdate(update: {
+  messageThreadId?: number;
+  directMessagesTopicId?: number;
+}): TelegramDestination {
+  return {
+    ...(update.messageThreadId ? { messageThreadId: update.messageThreadId } : {}),
+    ...(update.directMessagesTopicId
+      ? { directMessagesTopicId: update.directMessagesTopicId }
+      : {}),
+  };
+}
+
 function destinationFromOptions(options: TelegramSendOptions): TelegramDestination {
   return {
     ...(options.messageThreadId ? { messageThreadId: options.messageThreadId } : {}),
@@ -9182,6 +9350,17 @@ function replyRelationClause(relation?: string): string {
     default:
       return "";
   }
+}
+
+/**
+ * The identity of ONE superseded batch, for the per-batch attachment counts.
+ * An album arrives as several message ids in a single update, and the same
+ * batch can be recorded superseded more than once (a replayed job, a second
+ * attempt) — so the key is the batch itself, and a re-record overwrites its own
+ * entry instead of adding a second one.
+ */
+function batchKey(messageIds: number[]): string {
+  return [...messageIds].sort((a, b) => a - b).join(",");
 }
 
 /** First id wins, so this update's own refs outrank an inherited copy. */
