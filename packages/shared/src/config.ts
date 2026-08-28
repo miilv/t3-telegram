@@ -58,6 +58,23 @@ const envSchema = z.object({
    */
   OPERATOR_INTERRUPT_GRACE_MS: z.coerce.number().int().min(500).max(60_000).default(8_000),
   /**
+   * What the owner's next message does to the turn that is already answering
+   * them.
+   *
+   * `supersede` — the package 1.1 canon, and the default: single voice, the
+   * newest message IS the conversation, the running turn is interrupted and
+   * never delivers. Changing that silently for every box is not on the table,
+   * which is why this defaults to the behaviour that shipped.
+   *
+   * `off` — FIFO. The running turn is finished; messages that arrive while it
+   * runs wait, and the turn that finally starts answers ALL of them from one
+   * envelope, each as its own labelled block with its own attachments. It is
+   * the right mode for an owner who thinks in short bursts — a photo, then the
+   * question about it, then a second thought — where "answer only the current
+   * message" throws away two thirds of what they said.
+   */
+  OPERATOR_PREEMPTION: z.enum(["supersede", "off"]).default("supersede"),
+  /**
    * Extra environment names inherited by provider subprocesses on top of the
    * runtime allowlist. Comma-separated; a trailing `*` matches by prefix.
    */
@@ -353,6 +370,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       compactThresholdPercent: parsed.OPERATOR_COMPACT_THRESHOLD_PERCENT,
       turnTimeoutMs: parsed.OPERATOR_TURN_TIMEOUT_MS,
       interruptGraceMs: parsed.OPERATOR_INTERRUPT_GRACE_MS,
+      preemption: parsed.OPERATOR_PREEMPTION,
       envPassthrough,
       mediationTimeoutMs: parsed.OPERATOR_MEDIATION_TIMEOUT_MS,
       voiceFallbackMs: parsed.OPERATOR_VOICE_FALLBACK_MINUTES * 60_000,

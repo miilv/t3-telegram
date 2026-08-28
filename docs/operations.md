@@ -38,6 +38,17 @@ message, the work behind it (dialogue-flow §4).
   otherwise outlive an emptied default. Do not set the variable to an empty
   string — either leave it out or give it one of `full|minimal|hidden`; an empty
   value fails validation at start-up, as it does for the neighbouring enums.
+- `OPERATOR_PREEMPTION` decides what the owner's next message does to the turn
+  already answering them: `supersede` (default) interrupts it — single voice,
+  the newest message is the conversation — while `off` finishes it and answers
+  the messages that piled up behind it together, each as its own labelled block
+  with its own attachments. Pick `off` for an owner who thinks in short bursts,
+  where "answer only the current message" throws away most of what they said;
+  keep the default where a stale half-answer is worse than a lost one. An
+  envelope carries at most 20 queued messages before it stops waiting. As with
+  the neighbouring enums, an empty value fails validation at start-up — leave
+  the variable out or give it one of `supersede|off`. Restart to apply. Full
+  mechanics: `docs/dialogue-flow.md` §4.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
 - Set `OBSERVABILITY_HASH_SALT` to a random secret so the irreversible chat
   pseudonym remains stable across restarts. Without it, a process-random salt

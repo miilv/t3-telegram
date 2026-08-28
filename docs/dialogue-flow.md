@@ -509,6 +509,13 @@ to fan out. The deterministic routing cascade was deliberately deleted.
 
 ## 4. Preemption, cancellation and mid-turn messages
 
+**Two modes, one switch — `OPERATOR_PREEMPTION`.** `supersede` (the default,
+described in the rest of this section) is single voice: the owner's newest
+message IS the conversation. `off` is FIFO with coalescing, described at the end
+of the section: the running turn is finished and the messages that piled up
+behind it are answered together. The default does not move — a box that was
+never configured keeps the behaviour it shipped with.
+
 **Preemption is the default** (package 1.1). A message from the owner that
 arrives while their own Operator turn runs in that chat supersedes it — no
 cancel word needed:
@@ -627,6 +634,86 @@ Operator turn at a time is a session invariant, not a queue detail):
 | `user` | live message updates, `ask_choices` button answers |
 | `thread-events` | digested worker events (package 1.2 connects the feed) |
 | `background` | startup ingress replay, the 1 s reliability pump |
+
+### FIFO with coalescing: `OPERATOR_PREEMPTION=off`
+
+Single voice buys its coherence by throwing messages away, and for some owners
+that is the wrong trade. Two real shapes it loses: a photo with «напиши стишок
+про этого котика» followed, while the OCR still runs, by «собери отчёт» — the
+poem is never written, because the envelope of the second turn says *answer only
+the current message*. And the owner who thinks in short bursts, five messages in
+twenty seconds, of which four are superseded before they are read.
+
+With `OPERATOR_PREEMPTION=off` the running turn is **finished**, and the
+messages that arrived while it ran are **glued into the envelope of the next
+turn**, each as its own block. Concretely:
+
+```
+noteInboundMessage → returns immediately. BOTH halves of preemption are off:
+        no interrupt, and no watermark either. The mark is not a clock, it is
+        the other window — a message landing while an EARLIER one is still
+        downloading and transcribing used to kill that earlier turn without
+        interrupting anything, because the turn read the mark itself when it
+        reached answerDirect. inboundSupersedes() answers false in this mode,
+        and the restart seeding is skipped for the same reason.
+        The 2 s batch window upstream is untouched: gluing is not preemption.
+
+handleUpdate, after ingest/commands/natural memory, before the turn:
+   └─ deferToOwnerQueue: is there ANOTHER owner ingress job of this same
+        conversation, pending and claimable right now? If yes, THIS message
+        steps aside — its text, its date and its artifact ids are appended to
+        `chat_queue:<chatId>:<topic>:<dmTopic>:<userId>` and its ingress job
+        completes. It has already paid for its own ingest; what it has not had
+        is a provider call, and the message behind it will make that call for
+        both. If no — the ordinary case, one message into a quiet chat — nothing
+        is deferred and the latency is exactly what it always was.
+   └─ the cap is 20 (`OWNER_QUEUE_MAX`). Someone who never stops typing must
+        still get an answer: past that depth the turn stops standing aside.
+
+answerDirect → consumeOwnerQueue:
+   └─ each queued entry becomes one block: `--- Queued message N of M — sent
+        HH:MM:SS, messageId … ---`, its own untrusted fence (its own nonce), and
+        its own `Attachments of THIS queued message:` line. The cat hangs on the
+        message that carried it, never on the one that followed.
+   └─ their artifacts join `Registered attachments`, the lease allowlist and
+        `allowedMessageIds`; unreachable ones join the unavailable-attachments
+        line.
+   └─ a queued message that was a reply into a work thread names it in its own
+        block: the envelope has ONE reply block and it belongs to the current
+        message, so this is the only place that fact survives. The earlier
+        branches are untouched by the mode — a reply that ANSWERS a worker's
+        question, a command inside the burst and the natural-memory sniffer all
+        still return before the deferral, exactly as they do under preemption.
+   └─ the instruction is the OPPOSITE of the supersede note: this is a QUEUE,
+        every message in it is still owed an answer, one coherent reply or point
+        by point — never "answer only the current message". The word
+        "superseded" is deliberately absent from the block.
+   └─ ordering is by Telegram's own message ids, not by write order, so an entry
+        that came back from a retry backoff is still read in the order it was
+        said.
+```
+
+The queue is spent by **delivery**, exactly like the supersede handoff: a turn
+the watchdog writes off, or one that failed and is about to replay, leaves it in
+place, and the replay picks it up again. A retry notice is not an answer.
+
+`chat_pending` still exists in this mode, because the watchdog can still write
+off a turn — but its envelope line drops the supersede framing: nothing here was
+replaced by anything, so the note says the turn was written off, hands over the
+material and the do-not-dispatch-twice fact, and says nothing about which
+message to answer.
+
+Metrics and events: `operator_messages_queued_total` counts the messages that
+stepped aside, `operator_queue_merged_messages_total` the ones that were glued
+into an envelope, and `operator.turn.queued` / `operator.turn.queue_merged` are
+the audit trail. A merged envelope also logs one `info` line naming how many
+messages it carries.
+
+Cancellation, the watchdog and the lanes below are unchanged by the mode. Stop
+words are one of them: path A still interrupts on a bare cancel word, and
+everything else — including the ordinary «стоп» inside a sentence — travels as
+text into the next turn, where the model reads it in the queue like any other
+message. There is no special stop handling for the queue.
 
 ### The watchdog: a hung turn may never freeze the system (package 1.5)
 

@@ -210,6 +210,30 @@ describe("command menu configuration", () => {
   });
 });
 
+describe("preemption mode configuration", () => {
+  const base = {
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_ALLOWED_USER_ID: "42",
+    OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+  };
+
+  it("defaults to the single-voice canon and accepts FIFO explicitly", () => {
+    // The default is the behaviour that shipped: turning preemption off for
+    // every box because one owner wanted FIFO is not a default change, it is a
+    // silent product change.
+    expect(loadConfig(base).operator.preemption).toBe("supersede");
+    expect(loadConfig({ ...base, OPERATOR_PREEMPTION: "off" }).operator.preemption).toBe("off");
+  });
+
+  it("refuses a mode it does not know instead of falling back to preemption", () => {
+    // «false», «no», «fifo» all look right to an owner writing the env file,
+    // and a silent fallback would leave them watching messages disappear.
+    expect(() => loadConfig({ ...base, OPERATOR_PREEMPTION: "false" })).toThrow();
+    expect(() => loadConfig({ ...base, OPERATOR_PREEMPTION: "fifo" })).toThrow();
+    expect(() => loadConfig({ ...base, OPERATOR_PREEMPTION: "" })).toThrow();
+  });
+});
+
 describe("child environment passthrough configuration", () => {
   const base = {
     TELEGRAM_BOT_TOKEN: "test-token",

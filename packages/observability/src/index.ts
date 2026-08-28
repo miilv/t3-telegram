@@ -31,6 +31,14 @@ export type MetricName =
   /** Package 1.5: running threads reported to the Operator as silent. */
   | "worker_threads_stalled_total"
   /**
+   * OPERATOR_PREEMPTION=off: owner messages that stepped aside so a newer one
+   * could answer for both, and the messages that were then glued into one
+   * envelope. The two differ by the bursts that never got a queue at all, so
+   * the ratio is what says whether FIFO is actually coalescing anything.
+   */
+  | "operator_messages_queued_total"
+  | "operator_queue_merged_messages_total"
+  /**
    * Package 4.1: chat actions Telegram refused. Deliberately separate from
    * `telegram_errors_total`: indicators are best-effort and a blocked bot
    * produces a steady trickle of them, which would drown the signal that real
