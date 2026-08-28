@@ -6713,6 +6713,367 @@ describe("OperatorDaemon product flow", () => {
   }, 30_000);
 
   /**
+   * OPERATOR_PREEMPTION=off — the mode built for the owner who thinks out loud.
+   *
+   * The incident this answers is the one preemption cannot: a photo with «напиши
+   * стишок про этого котика», and while the OCR is still running, «и заодно
+   * собери отчёт». Single voice answers the report and the poem is never written
+   * at all — the message was not late, it was thrown away. FIFO finishes the
+   * queue instead: the photo's request steps aside as a durable queue entry, and
+   * the turn that finally reaches the provider carries both, each labelled, the
+   * cat attached to the message that actually carried it.
+   */
+  it("queues the message that overtook the photo and answers both from one envelope (OPERATOR_PREEMPTION=off)", async () => {
+    const home = tempDirectory("daemon-fifo-photo-");
+    const store = tempStore();
+    let releaseOcr!: () => void;
+    const ocrHeld = new Promise<void>((resolve) => { releaseOcr = resolve; });
+    let ocrCalls = 0;
+    const media = {
+      ocrInbound: async () => {
+        ocrCalls += 1;
+        await ocrHeld;
+        return { text: "рыжий кот на подоконнике", provider: "docling" };
+      },
+    } as unknown as MediaProcessor;
+    const readByAgent: string[] = [];
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      if (!envelope.includes("собери отчёт")) return "Париж.";
+      for (const artifactId of envelopeArtifactIds(envelope)) {
+        readByAgent.push(((await call("artifacts.resolve", { artifactId })) as { id: string }).id);
+      }
+      return "Стишок про котика готов, и отчёт собрал.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      fifoConfig(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools, media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(captionedPhotoMessage(1, "напиши стишок про этого котика"));
+    await waitFor(() => ocrCalls === 1);
+    // Inside the OCR window — the window in which preemption used to kill it.
+    telegram.push(message(2, "и заодно собери отчёт по проекту"));
+    await waitFor(() => pendingIngressMessageIds(store).includes(2));
+    releaseOcr();
+
+    await waitFor(
+      () => telegram.sent.some((sent) => sent.text.includes("Стишок про котика готов")),
+      15_000,
+    );
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("собери отчёт"))!;
+    const ids = envelopeArtifactIds(envelope);
+    expect(ids).toHaveLength(1);
+
+    // (а) both messages are in the envelope, and the earlier one is a QUEUE
+    // entry — not a replaced message, and not a reason to answer only the last.
+    expect(envelope).toContain("Queued owner messages");
+    expect(envelope).toContain("Queued message 1 of 1");
+    expect(envelope).toContain("напиши стишок про этого котика");
+    expect(envelope).not.toContain("superseded");
+    expect(envelope).not.toContain("Answer only the current message");
+
+    // (б) the cat hangs on ITS OWN message. The report request carried nothing,
+    // and an envelope that let the photo drift onto it would be inviting the
+    // model to write a poem about a report.
+    const block = envelope.slice(
+      envelope.indexOf("--- Queued message 1 of 1"),
+      envelope.indexOf("User message:"),
+    );
+    expect(block).toContain(`Attachments of THIS queued message: ${ids[0]}`);
+    // (в) …and it is readable, not merely printed: the lease says so too.
+    expect(readByAgent).toEqual(ids);
+
+    // (г) one turn, one answer, nothing interrupted, and the queue is spent.
+    expect(runtime.prompts.filter((prompt) => prompt.includes("User message:"))).toHaveLength(1);
+    expect(
+      store.db
+        .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.superseded'")
+        .get(),
+    ).toMatchObject({ count: 0 });
+    expect(
+      store.db
+        .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.queued'")
+        .get(),
+    ).toMatchObject({ count: 1 });
+    expect(
+      store.db
+        .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.queue_merged'")
+        .get(),
+    ).toMatchObject({ count: 1 });
+    expect(store.getRuntimeState("chat_queue:7:0:0:42") || "").toBe("");
+    expect(store.listBackgroundJobs("telegram_ingress", "pending")).toHaveLength(0);
+    expect(store.listBackgroundJobs("telegram_ingress", "completed")).toHaveLength(2);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  /**
+   * The non-technical owner's burst: four messages, material on two of them,
+   * one answer. Everything hangs where it was sent — this is the property that
+   * makes «посмотри на кота» and «вот требования» two different questions
+   * instead of one pile of files.
+   */
+  it("glues a queue of three messages into one envelope, each with its own attachments (OPERATOR_PREEMPTION=off)", async () => {
+    const home = tempDirectory("daemon-fifo-burst-");
+    const store = tempStore();
+    let releaseOcr!: () => void;
+    const ocrHeld = new Promise<void>((resolve) => { releaseOcr = resolve; });
+    let ocrCalls = 0;
+    const media = {
+      ocrInbound: async () => {
+        ocrCalls += 1;
+        await ocrHeld;
+        return { text: "кот", provider: "docling" };
+      },
+    } as unknown as MediaProcessor;
+    const runtime = new DelegatingRuntime(async (envelope) => {
+      if (!envelope.includes("что в итоге")) return "Париж.";
+      return "Отвечаю по всем четырём пунктам.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      fifoConfig(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools, media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(captionedPhotoMessage(1, "посмотри на кота"));
+    await waitFor(() => ocrCalls === 1);
+    telegram.push(message(2, "и ещё вопрос про сроки"));
+    telegram.push(documentMessage(3, "вот требования"));
+    telegram.push(message(4, "что в итоге?"));
+    await waitFor(() => [2, 3, 4].every((id) => pendingIngressMessageIds(store).includes(id)));
+    releaseOcr();
+
+    await waitFor(
+      () => telegram.sent.some((sent) => sent.text.includes("по всем четырём пунктам")),
+      20_000,
+    );
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("что в итоге"))!;
+
+    // Three queued blocks, in the order they were said, plus the current one.
+    expect(envelope).toContain("the owner sent 3 more message(s)");
+    const first = envelope.indexOf("--- Queued message 1 of 3");
+    const second = envelope.indexOf("--- Queued message 2 of 3");
+    const third = envelope.indexOf("--- Queued message 3 of 3");
+    expect(first).toBeGreaterThan(-1);
+    expect(second).toBeGreaterThan(first);
+    expect(third).toBeGreaterThan(second);
+    const blocks = [
+      envelope.slice(first, second),
+      envelope.slice(second, third),
+      envelope.slice(third, envelope.indexOf("User message:")),
+    ];
+    expect(blocks[0]).toContain("посмотри на кота");
+    expect(blocks[1]).toContain("и ещё вопрос про сроки");
+    expect(blocks[2]).toContain("вот требования");
+    // The photo belongs to the first message, the document to the third, and
+    // the message that carried nothing claims nothing.
+    const ids = envelopeArtifactIds(envelope);
+    expect(ids).toHaveLength(2);
+    expect(blocks[0]).toContain("Attachments of THIS queued message:");
+    expect(blocks[1]).not.toContain("Attachments of THIS queued message:");
+    expect(blocks[2]).toContain("Attachments of THIS queued message:");
+    expect(blocks[0]!.match(/art_[\w-]+/gu)).toHaveLength(1);
+    expect(blocks[2]!.match(/art_[\w-]+/gu)).toHaveLength(1);
+    expect(blocks[0]!.match(/art_[\w-]+/gu)![0]).not.toBe(blocks[2]!.match(/art_[\w-]+/gu)![0]);
+
+    // One answer for four messages, and the record is spent afterwards.
+    expect(telegram.sent.filter((sent) => sent.text.includes("по всем четырём"))).toHaveLength(1);
+    expect(store.getRuntimeState("chat_queue:7:0:0:42") || "").toBe("");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
+  /**
+   * The same burst, on the default. Nothing about the canon moves: the photo's
+   * request is superseded, the envelope says so, and no queue is ever written.
+   */
+  it("keeps single voice on the default OPERATOR_PREEMPTION=supersede", async () => {
+    const home = tempDirectory("daemon-fifo-default-");
+    const store = tempStore();
+    let releaseOcr!: () => void;
+    const ocrHeld = new Promise<void>((resolve) => { releaseOcr = resolve; });
+    let ocrCalls = 0;
+    const media = {
+      ocrInbound: async () => {
+        ocrCalls += 1;
+        await ocrHeld;
+        return { text: "кот", provider: "docling" };
+      },
+    } as unknown as MediaProcessor;
+    const runtime = new DelegatingRuntime(async (envelope) =>
+      envelope.includes("собери отчёт") ? "Отчёт собран." : "Париж.",
+    );
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools, media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(captionedPhotoMessage(1, "напиши стишок про этого котика"));
+    await waitFor(() => ocrCalls === 1);
+    telegram.push(message(2, "и заодно собери отчёт по проекту"));
+    releaseOcr();
+
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Отчёт собран")), 15_000);
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("собери отчёт"))!;
+    expect(envelope).toContain("previous message was superseded");
+    expect(envelope).toContain("Answer only the current message");
+    expect(envelope).not.toContain("Queued owner messages");
+    expect(
+      store.db
+        .prepare("SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.turn.queued'")
+        .get(),
+    ).toMatchObject({ count: 0 });
+    expect(store.getRuntimeState("chat_queue:7:0:0:42") || "").toBe("");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  /**
+   * The deadline hazard of FIFO: the queue is durable state that ONE turn is
+   * holding, and a turn the watchdog writes off never delivers. If the write-off
+   * spent the queue, the burst would die with it — the exact loss the mode
+   * exists to prevent, one layer down. The replay must find it again.
+   */
+  it("keeps the queue for the replay when the watchdog writes the turn off (OPERATOR_PREEMPTION=off)", async () => {
+    const home = tempDirectory("daemon-fifo-zombie-");
+    const store = tempStore();
+    let releaseOcr!: () => void;
+    const ocrHeld = new Promise<void>((resolve) => { releaseOcr = resolve; });
+    let ocrCalls = 0;
+    const media = {
+      ocrInbound: async () => {
+        ocrCalls += 1;
+        await ocrHeld;
+        return { text: "кот", provider: "docling" };
+      },
+    } as unknown as MediaProcessor;
+    // Wedges the first attempt, answers the replay.
+    const runtime = new WedgedOnceRuntime();
+    const broker = new InterruptCountingBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      fifoConfig(home, watchdogConfig(home, { watchdogStallMs: 100_000, watchdogGraceMs: 30_000 })),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      tools,
+      media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+    try {
+      telegram.push(captionedPhotoMessage(1, "посмотри на кота"));
+      await waitFor(() => ocrCalls === 1);
+      telegram.push(message(2, "зависший вопрос: что в итоге?"));
+      await waitFor(() => pendingIngressMessageIds(store).includes(2));
+      releaseOcr();
+      await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("зависший вопрос")), 15_000);
+      expect(runtime.prompts[0]).toContain("Queued message 1 of 1");
+
+      // Another topic, so the watchdog has a real waiter without touching this
+      // conversation's queue.
+      telegram.push({ ...message(3, "вопрос в другом топике"), messageThreadId: 22 });
+      const startedAt = Date.now();
+      await waitFor(() => {
+        daemon.watchdogTick(startedAt + 200_000);
+        return runtime.interrupts >= 1;
+      }, 5_000);
+      daemon.watchdogTick(startedAt + 400_000);
+
+      await waitFor(
+        () => telegram.sent.some((sent) => sent.text.includes("Ответ со второй попытки")),
+        20_000,
+      );
+      const replayed = runtime.prompts.filter((prompt) => prompt.includes("зависший вопрос"));
+      expect(replayed).toHaveLength(2);
+      // THE assertion: the burst survived the write-off intact — same block,
+      // same photo, in the envelope that finally spoke.
+      expect(replayed[1]).toContain("Queued message 1 of 1");
+      expect(replayed[1]).toContain("посмотри на кота");
+      expect(envelopeArtifactIds(replayed[1]!)).toEqual(envelopeArtifactIds(replayed[0]!));
+      // A watchdog write-off is not a supersession, and in this mode nothing
+      // may tell the model otherwise.
+      expect(replayed[1]).not.toContain("superseded by this one");
+      expect(replayed[1]).not.toContain("Answer only the current message");
+      // Delivered at last, so the queue is finally spent.
+      expect(store.getRuntimeState("chat_queue:7:0:0:42") || "").toBe("");
+    } finally {
+      runtime.release();
+    }
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
+  /**
    * Adversarial review of the 27.08 package, finding 2. The handoff a
    * superseded message leaves was keyed by chat and topic alone, and
    * supersession is per USER — so the next person to write in the chat
@@ -11140,6 +11501,29 @@ function watchdogConfig(
   return { ...base, operator: { ...base.operator, ...overrides } };
 }
 
+/** OPERATOR_PREEMPTION=off — FIFO with coalescing instead of single voice. */
+function fifoConfig(home: string, base: Config = config(home)): Config {
+  return { ...base, operator: { ...base.operator, preemption: "off" } };
+}
+
+/** A photo with a caption — the shape a burst-writing owner actually sends. */
+function captionedPhotoMessage(
+  messageId: number,
+  caption: string,
+): Extract<TelegramInbound, { type: "message" }> {
+  return { ...photoMessage(messageId), text: caption, textIsMediaPlaceholder: false };
+}
+
+/** The message ids sitting in the durable ingress queue right now. */
+function pendingIngressMessageIds(store: OperatorStore): number[] {
+  return store
+    .listBackgroundJobs<{ update: Extract<TelegramInbound, { type: "message" }> }>(
+      "telegram_ingress",
+      "pending",
+    )
+    .flatMap((job) => job.payload.update.messageIds ?? []);
+}
+
 function config(home: string): Config {
   return {
     owner: { name: "Ilia Mikhalchuk", language: "ru", timezone: "Europe/Moscow" },
@@ -11170,6 +11554,9 @@ function config(home: string): Config {
       compactThresholdPercent: 80,
       turnTimeoutMs: 600_000,
       interruptGraceMs: 8_000,
+      // The canon, so every existing test keeps judging the behaviour that
+      // ships by default; the FIFO tests override it explicitly.
+      preemption: "supersede",
       envPassthrough: [],
       extraMcpConfigPath: undefined,
       mediationTimeoutMs: 250,
