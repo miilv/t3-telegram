@@ -5986,11 +5986,18 @@ export class OperatorDaemon {
    *
    * Best effort throughout: someone who has never opened the chat has no chat
    * for Telegram to scope to, and a menu is not worth failing a boot over.
+   *
+   * `OPERATOR_MENU` narrows every scope alike, `hidden` down to an empty list:
+   * the menu is republished on each boot rather than skipped on a remembered
+   * key, so changing the variable and restarting really does rewrite what the
+   * client shows. `telegram_command_scopes` is bookkeeping about WHICH chats
+   * were published into, never a "published already" cache.
    */
   private async publishTelegramCommands(): Promise<void> {
     if (!this.telegram.setMyCommands) return;
+    const mode = this.config.telegram.commandMenu;
     try {
-      await this.telegram.setMyCommands(telegramCommandMenu("viewer"), { type: "default" });
+      await this.telegram.setMyCommands(telegramCommandMenu("viewer", mode), { type: "default" });
     } catch (error) {
       this.logger.warn({ err: error }, "Could not publish the default Telegram command menu");
     }
@@ -6035,7 +6042,7 @@ export class OperatorDaemon {
     if (!this.telegram.setMyCommands) return false;
     const scopeRole = role ?? this.roleForUser(userId);
     try {
-      await this.telegram.setMyCommands(telegramCommandMenu(scopeRole), {
+      await this.telegram.setMyCommands(telegramCommandMenu(scopeRole, this.config.telegram.commandMenu), {
         type: "chat",
         chatId: userId,
       });

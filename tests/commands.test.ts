@@ -70,6 +70,30 @@ describe("command catalogue (package 4.3)", () => {
     expect(member).not.toContain("memory");
   });
 
+  it("narrows the published menu on OPERATOR_MENU without touching the table", () => {
+    // hidden: an empty payload in every scope — that is how the «Меню» button
+    // goes away — while the table itself still holds every command.
+    for (const role of ["viewer", "member", "admin", "owner"] as const) {
+      expect(telegramCommandMenu(role, "hidden")).toEqual([]);
+    }
+
+    // minimal: two commands, whatever the role may run. /start is dispatchable
+    // but unlisted: Telegram sends it on the first open regardless.
+    for (const role of ["viewer", "member", "owner"] as const) {
+      expect(telegramCommandMenu(role, "minimal").map((entry) => entry.command)).toEqual([
+        "status",
+        "help",
+      ]);
+    }
+
+    // full is the default and is what the role-filtered table has always been.
+    expect(telegramCommandMenu("owner", "full")).toEqual(telegramCommandMenu("owner"));
+    expect(telegramCommandMenu("owner", "full").map((entry) => entry.command)).toContain("debug");
+    // Nothing about dispatching moved: every mode is a publication filter.
+    expect(dispatchableCommandName("/debug")).toBe("debug");
+    expect(dispatchableCommandName("/start")).toBe("start");
+  });
+
   it("gates the viewer wall on the same table as the menu", () => {
     for (const safe of ["/status", "/projects 2", "/work", "/help", "/start", "/status@t3captain_bot"]) {
       expect(isViewerSafeMessage(safe)).toBe(true);

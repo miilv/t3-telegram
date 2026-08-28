@@ -10592,6 +10592,7 @@ function config(home: string): Config {
       allowedUserId: 42,
       users: { 42: "owner" },
       allowGroups: false,
+      commandMenu: "full",
       pollTimeoutSeconds: 1,
       apiBase: "https://api.telegram.org",
       maxUploadBytes: 50 * 1024 * 1024,
@@ -12315,6 +12316,8 @@ describe("Operator commands (package 4.3)", () => {
     users: Config["telegram"]["users"] = { 42: "owner" },
     /** Reuse a store to model a restart with different configuration. */
     existingStore?: OperatorStore,
+    /** `OPERATOR_MENU` for this boot. */
+    commandMenu: Config["telegram"]["commandMenu"] = "full",
   ) {
     const home = tempDirectory(prefix);
     const store = existingStore ?? tempStore();
@@ -12324,7 +12327,7 @@ describe("Operator commands (package 4.3)", () => {
     const logger = pino({ enabled: false });
     const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
     const base = config(home);
-    const daemonConfig: Config = { ...base, telegram: { ...base.telegram, users } };
+    const daemonConfig: Config = { ...base, telegram: { ...base.telegram, users, commandMenu } };
     let daemon: OperatorDaemon;
     const scheduler = new DailyScheduler(() => daemon.compact(), logger);
     daemon = new OperatorDaemon(daemonConfig, store, runtime, broker, telegram, artifacts, scheduler, logger);
@@ -12738,6 +12741,53 @@ describe("Operator commands (package 4.3)", () => {
     await waitFor(() => store.getRuntimeState("telegram_command_scopes") === "42", 5_000);
 
     await daemon.stop();
+  });
+
+  it("publishes OPERATOR_MENU=minimal in every scope and still dispatches the rest", async () => {
+    const harness = commandHarness("daemon-menu-minimal-", { 42: "owner" }, undefined, "minimal");
+    const { telegram, daemon } = harness;
+    await daemon.initialize();
+    const run = daemon.run();
+    await waitFor(() => Boolean(telegram.menuFor({ type: "chat", chatId: 42 })), 5_000);
+    // The owner is an owner: the narrow menu is a choice about what is offered,
+    // not about what they may do.
+    expect(telegram.menuFor({ type: "chat", chatId: 42 })).toEqual(["status", "help"]);
+    expect(telegram.menuFor({ type: "default" })).toEqual(["status", "help"]);
+
+    // /debug is not in the menu and still answers when typed by hand.
+    telegram.push(message(1, "/debug"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Operator debug")), 5_000);
+    // As does /start, which Telegram sends on the first open whatever the menu says.
+    telegram.push(message(2, "/start"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text.startsWith("## Operator")), 5_000);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("empties every scope on OPERATOR_MENU=hidden and refills it on the next boot", async () => {
+    const hidden = commandHarness("daemon-menu-hidden-", { 42: "owner", 11: "member" }, undefined, "hidden");
+    await hidden.daemon.initialize();
+    await waitFor(() => hidden.telegram.publishedCommands.length >= 3, 5_000);
+    // Default scope and both chat scopes: an empty list is how Telegram is told
+    // to drop the «Меню» button, so none of them may be skipped.
+    for (const published of hidden.telegram.publishedCommands) {
+      expect(published.commands).toEqual([]);
+    }
+    expect(hidden.telegram.menuFor({ type: "chat", chatId: 42 })).toEqual([]);
+    await hidden.daemon.stop();
+
+    // A restart with OPERATOR_MENU flipped back, carrying the scope bookkeeping
+    // the hidden boot left behind: it must not be read as "published already"
+    // or the client would keep the empty menu until the allowlist changes.
+    const full = commandHarness("daemon-menu-hidden-back-", { 42: "owner", 11: "member" }, undefined, "full");
+    full.store.setRuntimeState("telegram_command_scopes", "42,11");
+    await full.daemon.initialize();
+    await waitFor(() => Boolean(full.telegram.menuFor({ type: "chat", chatId: 42 })?.length), 5_000);
+    expect(full.telegram.menuFor({ type: "chat", chatId: 42 })).toContain("policy");
+    expect(full.telegram.menuFor({ type: "chat", chatId: 11 })).toContain("automation");
+    await full.daemon.stop();
   });
 
   it("carries a burst's media context past every command it is glued to (review №4)", async () => {
