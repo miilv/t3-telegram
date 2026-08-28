@@ -189,6 +189,27 @@ describe("media configuration", () => {
   });
 });
 
+describe("command menu configuration", () => {
+  const base = {
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_ALLOWED_USER_ID: "42",
+    OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+  };
+
+  it("defaults to the full menu and accepts the two narrower modes", () => {
+    expect(loadConfig(base).telegram.commandMenu).toBe("full");
+    expect(loadConfig({ ...base, OPERATOR_MENU: "minimal" }).telegram.commandMenu).toBe("minimal");
+    expect(loadConfig({ ...base, OPERATOR_MENU: "hidden" }).telegram.commandMenu).toBe("hidden");
+  });
+
+  it("refuses a menu mode it does not know instead of falling back to full", () => {
+    // A typo here is silent otherwise: the owner sets OPERATOR_MENU=none, sees
+    // all fourteen commands anyway and has no way to tell why.
+    expect(() => loadConfig({ ...base, OPERATOR_MENU: "none" })).toThrow();
+    expect(() => loadConfig({ ...base, OPERATOR_MENU: "" })).toThrow();
+  });
+});
+
 describe("child environment passthrough configuration", () => {
   const base = {
     TELEGRAM_BOT_TOKEN: "test-token",

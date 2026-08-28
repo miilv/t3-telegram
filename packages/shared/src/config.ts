@@ -8,6 +8,17 @@ const envSchema = z.object({
   TELEGRAM_ALLOWED_USER_ID: z.coerce.number().int().positive(),
   TELEGRAM_ALLOWED_USERS: z.string().default(""),
   TELEGRAM_ALLOW_GROUPS: z.enum(["true", "false"]).default("false"),
+  /**
+   * How much of the command table Telegram is told about. The commands
+   * themselves never change: every one of them still dispatches when typed by
+   * hand, this only decides what the client offers in «Меню» and autocomplete.
+   *
+   * `full` — the role-filtered table (an owner sees all fourteen commands).
+   * `minimal` — `/help` and `/status` only, for an owner who is not an engineer
+   * and reads «Диагностика демона» as an invitation to break something.
+   * `hidden` — an empty menu in every scope, i.e. no «Меню» button at all.
+   */
+  OPERATOR_MENU: z.enum(["full", "minimal", "hidden"]).default("full"),
   T3_BASE_URL: z.string().url().default("http://127.0.0.1:3773"),
   T3_BEARER_TOKEN: z.string().optional(),
   T3_PROVIDER_INSTANCE_ID: z.string().min(1).default("claude"),
@@ -311,6 +322,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       allowedUserId: parsed.TELEGRAM_ALLOWED_USER_ID,
       users: Object.fromEntries(telegramUsers),
       allowGroups: parsed.TELEGRAM_ALLOW_GROUPS === "true",
+      commandMenu: parsed.OPERATOR_MENU,
       pollTimeoutSeconds: parsed.TELEGRAM_POLL_TIMEOUT_SECONDS,
       apiBase: parsed.TELEGRAM_API_BASE.replace(/\/$/, ""),
       maxUploadBytes: parsed.TELEGRAM_MAX_UPLOAD_BYTES,

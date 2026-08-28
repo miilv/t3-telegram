@@ -28,6 +28,12 @@ message, the work behind it (dialogue-flow §4).
 - `/share <project> <id> <owner|editor|viewer>` — grant project access. Team
   viewers may receive viewer access only; callbacks and process-scoped tools
   re-check the same permissions instead of trusting Telegram UI visibility.
+- `OPERATOR_MENU` decides how much of the command table Telegram is told about:
+  `full` (default, the role-filtered list), `minimal` (`/help` and `/status`
+  only) or `hidden` (an empty list in every scope, i.e. no «Меню» button). It is
+  a publication filter, not a permission: every command still dispatches when
+  typed by hand, and `/help` still lists them. The menu is republished on each
+  boot, so changing the value and restarting is enough.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
 - Set `OBSERVABILITY_HASH_SALT` to a random secret so the irreversible chat
   pseudonym remains stable across restarts. Without it, a process-random salt

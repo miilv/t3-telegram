@@ -190,13 +190,39 @@ export function commandsForRole(role: TeamRole): OperatorCommandSpec[] {
 }
 
 /**
+ * `OPERATOR_MENU`: how much of the table Telegram is told about. This is a
+ * publication filter only — `handleCommand` keeps dispatching every command
+ * typed by hand in all three modes, and `/help` keeps listing them.
+ */
+export type OperatorMenuMode = "full" | "minimal" | "hidden";
+
+/**
+ * The commands `minimal` publishes. `/start` is deliberately absent: Telegram
+ * sends it on the first open of a chat whether or not it is in the menu, so it
+ * stays dispatchable while taking no room in a menu whose whole point is to be
+ * two lines long.
+ */
+const MINIMAL_MENU_COMMANDS: ReadonlySet<string> = new Set(["help", "status"]);
+
+/**
  * The `setMyCommands` payload for a role: canonical order, plain descriptions.
  * Aliases get their own row — Telegram autocompletes only what it was told
  * about, and `/automations` is a spelling the daemon really does answer — with
  * the relationship spelled out so the menu does not look like two commands.
+ *
+ * `mode` narrows the result further (`OPERATOR_MENU`); `hidden` returns an
+ * empty payload, which is how Telegram is told to drop the «Меню» button for
+ * that scope.
  */
-export function telegramCommandMenu(role: TeamRole): Array<{ command: string; description: string }> {
-  return commandsForRole(role).flatMap((spec) => [
+export function telegramCommandMenu(
+  role: TeamRole,
+  mode: OperatorMenuMode = "full",
+): Array<{ command: string; description: string }> {
+  if (mode === "hidden") return [];
+  const commands = mode === "minimal"
+    ? commandsForRole(role).filter((spec) => MINIMAL_MENU_COMMANDS.has(spec.name))
+    : commandsForRole(role);
+  return commands.flatMap((spec) => [
     { command: spec.name, description: spec.menu },
     ...(spec.aliases ?? []).map((alias) => ({
       command: alias,
