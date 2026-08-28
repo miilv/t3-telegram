@@ -55,6 +55,18 @@ environment-variable bearer reference in an inline, isolated MCP config; the
 token itself never appears in argv. Codex user/project rules and user config are
 ignored, and its shell/edit/image tool paths are disabled.
 
+Servers beyond the built-in `operator` one are opt-in through
+`OPERATOR_EXTRA_MCP_CONFIG`: a path to a JSON file in Claude Code's own
+`--mcp-config` shape (`{"mcpServers": {"brain": {"command": …}}}`, stdio or
+http/sse). Its entries are merged into the per-turn config and each attached
+server gets an `mcp__<name>__*` entry in `--allowed-tools`, without which
+`dontAsk` would refuse its tools. `--strict-mcp-config` stays on, so an ambient
+`~/.mcp.json` still reaches nothing, and an entry named `operator` is ignored —
+the built-in server carries the turn capability and always wins. The file is
+re-read on every turn, so editing it needs no restart; an unreadable or
+malformed one costs one `warn` line and the turn runs with `operator` alone.
+Contents are never logged, only server names: the file holds tokens.
+
 Provider subprocesses inherit an environment allowlist, not a denylist: `PATH`,
 `HOME`, `PWD`, `LANG`, `LC_*`, `TZ`, `TERM`, `USER`, `LOGNAME`, `SHELL`,
 `TMPDIR`, `XDG_*`, `NODE_ENV`, `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` (the Codex

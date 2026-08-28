@@ -225,6 +225,27 @@ describe("child environment passthrough configuration", () => {
     ).toEqual(["WF_*", "WORKFLOW_PROFILE"]);
   });
 
+  it("resolves the extra MCP allowlist path and defaults to no extra servers", () => {
+    expect(loadConfig({ ...base }).operator.extraMcpConfigPath).toBeUndefined();
+    // Whitespace only is "unset", not a path to the current directory.
+    expect(loadConfig({ ...base, OPERATOR_EXTRA_MCP_CONFIG: "   " }).operator.extraMcpConfigPath)
+      .toBeUndefined();
+    expect(
+      loadConfig({ ...base, OPERATOR_EXTRA_MCP_CONFIG: " /etc/operator/extra-mcp.json " }).operator
+        .extraMcpConfigPath,
+    ).toBe("/etc/operator/extra-mcp.json");
+    // Relative and ~/ paths are resolved here: the CLI is spawned with a
+    // different cwd, so an unresolved one would point at nothing.
+    expect(
+      loadConfig({ ...base, OPERATOR_EXTRA_MCP_CONFIG: "~/extra-mcp.json" }).operator
+        .extraMcpConfigPath,
+    ).toMatch(/^\/.*\/extra-mcp\.json$/u);
+    expect(
+      loadConfig({ ...base, OPERATOR_EXTRA_MCP_CONFIG: "extra-mcp.json" }).operator
+        .extraMcpConfigPath,
+    ).toBe(`${process.cwd()}/extra-mcp.json`);
+  });
+
   it("rejects a bare wildcard and an empty prefix at load time", () => {
     expect(() => loadConfig({ ...base, OPERATOR_ENV_PASSTHROUGH: "*" })).toThrow(
       /must name a variable or a non-empty prefix/,

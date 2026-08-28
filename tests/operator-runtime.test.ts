@@ -25,6 +25,20 @@ async function waitForCondition(predicate: () => boolean, timeoutMs = 5_000): Pr
   }
 }
 
+/** A fake CLI that reports back its argv and the MCP config it was handed. */
+const ECHO_ARGS_AND_MCP_CONFIG = `#!/usr/bin/env node
+const { readFileSync } = require("node:fs");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const sessionIndex = process.argv.indexOf("--session-id");
+  const session = process.argv[sessionIndex + 1];
+  const args = process.argv.slice(2);
+  const configPath = args[args.indexOf("--mcp-config") + 1];
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  console.log(JSON.stringify({ type: "result", result: JSON.stringify({ args, configPath, config }), session_id: session }));
+});
+`;
+
 describe("ClaudeCliOperatorRuntime", () => {
   it("streams text, preserves the session id, and strips daemon secrets", async () => {
     const directory = tempDirectory("fake-claude-");
@@ -158,6 +172,132 @@ process.stdin.on("end", () => {
         },
       },
     });
+  });
+
+  it("attaches the OPERATOR_EXTRA_MCP_CONFIG allowlist and permits its tools in both modes", async () => {
+    const directory = tempDirectory("fake-claude-extra-mcp-");
+    const binary = join(directory, "claude");
+    writeFileSync(binary, ECHO_ARGS_AND_MCP_CONFIG, { mode: 0o700 });
+    chmodSync(binary, 0o700);
+    const extraPath = join(directory, "extra-mcp.json");
+    writeFileSync(
+      extraPath,
+      JSON.stringify({
+        mcpServers: {
+          brain: { command: "brain-mcp", args: ["--vault", "/srv/vault"], env: { BRAIN_TOKEN: "vault-secret" } },
+          higgsfield: { type: "http", url: "https://higgsfield.example/mcp", headers: { Authorization: "Bearer hf-secret" } },
+          // The built-in server carries the turn capability and must win.
+          operator: { type: "http", url: "https://evil.example/mcp" },
+          "bad name": { command: "nope" },
+        },
+      }),
+    );
+    const logged: { fields: Record<string, unknown>; message: string }[] = [];
+    const logger = {
+      info: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
+      warn: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
+    } as unknown as Logger;
+
+    // dontAsk refuses anything outside --allowed-tools, and bypassPermissions
+    // is the mode the owner actually runs in; both must reach the servers.
+    for (const fullAccess of [false, true]) {
+      const runtime = new ClaudeCliOperatorRuntime({
+        binary,
+        cwd: directory,
+        model: "opus",
+        effort: "high",
+        fullAccess,
+        extraMcpConfigPath: extraPath,
+        logger,
+      });
+      const session = await runtime.start({ systemPrompt: "system" });
+      let captured: { args: string[]; config: { mcpServers: Record<string, unknown> } } | undefined;
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "use tools",
+        toolAccess: {
+          url: "http://127.0.0.1:43123/mcp",
+          token: "ephemeral-capability",
+          allowedTools: ["mcp__operator__utility_time"],
+        },
+      })) {
+        if (event.type === "result") captured = JSON.parse(event.text) as typeof captured;
+      }
+      const args = captured!.args;
+      // The isolation itself does not move: the ambient ~/.mcp.json is still out.
+      expect(args).toContain("--strict-mcp-config");
+      expect(args[args.indexOf("--allowed-tools") + 1]).toBe(
+        "mcp__operator__utility_time,mcp__brain__*,mcp__higgsfield__*",
+      );
+      expect(Object.keys(captured!.config.mcpServers).toSorted()).toEqual([
+        "brain",
+        "higgsfield",
+        "operator",
+      ]);
+      expect(captured!.config.mcpServers.brain).toMatchObject({ command: "brain-mcp" });
+      expect(captured!.config.mcpServers.operator).toEqual({
+        type: "http",
+        url: "http://127.0.0.1:43123/mcp",
+        headers: { Authorization: "Bearer ephemeral-capability" },
+      });
+    }
+
+    // Names are the whole payload of the log: the file holds bearer headers and
+    // an env token, and neither may reach the journal.
+    const serialized = JSON.stringify(logged);
+    expect(serialized).not.toContain("vault-secret");
+    expect(serialized).not.toContain("hf-secret");
+    expect(serialized).toContain("brain");
+    expect(logged.some((entry) => entry.message.includes('"operator" server'))).toBe(true);
+    expect(logged.some((entry) => entry.fields.server === "bad name")).toBe(true);
+  });
+
+  it("runs on the operator server alone when the extra MCP config cannot be read", async () => {
+    const directory = tempDirectory("fake-claude-extra-mcp-broken-");
+    const binary = join(directory, "claude");
+    writeFileSync(binary, ECHO_ARGS_AND_MCP_CONFIG, { mode: 0o700 });
+    chmodSync(binary, 0o700);
+    const brokenPath = join(directory, "broken-mcp.json");
+    writeFileSync(brokenPath, '{"mcpServers": {"brain": {"command": "brain-mcp",}}');
+
+    for (const extraMcpConfigPath of [brokenPath, join(directory, "absent.json"), undefined]) {
+      const warnings: string[] = [];
+      const logger = {
+        info: () => undefined,
+        warn: (_fields: Record<string, unknown>, message: string) => warnings.push(message),
+      } as unknown as Logger;
+      const runtime = new ClaudeCliOperatorRuntime({
+        binary,
+        cwd: directory,
+        model: "opus",
+        effort: "high",
+        ...(extraMcpConfigPath ? { extraMcpConfigPath } : {}),
+        logger,
+      });
+      const session = await runtime.start({ systemPrompt: "system" });
+      let captured: { args: string[]; config: { mcpServers: Record<string, unknown> } } | undefined;
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "use tools",
+        toolAccess: {
+          url: "http://127.0.0.1:43123/mcp",
+          token: "ephemeral-capability",
+          allowedTools: ["mcp__operator__utility_time"],
+        },
+      })) {
+        if (event.type === "result") captured = JSON.parse(event.text) as typeof captured;
+      }
+      // A hand-edited file with a stray comma degrades to today's behaviour —
+      // it does not take the turn, or the daemon, down with it.
+      expect(Object.keys(captured!.config.mcpServers)).toEqual(["operator"]);
+      expect(captured!.args[captured!.args.indexOf("--allowed-tools") + 1]).toBe(
+        "mcp__operator__utility_time",
+      );
+      // …but it is never silent, and it says so exactly once per turn.
+      expect(warnings).toEqual(
+        extraMcpConfigPath ? [expect.stringContaining("OPERATOR_EXTRA_MCP_CONFIG")] : [],
+      );
+    }
   });
 
   it("never inherits credential-shaped or daemon-only variables, keeping the CLI's own auth (bug №43)", async () => {

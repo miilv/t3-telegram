@@ -62,6 +62,16 @@ const envSchema = z.object({
    * runtime allowlist. Comma-separated; a trailing `*` matches by prefix.
    */
   OPERATOR_ENV_PASSTHROUGH: z.string().default(""),
+  /**
+   * Path to a JSON file (`{"mcpServers": {...}}`, the shape Claude Code's own
+   * `--mcp-config` takes) with MCP servers the owner wants beside the built-in
+   * `operator` one. Empty — the default — means the turn sees `operator` alone.
+   *
+   * This exists so an explicit allowlist can be the answer instead of dropping
+   * `--strict-mcp-config`, which would hand the agent every server in an
+   * ambient `~/.mcp.json`.
+   */
+  OPERATOR_EXTRA_MCP_CONFIG: z.string().default(""),
   // Budget for the out-of-session mediation pass over worker questions and
   // approvals (bug №49). On timeout the raw prompt is shown directly.
   OPERATOR_MEDIATION_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
@@ -307,6 +317,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     }),
   );
   const envPassthrough = parseEnvPassthrough(parsed.OPERATOR_ENV_PASSTHROUGH);
+  // Resolved here, `~/` included: the runtime spawns the CLI with its own cwd,
+  // so a path relative to the daemon's would silently point elsewhere.
+  const extraMcpConfig = parsed.OPERATOR_EXTRA_MCP_CONFIG.trim();
+  const extraMcpConfigPath = !extraMcpConfig
+    ? undefined
+    : extraMcpConfig.startsWith("~/")
+      ? resolve(homedir(), extraMcpConfig.slice(2))
+      : resolve(extraMcpConfig);
   if (parsed.OPERATOR_PROVIDER === "codex" && parsed.OPERATOR_CODEX_ENABLED !== "true") {
     throw new Error("OPERATOR_PROVIDER=codex requires OPERATOR_CODEX_ENABLED=true");
   }
@@ -354,6 +372,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       turnTimeoutMs: parsed.OPERATOR_TURN_TIMEOUT_MS,
       interruptGraceMs: parsed.OPERATOR_INTERRUPT_GRACE_MS,
       envPassthrough,
+      extraMcpConfigPath,
       mediationTimeoutMs: parsed.OPERATOR_MEDIATION_TIMEOUT_MS,
       voiceFallbackMs: parsed.OPERATOR_VOICE_FALLBACK_MINUTES * 60_000,
       threadDigestWindowMs: parsed.THREAD_DIGEST_WINDOW_MS,

@@ -39,6 +39,9 @@ async function main(): Promise<void> {
     interruptGraceMs: config.operator.interruptGraceMs,
     fullAccess: config.operator.fullAccess,
     envPassthrough: config.operator.envPassthrough,
+    ...(config.operator.extraMcpConfigPath
+      ? { extraMcpConfigPath: config.operator.extraMcpConfigPath }
+      : {}),
     logger,
   });
   const providers: Record<string, OperatorRuntime> = { claude: claudeRuntime };

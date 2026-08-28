@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, mkdir, readdir, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Logger } from "pino";
@@ -64,6 +64,14 @@ export interface ClaudeCliRuntimeOptions extends EnvironmentFilterOptions {
   interruptGraceMs?: number;
   /** Owner opt-in: unrestricted built-in tools (Bash/Read/Write) on the host. */
   fullAccess?: boolean;
+  /**
+   * `OPERATOR_EXTRA_MCP_CONFIG`: a JSON file whose `mcpServers` are merged into
+   * the per-turn config beside the built-in `operator` server. This is the only
+   * supported way back to an MCP server the owner actually needs (a memory
+   * vault, an image generator): `--strict-mcp-config` stays on, so an ambient
+   * `~/.mcp.json` still reaches nothing.
+   */
+  extraMcpConfigPath?: string;
 }
 
 export interface CodexCliRuntimeOptions extends EnvironmentFilterOptions {
@@ -655,11 +663,18 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     const mcpConfigPath = input.toolAccess
       ? join(this.options.cwd, `.operator-mcp-${randomUUID()}.json`)
       : undefined;
+    // Re-read per turn rather than at construction: the file is edited by hand
+    // on the box, and a config change should not need a daemon restart.
+    const extraServers = input.toolAccess
+      ? await loadExtraMcpServers(this.options.extraMcpConfigPath, this.options.logger)
+      : {};
     if (input.toolAccess && mcpConfigPath) {
-      await writeFile(mcpConfigPath, operatorMcpConfig(input.toolAccess), { mode: 0o600 });
+      await writeFile(mcpConfigPath, operatorMcpConfig(input.toolAccess, extraServers), {
+        mode: 0o600,
+      });
     }
     const mcpArgs = input.toolAccess && mcpConfigPath
-      ? operatorMcpArgs(input.toolAccess, mcpConfigPath)
+      ? operatorMcpArgs(input.toolAccess, mcpConfigPath, Object.keys(extraServers))
       : [];
     const args = [
       "-p",
@@ -947,9 +962,85 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   }
 }
 
-function operatorMcpConfig(access: OperatorToolAccess): string {
+/** A server name that survives `mcp__<name>__<tool>`, which is how the CLI
+ * spells a permission identifier. Anything else could not be allow-listed. */
+const EXTRA_MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
+
+/**
+ * `OPERATOR_EXTRA_MCP_CONFIG`, read fresh per turn.
+ *
+ * Everything here degrades to "run with the built-in server only": the file is
+ * hand-edited on the box, and a stray comma must not take the daemon down or,
+ * worse, be swallowed in silence — every rejection is one warn line. The file
+ * carries bearer headers and API keys in `env`, so only server NAMES are ever
+ * logged, never the entry itself.
+ */
+async function loadExtraMcpServers(
+  configPath: string | undefined,
+  logger?: Logger,
+): Promise<Record<string, unknown>> {
+  if (!configPath) return {};
+  let raw: string;
+  try {
+    raw = await readFile(configPath, "utf8");
+  } catch (error) {
+    logger?.warn(
+      { err: error, path: configPath },
+      "Could not read OPERATOR_EXTRA_MCP_CONFIG; starting the turn with the operator server only",
+    );
+    return {};
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    logger?.warn(
+      // The message of a JSON error quotes the offending fragment, which may be
+      // a token; only its position survives.
+      { path: configPath, position: (error as { message?: string }).message?.match(/position \d+/u)?.[0] },
+      "OPERATOR_EXTRA_MCP_CONFIG is not valid JSON; starting the turn with the operator server only",
+    );
+    return {};
+  }
+  const servers = isRecord(parsed) && isRecord(parsed.mcpServers) ? parsed.mcpServers : undefined;
+  if (!servers) {
+    logger?.warn(
+      { path: configPath },
+      'OPERATOR_EXTRA_MCP_CONFIG has no "mcpServers" object; starting the turn with the operator server only',
+    );
+    return {};
+  }
+  const accepted: Record<string, unknown> = {};
+  for (const [name, definition] of Object.entries(servers)) {
+    if (name === "operator") {
+      // The built-in server carries this turn's capability; a file entry must
+      // never be able to point the Operator's own tools somewhere else.
+      logger?.warn(
+        { path: configPath },
+        'OPERATOR_EXTRA_MCP_CONFIG may not redefine the built-in "operator" server; ignoring it',
+      );
+      continue;
+    }
+    if (!EXTRA_MCP_SERVER_NAME.test(name) || !isRecord(definition)) {
+      logger?.warn({ path: configPath, server: name }, "Ignoring an unusable OPERATOR_EXTRA_MCP_CONFIG server");
+      continue;
+    }
+    accepted[name] = definition;
+  }
+  if (Object.keys(accepted).length) {
+    logger?.info({ servers: Object.keys(accepted) }, "Attaching extra MCP servers to the Operator turn");
+  }
+  return accepted;
+}
+
+function operatorMcpConfig(
+  access: OperatorToolAccess,
+  extraServers: Record<string, unknown> = {},
+): string {
   const config = {
     mcpServers: {
+      ...extraServers,
+      // Last, so a name that slipped past the loader still cannot shadow it.
       operator: {
         type: "http",
         url: access.url,
@@ -960,12 +1051,23 @@ function operatorMcpConfig(access: OperatorToolAccess): string {
   return JSON.stringify(config);
 }
 
-function operatorMcpArgs(access: OperatorToolAccess, configPath: string): string[] {
+/**
+ * `--allowed-tools` is an allowlist, and in `dontAsk` mode a tool outside it is
+ * simply refused — so an attached server whose tools are not named there would
+ * be visible and unusable. Each extra server contributes one `mcp__<name>__*`
+ * pattern; the built-in tools stay enumerated one by one, as the capability
+ * lease minted them.
+ */
+function operatorMcpArgs(
+  access: OperatorToolAccess,
+  configPath: string,
+  extraServerNames: readonly string[] = [],
+): string[] {
   return [
     "--mcp-config",
     configPath,
     "--allowed-tools",
-    access.allowedTools.join(","),
+    [...access.allowedTools, ...extraServerNames.map((name) => `mcp__${name}__*`)].join(","),
   ];
 }
 
