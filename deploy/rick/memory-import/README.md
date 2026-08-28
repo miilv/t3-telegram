@@ -4,9 +4,9 @@
 
 | файл | зачем |
 |---|---|
-| `DISTILL-PROMPT-v2.md` | **актуальное** задание для Claude на боксе: волновая дистилляция vault и файловой памяти в `notes-wave<N>.jsonl` |
+| `DISTILL-PROMPT-v2.md` | **актуальное** задание для Claude на боксе: волновая дистилляция vault и файловой памяти в `notes-wave-<N>.jsonl` |
 | `DISTILL-PROMPT.md` | v1, прогон 27.08.2026. Оставлен как история: по нему видно, из-за чего v2 переписан. Для работы не использовать |
-| `import-notes.mjs` | заливка `notes-wave<N>.jsonl` в `operator.db` штатным путём (`OperatorStore.rememberKeyedOperatorNote`) |
+| `import-notes.mjs` | заливка `notes-wave-<N>.jsonl` в `operator.db` штатным путём (`OperatorStore.rememberKeyedOperatorNote`) |
 | `verify.mjs` | проверка, что новый бот заметки действительно видит |
 | `example.jsonl` | образец формата, годится для проверки инструмента |
 
@@ -140,7 +140,7 @@ cp /root/t3-telegram/deploy/rick/memory-import/DISTILL-PROMPT-v2.md /opt/distill
 ```
 
 Туда же владелец кладёт параметры каждой волны (шаг 2), туда же дистиллятор
-пишет `notes-wave<N>.jsonl`. `import-notes.mjs` и `verify.mjs` вызываются
+пишет `notes-wave-<N>.jsonl`. `import-notes.mjs` и `verify.mjs` вызываются
 **по абсолютному пути** `/root/t3-telegram/deploy/rick/memory-import/…` —
 копировать их в `/opt/distill` не надо.
 
@@ -152,12 +152,41 @@ cp /root/t3-telegram/deploy/rick/memory-import/DISTILL-PROMPT-v2.md /opt/distill
 `find`/`wc` за него выполняет владелец; сырой вывод дистиллятор вставляет в
 начало ведомости покрытия, и по нему же строится по-файловая таблица.
 
+Формат строки — **один на все волны и на все файлы**: `размер_в_байтах TAB путь`,
+отсортировано по пути (`-printf '%s\t%p\n' | sort -k2`). Никаких `ls -l` вперемешку:
+дистиллятор берёт «всего байт» для ведомости из первой колонки, и она должна быть
+одинаковой во всех строках файла.
+
 ```bash
-# пример для волны 2a
-find /root/vault/objects /root/vault/decisions /root/vault/reports -type f \
-  -printf '%s\t%p\n' | sort -k2 > /opt/distill/files-wave-2a.txt
-ls -l --time-style=+ /root/vault/dashboard.md /root/vault/_server-map.md \
-  /root/vault/_current-task.md >> /opt/distill/files-wave-2a.txt
+# волна 1 — 13 непрочитанных файлов памяти (все infra_*, все skill_*,
+# higgsfield_advanced_tools) + MEMORY.md для сверки хуков + /root/CLAUDE.md.
+# MEMORY.md.bak.2026-07-17 под маски не попадает — и не должен.
+{ find /root/.claude/projects/-root/memory -maxdepth 1 -type f \
+    \( -name 'infra_*.md' -o -name 'skill_*.md' \
+       -o -name 'higgsfield_advanced_tools.md' -o -name 'MEMORY.md' \) \
+    -printf '%s\t%p\n'
+  find /root/CLAUDE.md -type f -printf '%s\t%p\n'
+} | sort -k2 > /opt/distill/files-wave-1.txt
+
+# волна 2a — objects + decisions + reports + три файла в корне vault
+{ find /root/vault/objects /root/vault/decisions /root/vault/reports -type f \
+    -printf '%s\t%p\n'
+  find /root/vault -maxdepth 1 -type f -name '*.md' -printf '%s\t%p\n'
+} | sort -k2 > /opt/distill/files-wave-2a.txt
+
+# волна 2b — knowledge + inbox, включая бинарники: они обязаны быть в ведомости
+# со строкой «пропущен, бинарный файл», а не выпасть из неё молча
+find /root/vault/knowledge /root/vault/inbox -type f \
+  -printf '%s\t%p\n' | sort -k2 > /opt/distill/files-wave-2b.txt
+
+# волна 3 — скиллы; trello-mcp без SKILL.md сюда не попадёт,
+# его отсутствие дистиллятор отмечает в ведомости отдельной строкой
+find /root/.claude/skills -maxdepth 2 -type f -name 'SKILL.md' \
+  -printf '%s\t%p\n' | sort -k2 > /opt/distill/files-wave-3.txt
+
+# волна 4 — conversations + audio
+find /root/vault/conversations /root/vault/audio -type f \
+  -printf '%s\t%p\n' | sort -k2 > /opt/distill/files-wave-4.txt
 ```
 
 **(б) Занятые заметки — целиком.** Дистиллятору нужны не только `key+category`,
@@ -191,7 +220,7 @@ console.log("copy ->",dst)' /root/.operator/operator.db /root/.operator/operator
 ### 3. Запуск дистилляции
 
 Дистиллятору выдаётся ровно четыре инструмента. `Write` нужен для
-`notes-wave<N>.jsonl`; `Bash` **не даётся** — не потому, что он бесполезен, а
+`notes-wave-<N>.jsonl`; `Bash` **не даётся** — не потому, что он бесполезен, а
 потому, что вместе с ним у агента под root появляется возможность выполнить то,
 что он вычитал в чужих файлах. Всё, ради чего нужен был `Bash` (`find`, `wc`,
 `import-notes.mjs`), делает владелец на шагах 2 и 4.
@@ -221,9 +250,12 @@ claude -p "$(cat /opt/distill/DISTILL-PROMPT-v2.md)
 
 ### 4. Dry-run — по КОПИИ, не по боевой базе
 
+Скрипты вызываются **по абсолютному пути и не зависят от cwd** — `cd` в каталог
+репозитория не нужен ни здесь, ни на шагах 5 и 6.
+
 ```bash
-cd /root/t3-telegram/deploy/rick/memory-import
-node import-notes.mjs --input /opt/distill/notes-wave-2a.jsonl \
+node /root/t3-telegram/deploy/rick/memory-import/import-notes.mjs \
+  --input /opt/distill/notes-wave-2a.jsonl \
   --db /root/.operator/operator.db.distill-copy --dry-run --verbose
 ```
 
@@ -233,7 +265,7 @@ node import-notes.mjs --input /opt/distill/notes-wave-2a.jsonl \
 
 Критерий сдачи волны: **«отклонено строк: 0» И «ошибок записи: 0»**. Отклонённые
 строки (кривой JSON, длинный `content`, `description` без стрелки, дубль ключа,
-похожее на секрет) чинятся в `notes-wave<N>.jsonl`, и dry-run повторяется.
+похожее на секрет) чинятся в `notes-wave-<N>.jsonl`, и dry-run повторяется.
 
 Про раздел «Требует решения человека» (`merge-proposal`): в общем случае это
 почти-дубли, которые writer сознательно не пишет. Но на боксе Рика семантический
@@ -243,13 +275,14 @@ node import-notes.mjs --input /opt/distill/notes-wave-2a.jsonl \
 импортёр `distilled` не пускает. Значит, всё, что здесь окажется, — **ошибки
 записи**, и чинить их обязательно. Следствие: один и тот же факт под двумя
 разными `key` (`rick-city` и `rick-tbilisi`) уедет в базу дважды и никто не
-возразит. Ловить дубли придётся глазами по `notes-wave<N>.jsonl` и по
+возразит. Ловить дубли придётся глазами по `notes-wave-<N>.jsonl` и по
 `notes-existing.txt` — это и есть смысл пункта «Дубли» в `DISTILL-PROMPT-v2.md`.
 
 ### 5. Импорт
 
 ```bash
-node import-notes.mjs --input /opt/distill/notes-wave-2a.jsonl \
+node /root/t3-telegram/deploy/rick/memory-import/import-notes.mjs \
+  --input /opt/distill/notes-wave-2a.jsonl \
   --db /root/.operator/operator.db --verbose
 ```
 
@@ -271,9 +304,10 @@ node import-notes.mjs --input /opt/distill/notes-wave-2a.jsonl \
 
 ```bash
 # волна 2a
-node verify.mjs --db /root/.operator/operator.db --query "Чепурнов"
-node verify.mjs --db /root/.operator/operator.db --query "Молочный"
-node verify.mjs --db /root/.operator/operator.db --query "Маша" --key client-masha-bot-live
+V=/root/t3-telegram/deploy/rick/memory-import/verify.mjs
+node "$V" --db /root/.operator/operator.db --query "Чепурнов"
+node "$V" --db /root/.operator/operator.db --query "Молочный"
+node "$V" --db /root/.operator/operator.db --query "Маша" --key client-masha-bot-live
 ```
 
 Скрипт печатает: счётчики по статусам, разбивку по категориям, число свежих
