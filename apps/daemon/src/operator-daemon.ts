@@ -62,6 +62,9 @@ import {
   releaseOwnDispatchPending,
   redactSecretsForOutput,
 } from "../../../packages/shared/src/index.js";
+// `/debug` reports the extra MCP servers through the very loader the next turn
+// will run, so the two can never disagree about what is attached.
+import { loadExtraMcpServers } from "../../../packages/operator-runtime/src/index.js";
 import type {
   BackgroundJob,
   LocalApprovalTarget,
@@ -6188,6 +6191,18 @@ export class OperatorDaemon {
         this.runtime.health(),
         this.telegram.health(),
       ]);
+      // Read here, not remembered from the last turn: the file is re-read per
+      // turn and hand-edited between them, so «what would attach right now» is
+      // the only answer worth printing. Names only — the file holds tokens.
+      const extraMcp = await loadExtraMcpServers(this.config.operator.extraMcpConfigPath, this.logger);
+      const extraMcpNames = Object.keys(extraMcp.servers);
+      const extraMcpStatus = !this.config.operator.extraMcpConfigPath
+        ? "not configured"
+        : extraMcp.rejected
+          ? `rejected (${extraMcp.rejected})`
+          : extraMcpNames.length
+            ? extraMcpNames.map((name) => escapeMarkdownText(name)).join(", ")
+            : "none";
       const database = this.store.diagnostics();
       const outbox = this.store.telegramOutboxCounts();
       const pendingDispatches = this.store.listBackgroundJobs("t3_dispatch").length;
@@ -6210,6 +6225,7 @@ export class OperatorDaemon {
           `- T3: ${t3.healthy ? "ok" : "unavailable"}; pending dispatches=${pendingDispatches}`,
           `- Claude: ${operator.healthy ? "ok" : "unavailable"}`,
           `- Telegram: ${telegram.healthy ? "ok" : "unavailable"}; ${capabilities}`,
+          `- Extra MCP: ${extraMcpStatus}`,
           `- Active subscriptions: ${this.monitors.size}`,
           `- SQLite: ${database.integrity}; ${database.journalMode}; ${database.sizeBytes} bytes; events=${database.eventCount}`,
           `- Outbox: pending=${outbox.pending + outbox.sending}, uncertain=${outbox.uncertain}, dead=${outbox.dead}`,

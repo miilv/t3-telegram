@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import { describe, expect, it } from "vitest";
@@ -192,9 +192,12 @@ process.stdin.on("end", () => {
         },
       }),
     );
+    // Ownership is checked on the file, and umask is not a test fixture.
+    chmodSync(extraPath, 0o600);
     const logged: { fields: Record<string, unknown>; message: string }[] = [];
     const logger = {
       info: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
+      debug: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
       warn: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
     } as unknown as Logger;
 
@@ -259,11 +262,13 @@ process.stdin.on("end", () => {
     chmodSync(binary, 0o700);
     const brokenPath = join(directory, "broken-mcp.json");
     writeFileSync(brokenPath, '{"mcpServers": {"brain": {"command": "brain-mcp",}}');
+    chmodSync(brokenPath, 0o600);
 
     for (const extraMcpConfigPath of [brokenPath, join(directory, "absent.json"), undefined]) {
       const warnings: string[] = [];
       const logger = {
         info: () => undefined,
+        debug: () => undefined,
         warn: (_fields: Record<string, unknown>, message: string) => warnings.push(message),
       } as unknown as Logger;
       const runtime = new ClaudeCliOperatorRuntime({
@@ -298,6 +303,197 @@ process.stdin.on("end", () => {
         extraMcpConfigPath ? [expect.stringContaining("OPERATOR_EXTRA_MCP_CONFIG")] : [],
       );
     }
+  });
+
+  it("refuses an extra MCP config that someone other than the daemon could write", async () => {
+    // The file names executables — a stdio entry is a command run with the
+    // daemon's privileges, and every accepted server gets a blanket
+    // mcp__<name>__*. On a box with OPERATOR_FULL_ACCESS the agent itself can
+    // write files, so «who could have written this» is the whole guarantee.
+    const directory = tempDirectory("fake-claude-extra-mcp-perms-");
+    const binary = join(directory, "claude");
+    writeFileSync(binary, ECHO_ARGS_AND_MCP_CONFIG, { mode: 0o700 });
+    chmodSync(binary, 0o700);
+    const put = (path: string, mode: number): string => {
+      writeFileSync(path, JSON.stringify({ mcpServers: { brain: { command: "brain-mcp" } } }));
+      // Explicitly, not through writeFileSync's mode: umask would silently make
+      // the 0o666 case a 0o644 one, and the test would pass by not testing.
+      chmodSync(path, mode);
+      return path;
+    };
+    const ownFile = put(join(directory, "own.json"), 0o644);
+    const groupWritable = put(join(directory, "group.json"), 0o664);
+    const worldWritable = put(join(directory, "world.json"), 0o666);
+    const openDirectory = join(directory, "open");
+    mkdirSync(openDirectory);
+    const inOpenDirectory = put(join(openDirectory, "extra.json"), 0o600);
+    // The file itself is airtight; the directory around it is not, and write on
+    // a directory is permission to replace what is inside it.
+    chmodSync(openDirectory, 0o777);
+
+    for (const [extraMcpConfigPath, attached] of [
+      [ownFile, true],
+      [groupWritable, false],
+      [worldWritable, false],
+      [inOpenDirectory, false],
+    ] as const) {
+      const warnings: string[] = [];
+      const logger = {
+        info: () => undefined,
+        debug: () => undefined,
+        warn: (_fields: Record<string, unknown>, message: string) => warnings.push(message),
+      } as unknown as Logger;
+      const runtime = new ClaudeCliOperatorRuntime({
+        binary,
+        cwd: directory,
+        model: "opus",
+        effort: "high",
+        extraMcpConfigPath,
+        logger,
+      });
+      const session = await runtime.start({ systemPrompt: "system" });
+      let captured: { args: string[]; config: { mcpServers: Record<string, unknown> } } | undefined;
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "use tools",
+        toolAccess: {
+          url: "http://127.0.0.1:43123/mcp",
+          token: "ephemeral-capability",
+          allowedTools: ["mcp__operator__utility_time"],
+        },
+      })) {
+        if (event.type === "result") captured = JSON.parse(event.text) as typeof captured;
+      }
+      expect(Object.keys(captured!.config.mcpServers).toSorted()).toEqual(
+        attached ? ["brain", "operator"] : ["operator"],
+      );
+      // A refused file must not leave its name in the allowlist either.
+      expect(captured!.args[captured!.args.indexOf("--allowed-tools") + 1]).toBe(
+        attached ? "mcp__operator__utility_time,mcp__brain__*" : "mcp__operator__utility_time",
+      );
+      // Refusal is loud, once, and says nothing about what was inside.
+      expect(warnings).toEqual(attached ? [] : [expect.stringContaining("writable by others")]);
+    }
+  });
+
+  it("drops an extra MCP server the CLI could never launch", async () => {
+    const directory = tempDirectory("fake-claude-extra-mcp-halfwritten-");
+    const binary = join(directory, "claude");
+    writeFileSync(binary, ECHO_ARGS_AND_MCP_CONFIG, { mode: 0o700 });
+    chmodSync(binary, 0o700);
+    const extraPath = join(directory, "extra-mcp.json");
+    writeFileSync(
+      extraPath,
+      JSON.stringify({
+        mcpServers: {
+          // The shape a half-finished hand edit leaves behind: no command for a
+          // stdio server, no url for an http one. Taking either would put
+          // mcp__<name>__* in --allowed-tools for a server that never answers.
+          brain: {},
+          nourl: { type: "http" },
+          nocommand: { args: ["--vault", "/srv/vault"] },
+          weird: { type: "carrier-pigeon", command: "pigeon" },
+          works: { command: "brain-mcp" },
+        },
+      }),
+    );
+    chmodSync(extraPath, 0o600);
+    const warnings: Array<Record<string, unknown>> = [];
+    const logger = {
+      info: () => undefined,
+      debug: () => undefined,
+      warn: (fields: Record<string, unknown>) => warnings.push(fields),
+    } as unknown as Logger;
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+      extraMcpConfigPath: extraPath,
+      logger,
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+    let captured: { args: string[]; config: { mcpServers: Record<string, unknown> } } | undefined;
+    for await (const event of runtime.sendTurn({
+      sessionId: session.id,
+      prompt: "use tools",
+      toolAccess: {
+        url: "http://127.0.0.1:43123/mcp",
+        token: "ephemeral-capability",
+        allowedTools: ["mcp__operator__utility_time"],
+      },
+    })) {
+      if (event.type === "result") captured = JSON.parse(event.text) as typeof captured;
+    }
+    expect(Object.keys(captured!.config.mcpServers).toSorted()).toEqual(["operator", "works"]);
+    expect(captured!.args[captured!.args.indexOf("--allowed-tools") + 1]).toBe(
+      "mcp__operator__utility_time,mcp__works__*",
+    );
+    expect(warnings.map((fields) => fields.server).toSorted()).toEqual([
+      "brain",
+      "nocommand",
+      "nourl",
+      "weird",
+    ]);
+  });
+
+  it("says so once when the attached MCP servers change, not on every turn", async () => {
+    const directory = tempDirectory("fake-claude-extra-mcp-noise-");
+    const binary = join(directory, "claude");
+    writeFileSync(binary, ECHO_ARGS_AND_MCP_CONFIG, { mode: 0o700 });
+    chmodSync(binary, 0o700);
+    const extraPath = join(directory, "extra-mcp.json");
+    const publish = (servers: Record<string, unknown>): void => {
+      writeFileSync(extraPath, JSON.stringify({ mcpServers: servers }));
+      chmodSync(extraPath, 0o600);
+    };
+    publish({ brain: { command: "brain-mcp" } });
+    const info: string[][] = [];
+    const debug: string[][] = [];
+    // Only the composition lines: the runtime also logs its environment filter
+    // at info once, and that is not what this test is about.
+    const logger = {
+      info: (fields: { servers?: string[] }) => fields.servers && info.push(fields.servers),
+      debug: (fields: { servers?: string[] }) => fields.servers && debug.push(fields.servers),
+      warn: () => undefined,
+    } as unknown as Logger;
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+      extraMcpConfigPath: extraPath,
+      logger,
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+    const turn = async (): Promise<void> => {
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "use tools",
+        toolAccess: {
+          url: "http://127.0.0.1:43123/mcp",
+          token: "ephemeral-capability",
+          allowedTools: ["mcp__operator__utility_time"],
+        },
+      })) {
+        void event;
+      }
+    };
+    await turn();
+    await turn();
+    await turn();
+    // Three turns, one composition: the box would otherwise carry this line in
+    // its journal once per message, forever.
+    expect(info).toEqual([["brain"]]);
+    expect(debug).toEqual([["brain"], ["brain"]]);
+
+    publish({ brain: { command: "brain-mcp" }, higgsfield: { type: "http", url: "https://h.example/mcp" } });
+    await turn();
+    // A change is news — including the change to nothing, which is a turn that
+    // silently lost the tools it had a minute ago.
+    publish({});
+    await turn();
+    expect(info).toEqual([["brain"], ["brain", "higgsfield"], []]);
   });
 
   it("never inherits credential-shaped or daemon-only variables, keeping the CLI's own auth (bug №43)", async () => {

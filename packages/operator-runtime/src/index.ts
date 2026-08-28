@@ -1,7 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readdir, unlink, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Logger } from "pino";
 import type {
   OperatorEvent,
@@ -630,7 +631,38 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
 
   private environmentLogged = false;
 
+  /**
+   * The extra MCP servers the previous turn attached, joined. The file is read
+   * per turn, so an `info` line about it is per turn too — pure noise on a box
+   * that has had the same two servers attached for a month. Only a CHANGE is
+   * news; the steady state stays at `debug`.
+   */
+  private lastAttachedMcpServers: string | undefined;
+
   constructor(private readonly options: ClaudeCliRuntimeOptions) {}
+
+  /** Package: `OPERATOR_EXTRA_MCP_CONFIG` — log the composition, not the turn. */
+  private noteAttachedMcpServers(servers: string[]): void {
+    const signature = servers.join(",");
+    if (signature === this.lastAttachedMcpServers) {
+      if (servers.length) {
+        this.options.logger?.debug({ servers }, "Attaching extra MCP servers to the Operator turn");
+      }
+      return;
+    }
+    const first = this.lastAttachedMcpServers === undefined;
+    this.lastAttachedMcpServers = signature;
+    // A set that emptied out is news of the same weight as one that filled: the
+    // turn silently lost tools it had a minute ago.
+    if (servers.length || !first) {
+      this.options.logger?.info(
+        { servers },
+        servers.length
+          ? "Attaching extra MCP servers to the Operator turn"
+          : "No extra MCP servers are attached to the Operator turn any more",
+      );
+    }
+  }
 
   /** Sanitized child environment; logs the filtered names once per runtime. */
   private childEnvironment(): NodeJS.ProcessEnv {
@@ -666,8 +698,9 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     // Re-read per turn rather than at construction: the file is edited by hand
     // on the box, and a config change should not need a daemon restart.
     const extraServers = input.toolAccess
-      ? await loadExtraMcpServers(this.options.extraMcpConfigPath, this.options.logger)
+      ? (await loadExtraMcpServers(this.options.extraMcpConfigPath, this.options.logger)).servers
       : {};
+    if (input.toolAccess) this.noteAttachedMcpServers(Object.keys(extraServers));
     if (input.toolAccess && mcpConfigPath) {
       await writeFile(mcpConfigPath, operatorMcpConfig(input.toolAccess, extraServers), {
         mode: 0o600,
@@ -967,6 +1000,48 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
 const EXTRA_MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
 
 /**
+ * Why the whole file was refused, in words safe to show an owner. Individual
+ * servers dropped out of an otherwise good file are not a rejection.
+ */
+export type ExtraMcpRejection =
+  | "unreadable"
+  | "insecure-permissions"
+  | "insecure-directory"
+  | "invalid-json"
+  | "no-servers";
+
+export interface ExtraMcpServers {
+  /** The servers that will be attached to the turn. */
+  servers: Record<string, unknown>;
+  /** Set when the file as a whole was refused and `servers` is therefore empty. */
+  rejected?: ExtraMcpRejection;
+}
+
+/**
+ * The file names executables. A stdio entry is `command` + `args` + `env`, run
+ * as the daemon user with the daemon's privileges, and the loader hands every
+ * accepted server a blanket `mcp__<name>__*` in `--allowed-tools`. So this is a
+ * code-execution channel, and on a box with `OPERATOR_FULL_ACCESS=true` the
+ * agent itself can write files: appending a `{"command": "/bin/sh"}` server
+ * would start a shell on the next turn, without a restart and without anyone
+ * approving it.
+ *
+ * The gate is ownership: only the user the daemon runs as may have been able to
+ * write the file, and nobody else may be able to write it now. Checked on the
+ * OPEN DESCRIPTOR, not the path — between a `stat(path)` and a `read(path)` the
+ * file can be replaced, and the check would be of a file that no longer exists.
+ * The containing directory is checked by the same rule and for the same reason:
+ * write on a directory is permission to swap the file inside it for one's own.
+ */
+function insecureOwnership(stats: { uid: number; mode: number }): boolean {
+  const uid = process.getuid?.();
+  // Only meaningful where processes have uids at all; a platform without them
+  // (Windows) has no answer this function could give.
+  if (uid === undefined) return false;
+  return stats.uid !== uid || (stats.mode & 0o022) !== 0;
+}
+
+/**
  * `OPERATOR_EXTRA_MCP_CONFIG`, read fresh per turn.
  *
  * Everything here degrades to "run with the built-in server only": the file is
@@ -974,21 +1049,47 @@ const EXTRA_MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,64}$/u;
  * worse, be swallowed in silence — every rejection is one warn line. The file
  * carries bearer headers and API keys in `env`, so only server NAMES are ever
  * logged, never the entry itself.
+ *
+ * Exported so `/debug` can report the same answer the next turn will get,
+ * rather than a second implementation of the same reading.
  */
-async function loadExtraMcpServers(
+export async function loadExtraMcpServers(
   configPath: string | undefined,
   logger?: Logger,
-): Promise<Record<string, unknown>> {
-  if (!configPath) return {};
+): Promise<ExtraMcpServers> {
+  if (!configPath) return { servers: {} };
   let raw: string;
+  let directory: FileHandle | undefined;
+  let file: FileHandle | undefined;
   try {
-    raw = await readFile(configPath, "utf8");
+    // The directory first: a world-writable directory makes any guarantee about
+    // the file inside it a guarantee about a file someone else can replace.
+    directory = await open(dirname(configPath), "r");
+    if (insecureOwnership(await directory.stat())) {
+      logger?.warn(
+        { path: configPath, directory: dirname(configPath) },
+        "The OPERATOR_EXTRA_MCP_CONFIG directory is writable by others or owned by another user; starting the turn with the operator server only",
+      );
+      return { servers: {}, rejected: "insecure-directory" };
+    }
+    file = await open(configPath, "r");
+    if (insecureOwnership(await file.stat())) {
+      logger?.warn(
+        { path: configPath },
+        "OPERATOR_EXTRA_MCP_CONFIG is writable by others or owned by another user; starting the turn with the operator server only",
+      );
+      return { servers: {}, rejected: "insecure-permissions" };
+    }
+    raw = await file.readFile("utf8");
   } catch (error) {
     logger?.warn(
       { err: error, path: configPath },
       "Could not read OPERATOR_EXTRA_MCP_CONFIG; starting the turn with the operator server only",
     );
-    return {};
+    return { servers: {}, rejected: "unreadable" };
+  } finally {
+    await file?.close().catch(() => undefined);
+    await directory?.close().catch(() => undefined);
   }
   let parsed: unknown;
   try {
@@ -1000,7 +1101,7 @@ async function loadExtraMcpServers(
       { path: configPath, position: (error as { message?: string }).message?.match(/position \d+/u)?.[0] },
       "OPERATOR_EXTRA_MCP_CONFIG is not valid JSON; starting the turn with the operator server only",
     );
-    return {};
+    return { servers: {}, rejected: "invalid-json" };
   }
   const servers = isRecord(parsed) && isRecord(parsed.mcpServers) ? parsed.mcpServers : undefined;
   if (!servers) {
@@ -1008,7 +1109,7 @@ async function loadExtraMcpServers(
       { path: configPath },
       'OPERATOR_EXTRA_MCP_CONFIG has no "mcpServers" object; starting the turn with the operator server only',
     );
-    return {};
+    return { servers: {}, rejected: "no-servers" };
   }
   const accepted: Record<string, unknown> = {};
   for (const [name, definition] of Object.entries(servers)) {
@@ -1021,16 +1122,31 @@ async function loadExtraMcpServers(
       );
       continue;
     }
-    if (!EXTRA_MCP_SERVER_NAME.test(name) || !isRecord(definition)) {
+    if (!EXTRA_MCP_SERVER_NAME.test(name) || !isRecord(definition) || !usableMcpServer(definition)) {
       logger?.warn({ path: configPath, server: name }, "Ignoring an unusable OPERATOR_EXTRA_MCP_CONFIG server");
       continue;
     }
     accepted[name] = definition;
   }
-  if (Object.keys(accepted).length) {
-    logger?.info({ servers: Object.keys(accepted) }, "Attaching extra MCP servers to the Operator turn");
-  }
-  return accepted;
+  return { servers: accepted };
+}
+
+/**
+ * A definition the CLI could actually launch: stdio needs a `command`, http and
+ * sse need a `url`. `{"brain": {}}` is the shape a half-finished hand edit
+ * leaves behind, and taking it would put `mcp__brain__*` in `--allowed-tools`
+ * and a broken entry in the config for a server that can never answer.
+ */
+function usableMcpServer(definition: Record<string, unknown>): boolean {
+  const nonEmpty = (value: unknown): boolean => typeof value === "string" && value.trim().length > 0;
+  const type = typeof definition.type === "string"
+    ? definition.type
+    : nonEmpty(definition.url)
+      ? "http"
+      : "stdio";
+  if (type === "stdio") return nonEmpty(definition.command);
+  if (type === "http" || type === "sse") return nonEmpty(definition.url);
+  return false;
 }
 
 function operatorMcpConfig(

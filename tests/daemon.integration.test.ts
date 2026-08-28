@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { GrammyError } from "grammy";
@@ -5310,7 +5310,23 @@ describe("OperatorDaemon product flow", () => {
       onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
     });
     const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
-    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    // The extra MCP servers change per turn and without a restart, and an MCP
+    // server that fails to start costs the turn its tools in silence. /debug is
+    // the only place the owner can see what would attach right now.
+    const extraMcpConfigPath = `${home}/extra-mcp.json`;
+    writeFileSync(
+      extraMcpConfigPath,
+      JSON.stringify({
+        mcpServers: {
+          brain: { command: "brain-mcp", env: { BRAIN_TOKEN: "vault-secret" } },
+          half: {},
+        },
+      }),
+    );
+    chmodSync(extraMcpConfigPath, 0o600);
+    const base = config(home);
+    const debugConfig: Config = { ...base, operator: { ...base.operator, extraMcpConfigPath } };
+    daemon = new OperatorDaemon(debugConfig, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
 
@@ -5324,6 +5340,19 @@ describe("OperatorDaemon product flow", () => {
     expect(diagnostic).toContain("Metrics");
     expect(diagnostic).toMatch(/Chat: `chat_[a-f0-9]{12}`/);
     expect(diagnostic).not.toContain("Chat: `7`");
+    // Names only — the file holds env tokens and bearer headers — and the
+    // half-written entry is not among them: it would never have started.
+    expect(diagnostic).toContain("Extra MCP: brain");
+    expect(diagnostic).not.toContain("half");
+    expect(diagnostic).not.toContain("vault-secret");
+
+    // A file the box owner made writable by everyone is refused, and /debug is
+    // where the missing tools stop being a mystery.
+    chmodSync(extraMcpConfigPath, 0o666);
+    telegram.push(message(2, "/debug"));
+    await waitFor(() => telegram.sent.filter((entry) => entry.text.startsWith("## Operator debug")).length >= 2);
+    const refused = telegram.sent.findLast((entry) => entry.text.startsWith("## Operator debug"))!.text;
+    expect(refused).toContain("Extra MCP: rejected (insecure-permissions)");
 
     telegram.finish();
     await run;

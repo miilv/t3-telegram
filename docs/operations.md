@@ -67,6 +67,15 @@ re-read on every turn, so editing it needs no restart; an unreadable or
 malformed one costs one `warn` line and the turn runs with `operator` alone.
 Contents are never logged, only server names: the file holds tokens.
 
+The file names executables, so it is refused unless it — and the directory
+holding it — is owned by the daemon's own user and is not group- or
+world-writable (`chown $USER`, `chmod 0644`/`0600`, directory `0755`/`0700`).
+Otherwise anyone with write access there could add a `{"command": "/bin/sh"}`
+server and have it start on the next turn. An entry that could not be launched
+at all (no `command` for stdio, no `url` for http/sse) is dropped with a warn.
+`/debug` prints the server names that would attach right now, or the reason the
+file was refused.
+
 Provider subprocesses inherit an environment allowlist, not a denylist: `PATH`,
 `HOME`, `PWD`, `LANG`, `LC_*`, `TZ`, `TERM`, `USER`, `LOGNAME`, `SHELL`,
 `TMPDIR`, `XDG_*`, `NODE_ENV`, `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` (the Codex
