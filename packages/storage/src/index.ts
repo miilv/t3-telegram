@@ -393,6 +393,13 @@ export class OperatorStore {
     if (!threadColumns.some((column) => column.name === "model")) {
       this.db.exec("ALTER TABLE threads ADD COLUMN model TEXT");
     }
+    // A database written before topic-scoped artifact lookup existed: the rows
+    // it already holds keep NULL topics, which a topic-scoped query treats as
+    // "not this topic" — undelivered material rather than someone else's.
+    this.addColumns("telegram_messages", [
+      ["message_thread_id", "INTEGER"],
+      ["direct_messages_topic_id", "INTEGER"],
+    ]);
     const artifactColumns = this.db.prepare("PRAGMA table_info(artifacts)").all() as Row[];
     if (!artifactColumns.some((column) => column.name === "derived_from_artifact_id")) {
       this.db.exec("ALTER TABLE artifacts ADD COLUMN derived_from_artifact_id TEXT");
@@ -1059,8 +1066,9 @@ export class OperatorStore {
       .prepare(`
         INSERT OR IGNORE INTO telegram_messages(
           chat_id,message_id,operator_turn_id,primary_project_id,primary_thread_id,
-          related_thread_ids_json,artifact_ids_json,message_type,created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?)
+          related_thread_ids_json,artifact_ids_json,message_type,created_at,
+          message_thread_id,direct_messages_topic_id
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
       `)
       .run(
         record.chatId,
@@ -1072,6 +1080,12 @@ export class OperatorStore {
         JSON.stringify(record.artifactIds),
         record.messageType,
         record.createdAt,
+        // The topic a message belongs to: a forum topic or a direct-messages
+        // topic is its own conversation, and this is the only place an
+        // artifact's conversation can be recovered from — the artifacts table
+        // carries chat and message coordinates but no topic.
+        record.messageThreadId ?? null,
+        record.directMessagesTopicId ?? null,
       );
     return result.changes > 0;
   }
@@ -2057,34 +2071,59 @@ export class OperatorStore {
   }
 
   /**
-   * Artifacts ingested from ONE Telegram chat, newest first, optionally
+   * Artifacts ingested from ONE Telegram conversation, newest first, optionally
    * narrowed to a single message. Chat-scoped on purpose: it backs the
    * Operator's own lookup of the material of a conversation, and a query that
    * spanned chats would hand one owner's turn the attachments of another's.
+   *
+   * A chat is not always one conversation, though. In a forum, and in a
+   * direct-messages chat where every writer has a topic of their own inside one
+   * chatId, the conversation is chat + topic — so a caller that stands in a
+   * topic passes it, and the query joins `telegram_messages` for the topic the
+   * artifact's message was written in. Artifacts whose message has no row there
+   * are left out of a topic-scoped answer: undelivered material is a smaller
+   * fault than another person's file.
    *
    * Derived artifacts (OCR sidecars, keyframes) inherit neither chat nor
    * message id, so they are reached through their parent, not through here.
    */
   listTelegramArtifacts(
     chatId: number,
-    options: { telegramMessageId?: number; limit?: number } = {},
+    options: {
+      telegramMessageId?: number;
+      limit?: number;
+      /** Present and non-zero ⇒ the answer is narrowed to that one topic. */
+      topic?: { messageThreadId?: number; directMessagesTopicId?: number };
+    } = {},
   ): Artifact[] {
     const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
-    const rows = (
-      options.telegramMessageId === undefined
-        ? this.db
-            .prepare(`
-              SELECT * FROM artifacts WHERE telegram_chat_id=?
-              ORDER BY created_at DESC, id DESC LIMIT ?
-            `)
-            .all(chatId, limit)
-        : this.db
-            .prepare(`
-              SELECT * FROM artifacts WHERE telegram_chat_id=? AND telegram_message_id=?
-              ORDER BY created_at DESC, id DESC LIMIT ?
-            `)
-            .all(chatId, options.telegramMessageId, limit)
-    ) as Row[];
+    const messageThreadId = options.topic?.messageThreadId ?? 0;
+    const directMessagesTopicId = options.topic?.directMessagesTopicId ?? 0;
+    // A conversation with no topic at all (an ordinary 1:1, a group without
+    // forum topics) is the whole chat, and the join would only cost rows.
+    const scoped = messageThreadId !== 0 || directMessagesTopicId !== 0;
+    const clauses = ["a.telegram_chat_id=?"];
+    const parameters: Array<number> = [chatId];
+    if (options.telegramMessageId !== undefined) {
+      clauses.push("a.telegram_message_id=?");
+      parameters.push(options.telegramMessageId);
+    }
+    if (scoped) {
+      clauses.push(
+        "COALESCE(m.message_thread_id,0)=?",
+        "COALESCE(m.direct_messages_topic_id,0)=?",
+      );
+      parameters.push(messageThreadId, directMessagesTopicId);
+    }
+    parameters.push(limit);
+    const rows = this.db
+      .prepare(`
+        SELECT a.* FROM artifacts a
+        ${scoped ? "JOIN telegram_messages m ON m.chat_id=a.telegram_chat_id AND m.message_id=a.telegram_message_id" : ""}
+        WHERE ${clauses.join(" AND ")}
+        ORDER BY a.created_at DESC, a.id DESC LIMIT ?
+      `)
+      .all(...parameters) as Row[];
     return rows.map(rowToArtifact);
   }
 
@@ -3411,6 +3450,12 @@ function rowToTelegramMessage(row: Row): TelegramMessageRecord {
     ...(row.operator_turn_id ? { operatorTurnId: String(row.operator_turn_id) } : {}),
     ...(row.primary_project_id ? { primaryProjectId: String(row.primary_project_id) } : {}),
     ...(row.primary_thread_id ? { primaryThreadId: String(row.primary_thread_id) } : {}),
+    ...(row.message_thread_id === null || row.message_thread_id === undefined
+      ? {}
+      : { messageThreadId: Number(row.message_thread_id) }),
+    ...(row.direct_messages_topic_id === null || row.direct_messages_topic_id === undefined
+      ? {}
+      : { directMessagesTopicId: Number(row.direct_messages_topic_id) }),
   };
 }
 

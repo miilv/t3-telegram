@@ -189,6 +189,110 @@ describe("OperatorToolServer", () => {
     }
   });
 
+  /**
+   * Adversarial review of the 27.08 package, finding 1. In a direct-messages
+   * chat every writer gets a topic of their own inside ONE chatId, so "this
+   * turn's chat" is not "this turn's conversation": a member listing the chat's
+   * recent attachments was handed the ids of a stranger's files — and the
+   * listing is a grant, so those ids then opened.
+   */
+  it("keeps artifacts.list_recent inside the turn's own topic, not just its chat", async () => {
+    const store = tempStore();
+    const artifacts = new ArtifactRegistry(
+      `${tempDirectory("operator-tools-list-recent-topic-")}/artifacts`,
+      store,
+    );
+    await artifacts.initialize();
+    const mine = await artifacts.ingestTelegram({
+      bytes: Buffer.from("my photo"),
+      filename: "mine.jpg",
+      mimeType: "image/jpeg",
+      telegramFileId: "file_mine",
+      chatId: 777,
+      messageId: 91,
+    });
+    const theirs = await artifacts.ingestTelegram({
+      bytes: Buffer.from("someone else's photo"),
+      filename: "theirs.jpg",
+      mimeType: "image/jpeg",
+      telegramFileId: "file_theirs",
+      chatId: 777,
+      messageId: 92,
+    });
+    // Ingested before the topic was recorded on message rows: no row, so no
+    // proof of which conversation it belongs to.
+    const unbound = await artifacts.ingestTelegram({
+      bytes: Buffer.from("a photo from before topics were recorded"),
+      filename: "legacy.jpg",
+      mimeType: "image/jpeg",
+      telegramFileId: "file_legacy",
+      chatId: 777,
+      messageId: 93,
+    });
+    for (const [messageId, topicId] of [[91, 11], [92, 22]] as const) {
+      store.saveTelegramMessage({
+        chatId: 777,
+        messageId,
+        relatedThreadIds: [],
+        artifactIds: [],
+        messageType: "inbound",
+        createdAt: nowIso(),
+        directMessagesTopicId: topicId,
+      });
+    }
+    const server = new OperatorToolServer({
+      broker: { health: async () => ({ healthy: true }) } as unknown as T3Broker,
+      store,
+      telegram: new ToolTelegram() as unknown as TelegramTransport,
+      artifacts,
+      logger: pino({ enabled: false }),
+    });
+    await server.start();
+    const lease = server.issue({
+      chatId: 777,
+      ownerId: "43",
+      teamRole: "member",
+      originMessageId: 94,
+      operatorTurnId: "opturn_list_recent_topic",
+      turnOrigin: "human",
+      directMessagesTopicId: 11,
+      allowedArtifactIds: [],
+    });
+    const client = new Client({ name: "artifact-list-recent-topic-test", version: "1.0.0" });
+    try {
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(lease.access.url), {
+          requestInit: { headers: { Authorization: `Bearer ${lease.access.token}` } },
+        }),
+      );
+      const listed = await callJson(client, "artifacts.list_recent", {}) as {
+        artifacts: Array<{ id: string }>;
+      };
+      // Only this topic's material — and the artifact whose conversation cannot
+      // be proved is left out too: undelivered is a smaller fault than someone
+      // else's photo delivered.
+      expect(listed.artifacts.map((entry) => entry.id)).toEqual([mine.id]);
+      expect(listed.artifacts.some((entry) => entry.id === unbound.id)).toBe(false);
+      // Narrowing by message id is not a way around the topic either.
+      const narrowed = await callJson(client, "artifacts.list_recent", { telegramMessageId: 92 }) as {
+        artifacts: Array<{ id: string }>;
+      };
+      expect(narrowed.artifacts).toEqual([]);
+      // …and nothing that was not listed became readable.
+      await expect(callJson(client, "artifacts.resolve", { artifactId: theirs.id }))
+        .rejects.toThrow(/access unscoped artifacts/);
+      const resolved = await callJson(client, "artifacts.resolve", { artifactId: mine.id }) as {
+        id: string;
+      };
+      expect(resolved.id).toBe(mine.id);
+    } finally {
+      lease.revoke();
+      await client.close().catch(() => undefined);
+      await server.stop();
+      store.close();
+    }
+  });
+
   it("accepts strict offset RFC3339 note deadlines over the real MCP boundary", async () => {
     const store = tempStore();
     const artifacts = new ArtifactRegistry(
