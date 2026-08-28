@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import {
@@ -166,6 +167,7 @@ export const OPERATOR_MCP_TOOL_NAMES = [
   "telegram.send_video_note",
   "telegram.react",
   "artifacts.resolve",
+  "artifacts.list_recent",
   "artifacts.view_image",
   "artifacts.read_text",
   "artifacts.materialize_for_thread",
@@ -210,6 +212,7 @@ export const APP_TURN_REPLAY_SAFE_TOOL_NAMES: readonly OperatorMcpToolName[] = [
   "email.search",
   "policy.get",
   "artifacts.resolve",
+  "artifacts.list_recent",
   "artifacts.view_image",
   "artifacts.read_text",
   "utility.time",
@@ -1487,6 +1490,57 @@ export class OperatorToolServer {
         const artifact = this.options.artifacts.resolve(artifactId);
         this.requireArtifactAccess(capability, artifact);
         return compactArtifact(artifact, true);
+      },
+    });
+    this.addTool(server, token, {
+      name: "artifacts.list_recent",
+      description:
+        "List the recently registered attachments of THIS conversation's chat, newest first, optionally narrowed to one Telegram message id. Use it when the envelope refers to an attachment you have no id for — a photo the owner quoted, or one they sent a moment before the message you are answering. Returns metadata only (id, filename, mimeType, sizeBytes, createdAt, telegramMessageId); attachments whose file is gone are omitted. Every id it returns is readable with artifacts.resolve/view_image/read_text for the rest of this turn.",
+      schema: z.object({
+        // Present so the model can be explicit about which chat it means, and
+        // rejected when it means another one: the answer is the same either
+        // way, but a wrong guess is told it is wrong instead of silently
+        // getting this chat's material back.
+        chatId: z.number().int().optional(),
+        telegramMessageId: z.number().int().optional(),
+        limit: z.number().int().min(1).max(20).default(10),
+      }),
+      readOnly: true,
+      handler: ({ chatId, telegramMessageId, limit }, capability) => {
+        // Incident 27.08 gave the Operator no way back to an orphaned photo.
+        // This is that way back — and it is deliberately not a global search:
+        // the turn may look at the material of the conversation it is in, and
+        // nothing else. A cross-chat lookup would hand one owner's turn the
+        // attachments of another's, which no envelope ever asked for.
+        if (chatId !== undefined && chatId !== capability.context.chatId) {
+          throw new Error("artifact listing is limited to this turn's own chat");
+        }
+        const found = this.options.store
+          .listTelegramArtifacts(capability.context.chatId, {
+            ...(telegramMessageId !== undefined ? { telegramMessageId } : {}),
+            limit,
+          })
+          .filter((artifact) => existsSync(artifact.localPath));
+        // Granted into the allowlist rather than left to `requireArtifactAccess`.
+        // These are unscoped inbound artifacts — no project, no thread — so that
+        // path would fall through to the administrator check and let a member
+        // LIST what they may not read, one inconsistency in place of a rule.
+        // The allowlist already means exactly "material of this turn", which is
+        // what a chat-scoped lookup has just established, and it dies with the
+        // capability at the end of the turn.
+        const allowed = (capability.context.allowedArtifactIds ??= []);
+        for (const artifact of found) {
+          if (!allowed.includes(artifact.id)) allowed.push(artifact.id);
+        }
+        return {
+          artifacts: found.map((artifact) => ({
+            ...compactArtifact(artifact),
+            createdAt: artifact.createdAt,
+            ...(artifact.telegramMessageId !== undefined
+              ? { telegramMessageId: artifact.telegramMessageId }
+              : {}),
+          })),
+        };
       },
     });
     this.addTool(server, token, {
