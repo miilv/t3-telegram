@@ -6483,6 +6483,239 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  /**
+   * The incident of 27.08, end to end. The owner sends a photo; OCR spends
+   * twelve seconds on it; in that window the owner answers their own photo with
+   * the question. The photo's turn is superseded — and the photo used to be
+   * superseded with it: the replacing turn was handed "No attachments." plus a
+   * quote saying "[1 attachment(s): photo]" with no id in it, the artifact was
+   * left orphaned outside the allowlist, and the bot asked three times for a
+   * file it was holding.
+   */
+  it("inherits the photo of the message it supersedes, ids and all (incident 27.08)", async () => {
+    const home = tempDirectory("daemon-preempt-attachment-");
+    const store = tempStore();
+    let releaseOcr!: () => void;
+    const ocrHeld = new Promise<void>((resolve) => { releaseOcr = resolve; });
+    let ocrCalls = 0;
+    const media = {
+      ocrInbound: async () => {
+        ocrCalls += 1;
+        // The 11.9 seconds of the incident.
+        await ocrHeld;
+        return { text: "смета: 1 200 000 ₽", provider: "docling" };
+      },
+    } as unknown as MediaProcessor;
+    const readByAgent: string[] = [];
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      if (!envelope.includes("что скажешь")) return "Париж.";
+      // The allowlist is the real assertion: an id printed in the envelope that
+      // the turn capability refuses to open would be the same dead end in a
+      // politer wrapper.
+      for (const artifactId of envelopeArtifactIds(envelope)) {
+        const artifact = await call("artifacts.resolve", { artifactId }) as { id: string };
+        readByAgent.push(artifact.id);
+      }
+      return "Смета на 1 200 000 — вижу.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools, media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(photoMessage(1));
+    await waitFor(() => ocrCalls === 1);
+    // Still inside the OCR window, the owner quotes their own photo and asks.
+    telegram.push(quotingPhotoMessage(2, 1, "что скажешь?"));
+    releaseOcr();
+
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("1 200 000")));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("что скажешь"))!;
+    const ids = envelopeArtifactIds(envelope);
+    expect(ids).toHaveLength(1);
+    expect(envelope).not.toContain("No attachments.");
+    // Nothing is unavailable here — the photo is right there, which is exactly
+    // what the turn could not tell before.
+    expect(envelope).not.toContain("Unavailable attachments");
+    // (a) the envelope's registered attachments, (b) the allowlist, (c) the
+    // superseded note, (2) the quote — all naming the same artifact.
+    expect(envelope).toContain("previous message was superseded");
+    expect(envelope).toContain(`Its attachment(s) carry over to this turn and are registered below: ${ids[0]}`);
+    expect(envelope).toContain(`readable by id: ${ids[0]}`);
+    expect(readByAgent).toEqual(ids);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("inherits attachments even when the replacing message quotes nothing (package 1.1)", async () => {
+    const home = tempDirectory("daemon-preempt-attachment-plain-");
+    const store = tempStore();
+    let releaseOcr!: () => void;
+    const ocrHeld = new Promise<void>((resolve) => { releaseOcr = resolve; });
+    let ocrCalls = 0;
+    const media = {
+      ocrInbound: async () => {
+        ocrCalls += 1;
+        await ocrHeld;
+        return { text: "смета", provider: "docling" };
+      },
+    } as unknown as MediaProcessor;
+    const readByAgent: string[] = [];
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      if (!envelope.includes("а сколько там итого")) return "Париж.";
+      for (const artifactId of envelopeArtifactIds(envelope)) {
+        readByAgent.push(((await call("artifacts.resolve", { artifactId })) as { id: string }).id);
+      }
+      return "Итого по смете.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(
+      config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools, media,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(photoMessage(1));
+    await waitFor(() => ocrCalls === 1);
+    // No quote at all: the owner simply keeps typing. The photo is still the
+    // material of the question they are now asking.
+    telegram.push(message(2, "а сколько там итого?"));
+    releaseOcr();
+
+    await waitFor(() => telegram.sent.some((sent) => sent.text.includes("Итого по смете")));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("а сколько там итого"))!;
+    const ids = envelopeArtifactIds(envelope);
+    expect(ids).toHaveLength(1);
+    expect(envelope).toContain("carry over to this turn");
+    expect(readByAgent).toEqual(ids);
+    // The handoff is spent by delivery, exactly as the thread half of it is.
+    expect(store.getRuntimeState("chat_pending:7:0:0")).toBe("");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("gives the quoted message's attachments ids the turn can actually open (incident 27.08)", async () => {
+    const home = tempDirectory("daemon-quote-attachment-");
+    const store = tempStore();
+    const readByAgent: string[] = [];
+    const runtime = new DelegatingRuntime(async (envelope, call) => {
+      if (!envelope.includes("что на фото")) return "Париж.";
+      for (const artifactId of envelopeArtifactIds(envelope)) {
+        readByAgent.push(((await call("artifacts.resolve", { artifactId })) as { id: string }).id);
+      }
+      return "На фото смета.";
+    });
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // The photo turn runs to completion this time: no supersession, nothing
+    // inherited. The quote alone has to carry the ids.
+    telegram.push(photoMessage(1));
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."));
+    const photoId = store.getTelegramMessage(7, 1)!.artifactIds[0]!;
+
+    telegram.push(quotingPhotoMessage(2, 1, "что на фото?"));
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "На фото смета."));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("что на фото"))!;
+    expect(envelope).toContain(`readable by id: ${photoId}`);
+    expect(envelopeArtifactIds(envelope)).toEqual([photoId]);
+    expect(envelope).not.toContain("previous message was superseded");
+    expect(readByAgent).toEqual([photoId]);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  it("says outright that a quoted attachment cannot be reached instead of leaving it unmentioned", async () => {
+    const home = tempDirectory("daemon-quote-attachment-gone-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(async () => "Париж.");
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(photoMessage(1));
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Париж."));
+    const photoId = store.getTelegramMessage(7, 1)!.artifactIds[0]!;
+    // Retention swept the artifact; the binding on the message still names it.
+    expect(store.deleteArtifactRecord(photoId)).toBe(true);
+
+    telegram.push(quotingPhotoMessage(2, 1, "и что там было?"));
+    await waitFor(() => runtime.prompts.some((prompt) => prompt.includes("и что там было")));
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("и что там было"))!;
+    expect(envelope).toContain("No attachments.");
+    expect(envelope).not.toContain(photoId);
+    // The silence this replaces is what the invented explanation grew in.
+    expect(envelope).toContain("Unavailable attachments: 1 of the quoted message's attachment(s) are not registered here");
+    expect(envelope).toContain("do not invent a reason");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
   it("answers only the newest of the messages a crash left queued (package 1.1)", async () => {
     const home = tempDirectory("daemon-restart-burst-");
     const store = tempStore();
@@ -10736,6 +10969,41 @@ function videoNoteMessage(messageId: number): Extract<TelegramInbound, { type: "
         height: 640,
       },
     ],
+  };
+}
+
+/** A captionless photo, the shape the incident of 27.08 started from. */
+function photoMessage(messageId: number): Extract<TelegramInbound, { type: "message" }> {
+  return {
+    ...message(messageId, "(photo)"),
+    textIsMediaPlaceholder: true,
+    attachments: [
+      {
+        type: "photo",
+        fileId: `photo_${messageId}`,
+        mimeType: "image/jpeg",
+        sizeBytes: 120_000,
+      },
+    ],
+  };
+}
+
+/** The owner answering their own photo with a quote-reply on it. */
+function quotingPhotoMessage(
+  messageId: number,
+  quotedMessageId: number,
+  text: string,
+): Extract<TelegramInbound, { type: "message" }> {
+  return {
+    ...message(messageId, text),
+    replyToMessageId: quotedMessageId,
+    reply: {
+      messageId: quotedMessageId,
+      userId: 42,
+      attachments: [
+        { type: "photo", fileId: `photo_${quotedMessageId}`, mimeType: "image/jpeg" },
+      ],
+    },
   };
 }
 
