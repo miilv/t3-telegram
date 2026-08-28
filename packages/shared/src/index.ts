@@ -366,6 +366,14 @@ export interface TelegramMessageRecord {
   artifactIds: string[];
   messageType: string;
   createdAt: string;
+  /**
+   * The topic this message belongs to, when the chat has topics. A forum topic
+   * and a direct-messages topic are separate conversations inside ONE chatId,
+   * and this row is where an artifact's conversation is recovered from: the
+   * artifacts table records chat and message coordinates, never a topic.
+   */
+  messageThreadId?: number;
+  directMessagesTopicId?: number;
 }
 
 export interface ReplyContext {

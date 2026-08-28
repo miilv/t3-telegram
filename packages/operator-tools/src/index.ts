@@ -1495,7 +1495,7 @@ export class OperatorToolServer {
     this.addTool(server, token, {
       name: "artifacts.list_recent",
       description:
-        "List the recently registered attachments of THIS conversation's chat, newest first, optionally narrowed to one Telegram message id. Use it when the envelope refers to an attachment you have no id for — a photo the owner quoted, or one they sent a moment before the message you are answering. Returns metadata only (id, filename, mimeType, sizeBytes, createdAt, telegramMessageId); attachments whose file is gone are omitted. Every id it returns is readable with artifacts.resolve/view_image/read_text for the rest of this turn.",
+        "List the recently registered attachments of THIS conversation, newest first, optionally narrowed to one Telegram message id. Use it when the envelope refers to an attachment you have no id for — a photo the owner quoted, or one they sent a moment before the message you are answering. Returns metadata only (id, filename, mimeType, sizeBytes, createdAt, telegramMessageId); attachments whose file is gone are omitted. Every id it returns is readable with artifacts.resolve/view_image/read_text for the rest of this turn.",
       schema: z.object({
         // Present so the model can be explicit about which chat it means, and
         // rejected when it means another one: the answer is the same either
@@ -1519,6 +1519,20 @@ export class OperatorToolServer {
           .listTelegramArtifacts(capability.context.chatId, {
             ...(telegramMessageId !== undefined ? { telegramMessageId } : {}),
             limit,
+            // …and not the whole chat either, when the chat holds more than one
+            // conversation. In a direct-messages chat every writer has a topic
+            // of their own under ONE chatId, so a chat-wide answer would hand a
+            // member the ids of a stranger's files — and the allowlist grant
+            // below would then make those ids genuinely readable. The unit of a
+            // conversation here is the same one preemption uses: chat + topic.
+            topic: {
+              ...(capability.context.messageThreadId !== undefined
+                ? { messageThreadId: capability.context.messageThreadId }
+                : {}),
+              ...(capability.context.directMessagesTopicId !== undefined
+                ? { directMessagesTopicId: capability.context.directMessagesTopicId }
+                : {}),
+            },
           })
           .filter((artifact) => existsSync(artifact.localPath));
         // Granted into the allowlist rather than left to `requireArtifactAccess`.
@@ -1526,8 +1540,8 @@ export class OperatorToolServer {
         // path would fall through to the administrator check and let a member
         // LIST what they may not read, one inconsistency in place of a rule.
         // The allowlist already means exactly "material of this turn", which is
-        // what a chat-scoped lookup has just established, and it dies with the
-        // capability at the end of the turn.
+        // what a conversation-scoped lookup has just established, and it dies
+        // with the capability at the end of the turn.
         const allowed = (capability.context.allowedArtifactIds ??= []);
         for (const artifact of found) {
           if (!allowed.includes(artifact.id)) allowed.push(artifact.id);
@@ -2144,6 +2158,14 @@ export class OperatorToolServer {
         artifactIds,
         messageType,
         createdAt: nowIso(),
+        // The turn's own topic: a message row with no topic reads as "the chat
+        // at large" to the conversation-scoped artifact lookup.
+        ...(capability.context.messageThreadId
+          ? { messageThreadId: capability.context.messageThreadId }
+          : {}),
+        ...(capability.context.directMessagesTopicId
+          ? { directMessagesTopicId: capability.context.directMessagesTopicId }
+          : {}),
       });
       if (threadId) {
         this.options.store.linkMessageThread(message.chatId, message.messageId, threadId, "operator_output");

@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
   artifact_ids_json TEXT NOT NULL DEFAULT '[]',
   message_type TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  -- The topic of the message: a forum topic or a direct-messages topic is a
+  -- conversation of its own inside one chat_id, and artifacts carry no topic
+  -- coordinates, so a topic-scoped lookup of them joins through here.
+  message_thread_id INTEGER,
+  direct_messages_topic_id INTEGER,
   PRIMARY KEY (chat_id, message_id)
 );
 
