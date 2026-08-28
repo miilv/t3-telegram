@@ -376,6 +376,109 @@ process.stdin.on("end", () => {
     }
   });
 
+  it("attaches curated settings and skills, and nothing at all without them", async () => {
+    const directory = tempDirectory("fake-claude-curated-");
+    const binary = join(directory, "claude");
+    writeFileSync(binary, ECHO_ARGS_AND_MCP_CONFIG, { mode: 0o700 });
+    chmodSync(binary, 0o700);
+    const settingsPath = join(directory, "claude-settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ disableBundledSkills: true }));
+    chmodSync(settingsPath, 0o600);
+    const skillsDir = join(directory, "plugin");
+    mkdirSync(join(skillsDir, "skills", "invoices"), { recursive: true });
+    writeFileSync(join(skillsDir, "skills", "invoices", "SKILL.md"), "---\nname: invoices\n---\n");
+    chmodSync(skillsDir, 0o700);
+
+    const argsFor = async (options: { claudeSettingsPath?: string; skillsDir?: string }) => {
+      const runtime = new ClaudeCliOperatorRuntime({
+        binary,
+        cwd: directory,
+        model: "opus",
+        effort: "high",
+        fullAccess: true,
+        ...options,
+      });
+      const session = await runtime.start({ systemPrompt: "system" });
+      let captured: { args: string[] } | undefined;
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "work",
+        toolAccess: { url: "http://127.0.0.1:1/mcp", token: "cap", allowedTools: [] },
+      })) {
+        if (event.type === "result") captured = JSON.parse(event.text) as typeof captured;
+      }
+      return captured!.args;
+    };
+
+    const bare = await argsFor({});
+    expect(bare).not.toContain("--settings");
+    expect(bare).not.toContain("--plugin-dir");
+    // Without a skill directory nothing changes: the turn keeps the flag that
+    // takes the CLI's own bundled skills out.
+    expect(bare).toContain("--disable-slash-commands");
+
+    const curated = await argsFor({ claudeSettingsPath: settingsPath, skillsDir });
+    expect(curated[curated.indexOf("--settings") + 1]).toBe(settingsPath);
+    expect(curated[curated.indexOf("--plugin-dir") + 1]).toBe(skillsDir);
+    // The isolation itself does not move. `--setting-sources ""` is what keeps
+    // the owner's ~/.claude — its settings, its hooks, its skills — out of the
+    // turn; the curated set arrives by name instead.
+    expect(curated[curated.indexOf("--setting-sources") + 1]).toBe("");
+    expect(curated).toContain("--strict-mcp-config");
+    // `--disable-slash-commands` disables ALL skills, so it cannot survive a
+    // curated skill directory — the flag and the feature are the same switch.
+    expect(curated).not.toContain("--disable-slash-commands");
+  });
+
+  it("refuses curated settings and skills anyone else could write", async () => {
+    const directory = tempDirectory("fake-claude-curated-insecure-");
+    const binary = join(directory, "claude");
+    writeFileSync(binary, ECHO_ARGS_AND_MCP_CONFIG, { mode: 0o700 });
+    chmodSync(binary, 0o700);
+    // A hooks file is a list of commands the CLI runs, and a plugin directory
+    // carries a hooks file of its own: both are code execution, so both are
+    // held to "only the daemon user could have written this".
+    const settingsPath = join(directory, "claude-settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ hooks: {} }));
+    chmodSync(settingsPath, 0o666);
+    const skillsDir = join(directory, "plugin");
+    mkdirSync(join(skillsDir, "skills"), { recursive: true });
+    chmodSync(skillsDir, 0o777);
+    const logged: { fields: Record<string, unknown>; message: string }[] = [];
+    const logger = {
+      info: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
+      debug: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
+      warn: (fields: Record<string, unknown>, message: string) => logged.push({ fields, message }),
+    } as unknown as Logger;
+    const runtime = new ClaudeCliOperatorRuntime({
+      binary,
+      cwd: directory,
+      model: "opus",
+      effort: "high",
+      fullAccess: true,
+      claudeSettingsPath: settingsPath,
+      skillsDir,
+      logger,
+    });
+    const session = await runtime.start({ systemPrompt: "system" });
+    let captured: { args: string[] } | undefined;
+    for await (const event of runtime.sendTurn({
+      sessionId: session.id,
+      prompt: "work",
+      toolAccess: { url: "http://127.0.0.1:1/mcp", token: "cap", allowedTools: [] },
+    })) {
+      if (event.type === "result") captured = JSON.parse(event.text) as typeof captured;
+    }
+    const args = captured!.args;
+    expect(args).not.toContain("--settings");
+    expect(args).not.toContain("--plugin-dir");
+    // A refused skill set must not quietly hand the CLI's bundled ones back.
+    expect(args).toContain("--disable-slash-commands");
+    const serialized = JSON.stringify(logged);
+    expect(serialized).toContain("OPERATOR_CLAUDE_SETTINGS");
+    expect(serialized).toContain("OPERATOR_SKILLS_DIR");
+  });
+
   it("drops an extra MCP server the CLI could never launch", async () => {
     const directory = tempDirectory("fake-claude-extra-mcp-halfwritten-");
     const binary = join(directory, "claude");

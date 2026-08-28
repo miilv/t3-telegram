@@ -12084,6 +12084,8 @@ function config(home: string): Config {
       preemption: "supersede",
       envPassthrough: [],
       extraMcpConfigPath: undefined,
+      claudeSettingsPath: undefined,
+      skillsDir: undefined,
       mediationTimeoutMs: 250,
       // Package 1.2: tests that exercise the degraded fallback set their own
       // deadline; this only has to be a real, non-zero one.

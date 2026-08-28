@@ -89,6 +89,24 @@ const envSchema = z.object({
    * ambient `~/.mcp.json`.
    */
   OPERATOR_EXTRA_MCP_CONFIG: z.string().default(""),
+  /**
+   * Path to a curated Claude Code settings JSON, passed as `--settings`. With
+   * `--setting-sources ""` the CLI reads no settings file of its own, so this
+   * is the only way back to hooks — and a `PreToolUse` hook is the only thing
+   * that can stand between the agent and a paid MCP tool. The owner's
+   * `~/.claude/settings.json` is still never read: this file is named
+   * explicitly and lives where only the daemon user can write it.
+   */
+  OPERATOR_CLAUDE_SETTINGS: z.string().default(""),
+  /**
+   * Path to a directory laid out as a Claude Code plugin — its `skills/<name>/
+   * SKILL.md` files become the turn's skills, passed as `--plugin-dir`.
+   *
+   * Skills cannot come from `--settings` (the `skillsDirs` key is team-store
+   * only) and the user scope is exactly what `--setting-sources ""` exists to
+   * keep out; `--plugin-dir` is the one channel that survives the isolation.
+   */
+  OPERATOR_SKILLS_DIR: z.string().default(""),
   // Budget for the out-of-session mediation pass over worker questions and
   // approvals (bug №49). On timeout the raw prompt is shown directly.
   OPERATOR_MEDIATION_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
@@ -267,6 +285,19 @@ export const PROVIDER_EXEMPT_CREDENTIAL_ENV_NAMES: readonly string[] = Object.fr
 );
 
 /**
+ * A hand-written path from the box's env file, made absolute here.
+ *
+ * The runtime spawns the CLI with its own cwd, so a relative path would resolve
+ * against a directory the person editing the env file never saw. Whitespace
+ * only is "unset", not a path to the current directory.
+ */
+export function resolveOwnerPath(raw: string): string | undefined {
+  const value = raw.trim();
+  if (!value) return undefined;
+  return value.startsWith("~/") ? resolve(homedir(), value.slice(2)) : resolve(value);
+}
+
+/**
  * A bare `*` (or a pattern that is only a wildcard) would hand the child the
  * entire daemon environment, which is exactly what the allowlist exists to
  * prevent. Reject it at load rather than silently narrowing it later.
@@ -336,12 +367,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const envPassthrough = parseEnvPassthrough(parsed.OPERATOR_ENV_PASSTHROUGH);
   // Resolved here, `~/` included: the runtime spawns the CLI with its own cwd,
   // so a path relative to the daemon's would silently point elsewhere.
-  const extraMcpConfig = parsed.OPERATOR_EXTRA_MCP_CONFIG.trim();
-  const extraMcpConfigPath = !extraMcpConfig
-    ? undefined
-    : extraMcpConfig.startsWith("~/")
-      ? resolve(homedir(), extraMcpConfig.slice(2))
-      : resolve(extraMcpConfig);
+  const extraMcpConfigPath = resolveOwnerPath(parsed.OPERATOR_EXTRA_MCP_CONFIG);
+  const claudeSettingsPath = resolveOwnerPath(parsed.OPERATOR_CLAUDE_SETTINGS);
+  const skillsDir = resolveOwnerPath(parsed.OPERATOR_SKILLS_DIR);
   if (parsed.OPERATOR_PROVIDER === "codex" && parsed.OPERATOR_CODEX_ENABLED !== "true") {
     throw new Error("OPERATOR_PROVIDER=codex requires OPERATOR_CODEX_ENABLED=true");
   }
@@ -391,6 +419,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       preemption: parsed.OPERATOR_PREEMPTION,
       envPassthrough,
       extraMcpConfigPath,
+      claudeSettingsPath,
+      skillsDir,
       mediationTimeoutMs: parsed.OPERATOR_MEDIATION_TIMEOUT_MS,
       voiceFallbackMs: parsed.OPERATOR_VOICE_FALLBACK_MINUTES * 60_000,
       threadDigestWindowMs: parsed.THREAD_DIGEST_WINDOW_MS,

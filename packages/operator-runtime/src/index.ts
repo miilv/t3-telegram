@@ -73,6 +73,22 @@ export interface ClaudeCliRuntimeOptions extends EnvironmentFilterOptions {
    * `~/.mcp.json` still reaches nothing.
    */
   extraMcpConfigPath?: string;
+  /**
+   * `OPERATOR_CLAUDE_SETTINGS`: a curated settings JSON passed as `--settings`.
+   * `--setting-sources ""` leaves the CLI reading no settings file at all, and
+   * hooks live nowhere else — so without this there is no `PreToolUse` gate in
+   * front of a paid MCP tool. Named explicitly and ownership-checked, so the
+   * owner's `~/.claude/settings.json` still never reaches the turn.
+   */
+  claudeSettingsPath?: string;
+  /**
+   * `OPERATOR_SKILLS_DIR`: a plugin-shaped directory (`skills/<name>/SKILL.md`)
+   * passed as `--plugin-dir`. Measured against 2.1.233: skills cannot be named
+   * from a settings file (`skillsDirs` is team-store only), and the user scope
+   * is exactly what the isolation excludes — `--plugin-dir` is the only channel
+   * that carries skills through `--setting-sources ""`.
+   */
+  skillsDir?: string;
 }
 
 export interface CodexCliRuntimeOptions extends EnvironmentFilterOptions {
@@ -639,6 +655,17 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
    */
   private lastAttachedMcpServers: string | undefined;
 
+  /**
+   * The curated `--settings`/`--plugin-dir` verdict of the previous turn. Same
+   * reasoning as the MCP signature above: both paths are re-checked per turn so
+   * that a `chmod` on the box takes effect without a restart, and a box where
+   * nothing changed must not narrate it once a minute.
+   */
+  private lastCuratedSignature: string | undefined;
+
+  /** Whether the "skills without disableBundledSkills" warning has been said. */
+  private bundledSkillsWarned = false;
+
   constructor(private readonly options: ClaudeCliRuntimeOptions) {}
 
   /** Package: `OPERATOR_EXTRA_MCP_CONFIG` — log the composition, not the turn. */
@@ -662,6 +689,61 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
           : "No extra MCP servers are attached to the Operator turn any more",
       );
     }
+  }
+
+  /**
+   * The owner-curated `--settings` and `--plugin-dir` arguments for this turn.
+   *
+   * Read per turn, like the MCP allowlist and for the same reason: both are
+   * hand-edited on the box, and a fix must not need a daemon restart. Anything
+   * that fails the ownership gate is simply left off — a turn without its hooks
+   * or skills still answers, and the warn line says why.
+   */
+  private async curatedArgs(): Promise<{ args: string[]; skills: boolean }> {
+    const args: string[] = [];
+    const { claudeSettingsPath, skillsDir, logger } = this.options;
+    const settingsOk =
+      !!claudeSettingsPath &&
+      !(await verifyCuratedPath(claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS", logger));
+    if (settingsOk && claudeSettingsPath) args.push("--settings", claudeSettingsPath);
+    const skillsOk =
+      !!skillsDir && !(await verifyCuratedPath(skillsDir, "OPERATOR_SKILLS_DIR", logger));
+    if (skillsOk && skillsDir) {
+      // The CLI reads `<dir>/skills/<name>/SKILL.md`; a directory of bare skill
+      // folders loads silently as an empty plugin, which looks exactly like a
+      // working configuration until someone asks for a skill by name.
+      if ((await verifyCuratedPath(join(skillsDir, "skills"), "OPERATOR_SKILLS_DIR")) === "unreadable") {
+        logger?.warn(
+          { path: skillsDir },
+          'OPERATOR_SKILLS_DIR has no "skills" subdirectory; the skills belong in <dir>/skills/<name>/SKILL.md',
+        );
+      }
+      args.push("--plugin-dir", skillsDir);
+    }
+    if (skillsOk && !settingsOk && !this.bundledSkillsWarned) {
+      this.bundledSkillsWarned = true;
+      // Dropping --disable-slash-commands for the curated skills also lets the
+      // CLI's own bundled skills back in; only `disableBundledSkills` in the
+      // settings file takes them out again.
+      logger?.warn(
+        { skillsDir },
+        "OPERATOR_SKILLS_DIR is set without a usable OPERATOR_CLAUDE_SETTINGS; the CLI's bundled skills are attached too",
+      );
+    }
+    const signature = args.join(" ");
+    if (signature !== this.lastCuratedSignature) {
+      const first = this.lastCuratedSignature === undefined;
+      this.lastCuratedSignature = signature;
+      if (args.length || !first) {
+        logger?.info(
+          { settings: settingsOk, skills: skillsOk },
+          args.length
+            ? "Attaching curated settings and skills to the Operator turn"
+            : "No curated settings or skills are attached to the Operator turn any more",
+        );
+      }
+    }
+    return { args, skills: skillsOk };
   }
 
   /** Sanitized child environment; logs the filtered names once per runtime. */
@@ -709,6 +791,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     const mcpArgs = input.toolAccess && mcpConfigPath
       ? operatorMcpArgs(input.toolAccess, mcpConfigPath, Object.keys(extraServers))
       : [];
+    const curated = await this.curatedArgs();
     const args = [
       "-p",
       "--output-format",
@@ -728,7 +811,16 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       // explicit process-scoped MCP server supplied below.
       "--setting-sources",
       "",
-      ...(input.allowBuiltInSlashCommands ? [] : ["--disable-slash-commands"]),
+      // `--settings` is read even with no setting sources; hooks, and only
+      // hooks, are what stands between the agent and a paid MCP tool.
+      // `--plugin-dir` is likewise the one skill channel that survives the
+      // isolation — both verified against CLI 2.1.233.
+      ...curated.args,
+      // `--disable-slash-commands` disables ALL skills, curated ones included,
+      // so it cannot stay once the owner has attached a skill directory. The
+      // CLI's own bundled skills are taken out by `disableBundledSkills` in the
+      // curated settings file instead.
+      ...(input.allowBuiltInSlashCommands || curated.skills ? [] : ["--disable-slash-commands"]),
       "--tools",
       this.options.fullAccess ? "default" : "WebSearch,WebFetch",
       "--strict-mcp-config",
@@ -847,6 +939,15 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
   async oneShot(input: { prompt: string; timeoutMs?: number }): Promise<string> {
     await this.prepareRuntimeDirectory();
     const timeoutMs = input.timeoutMs ?? 15_000;
+    const { claudeSettingsPath } = this.options;
+    // The curated settings, so that "what settings does the CLI run with on this
+    // box" has one answer. Not the skills: this call has `--tools ""` and no
+    // slash commands, so a skill could never be used, only paid for.
+    const settingsArgs =
+      claudeSettingsPath &&
+      !(await verifyCuratedPath(claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS", this.options.logger))
+        ? ["--settings", claudeSettingsPath]
+        : [];
     const args = [
       "-p",
       "--output-format",
@@ -859,6 +960,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
       "dontAsk",
       "--setting-sources",
       "",
+      ...settingsArgs,
       "--disable-slash-commands",
       "--tools",
       "",
@@ -1041,6 +1143,73 @@ function insecureOwnership(stats: { uid: number; mode: number }): boolean {
   return stats.uid !== uid || (stats.mode & 0o022) !== 0;
 }
 
+/** Why an owner-curated path was refused; all three degrade to "not attached". */
+export type CuratedPathRejection = "insecure-directory" | "insecure-permissions" | "unreadable";
+
+/**
+ * Opens an owner-curated path and hands back the descriptor only if the daemon
+ * user owns it and nobody else may write it. The containing directory is held
+ * to the same rule first: write on a directory is permission to replace the
+ * entry inside it, so a guarantee about the file would be a guarantee about a
+ * file someone else can swap.
+ *
+ * Works for a directory as well as a file — `open(dir, "r")` is enough to
+ * `fstat` it, which is all the caller needs.
+ *
+ * The caller closes the handles.
+ */
+async function openCuratedPath(
+  path: string,
+): Promise<
+  | { handle: FileHandle; directory: FileHandle }
+  | { rejected: CuratedPathRejection; handle?: FileHandle; directory?: FileHandle }
+> {
+  let directory: FileHandle | undefined;
+  let handle: FileHandle | undefined;
+  try {
+    directory = await open(dirname(path), "r");
+    if (insecureOwnership(await directory.stat())) return { rejected: "insecure-directory", directory };
+    handle = await open(path, "r");
+    if (insecureOwnership(await handle.stat())) return { rejected: "insecure-permissions", directory, handle };
+    return { handle, directory };
+  } catch {
+    return { rejected: "unreadable", ...(directory ? { directory } : {}), ...(handle ? { handle } : {}) };
+  }
+}
+
+/**
+ * The same ownership gate as `OPERATOR_EXTRA_MCP_CONFIG`, for the paths that are
+ * handed to the CLI by name rather than read here: `--settings` (hooks are
+ * commands the CLI runs) and `--plugin-dir` (a plugin's `hooks/hooks.json` runs
+ * too — verified against 2.1.233). Both are code-execution channels, and on a
+ * `OPERATOR_FULL_ACCESS=true` box the agent can write files, so "the daemon user
+ * wrote this" is the only thing separating a curated skill set from one the
+ * agent wrote for itself last turn.
+ *
+ * Unlike the MCP config this cannot close the TOCTOU window — the CLI reopens
+ * the path by name — but it still refuses the durable misconfiguration, which
+ * is what actually happens on a box: a 0644 file dropped in a shared directory.
+ *
+ * Returns the rejection reason, or undefined when the path may be attached.
+ */
+export async function verifyCuratedPath(
+  path: string,
+  variable: string,
+  logger?: Logger,
+): Promise<CuratedPathRejection | undefined> {
+  const opened = await openCuratedPath(path);
+  await opened.handle?.close().catch(() => undefined);
+  await opened.directory?.close().catch(() => undefined);
+  if (!("rejected" in opened)) return undefined;
+  logger?.warn(
+    { path, variable, reason: opened.rejected },
+    opened.rejected === "unreadable"
+      ? `Could not read ${variable}; starting the turn without it`
+      : `${variable} is writable by others or owned by another user; starting the turn without it`,
+  );
+  return opened.rejected;
+}
+
 /**
  * `OPERATOR_EXTRA_MCP_CONFIG`, read fresh per turn.
  *
@@ -1059,28 +1228,23 @@ export async function loadExtraMcpServers(
 ): Promise<ExtraMcpServers> {
   if (!configPath) return { servers: {} };
   let raw: string;
-  let directory: FileHandle | undefined;
-  let file: FileHandle | undefined;
+  // The directory is checked first, inside the shared gate: a world-writable
+  // directory makes any guarantee about the file inside it a guarantee about a
+  // file someone else can replace.
+  const opened = await openCuratedPath(configPath);
   try {
-    // The directory first: a world-writable directory makes any guarantee about
-    // the file inside it a guarantee about a file someone else can replace.
-    directory = await open(dirname(configPath), "r");
-    if (insecureOwnership(await directory.stat())) {
+    if ("rejected" in opened) {
       logger?.warn(
-        { path: configPath, directory: dirname(configPath) },
-        "The OPERATOR_EXTRA_MCP_CONFIG directory is writable by others or owned by another user; starting the turn with the operator server only",
+        { path: configPath, ...(opened.rejected === "insecure-directory" ? { directory: dirname(configPath) } : {}) },
+        opened.rejected === "unreadable"
+          ? "Could not read OPERATOR_EXTRA_MCP_CONFIG; starting the turn with the operator server only"
+          : opened.rejected === "insecure-directory"
+            ? "The OPERATOR_EXTRA_MCP_CONFIG directory is writable by others or owned by another user; starting the turn with the operator server only"
+            : "OPERATOR_EXTRA_MCP_CONFIG is writable by others or owned by another user; starting the turn with the operator server only",
       );
-      return { servers: {}, rejected: "insecure-directory" };
+      return { servers: {}, rejected: opened.rejected };
     }
-    file = await open(configPath, "r");
-    if (insecureOwnership(await file.stat())) {
-      logger?.warn(
-        { path: configPath },
-        "OPERATOR_EXTRA_MCP_CONFIG is writable by others or owned by another user; starting the turn with the operator server only",
-      );
-      return { servers: {}, rejected: "insecure-permissions" };
-    }
-    raw = await file.readFile("utf8");
+    raw = await opened.handle.readFile("utf8");
   } catch (error) {
     logger?.warn(
       { err: error, path: configPath },
@@ -1088,8 +1252,8 @@ export async function loadExtraMcpServers(
     );
     return { servers: {}, rejected: "unreadable" };
   } finally {
-    await file?.close().catch(() => undefined);
-    await directory?.close().catch(() => undefined);
+    await opened.handle?.close().catch(() => undefined);
+    await opened.directory?.close().catch(() => undefined);
   }
   let parsed: unknown;
   try {

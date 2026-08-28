@@ -270,6 +270,23 @@ describe("child environment passthrough configuration", () => {
     ).toBe(`${process.cwd()}/extra-mcp.json`);
   });
 
+  it("resolves the curated settings and skills paths and defaults to neither", () => {
+    expect(loadConfig({ ...base }).operator.claudeSettingsPath).toBeUndefined();
+    expect(loadConfig({ ...base }).operator.skillsDir).toBeUndefined();
+    expect(loadConfig({ ...base, OPERATOR_CLAUDE_SETTINGS: "  " }).operator.claudeSettingsPath)
+      .toBeUndefined();
+    expect(
+      loadConfig({ ...base, OPERATOR_CLAUDE_SETTINGS: " /root/.operator/claude-settings.json " })
+        .operator.claudeSettingsPath,
+    ).toBe("/root/.operator/claude-settings.json");
+    // Same reason as the MCP allowlist: the CLI is spawned with a different cwd,
+    // so an unresolved path would point at nothing.
+    expect(loadConfig({ ...base, OPERATOR_SKILLS_DIR: "~/claude-plugin" }).operator.skillsDir)
+      .toMatch(/^\/.*\/claude-plugin$/u);
+    expect(loadConfig({ ...base, OPERATOR_SKILLS_DIR: "claude-plugin" }).operator.skillsDir)
+      .toBe(`${process.cwd()}/claude-plugin`);
+  });
+
   it("rejects a bare wildcard and an empty prefix at load time", () => {
     expect(() => loadConfig({ ...base, OPERATOR_ENV_PASSTHROUGH: "*" })).toThrow(
       /must name a variable or a non-empty prefix/,

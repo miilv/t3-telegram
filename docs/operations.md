@@ -96,6 +96,44 @@ at all (no `command` for stdio, no `url` for http/sse) is dropped with a warn.
 `/debug` prints the server names that would attach right now, or the reason the
 file was refused.
 
+### Curated settings and skills
+
+`--setting-sources ""` is what keeps the owner's `~/.claude` — its
+`settings.json`, its hooks, its skills, its `bypassPermissions` — out of every
+turn. Two things the owner does want are handed to the CLI by name instead, and
+neither loosens that.
+
+`OPERATOR_CLAUDE_SETTINGS`: a path to a Claude Code settings JSON, passed as
+`--settings`. It is read even with no setting sources, and hooks live nowhere
+else — a `PreToolUse` hook is the only thing that can stand between the agent
+and a paid MCP tool. Measured against CLI 2.1.233: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse` and `Stop` all fire from this file, a matcher
+of `mcp__<server>__.*` matches MCP tools, and a `deny` verdict really does stop
+the call before the server sees it.
+
+`OPERATOR_SKILLS_DIR`: a path to a directory shaped like a Claude Code plugin —
+its `skills/<name>/SKILL.md` files become the turn's skills — passed as
+`--plugin-dir`. This is the only skill channel that survives the isolation:
+skills cannot be named from a settings file (the `skillsDirs` key is team-store
+only), and the user scope is exactly what is being excluded. Note that
+`--disable-slash-commands` disables *all* skills, so it is dropped for the turn
+once a skill directory is attached; put `"disableBundledSkills": true` in the
+settings file to take the CLI's own bundled skills back out. The daemon warns
+once if a skill directory is configured without a usable settings file.
+
+Both paths are code-execution channels — a settings file is a list of commands
+the CLI runs, and a plugin directory can carry a `hooks/hooks.json` of its own
+(verified: it runs) — so both are held to the same ownership gate as
+`OPERATOR_EXTRA_MCP_CONFIG`: owned by the daemon's user, not group- or
+world-writable, in a directory that is the same. A path that fails is left off
+the command line with one `warn` line, and the turn runs without it. Both are
+re-checked per turn, so a `chmod` on the box needs no restart. `/debug` prints
+the verdict each would get right now.
+
+`--strict-mcp-config` still applies to a plugin: an `.mcp.json` inside the
+plugin directory attaches nothing (verified). The MCP allowlist stays the only
+way in.
+
 Provider subprocesses inherit an environment allowlist, not a denylist: `PATH`,
 `HOME`, `PWD`, `LANG`, `LC_*`, `TZ`, `TERM`, `USER`, `LOGNAME`, `SHELL`,
 `TMPDIR`, `XDG_*`, `NODE_ENV`, `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` (the Codex

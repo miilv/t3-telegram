@@ -65,7 +65,7 @@ import {
 } from "../../../packages/shared/src/index.js";
 // `/debug` reports the extra MCP servers through the very loader the next turn
 // will run, so the two can never disagree about what is attached.
-import { loadExtraMcpServers } from "../../../packages/operator-runtime/src/index.js";
+import { loadExtraMcpServers, verifyCuratedPath } from "../../../packages/operator-runtime/src/index.js";
 import type {
   BackgroundJob,
   LocalApprovalTarget,
@@ -7348,6 +7348,15 @@ export class OperatorDaemon {
           : extraMcpNames.length
             ? extraMcpNames.map((name) => escapeMarkdownText(name)).join(", ")
             : "none";
+      // Same reason as the MCP allowlist: both paths are re-checked per turn, so
+      // the only honest answer is the one the next turn would get. A path that
+      // failed the ownership gate is the whole point of printing this.
+      const curatedStatus = async (path: string | undefined, variable: string): Promise<string> =>
+        !path ? "not configured" : ((await verifyCuratedPath(path, variable)) ?? "ok");
+      const [settingsStatus, skillsStatus] = await Promise.all([
+        curatedStatus(this.config.operator.claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS"),
+        curatedStatus(this.config.operator.skillsDir, "OPERATOR_SKILLS_DIR"),
+      ]);
       const database = this.store.diagnostics();
       const outbox = this.store.telegramOutboxCounts();
       const pendingDispatches = this.store.listBackgroundJobs("t3_dispatch").length;
@@ -7371,6 +7380,7 @@ export class OperatorDaemon {
           `- Claude: ${operator.healthy ? "ok" : "unavailable"}`,
           `- Telegram: ${telegram.healthy ? "ok" : "unavailable"}; ${capabilities}`,
           `- Extra MCP: ${extraMcpStatus}`,
+          `- Claude settings: ${settingsStatus}; skills: ${skillsStatus}`,
           `- Active subscriptions: ${this.monitors.size}`,
           `- SQLite: ${database.integrity}; ${database.journalMode}; ${database.sizeBytes} bytes; events=${database.eventCount}`,
           `- Outbox: pending=${outbox.pending + outbox.sending}, uncertain=${outbox.uncertain}, dead=${outbox.dead}`,

@@ -42,6 +42,10 @@ async function main(): Promise<void> {
     ...(config.operator.extraMcpConfigPath
       ? { extraMcpConfigPath: config.operator.extraMcpConfigPath }
       : {}),
+    ...(config.operator.claudeSettingsPath
+      ? { claudeSettingsPath: config.operator.claudeSettingsPath }
+      : {}),
+    ...(config.operator.skillsDir ? { skillsDir: config.operator.skillsDir } : {}),
     logger,
   });
   const providers: Record<string, OperatorRuntime> = { claude: claudeRuntime };
