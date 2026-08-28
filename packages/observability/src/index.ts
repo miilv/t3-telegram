@@ -31,10 +31,11 @@ export type MetricName =
   /** Package 1.5: running threads reported to the Operator as silent. */
   | "worker_threads_stalled_total"
   /**
-   * OPERATOR_PREEMPTION=off: owner messages that stepped aside so a newer one
-   * could answer for both, and the messages that were then glued into one
-   * envelope. The two differ by the bursts that never got a queue at all, so
-   * the ratio is what says whether FIFO is actually coalescing anything.
+   * OPERATOR_PREEMPTION=off: owner messages that ended up in the queue — one
+   * that stepped aside so a newer message could answer for both, or one whose
+   * turn the watchdog wrote off — and the messages that were then glued into
+   * one envelope. The two differ by the bursts that never got a queue at all,
+   * so the ratio is what says whether FIFO is actually coalescing anything.
    */
   | "operator_messages_queued_total"
   | "operator_queue_merged_messages_total"

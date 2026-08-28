@@ -680,10 +680,7 @@ answerDirect → consumeOwnerQueue:
         line.
    └─ a queued message that was a reply into a work thread names it in its own
         block: the envelope has ONE reply block and it belongs to the current
-        message, so this is the only place that fact survives. The earlier
-        branches are untouched by the mode — a reply that ANSWERS a worker's
-        question, a command inside the burst and the natural-memory sniffer all
-        still return before the deferral, exactly as they do under preemption.
+        message, so this is the only place that fact survives.
    └─ the instruction is the OPPOSITE of the supersede note: this is a QUEUE,
         every message in it is still owed an answer, one coherent reply or point
         by point — never "answer only the current message". The word
@@ -691,29 +688,96 @@ answerDirect → consumeOwnerQueue:
    └─ ordering is by Telegram's own message ids, not by write order, so an entry
         that came back from a retry backoff is still read in the order it was
         said.
+   └─ the envelope also has a BYTE budget on top of the depth cap
+        (`OWNER_QUEUE_TEXT_BUDGET_BYTES`, 32 KiB). A queued message's text
+        includes everything ingest derived from its media, and one OCR'd page
+        runs to tens of kilobytes, so twenty of them would be half a megabyte of
+        prompt built out of a rule that said "twenty messages". Newest first;
+        what does not fit is COLLAPSED to its first 200 characters plus its
+        `telegramMessageId`, never dropped — the full text is in the chat and in
+        the ledger under that id.
 ```
+
+**A queue always has a claimant.** A message only steps aside when a job of the
+same conversation is already waiting, so somebody is always due to answer it —
+except that the job behind it may take a path that never reaches the provider.
+A slash command, an answer to a worker's question, a natural-memory «запомни»
+and a bare stop word all return from `handleUpdate` long before
+`deferToOwnerQueue`, and so does a job that exhausted its retries and told the
+owner «не удалось обработать сообщение». «Посчитай смету», then `/status` five
+seconds later, used to end with the estimate queued behind a command that
+answered itself and went home.
+
+So the invariant is **restored** where an ingress job ends: after a user-lane
+job completes (or gives up), a non-empty `chat_queue` with nothing pending for
+that conversation gets a **synthetic drain job** — an ingress update with
+`ownerQueueDrain: true`, no words of its own, whose only content is the queue
+rendered as blocks. It runs through the ordinary `answerDirect` path, so the
+lease, the artifacts, the watchdog and the delivery bookkeeping are the same
+ones every other turn gets. Two things about it are deliberate:
+
+- **It is VISIBLE to `hasWaitingConversationIngress`** — the only synthetic job
+  that is. Everything else the daemon sends itself is the daemon talking and
+  answers nobody's message; a drain exists for no reason but to answer this
+  conversation's queue, so it is a claimant in exactly the sense the predicate
+  means. A message arriving while it is pending therefore joins the queue and is
+  answered by the same envelope. Hiding it would produce the opposite: that
+  message would run its own turn, consume the queue on the way, and leave the
+  drain to wake up with nothing to say. (It does that gracefully anyway — a
+  drain that finds an empty queue ends without a provider call — but as a race
+  guard, not as the normal path.)
+- **Its job id is the SHAPE of the queue it drains** (conversation, newest
+  message id, depth). A restart between the enqueue and the run cannot produce
+  two drains of one burst, and a drain that itself dies without delivering finds
+  its own id taken and does not respawn — a wedged provider cannot turn this
+  into a loop of provider calls. The burst is not lost in that case either: the
+  owner's next message consumes the queue like any other turn.
 
 The queue is spent by **delivery**, exactly like the supersede handoff: a turn
 the watchdog writes off, or one that failed and is about to replay, leaves it in
-place, and the replay picks it up again. A retry notice is not an answer.
+place, and the replay picks it up again. A retry notice is not an answer. Two
+edges of that rule:
+
+- a replay that finds its own final already in the outbox (a crash between the
+  outbox row and the clearing) spends the queue **there**, up to the watermark
+  that final covered — otherwise the same messages would be glued into the next
+  envelope and answered a second time. A row whose `messageType` is
+  `operator_retry_notice` is not a final and does not spend anything;
+- a turn's own queue entry — the record it wrote before a replay brought it
+  back — is spent by the same delivery as the blocks, so an answered question
+  cannot survive in the queue and resurface later.
 
 `chat_pending` still exists in this mode, because the watchdog can still write
-off a turn — but its envelope line drops the supersede framing: nothing here was
-replaced by anything, so the note says the turn was written off, hands over the
-material and the do-not-dispatch-twice fact, and says nothing about which
-message to answer.
+off a turn — but in this mode the write-off also **puts the message itself back
+in the queue**. Its threads and its artifacts were always inherited; its WORDS
+were kept nowhere, so the next envelope could only say that "an earlier message
+never received an answer", which is the shape of an apology rather than of a
+question anyone can answer. Now the words go where unanswered words belong, and
+the two never say the same thing twice: when the message is in the queue, the
+`chat_pending` line keeps only what the queue cannot know — the durable work
+that turn had already started — and contributes no material and no attachment
+counts of its own.
+
+Switching a box back to `supersede` leaves whatever was in flight sitting under
+the queue key. Single voice does not answer old messages, so the first turn that
+finds such a record **discards** it — with a `warn` line and an
+`operator.queue.discarded` event naming the message ids, never silently.
 
 Metrics and events: `operator_messages_queued_total` counts the messages that
-stepped aside, `operator_queue_merged_messages_total` the ones that were glued
-into an envelope, and `operator.turn.queued` / `operator.turn.queue_merged` are
-the audit trail. A merged envelope also logs one `info` line naming how many
-messages it carries.
+stepped aside (a deferral or a write-off), `operator_queue_merged_messages_total`
+the ones that were glued into an envelope, and `operator.turn.queued` /
+`operator.turn.queue_merged` are the audit trail, joined by
+`operator.queue.drain_scheduled`, `operator.queue.drain_empty`,
+`operator.queue.already_delivered` and `operator.queue.discarded`. A merged
+envelope also logs one `info` line naming how many messages it carries.
 
 Cancellation, the watchdog and the lanes below are unchanged by the mode. Stop
 words are one of them: path A still interrupts on a bare cancel word, and
 everything else — including the ordinary «стоп» inside a sentence — travels as
 text into the next turn, where the model reads it in the queue like any other
-message. There is no special stop handling for the queue.
+message. There is no special stop handling for the queue — a bare cancel word
+stops the running work and leaves the queue for the drain, which answers it in
+its own turn.
 
 ### The watchdog: a hung turn may never freeze the system (package 1.5)
 
