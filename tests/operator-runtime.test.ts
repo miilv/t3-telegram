@@ -39,6 +39,20 @@ process.stdin.on("end", () => {
 });
 `;
 
+/**
+ * A usable curated settings file. Extra MCP servers are attached only behind
+ * one — the settings file is where the spend gate's PreToolUse hook lives, and
+ * paid tools without it is the combination the runtime refuses to assemble — so
+ * every test about the ALLOWLIST has to hand the runtime one, or it is testing
+ * the gate instead.
+ */
+function curatedSettings(directory: string, name = "claude-settings.json"): string {
+  const path = join(directory, name);
+  writeFileSync(path, JSON.stringify({ disableBundledSkills: true }));
+  chmodSync(path, 0o600);
+  return path;
+}
+
 describe("ClaudeCliOperatorRuntime", () => {
   it("streams text, preserves the session id, and strips daemon secrets", async () => {
     const directory = tempDirectory("fake-claude-");
@@ -211,6 +225,7 @@ process.stdin.on("end", () => {
         effort: "high",
         fullAccess,
         extraMcpConfigPath: extraPath,
+        claudeSettingsPath: curatedSettings(directory),
         logger,
       });
       const session = await runtime.start({ systemPrompt: "system" });
@@ -277,6 +292,7 @@ process.stdin.on("end", () => {
         model: "opus",
         effort: "high",
         ...(extraMcpConfigPath ? { extraMcpConfigPath } : {}),
+        claudeSettingsPath: curatedSettings(directory),
         logger,
       });
       const session = await runtime.start({ systemPrompt: "system" });
@@ -349,6 +365,7 @@ process.stdin.on("end", () => {
         model: "opus",
         effort: "high",
         extraMcpConfigPath,
+        claudeSettingsPath: curatedSettings(directory),
         logger,
       });
       const session = await runtime.start({ systemPrompt: "system" });
@@ -428,6 +445,80 @@ process.stdin.on("end", () => {
     // `--disable-slash-commands` disables ALL skills, so it cannot survive a
     // curated skill directory — the flag and the feature are the same switch.
     expect(curated).not.toContain("--disable-slash-commands");
+  });
+
+  it("attaches no extra MCP server at all while the curated settings are unusable", async () => {
+    // The spend gate is a PreToolUse hook, hooks arrive only through
+    // `--settings`, and the paid tools arrive only through the extra MCP
+    // config. The two are configured by separate env lines, so `chmod 644` on
+    // the settings file used to leave higgsfield attached with nothing in front
+    // of it. They are one switch now.
+    const directory = tempDirectory("fake-claude-gate-pair-");
+    const binary = join(directory, "claude");
+    writeFileSync(binary, ECHO_ARGS_AND_MCP_CONFIG, { mode: 0o700 });
+    chmodSync(binary, 0o700);
+    const extraPath = join(directory, "extra-mcp.json");
+    writeFileSync(extraPath, JSON.stringify({ mcpServers: { higgsfield: { command: "higgsfield-mcp" } } }));
+    chmodSync(extraPath, 0o600);
+    const worldWritable = curatedSettings(directory, "world.json");
+    chmodSync(worldWritable, 0o666);
+    const malformed = join(directory, "malformed.json");
+    writeFileSync(malformed, '{"hooks": {"PreToolUse": [ }');
+    chmodSync(malformed, 0o600);
+
+    for (const [claudeSettingsPath, attached] of [
+      [curatedSettings(directory), true],
+      // Anyone could have written it — including the agent, last turn.
+      [worldWritable, false],
+      // Present, owned by us, and its hooks will never load.
+      [malformed, false],
+      // Not configured at all: no channel for a hook to arrive by.
+      [undefined, false],
+    ] as const) {
+      const warnings: string[] = [];
+      const logger = {
+        info: () => undefined,
+        debug: () => undefined,
+        warn: (_fields: Record<string, unknown>, message: string) => warnings.push(message),
+      } as unknown as Logger;
+      const runtime = new ClaudeCliOperatorRuntime({
+        binary,
+        cwd: directory,
+        model: "opus",
+        effort: "high",
+        fullAccess: true,
+        extraMcpConfigPath: extraPath,
+        ...(claudeSettingsPath ? { claudeSettingsPath } : {}),
+        logger,
+      });
+      const session = await runtime.start({ systemPrompt: "system" });
+      let captured: { args: string[]; config: { mcpServers: Record<string, unknown> } } | undefined;
+      for await (const event of runtime.sendTurn({
+        sessionId: session.id,
+        prompt: "use tools",
+        toolAccess: {
+          url: "http://127.0.0.1:43123/mcp",
+          token: "ephemeral-capability",
+          allowedTools: ["mcp__operator__utility_time"],
+        },
+      })) {
+        if (event.type === "result") captured = JSON.parse(event.text) as typeof captured;
+      }
+      expect(Object.keys(captured!.config.mcpServers).toSorted()).toEqual(
+        attached ? ["higgsfield", "operator"] : ["operator"],
+      );
+      // The name must not survive in the allowlist either — a blanket
+      // `mcp__higgsfield__*` for a server that is not attached is the exact
+      // shape of a gate everyone believes in and nobody has.
+      expect(captured!.args[captured!.args.indexOf("--allowed-tools") + 1]).toBe(
+        attached ? "mcp__operator__utility_time,mcp__higgsfield__*" : "mcp__operator__utility_time",
+      );
+      if (!attached) {
+        expect(warnings.join("\n")).toContain("attaching no extra MCP servers");
+      } else {
+        expect(warnings).toEqual([]);
+      }
+    }
   });
 
   it("refuses curated settings and skills anyone else could write", async () => {
@@ -513,6 +604,7 @@ process.stdin.on("end", () => {
       model: "opus",
       effort: "high",
       extraMcpConfigPath: extraPath,
+      claudeSettingsPath: curatedSettings(directory),
       logger,
     });
     const session = await runtime.start({ systemPrompt: "system" });
@@ -566,6 +658,7 @@ process.stdin.on("end", () => {
       model: "opus",
       effort: "high",
       extraMcpConfigPath: extraPath,
+      claudeSettingsPath: curatedSettings(directory),
       logger,
     });
     const session = await runtime.start({ systemPrompt: "system" });

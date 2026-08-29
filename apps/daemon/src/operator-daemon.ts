@@ -7339,24 +7339,33 @@ export class OperatorDaemon {
       // Read here, not remembered from the last turn: the file is re-read per
       // turn and hand-edited between them, so «what would attach right now» is
       // the only answer worth printing. Names only — the file holds tokens.
+      // Same reason as the MCP allowlist: both paths are re-checked per turn, so
+      // the only honest answer is the one the next turn would get. A path that
+      // failed the ownership gate is the whole point of printing this.
+      const curatedStatus = async (
+        path: string | undefined,
+        variable: string,
+        options: { json?: boolean } = {},
+      ): Promise<string> =>
+        !path ? "not configured" : ((await verifyCuratedPath(path, variable, undefined, options)) ?? "ok");
+      const [settingsStatus, skillsStatus] = await Promise.all([
+        curatedStatus(this.config.operator.claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS", { json: true }),
+        curatedStatus(this.config.operator.skillsDir, "OPERATOR_SKILLS_DIR"),
+      ]);
       const extraMcp = await loadExtraMcpServers(this.config.operator.extraMcpConfigPath, this.logger);
       const extraMcpNames = Object.keys(extraMcp.servers);
       const extraMcpStatus = !this.config.operator.extraMcpConfigPath
         ? "not configured"
-        : extraMcp.rejected
-          ? `rejected (${extraMcp.rejected})`
-          : extraMcpNames.length
-            ? extraMcpNames.map((name) => escapeMarkdownText(name)).join(", ")
-            : "none";
-      // Same reason as the MCP allowlist: both paths are re-checked per turn, so
-      // the only honest answer is the one the next turn would get. A path that
-      // failed the ownership gate is the whole point of printing this.
-      const curatedStatus = async (path: string | undefined, variable: string): Promise<string> =>
-        !path ? "not configured" : ((await verifyCuratedPath(path, variable)) ?? "ok");
-      const [settingsStatus, skillsStatus] = await Promise.all([
-        curatedStatus(this.config.operator.claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS"),
-        curatedStatus(this.config.operator.skillsDir, "OPERATOR_SKILLS_DIR"),
-      ]);
+        : // The runtime attaches no extra server at all while the curated
+          // settings file is unusable — paid tools without the PreToolUse hook
+          // that gates them is the one combination the box must never run in.
+          settingsStatus !== "ok"
+          ? `blocked (Claude settings: ${settingsStatus})`
+          : extraMcp.rejected
+            ? `rejected (${extraMcp.rejected})`
+            : extraMcpNames.length
+              ? extraMcpNames.map((name) => escapeMarkdownText(name)).join(", ")
+              : "none";
       const database = this.store.diagnostics();
       const outbox = this.store.telegramOutboxCounts();
       const pendingDispatches = this.store.listBackgroundJobs("t3_dispatch").length;

@@ -699,12 +699,12 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
    * that fails the ownership gate is simply left off — a turn without its hooks
    * or skills still answers, and the warn line says why.
    */
-  private async curatedArgs(): Promise<{ args: string[]; skills: boolean }> {
+  private async curatedArgs(): Promise<{ args: string[]; skills: boolean; settings: boolean }> {
     const args: string[] = [];
     const { claudeSettingsPath, skillsDir, logger } = this.options;
     const settingsOk =
       !!claudeSettingsPath &&
-      !(await verifyCuratedPath(claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS", logger));
+      !(await verifyCuratedPath(claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS", logger, { json: true }));
     if (settingsOk && claudeSettingsPath) args.push("--settings", claudeSettingsPath);
     const skillsOk =
       !!skillsDir && !(await verifyCuratedPath(skillsDir, "OPERATOR_SKILLS_DIR", logger));
@@ -743,7 +743,7 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
         );
       }
     }
-    return { args, skills: skillsOk };
+    return { args, skills: skillsOk, settings: settingsOk };
   }
 
   /** Sanitized child environment; logs the filtered names once per runtime. */
@@ -777,11 +777,27 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     const mcpConfigPath = input.toolAccess
       ? join(this.options.cwd, `.operator-mcp-${randomUUID()}.json`)
       : undefined;
+    const curated = await this.curatedArgs();
     // Re-read per turn rather than at construction: the file is edited by hand
     // on the box, and a config change should not need a daemon restart.
-    const extraServers = input.toolAccess
+    //
+    // And read ONLY behind the curated settings file, because that file is where
+    // the spend gate lives. An extra MCP server is where the paid tools come
+    // from, `--settings` is the only channel a PreToolUse hook can arrive by,
+    // and the two are configured independently — so `chmod 644` on the settings
+    // file used to leave the paid tools attached with nothing in front of them,
+    // which is the one combination nobody would choose on purpose. The pair is
+    // now all-or-nothing: no usable settings, no extra servers.
+    const extraMcpGated = Boolean(this.options.extraMcpConfigPath) && !curated.settings;
+    const extraServers = input.toolAccess && !extraMcpGated
       ? (await loadExtraMcpServers(this.options.extraMcpConfigPath, this.options.logger)).servers
       : {};
+    if (input.toolAccess && extraMcpGated) {
+      this.options.logger?.warn(
+        { path: this.options.extraMcpConfigPath, settings: this.options.claudeSettingsPath },
+        "OPERATOR_EXTRA_MCP_CONFIG is configured but OPERATOR_CLAUDE_SETTINGS is missing or refused; attaching no extra MCP servers rather than paid tools without their hooks",
+      );
+    }
     if (input.toolAccess) this.noteAttachedMcpServers(Object.keys(extraServers));
     if (input.toolAccess && mcpConfigPath) {
       await writeFile(mcpConfigPath, operatorMcpConfig(input.toolAccess, extraServers), {
@@ -791,7 +807,6 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     const mcpArgs = input.toolAccess && mcpConfigPath
       ? operatorMcpArgs(input.toolAccess, mcpConfigPath, Object.keys(extraServers))
       : [];
-    const curated = await this.curatedArgs();
     const args = [
       "-p",
       "--output-format",
@@ -945,7 +960,9 @@ export class ClaudeCliOperatorRuntime implements OperatorRuntime {
     // slash commands, so a skill could never be used, only paid for.
     const settingsArgs =
       claudeSettingsPath &&
-      !(await verifyCuratedPath(claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS", this.options.logger))
+      !(await verifyCuratedPath(claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS", this.options.logger, {
+        json: true,
+      }))
         ? ["--settings", claudeSettingsPath]
         : [];
     const args = [
@@ -1144,7 +1161,11 @@ function insecureOwnership(stats: { uid: number; mode: number }): boolean {
 }
 
 /** Why an owner-curated path was refused; all three degrade to "not attached". */
-export type CuratedPathRejection = "insecure-directory" | "insecure-permissions" | "unreadable";
+export type CuratedPathRejection =
+  | "insecure-directory"
+  | "insecure-permissions"
+  | "unreadable"
+  | "invalid-json";
 
 /**
  * Opens an owner-curated path and hands back the descriptor only if the daemon
@@ -1190,16 +1211,38 @@ async function openCuratedPath(
  * the path by name — but it still refuses the durable misconfiguration, which
  * is what actually happens on a box: a 0644 file dropped in a shared directory.
  *
+ * `json: true` additionally requires the file to parse. A settings file that
+ * does not is a settings file whose hooks do not run, and the whole reason the
+ * settings channel exists here is that a hook is the only thing standing
+ * between the agent and a paid MCP tool: "present but broken" has to be as
+ * visible as "absent", not quietly indistinguishable from "fine".
+ *
  * Returns the rejection reason, or undefined when the path may be attached.
  */
 export async function verifyCuratedPath(
   path: string,
   variable: string,
   logger?: Logger,
+  options: { json?: boolean } = {},
 ): Promise<CuratedPathRejection | undefined> {
   const opened = await openCuratedPath(path);
+  let malformed = false;
+  if (options.json && !("rejected" in opened)) {
+    try {
+      JSON.parse(await opened.handle.readFile("utf8"));
+    } catch {
+      malformed = true;
+    }
+  }
   await opened.handle?.close().catch(() => undefined);
   await opened.directory?.close().catch(() => undefined);
+  if (malformed) {
+    logger?.warn(
+      { path, variable, reason: "invalid-json" },
+      `${variable} is not valid JSON; starting the turn without it`,
+    );
+    return "invalid-json";
+  }
   if (!("rejected" in opened)) return undefined;
   logger?.warn(
     { path, variable, reason: opened.rejected },

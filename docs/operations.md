@@ -96,6 +96,15 @@ at all (no `command` for stdio, no `url` for http/sse) is dropped with a warn.
 `/debug` prints the server names that would attach right now, or the reason the
 file was refused.
 
+The allowlist is also gated on the curated settings file below, and this pairing
+is a money rule rather than a hygiene one: paid MCP tools arrive through
+`OPERATOR_EXTRA_MCP_CONFIG`, the `PreToolUse` hook that gates them can arrive
+only through `OPERATOR_CLAUDE_SETTINGS`, and the two are separate env lines. So
+if the settings path is unset, unreadable, writable by anyone else or not valid
+JSON, **no** extra server is attached at all — one `warn`, and `/debug` says
+`blocked (Claude settings: …)`. Tools with a price and no hook in front of them
+is the one combination nobody would configure on purpose.
+
 ### Curated settings and skills
 
 `--setting-sources ""` is what keeps the owner's `~/.claude` — its
@@ -125,10 +134,18 @@ Both paths are code-execution channels — a settings file is a list of commands
 the CLI runs, and a plugin directory can carry a `hooks/hooks.json` of its own
 (verified: it runs) — so both are held to the same ownership gate as
 `OPERATOR_EXTRA_MCP_CONFIG`: owned by the daemon's user, not group- or
-world-writable, in a directory that is the same. A path that fails is left off
-the command line with one `warn` line, and the turn runs without it. Both are
-re-checked per turn, so a `chmod` on the box needs no restart. `/debug` prints
-the verdict each would get right now.
+world-writable, in a directory that is the same. The settings file must parse as
+JSON on top of that: one whose hooks will never load has to be as visible as one
+that is missing. A path that fails is left off the command line with one `warn`
+line, and the turn runs without it. Both are re-checked per turn, so a `chmod`
+on the box needs no restart. `/debug` prints the verdict each would get right
+now.
+
+None of this bounds an agent that means it: on a box with
+`OPERATOR_FULL_ACCESS=true` the daemon's user is also the agent's user, so the
+hook, the settings file and the transcript a hook reads are all writable from
+inside the turn. The gate stops an inattentive agent; a spending limit on the
+paid account is the boundary that stops a determined one.
 
 `--strict-mcp-config` still applies to a plugin: an `.mcp.json` inside the
 plugin directory attaches nothing (verified). The MCP allowlist stays the only

@@ -5324,8 +5324,17 @@ describe("OperatorDaemon product flow", () => {
       }),
     );
     chmodSync(extraMcpConfigPath, 0o600);
+    // Extra MCP servers are attached only behind a usable curated settings file
+    // — that file is where the spend gate's PreToolUse hook lives — so /debug
+    // needs one too, or it reports the gate instead of the allowlist.
+    const claudeSettingsPath = `${home}/claude-settings.json`;
+    writeFileSync(claudeSettingsPath, JSON.stringify({ disableBundledSkills: true }));
+    chmodSync(claudeSettingsPath, 0o600);
     const base = config(home);
-    const debugConfig: Config = { ...base, operator: { ...base.operator, extraMcpConfigPath } };
+    const debugConfig: Config = {
+      ...base,
+      operator: { ...base.operator, extraMcpConfigPath, claudeSettingsPath },
+    };
     daemon = new OperatorDaemon(debugConfig, store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
     await daemon.initialize();
     const run = daemon.run();
@@ -5353,6 +5362,16 @@ describe("OperatorDaemon product flow", () => {
     await waitFor(() => telegram.sent.filter((entry) => entry.text.startsWith("## Operator debug")).length >= 2);
     const refused = telegram.sent.findLast((entry) => entry.text.startsWith("## Operator debug"))!.text;
     expect(refused).toContain("Extra MCP: rejected (insecure-permissions)");
+
+    // And a settings file anyone could rewrite takes the whole allowlist with
+    // it: paid tools whose gate can be edited by the agent are worse than no
+    // paid tools, and /debug names which of the two failed.
+    chmodSync(extraMcpConfigPath, 0o600);
+    chmodSync(claudeSettingsPath, 0o666);
+    telegram.push(message(3, "/debug"));
+    await waitFor(() => telegram.sent.filter((entry) => entry.text.startsWith("## Operator debug")).length >= 3);
+    const ungated = telegram.sent.findLast((entry) => entry.text.startsWith("## Operator debug"))!.text;
+    expect(ungated).toContain("Extra MCP: blocked (Claude settings: insecure-permissions)");
 
     telegram.finish();
     await run;
