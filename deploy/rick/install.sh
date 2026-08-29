@@ -245,7 +245,22 @@ if [ -f "$SCRIPT_DIR/hooks/higgsfield-spend-gate.py" ]; then
   # not executed: 0600 is enough and keeps it off anyone else's PATH.
   install -m 0600 -o root -g root "$SCRIPT_DIR/hooks/higgsfield-spend-gate.py" \
     "$OPERATOR_HOME/hooks/higgsfield-spend-gate.py"
-  ok "higgsfield-spend-gate.py (0600)"
+  # The interpreter is named absolutely in claude-settings.json, and a hook the
+  # CLI cannot launch is a hook that lets the call through — exit 127 is not a
+  # refusal. A box without it must fail here, loudly, and not on the invoice.
+  [ -x /usr/bin/python3 ] || die "/usr/bin/python3 is missing; the higgsfield spend gate could not run and a paid call would go through ungated"
+  # Install-time smoke test: the gate is only real if it actually refuses. Feed
+  # it the shape the CLI feeds it — a paid tool with no transcript, no price and
+  # no consent — and require the refusal, on the exit code AND in the payload.
+  gate_probe=$(printf '%s' \
+    '{"hook_event_name":"PreToolUse","tool_name":"mcp__higgsfield__generate_image","tool_input":{}}' \
+    | /usr/bin/python3 "$OPERATOR_HOME/hooks/higgsfield-spend-gate.py" 2>/dev/null) && gate_status=0 || gate_status=$?
+  [ "$gate_status" = "2" ] || die "higgsfield spend gate did not block an unconfirmed paid call (exit $gate_status); refusing to install a gate that does not gate"
+  case "$gate_probe" in
+    *'"permissionDecision": "deny"'*|*'"permissionDecision":"deny"'*) : ;;
+    *) die "higgsfield spend gate returned no deny verdict for an unconfirmed paid call: $gate_probe" ;;
+  esac
+  ok "higgsfield-spend-gate.py (0600), blocks an unconfirmed paid call"
 fi
 : >>"$OPERATOR_HOME/operator.log"; chmod 0600 "$OPERATOR_HOME/operator.log"
 : >>"$OPERATOR_HOME/t3code.log";   chmod 0600 "$OPERATOR_HOME/t3code.log"
