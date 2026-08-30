@@ -11334,7 +11334,12 @@ describe("Operator push envelope (package 2.1)", () => {
     const second = directEnvelopes(runtime).at(-1)!;
     expect(second).not.toContain("Operator state snapshot");
     expect(second).not.toContain("Current state changed since your last turn");
-    expect(second.startsWith("Handle the user's Telegram message")).toBe(true);
+    // The live tool inventory is not pushed STATE: it leads every envelope,
+    // including one that pushes nothing, and the body follows it directly.
+    expect(second.startsWith("Attached now: MCP none; skills none")).toBe(true);
+    expect(second.slice(second.indexOf("\n") + 1).trimStart()).toMatch(
+      /^Handle the user's Telegram message/u,
+    );
 
     // (c) A cold gap re-pushes the whole state and says so in the envelope.
     store.setRuntimeState(
@@ -11347,6 +11352,82 @@ describe("Operator push envelope (package 2.1)", () => {
     expect(third).toContain("Operator state snapshot");
     expect(third).toContain("[gap:");
     expect(third).toContain("cold-resume");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
+  /**
+   * The agent used to reason about its own toolbox from memory notes, which
+   * are written weeks before the turn that reads them. The envelope now states
+   * what the daemon is attaching to THIS turn, read from the same files and
+   * through the same ownership gate the runtime uses moments later — including
+   * the rule that no extra MCP server is attached while the curated settings
+   * file (where the spend hook lives) is unusable.
+   */
+  it("states the live tool inventory in every envelope, and states it honestly", async () => {
+    const home = tempDirectory("daemon-attached-now-");
+    const store = tempStore();
+    const settingsPath = join(home, "claude-settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ disableBundledSkills: true }));
+    chmodSync(settingsPath, 0o600);
+    const mcpPath = join(home, "extra-mcp.json");
+    writeFileSync(
+      mcpPath,
+      JSON.stringify({
+        mcpServers: {
+          higgsfield: { type: "http", url: "https://example.invalid/mcp" },
+          vault: { command: "vault-mcp" },
+          // Half-finished hand edit: the loader refuses it, so the envelope
+          // must not promise it either.
+          broken: {},
+        },
+      }),
+    );
+    chmodSync(mcpPath, 0o600);
+    const skillsDir = join(home, "plugin");
+    for (const skill of ["invoices", "smeta"]) {
+      mkdirSync(join(skillsDir, "skills", skill), { recursive: true });
+      writeFileSync(join(skillsDir, "skills", skill, "SKILL.md"), `---\nname: ${skill}\n---\n`);
+    }
+    chmodSync(skillsDir, 0o700);
+
+    const base = config(home);
+    const curated: Config = {
+      ...base,
+      operator: {
+        ...base.operator,
+        claudeSettingsPath: settingsPath,
+        extraMcpConfigPath: mcpPath,
+        skillsDir,
+      },
+    };
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(curated, store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "какая столица Франции?"));
+    await waitFor(() => directEnvelopes(runtime).length >= 1);
+    const envelope = directEnvelopes(runtime).at(-1)!;
+    expect(envelope).toContain("Attached now: MCP higgsfield, vault; skills invoices, smeta");
+    expect(envelope).not.toContain("broken");
+
+    // A settings file the ownership gate refuses takes the paid servers with
+    // it — and the envelope says so instead of remembering yesterday's answer.
+    chmodSync(settingsPath, 0o666);
+    telegram.push(message(2, "а столица Италии?"));
+    await waitFor(() => directEnvelopes(runtime).length >= 2);
+    expect(directEnvelopes(runtime).at(-1)!).toContain(
+      "Attached now: MCP none; skills invoices, smeta",
+    );
 
     telegram.finish();
     await run;

@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, sep } from "node:path";
@@ -547,6 +547,11 @@ const PUSH_BASELINE_KEY = "memory_push_baseline";
  * Telegram tries again — and a start after a successful one never does.
  */
 const LEGACY_KEYBOARD_CLEARED_KEY = "legacy_keyboard_cleared";
+/**
+ * Lead of the live tool inventory in the envelope. The system prompt names it
+ * verbatim as the one authority on what is attached, so the two must not drift.
+ */
+const ATTACHED_TOOLS_HEADER = "Attached now:";
 /**
  * The in-the-moment check (memory-design §2.4.2), in `runtime_state` so it
  * survives a restart: the turn that mutated without recording anything, and how
@@ -3108,6 +3113,10 @@ export class OperatorDaemon {
     // after a fresh-session replay: a retry must not be told the owner has been
     // silent for the seconds the failed attempt burned.
     const pushAt = new Date();
+    // Read once per turn, here, where the turn is already async: `composePrompt`
+    // may be replayed synchronously for a fresh-session rebuild, and the answer
+    // to "what is attached" must be the same one on both passes.
+    const attachedTools = await this.describeAttachedTools();
     // The state layers are ADMINISTRATIVE state: the now layer renders every
     // live thread and the index every durable note, exactly what the viewer
     // wall (§1 of dialogue-flow) and `memory.search`'s own role check keep away
@@ -3130,7 +3139,12 @@ export class OperatorDaemon {
       !isThreadEventTurn && !update.synthetic && this.roleForUser(update.userId) === "owner";
     const composePrompt = (force: boolean): OperatorPromptContent & { commit: () => void } => {
       const push = mayReadState
-        ? this.buildPushSections({ ...(force ? { force: true } : {}), at: pushAt, ownerTurn })
+        ? this.buildPushSections({
+            ...(force ? { force: true } : {}),
+            at: pushAt,
+            ownerTurn,
+            attachedTools,
+          })
         : {
             sections: [] as string[],
             operatorReferences: [] as OperatorPromptReference[],
@@ -6969,6 +6983,53 @@ export class OperatorDaemon {
     return currentMemoryNotesForPush(this.store);
   }
 
+  /**
+   * What the daemon is ACTUALLY attaching to this turn, in one line.
+   *
+   * The agent used to reason about its own toolbox from memory notes, which
+   * are written weeks before the turn that reads them and go stale the moment
+   * a path is renamed or a `chmod` fails the ownership gate. Everything here
+   * is read fresh, from the same files and through the same gate the runtime
+   * itself uses a few milliseconds later — including the rule that no extra
+   * MCP server is attached while the curated settings file (where the spend
+   * hook lives) is unusable.
+   *
+   * Names only: the MCP file holds tokens, and the envelope is not the place
+   * for them. Failures degrade to "unknown" rather than to silence — an
+   * envelope that cannot say what is attached must not imply nothing is.
+   */
+  private async describeAttachedTools(): Promise<string> {
+    const { claudeSettingsPath, skillsDir, extraMcpConfigPath } = this.config.operator;
+    const settingsOk =
+      !!claudeSettingsPath &&
+      !(await verifyCuratedPath(claudeSettingsPath, "OPERATOR_CLAUDE_SETTINGS", undefined, {
+        json: true,
+      }));
+    const skillsOk =
+      !!skillsDir && !(await verifyCuratedPath(skillsDir, "OPERATOR_SKILLS_DIR", undefined));
+    const mcpServers =
+      extraMcpConfigPath && settingsOk
+        ? Object.keys((await loadExtraMcpServers(extraMcpConfigPath, this.logger)).servers)
+        : [];
+    const skills = skillsOk && skillsDir ? await this.listCuratedSkills(skillsDir) : [];
+    const names = (values: string[]): string => (values.length ? values.join(", ") : "none");
+    return `${ATTACHED_TOOLS_HEADER} MCP ${names(mcpServers)}; skills ${names(skills)}`;
+  }
+
+  /** The skill names the CLI would load from `<plugin-dir>/skills/<name>/`. */
+  private async listCuratedSkills(skillsDir: string): Promise<string[]> {
+    try {
+      const entries = await readdir(join(skillsDir, "skills"), { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+        .map((entry) => entry.name)
+        .sort();
+    } catch (error) {
+      this.logger.debug({ err: error, skillsDir }, "Curated skills directory could not be listed");
+      return [];
+    }
+  }
+
   /** The three push layers, rendered once for a turn (data here, shape in policy). */
   private buildStateLayers(nowItems = this.currentNowItems()): RenderedStateLayers {
     const notes = this.currentMemoryNotes();
@@ -7049,7 +7110,7 @@ export class OperatorDaemon {
    * economy of the model.
    */
   private buildPushSections(
-    options: { force?: boolean; at?: Date; ownerTurn: boolean },
+    options: { force?: boolean; at?: Date; ownerTurn: boolean; attachedTools?: string },
   ): {
     sections: string[];
     operatorReferences: readonly OperatorPromptReference[];
@@ -7114,7 +7175,14 @@ export class OperatorDaemon {
     }
     const pushCommit = commit;
     return {
-      sections,
+      // The live tool inventory leads the head and is unconditional: it is not
+      // pushed STATE (it never moves the diff baseline and is not part of the
+      // snapshot hash — nothing about it is the owner's to change), it is what
+      // the daemon is attaching right now, and a turn that gets a diff instead
+      // of a full snapshot needs it exactly as much. Prepended rather than
+      // pushed, so it cannot count as the "state above" the gap line asks
+      // about — that question is about the owner's state, not the toolbox.
+      sections: options.attachedTools ? [options.attachedTools, ...sections] : sections,
       operatorReferences,
       commit: () => {
         pushCommit();

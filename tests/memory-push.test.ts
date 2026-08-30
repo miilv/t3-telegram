@@ -800,6 +800,20 @@ describe("persona rules (memory-design §2.1)", () => {
     expect(language.text).toContain("unless they write to you in another one");
   });
 
+  it("states the burst, the two-minute ceiling and the tool inventory as rules, not hints", () => {
+    const prompt = buildOperatorSystemPrompt({ language: "ru" });
+    // One reply per burst, and no re-telling of the previous answer: both are
+    // what a wider batch window makes possible, and neither survives as a hint.
+    expect(prompt).toContain("A burst of related messages from the owner is ONE thought");
+    expect(prompt).toContain("Do not restate what you already told them in your previous answer");
+    // The ceiling that turns a twelve-minute turn into a thread plus a sentence.
+    expect(prompt).toContain("longer than ~2 minutes");
+    expect(prompt).toContain("answer immediately that it is running");
+    // The envelope's inventory line is named verbatim, so the two cannot drift.
+    expect(prompt).toContain('The "Attached now" line');
+    expect(prompt).toContain("never from memory notes");
+  });
+
   it("does not repeat itself in the policy prose it was split from (review No.2)", () => {
     const prompt = buildOperatorSystemPrompt({ language: "ru" });
     const policyHalf = prompt.slice(prompt.indexOf("Core behavior:"));
