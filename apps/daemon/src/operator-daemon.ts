@@ -394,6 +394,17 @@ interface DurableTelegramPayload {
   sentChunkCount?: number;
   /** Telegram message ids of those already-delivered chunks. */
   sentMessageIds?: number[];
+  /**
+   * The chunk that was handed to Telegram but whose outcome we never learned.
+   *
+   * Written BEFORE the send and cleared by its confirmation, so the record of
+   * an in-flight chunk survives what the confirmation cannot: a lost ACK, a
+   * killed process. A retry that finds it treats the chunk as delivered
+   * (at-most-once) — see {@link OperatorDaemon.sendDurableRich}. A send that
+   * came back with a DEFINITE error clears it on the spot: Telegram answering
+   * "no" is knowledge, and knowledge is worth more than the assumption.
+   */
+  pendingChunkIndex?: number;
   /** Set when an uncertain delivery was requeued once; a second failure goes dead (bug №2). */
   uncertainRequeued?: boolean;
   /**
@@ -8362,7 +8373,18 @@ export class OperatorDaemon {
         payload.uncertainRequeued = true;
         // Chunk progress means part of the answer definitely arrived and the
         // retry only continues it, so the duplicate warning would mislead.
-        if (item.operation === "rich" && payload.text && !payload.sentChunkCount) {
+        //
+        // A standing `pendingChunkIndex` says the same about the chunk that
+        // was in flight when the process stopped — this is the crash path,
+        // `resetInterruptedTelegramOutbox` lands a killed send here — and the
+        // retry will step OVER that chunk rather than repeat it. Rewriting the
+        // text would also re-cut the chunks the resume is counting.
+        if (
+          item.operation === "rich" &&
+          payload.text &&
+          !payload.sentChunkCount &&
+          payload.pendingChunkIndex === undefined
+        ) {
           payload.text = `${payload.text}\n\n⚠️ _Повторная отправка — возможно, предыдущее сообщение уже дошло._`;
         }
         this.store.updateTelegramOutboxPayload(item.id, payload);
@@ -8832,6 +8854,18 @@ export class OperatorDaemon {
           }
         : classifyTelegramDeliveryError(error);
       const detail = disposition.code;
+      // Reaching this handler at all is knowledge: the send came back, so
+      // whatever it says — a flood wait, a rejected entity, a connection cut
+      // mid-upload — this process KNOWS how the chunk ended, and the outcome
+      // is handled below (a definite failure retries the chunk; an ambiguous
+      // one goes through the controlled `uncertain` requeue, which labels its
+      // retry as a possible duplicate). So the intent is retired here. What it
+      // exists for is the case where this handler never runs at all, because
+      // the process died between the send and its confirmation.
+      if (payload.pendingChunkIndex !== undefined) {
+        delete payload.pendingChunkIndex;
+        this.store.updateTelegramOutboxPayload(item.id, payload);
+      }
       const idempotentEdit = Boolean(
         ((payload.editMessageId || anchor) && item.operation === "rich") ||
           item.operation === "clear_keyboard",
@@ -8881,6 +8915,32 @@ export class OperatorDaemon {
    * Multi-chunk rich delivery with durable resume state: every delivered chunk
    * is recorded in the outbox payload, so a retried item continues from the
    * first undelivered chunk instead of resending the whole answer (bug №22).
+   *
+   * Incident 30.08 — the same answer delivered twice. `sentChunkCount` was
+   * written AFTER Telegram accepted the chunk, so the window between the two
+   * belonged to nobody: a lost ACK or a crash inside it left a chunk sitting in
+   * the chat with the payload still saying "nothing sent", and the durable
+   * retry dutifully sent it again.
+   *
+   * The window is closed by writing the INTENT first (`pendingChunkIndex`) and
+   * resolving a retry that finds one AT MOST ONCE: the chunk is counted as
+   * delivered and never re-sent. Of the two ways to be wrong, this is the
+   * honest one. A duplicate is silent — the owner sees two answers and cannot
+   * tell which is real — while the loss is loud: it needs a double failure
+   * (the send really did not happen AND the daemon never learned it), and
+   * `noticeUncertainChunk` says so in one line so they can ask again.
+   *
+   * The rule applies only where the daemon has NO knowledge, which is exactly
+   * the crash window: a send that came back — even with an ambiguous network
+   * error — retires its own intent in the delivery handler, and that case keeps
+   * the controlled `uncertain` requeue of bug №2, whose retry is labelled
+   * «возможно, предыдущее сообщение уже дошло». A duplicate the owner can
+   * recognise is not the bug being fixed here.
+   *
+   * A killed send reaches this code through the same requeue —
+   * `resetInterruptedTelegramOutbox` files an in-flight non-idempotent row as
+   * `uncertain` — which is precisely where the second copy used to come from.
+   * The intent is what tells the two cases apart.
    */
   private async sendDurableRich(
     item: TelegramOutboxItem<DurableTelegramPayload>,
@@ -8892,18 +8952,82 @@ export class OperatorDaemon {
       messageId,
       ...destinationFromOptions(payload.options),
     }));
+    const confirmed = payload.sentChunkCount ?? 0;
+    const pending = payload.pendingChunkIndex;
+    // An intent still standing at the START of an attempt was left by a
+    // previous one that never came back to resolve it. Its chunk is assumed
+    // delivered, and the assumption is written down before anything else is
+    // sent, so a crash in THIS attempt cannot resurrect the same chunk.
+    const assumedDelivered = pending !== undefined && pending >= confirmed;
+    const completedChunks = assumedDelivered && pending !== undefined ? pending + 1 : confirmed;
+    if (assumedDelivered) {
+      payload.sentChunkCount = completedChunks;
+      delete payload.pendingChunkIndex;
+      this.store.updateTelegramOutboxPayload(item.id, payload);
+      this.store.appendEvent("telegram.outbox.chunk_assumed_delivered", {
+        correlationId: payload.correlationId ?? item.dedupeKey,
+        ...(payload.threadId ? { threadId: payload.threadId } : {}),
+        payload: { outboxId: item.id, chunkIndex: pending, messageType: payload.messageType },
+      });
+      this.logger.warn(
+        { outboxId: item.id, chunkIndex: pending, chat: hashChatId(item.chatId) },
+        "A rich chunk was in flight when the previous attempt ended; counting it as delivered instead of sending it again",
+      );
+      this.noticeUncertainChunk(item, payload);
+    }
     const sent = await this.telegram.sendRich(item.chatId, payload.text, payload.options, {
-      completedChunks: payload.sentChunkCount ?? 0,
-      onChunkSent: (completedChunks, chunkMessages) => {
-        payload.sentChunkCount = completedChunks;
+      completedChunks,
+      onChunkSending: (index) => {
+        payload.pendingChunkIndex = index;
+        this.store.updateTelegramOutboxPayload(item.id, payload);
+      },
+      onChunkSent: (chunks, chunkMessages) => {
+        payload.sentChunkCount = chunks;
         payload.sentMessageIds = [
           ...(payload.sentMessageIds ?? []),
           ...chunkMessages.map((message) => message.messageId),
         ];
+        delete payload.pendingChunkIndex;
         this.store.updateTelegramOutboxPayload(item.id, payload);
       },
     });
     return [...previouslySent, ...sent];
+  }
+
+  /**
+   * The one line the at-most-once rule owes the owner: a chunk was counted as
+   * delivered without proof, so if it never arrived they have to be able to
+   * say so. Out of band, like every other delivery notice — routed through the
+   * outbox it would queue behind the very item it is about.
+   */
+  private noticeUncertainChunk(
+    item: TelegramOutboxItem<DurableTelegramPayload>,
+    payload: DurableTelegramPayload,
+  ): void {
+    const target = this.ownerChatId() ?? item.chatId;
+    const destination: TelegramDestination =
+      target === item.chatId
+        ? {
+            ...(payload.options.messageThreadId
+              ? { messageThreadId: payload.options.messageThreadId }
+              : {}),
+            ...(payload.options.directMessagesTopicId
+              ? { directMessagesTopicId: payload.options.directMessagesTopicId }
+              : {}),
+          }
+        : {};
+    const task = this.telegram
+      .sendAlert(
+        target,
+        "⚠️ Предыдущая отправка могла не дойти — скажи, если не видел ответа.",
+        destination,
+      )
+      .catch((error: unknown) => {
+        this.logger.warn({ err: error, outboxId: item.id }, "Uncertain-chunk notice failed");
+      })
+      .then(() => undefined);
+    this.monitorTasks.add(task);
+    void task.finally(() => this.monitorTasks.delete(task));
   }
 
   private recordDurableOutgoing(messages: SentMessage[], payload: DurableTelegramPayload): void {

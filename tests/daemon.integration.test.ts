@@ -64,6 +64,8 @@ import type {
   TelegramCommandScope,
   TelegramDestination,
   TelegramInbound,
+  TelegramSendOptions,
+  TelegramSendProgress,
   TelegramTransport,
   TelegramUserInputChoice,
 } from "../packages/telegram/src/index.js";
@@ -4517,6 +4519,115 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   }, 60_000);
+
+  /**
+   * Incident 30.08 — the same answer delivered twice.
+   *
+   * `sentChunkCount` was written AFTER Telegram accepted the chunk, so a crash
+   * (or a lost ACK) inside that window left a chunk in the chat and a payload
+   * saying nothing had been sent; the durable retry sent it again. The intent
+   * is now written first, and a retry that finds one standing counts the chunk
+   * as delivered instead of guessing.
+   */
+  it("makes a rich chunk's send intent durable before the chunk reaches Telegram", async () => {
+    const home = tempDirectory("daemon-chunk-intent-order-");
+    const store = tempStore();
+    const runtime = new FakeRuntime();
+    const broker = new FakeBroker();
+    const telegram = new IntentOrderTelegram();
+    telegram.peekIntent = () =>
+      store
+        .listTelegramOutbox<{ pendingChunkIndex?: number; text?: string }>(["sending"], 20)
+        .find((row) => row.payload.text?.includes("Париж"))?.payload.pendingChunkIndex;
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "какая столица Франции?"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."));
+
+    // At the instant the chunk went on the wire, the payload already said so.
+    expect(telegram.intentAtSend).toEqual([0]);
+    // And the confirmation retires it: a delivered item carries no intent that
+    // a later revival could mistake for an in-flight chunk.
+    const delivered = store.listTelegramOutbox<{
+      pendingChunkIndex?: number;
+      sentChunkCount?: number;
+      text?: string;
+    }>(["delivered"], 50).find((row) => row.payload.text === "Париж.");
+    expect(delivered?.payload.pendingChunkIndex).toBeUndefined();
+    expect(delivered?.payload.sentChunkCount).toBe(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("never re-sends a rich chunk whose confirmation died with the process (incident 30.08)", async () => {
+    const home = tempDirectory("daemon-chunk-crash-");
+    const databasePath = `${home}/operator.db`;
+    const logger = pino({ enabled: false });
+    const text = "Смета посчитана: 412 000 ₽.";
+    const payload = {
+      text,
+      options: { replyToMessageId: 11 },
+      messageType: "operator_answer",
+    };
+
+    // Exactly the state a crash between the send and the persist leaves: the
+    // row is claimed (so the next boot revives it) and the payload already
+    // names the chunk that was handed to Telegram.
+    const seed = new OperatorStore(databasePath);
+    seed.migrate();
+    seed.setRuntimeState("owner_chat_id", "7");
+    const item = seed.enqueueTelegramOutbox({
+      dedupeKey: "telegram:operator:crashed-turn:final",
+      chatId: 7,
+      operation: "rich",
+      payload,
+    });
+    expect(seed.claimNextTelegramOutbox()?.id).toBe(item.id);
+    seed.updateTelegramOutboxPayload(item.id, { ...payload, pendingChunkIndex: 0 });
+    seed.close();
+
+    const store = new OperatorStore(databasePath);
+    const telegram = new FakeTelegram();
+    const broker = new FakeBroker();
+    const runtime = new FakeRuntime();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // A killed send lands in `uncertain`, whose controlled requeue is what
+    // used to put the second copy in the chat.
+    await waitFor(
+      () => store.getTelegramOutbox("telegram:operator:crashed-turn:final")?.status === "delivered",
+      15_000,
+    );
+    telegram.finish();
+    await run;
+    await daemon.stop();
+
+    // (а) the answer is not put in the chat a second time — with or without
+    // the «возможно, уже дошло» header the requeue used to add…
+    expect(telegram.sent.filter((entry) => entry.text.includes("412 000"))).toHaveLength(0);
+    // (б) …the item is finished rather than retried forever…
+    const verify = new OperatorStore(databasePath);
+    verify.migrate();
+    expect(verify.getTelegramOutbox("telegram:operator:crashed-turn:final")?.status).toBe("delivered");
+    verify.close();
+    // (в) …and the assumption is spoken, out of band, so a real loss is
+    // recoverable by the owner asking again.
+    expect(telegram.alerts.filter((alert) => alert.text.includes("могла не дойти"))).toHaveLength(1);
+    expect(telegram.sent.some((entry) => entry.text.includes("могла не дойти"))).toBe(false);
+  });
 
   it("tells the owner once after ten failed delivery attempts and keeps retrying forever (package 0.7)", async () => {
     const home = tempDirectory("daemon-stalled-delivery-");
@@ -13075,12 +13186,25 @@ class FakeTelegram implements TelegramTransport {
   updates(): AsyncIterable<TelegramInbound> {
     return this.queue;
   }
-  async sendRich(_chatId: number, text: string): Promise<SentMessage[]> {
+  async sendRich(
+    _chatId: number,
+    text: string,
+    _options: TelegramSendOptions = {},
+    progress?: TelegramSendProgress,
+  ): Promise<SentMessage[]> {
+    // One chunk: every text this suite sends is far below the split limit.
+    // The progress protocol is honoured all the same, because the durable
+    // resume state — and the at-most-once rule that guards its write window —
+    // is only exercised when the transport announces the chunk it is sending.
+    if ((progress?.completedChunks ?? 0) > 0) return [];
+    progress?.onChunkSending?.(0);
     const messageId = this.nextMessageId++;
     const at = Date.now();
     this.visible.push({ kind: "message", at });
     this.sent.push({ messageId, text, at });
-    return [{ chatId: 7, messageId }];
+    const sent = [{ chatId: 7, messageId }];
+    progress?.onChunkSent?.(1, sent);
+    return sent;
   }
   async sendDashboardCapability(chatId: number, url: string): Promise<SentMessage> {
     if (this.dashboardCapabilityFailures > 0) {
@@ -13708,6 +13832,31 @@ class InterruptTrackingRuntime extends BlockingRuntime {
 
   override async interrupt(): Promise<void> {
     this.interrupts += 1;
+  }
+}
+
+/**
+ * Reads the durable payload at the exact instant a chunk goes on the wire.
+ * The whole idempotency fix is an ORDERING claim, and this is the only place
+ * from which it can be observed.
+ */
+class IntentOrderTelegram extends FakeTelegram {
+  readonly intentAtSend: Array<number | undefined> = [];
+  peekIntent: () => number | undefined = () => undefined;
+
+  override async sendRich(
+    chatId: number,
+    text: string,
+    options: TelegramSendOptions = {},
+    progress?: TelegramSendProgress,
+  ): Promise<SentMessage[]> {
+    return super.sendRich(chatId, text, options, {
+      ...progress,
+      onChunkSending: (index) => {
+        progress?.onChunkSending?.(index);
+        this.intentAtSend.push(this.peekIntent());
+      },
+    });
   }
 }
 

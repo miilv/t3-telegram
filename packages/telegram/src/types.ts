@@ -293,6 +293,16 @@ export interface TelegramHealth {
 export interface TelegramSendProgress {
   /** Number of leading rich chunks a previous attempt already delivered. */
   completedChunks?: number;
+  /**
+   * Called with the chunk index IMMEDIATELY BEFORE it is handed to Telegram.
+   *
+   * The intent has to be durable before the send, not after it: between the
+   * API accepting a chunk and the caller persisting that fact there is a
+   * window (a lost ACK, a crash) in which the chunk exists in the chat and
+   * nowhere in our records — and a retry that trusts the records alone sends
+   * it a second time. That double delivery is the bug this hook closes.
+   */
+  onChunkSending?: (index: number) => void;
   /** Called after each delivered chunk with the new completed-chunk count. */
   onChunkSent?: (completedChunks: number, sent: SentMessage[]) => void;
 }

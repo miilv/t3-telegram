@@ -365,6 +365,9 @@ export class TelegramBotTransport implements TelegramTransport {
     for (const [index, chunk] of richChunks.entries()) {
       if (index < completedChunks) continue;
       const chunkOptions = index === 0 ? options : withoutReply(options);
+      // Announced BEFORE the wire, so the caller's durable record of "this
+      // chunk may already be in the chat" cannot be lost with the process.
+      progress?.onChunkSending?.(index);
       const chunkSent = await this.sendRichChunk(chatId, chunk, chunkOptions);
       sent.push(...chunkSent);
       progress?.onChunkSent?.(index + 1, chunkSent);
