@@ -550,9 +550,15 @@ const PUSH_BASELINE_KEY = "memory_push_baseline";
 const LEGACY_KEYBOARD_CLEARED_KEY = "legacy_keyboard_cleared";
 /**
  * Lead of the live tool inventory in the envelope. The system prompt names it
- * verbatim as the one authority on what is attached, so the two must not drift.
+ * verbatim, so the two must not drift.
+ *
+ * "Attaching", not "attached": the daemon reads the config files and the
+ * ownership gate, which is exactly as far as its knowledge goes — a valid
+ * `mcp.json` whose server then fails to start would make an "attached" claim a
+ * lie. Absence from the line stays a hard fact; presence is an intent for THIS
+ * turn, and the line says how the agent finds out otherwise.
  */
-const ATTACHED_TOOLS_HEADER = "Attached now:";
+const ATTACHED_TOOLS_HEADER = "Attaching this turn:";
 /**
  * The in-the-moment check (memory-design §2.4.2), in `runtime_state` so it
  * survives a restart: the turn that mutated without recording anything, and how
@@ -7023,6 +7029,13 @@ export class OperatorDaemon {
    * Names only: the MCP file holds tokens, and the envelope is not the place
    * for them. Failures degrade to "unknown" rather than to silence — an
    * envelope that cannot say what is attached must not imply nothing is.
+   *
+   * What it can honestly promise is asymmetric, and the line says so. A name
+   * MISSING is certain: the daemon is not passing that server or that skill,
+   * so it is not there. A name PRESENT is the daemon's intent for this turn,
+   * checked as far as the file and the gate — a server that then fails to
+   * start is invisible from here, and the agent learns it from the failing
+   * call, not from a claim in the envelope.
    */
   private async describeAttachedTools(): Promise<string> {
     const { claudeSettingsPath, skillsDir, extraMcpConfigPath } = this.config.operator;
@@ -7039,7 +7052,7 @@ export class OperatorDaemon {
         : [];
     const skills = skillsOk && skillsDir ? await this.listCuratedSkills(skillsDir) : [];
     const names = (values: string[]): string => (values.length ? values.join(", ") : "none");
-    return `${ATTACHED_TOOLS_HEADER} MCP ${names(mcpServers)}; skills ${names(skills)}`;
+    return `${ATTACHED_TOOLS_HEADER} MCP ${names(mcpServers)}; skills ${names(skills)} (not listed = not there; a failing call means that server did not start)`;
   }
 
   /** The skill names the CLI would load from `<plugin-dir>/skills/<name>/`. */

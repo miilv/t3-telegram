@@ -64,12 +64,15 @@ message, the work behind it (dialogue-flow §4).
   someone who thinks in three short messages needs a wider window (5000 is a
   reasonable setting for that) than someone who writes in paragraphs. The 180 s
   ceiling on a batch that keeps re-arming is unchanged. Restart to apply.
-- Every Operator envelope opens with one `Attached now: MCP …; skills …` line —
-  the extra MCP servers and curated skill directories the daemon is attaching to
-  *that* turn, read fresh through the same ownership gate the runtime uses. It
-  is deliberately not part of the pushed memory state (it moves no diff
-  baseline): the agent is told to take tool availability from that line and
-  never from its own memory notes.
+- Every Operator envelope opens with one `Attaching this turn: MCP …; skills …`
+  line — the extra MCP servers and curated skill directories the daemon is
+  attaching to *that* turn, read fresh through the same ownership gate the
+  runtime uses. It reports the daemon's own intent, not a handshake with the
+  servers: a name missing from it means the tool is genuinely not being passed,
+  while a name present means it is being passed and a failing call means that
+  server did not start. It is deliberately not part of the pushed memory state
+  (it moves no diff baseline): the agent is told to take tool availability from
+  that line and never from its own memory notes.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
 - Set `OBSERVABILITY_HASH_SALT` to a random secret so the irreversible chat
   pseudonym remains stable across restarts. Without it, a process-random salt

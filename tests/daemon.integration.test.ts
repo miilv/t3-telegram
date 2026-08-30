@@ -11464,7 +11464,7 @@ describe("Operator push envelope (package 2.1)", () => {
     expect(second).not.toContain("Current state changed since your last turn");
     // The live tool inventory is not pushed STATE: it leads every envelope,
     // including one that pushes nothing, and the body follows it directly.
-    expect(second.startsWith("Attached now: MCP none; skills none")).toBe(true);
+    expect(second.startsWith("Attaching this turn: MCP none; skills none")).toBe(true);
     expect(second.slice(second.indexOf("\n") + 1).trimStart()).toMatch(
       /^Handle the user's Telegram message/u,
     );
@@ -11545,7 +11545,9 @@ describe("Operator push envelope (package 2.1)", () => {
     telegram.push(message(1, "какая столица Франции?"));
     await waitFor(() => directEnvelopes(runtime).length >= 1);
     const envelope = directEnvelopes(runtime).at(-1)!;
-    expect(envelope).toContain("Attached now: MCP higgsfield, vault; skills invoices, smeta");
+    expect(envelope).toContain(
+      "Attaching this turn: MCP higgsfield, vault; skills invoices, smeta (not listed = not there; a failing call means that server did not start)",
+    );
     expect(envelope).not.toContain("broken");
 
     // A settings file the ownership gate refuses takes the paid servers with
@@ -11554,7 +11556,7 @@ describe("Operator push envelope (package 2.1)", () => {
     telegram.push(message(2, "а столица Италии?"));
     await waitFor(() => directEnvelopes(runtime).length >= 2);
     expect(directEnvelopes(runtime).at(-1)!).toContain(
-      "Attached now: MCP none; skills invoices, smeta",
+      "Attaching this turn: MCP none; skills invoices, smeta",
     );
 
     telegram.finish();

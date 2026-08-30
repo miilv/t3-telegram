@@ -810,8 +810,12 @@ describe("persona rules (memory-design §2.1)", () => {
     expect(prompt).toContain("longer than ~2 minutes");
     expect(prompt).toContain("answer immediately that it is running");
     // The envelope's inventory line is named verbatim, so the two cannot drift.
-    expect(prompt).toContain('The "Attached now" line');
-    expect(prompt).toContain("never from memory notes");
+    expect(prompt).toContain('The "Attaching this turn" line');
+    // Both halves of the asymmetry, so a rewrite cannot quietly drop one: an
+    // absent name is a fact, a present one is an intent the tool call verifies.
+    expect(prompt).toContain("a name ABSENT from it is a hard fact");
+    expect(prompt).toContain("that server did not come up");
+    expect(prompt).toContain("never take tool availability from memory notes");
   });
 
   it("does not repeat itself in the policy prose it was split from (review No.2)", () => {
