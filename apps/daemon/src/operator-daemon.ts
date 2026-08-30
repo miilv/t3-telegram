@@ -4459,7 +4459,18 @@ export class OperatorDaemon {
     // reader has to know means "no queue", and `readOwnerQueue` is not the only
     // thing that will ever look at this key.
     if (!remaining.length) this.store.deleteRuntimeState(issued.stateKey);
-    else this.store.setRuntimeState(issued.stateKey, JSON.stringify({ messages: remaining }));
+    // The acknowledgement mark rides along with the remainder, exactly as it
+    // does through a write-off: what is left is the SAME wait continuing, and
+    // dropping the mark here would re-apologise on every message of a long
+    // backlog — one line per queue turning into one line per turn.
+    else
+      this.store.setRuntimeState(
+        issued.stateKey,
+        JSON.stringify({
+          messages: remaining,
+          ...(current.ackedAt ? { ackedAt: current.ackedAt } : {}),
+        }),
+      );
   }
 
   /**
@@ -4486,7 +4497,16 @@ export class OperatorDaemon {
     );
     if (remaining.length === queue.messages.length) return;
     if (!remaining.length) this.store.deleteRuntimeState(stateKey);
-    else this.store.setRuntimeState(stateKey, JSON.stringify({ messages: remaining }));
+    // Same as `clearIssuedOwnerQueue`: the mark belongs to the queue, and the
+    // part of it that survives this delivery has already been apologised for.
+    else
+      this.store.setRuntimeState(
+        stateKey,
+        JSON.stringify({
+          messages: remaining,
+          ...(queue.ackedAt ? { ackedAt: queue.ackedAt } : {}),
+        }),
+      );
     this.store.appendEvent("operator.queue.already_delivered", {
       correlationId: correlationForUpdate(update),
       payload: {

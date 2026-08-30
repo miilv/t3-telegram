@@ -7643,6 +7643,85 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   }, 40_000);
 
+  /**
+   * "Once per queue" survives the delivery that only spends PART of the queue.
+   *
+   * A turn clears exactly what it carried; whatever queued while it ran stays
+   * behind, and that remainder is the SAME wait continuing. The acknowledgement
+   * mark used to be dropped in that rewrite (the write-off path kept it, this
+   * one did not), so on a backlog long enough to leave something behind the
+   * owner got a fresh «доделываю предыдущее» on every round of the queue.
+   */
+  it("keeps the acknowledgement mark on the part of the queue a turn leaves behind", async () => {
+    const home = tempDirectory("daemon-fifo-ack-carry-");
+    const store = tempStore();
+    const telegram = new FakeTelegram();
+    const secondsAgo = (seconds: number): number => Math.floor(Date.now() / 1000) - seconds;
+    const queued = (messageId: number, text: string) => ({
+      messageIds: [messageId],
+      artifactIds: [],
+      attachments: 0,
+      text,
+      date: secondsAgo(120),
+    });
+    // The mark of a wait that has already been apologised for, once.
+    const ackedAt = new Date(Date.now() - 5_000).toISOString();
+    const stateKey = "chat_queue:7:0:0:42";
+
+    let released!: () => void;
+    const held = new Promise<void>((resolve) => {
+      released = resolve;
+    });
+    let holding = false;
+    const runtime = new DelegatingRuntime(async (envelope) => {
+      if (!envelope.includes("что в итоге")) return "Ответил на остальное.";
+      // While THIS turn runs, a fourth message steps into the queue — the
+      // deferral appends to the record the turn is about to spend, mark and
+      // all, which is the state the rewrite below has to preserve.
+      store.setRuntimeState(
+        stateKey,
+        JSON.stringify({
+          messages: [queued(1, "посчитай смету"), queued(2, "и ещё про сроки"), queued(4, "и про материалы")],
+          ackedAt,
+        }),
+      );
+      holding = true;
+      await held;
+      return "Ответил по всем.";
+    });
+    const daemon = fifoDaemon({ home, store, runtime, telegram });
+    await daemon.initialize();
+    const run = daemon.run();
+
+    store.setRuntimeState(
+      stateKey,
+      JSON.stringify({ messages: [queued(1, "посчитай смету"), queued(2, "и ещё про сроки")], ackedAt }),
+    );
+    telegram.push(message(3, "что в итоге?"));
+    await waitFor(() => holding, 15_000);
+
+    // Two more arrive while the turn is held, so message 5 has something newer
+    // behind it and really does step aside when the lane frees up.
+    telegram.push({ ...message(5, "а по срокам?"), date: secondsAgo(120) });
+    telegram.push(message(6, "ну что там?"));
+    await waitFor(() => [5, 6].every((id) => pendingIngressMessageIds(store).includes(id)), 15_000);
+    released();
+
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Ответил на остальное."), 20_000);
+    // Messages 4 and 5 were owed an answer and got one: the remainder was
+    // carried, not lost, by the rewrite that kept the mark.
+    expect(runtime.prompts.find((prompt) => prompt.includes("ну что там"))).toContain(
+      "the owner sent 2 more message(s)",
+    );
+    // …and it was still ONE wait, so message 5's deferral says nothing.
+    expect(telegram.alerts.filter((alert) => alert.text.includes("Доделываю предыдущее"))).toHaveLength(0);
+    expect(store.getRuntimeState(stateKey) || "").toBe("");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
   it("says nothing when the queued message has not been waiting (OPERATOR_PREEMPTION=off)", async () => {
     const home = tempDirectory("daemon-fifo-ack-quiet-");
     const store = tempStore();
