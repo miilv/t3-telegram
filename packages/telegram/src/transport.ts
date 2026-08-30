@@ -761,6 +761,23 @@ export class TelegramBotTransport implements TelegramTransport {
     }
   }
 
+  /**
+   * Take back a persistent reply keyboard the chat still shows.
+   *
+   * `remove_keyboard` only travels on a message, so this posts one. Plain
+   * text, no parse mode: the caller's one-liner has nothing to format and a
+   * cleanup must not be able to fail on markup.
+   */
+  async clearReplyKeyboard(chatId: number, text: string): Promise<SentMessage> {
+    const message = await this.outbound(chatId, () =>
+      this.bot.api.sendMessage(chatId, redactSecretsForOutput(text).slice(0, 4_000), {
+        reply_markup: { remove_keyboard: true },
+        link_preview_options: { is_disabled: true },
+      }),
+    );
+    return sentMessage(chatId, message.message_id, {});
+  }
+
   async answerCallback(callbackId: string, text?: string): Promise<void> {
     const safeText = text ? redactSecretsForOutput(text) : undefined;
     await this.outbound(0, () =>

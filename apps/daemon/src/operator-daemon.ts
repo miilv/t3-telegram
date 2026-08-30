@@ -542,6 +542,12 @@ const OWNER_LAST_MESSAGE_KEY = "owner_last_message_at";
 /** Package 2.1: the persistent diff baseline of §1 (session, epoch, hashes). */
 const PUSH_BASELINE_KEY = "memory_push_baseline";
 /**
+ * Marks the one-off removal of a previous bot's persistent reply keyboard.
+ * Written only when the removal really left, so a start that could not reach
+ * Telegram tries again — and a start after a successful one never does.
+ */
+const LEGACY_KEYBOARD_CLEARED_KEY = "legacy_keyboard_cleared";
+/**
  * The in-the-moment check (memory-design §2.4.2), in `runtime_state` so it
  * survives a restart: the turn that mutated without recording anything, and how
  * many reminders have gone out back-to-back.
@@ -1031,6 +1037,9 @@ export class OperatorDaemon {
       this.logger.warn({ err: error }, "Telegram command menu publication failed");
     });
     await this.flushTelegramOutbox();
+    // After the outbox flush on purpose: a boot that owes the owner a crash
+    // notice must not spend its first Telegram round trip on cosmetics.
+    await this.clearLegacyReplyKeyboard();
     await this.drainT3Dispatches();
     // Package 1.2: a crash mid-sentence must not leave a terminal marked "being
     // interpreted" forever — that marker is exactly what holds the degraded
@@ -1229,6 +1238,41 @@ export class OperatorDaemon {
       );
     }
     return resolved;
+  }
+
+  /**
+   * The previous bot's persistent keyboard, taken back once.
+   *
+   * A reply keyboard («🆕 Новый чат» and friends) lives in the CLIENT, not in
+   * a message and not in the bot that installed it: the old bot can be gone
+   * for good and the buttons stay under the owner's input field, sending text
+   * this daemon has never heard of. `remove_keyboard` is the only way back,
+   * and it only travels on a message — so this is a one-off, marked in
+   * `runtime_state` rather than repeated at every restart. Best effort: a chat
+   * that cannot be reached at boot is not worth failing a boot for, and the
+   * marker is written only when the removal actually left.
+   */
+  private async clearLegacyReplyKeyboard(): Promise<void> {
+    if (this.store.getRuntimeState(LEGACY_KEYBOARD_CLEARED_KEY)) return;
+    const ownerChatId = this.ownerChatId();
+    // Nothing to clean yet: a box that has never seen the owner has no chat to
+    // send into, and the next start (after their first message) will do it.
+    if (ownerChatId === undefined) return;
+    try {
+      await this.telegram.clearReplyKeyboard(
+        ownerChatId,
+        "Убрал старую клавиатуру предыдущего бота — команды теперь в меню.",
+      );
+      this.store.setRuntimeState(LEGACY_KEYBOARD_CLEARED_KEY, nowIso());
+      this.store.appendEvent("telegram.legacy_keyboard.cleared", {
+        payload: { chat: hashChatId(ownerChatId) },
+      });
+    } catch (error) {
+      this.logger.warn(
+        { errorCode: classifyOperationalError(error, "telegram").code },
+        "Legacy reply keyboard cleanup did not get through; it will be tried again on the next start",
+      );
+    }
   }
 
   private reportUncleanRestart(recoveredCount: number): void {

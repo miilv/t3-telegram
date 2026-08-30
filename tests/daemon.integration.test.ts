@@ -4629,6 +4629,49 @@ describe("OperatorDaemon product flow", () => {
     expect(telegram.sent.some((entry) => entry.text.includes("могла не дойти"))).toBe(false);
   });
 
+  /**
+   * The previous bot left a persistent reply keyboard («🆕 Новый чат») in the
+   * client. It belongs to no message and to no bot, so only an explicit
+   * `remove_keyboard` takes it back — once, not at every restart.
+   */
+  it("takes back a legacy reply keyboard exactly once across restarts", async () => {
+    const home = tempDirectory("daemon-legacy-keyboard-");
+    const databasePath = `${home}/operator.db`;
+    const logger = pino({ enabled: false });
+    const seed = new OperatorStore(databasePath);
+    seed.migrate();
+    seed.setRuntimeState("owner_chat_id", "7");
+    seed.close();
+
+    const telegram = new FakeTelegram();
+    const broker = new FakeBroker();
+    const startOnce = async () => {
+      const store = new OperatorStore(databasePath);
+      const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+      const runtime = new FakeRuntime();
+      let daemon: OperatorDaemon;
+      const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+      daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger);
+      await daemon.initialize();
+      await daemon.stop();
+    };
+
+    // The first boot cannot reach Telegram: nothing was removed, so nothing is
+    // marked, and the next boot has to try again.
+    telegram.replyKeyboardClearFailures = 1;
+    await startOnce();
+    expect(telegram.replyKeyboardClears).toHaveLength(0);
+
+    await startOnce();
+    expect(telegram.replyKeyboardClears).toHaveLength(1);
+    expect(telegram.replyKeyboardClears[0]?.chatId).toBe(7);
+
+    // …and never again.
+    await startOnce();
+    await startOnce();
+    expect(telegram.replyKeyboardClears).toHaveLength(1);
+  });
+
   it("tells the owner once after ten failed delivery attempts and keeps retrying forever (package 0.7)", async () => {
     const home = tempDirectory("daemon-stalled-delivery-");
     const store = tempStore();
@@ -13136,6 +13179,10 @@ class FakeTelegram implements TelegramTransport {
   }> = [];
   readonly userInputEdits: Array<{ messageId: number; questionIndex: number; text: string; labels: string[] }> = [];
   readonly keyboardClears: number[] = [];
+  /** Reply-keyboard removals: the legacy-cleanup message sent per chat. */
+  readonly replyKeyboardClears: Array<{ chatId: number; text: string }> = [];
+  /** When set, the next reply-keyboard removal fails (Telegram unreachable at boot). */
+  replyKeyboardClearFailures = 0;
   readonly approvals: Array<{ messageId: number; text: string; approvalId: string }> = [];
   readonly sentDocuments: Array<{ path: string; caption?: string }> = [];
   /** Drafts dropped because their turn was superseded (package 1.1). */
@@ -13205,6 +13252,14 @@ class FakeTelegram implements TelegramTransport {
     const sent = [{ chatId: 7, messageId }];
     progress?.onChunkSent?.(1, sent);
     return sent;
+  }
+  async clearReplyKeyboard(chatId: number, text: string): Promise<SentMessage> {
+    if (this.replyKeyboardClearFailures > 0) {
+      this.replyKeyboardClearFailures -= 1;
+      throw new Error("telegram unreachable");
+    }
+    this.replyKeyboardClears.push({ chatId, text });
+    return { chatId, messageId: this.nextMessageId++ };
   }
   async sendDashboardCapability(chatId: number, url: string): Promise<SentMessage> {
     if (this.dashboardCapabilityFailures > 0) {

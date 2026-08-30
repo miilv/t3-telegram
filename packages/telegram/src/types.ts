@@ -406,6 +406,15 @@ export interface TelegramTransport {
   ): Promise<SentMessage>;
   editRich(chatId: number, messageId: number, text: string, options?: TelegramDestination): Promise<void>;
   clearInlineKeyboard(chatId: number, messageId: number): Promise<void>;
+  /**
+   * Drop a PERSISTENT reply keyboard from the chat.
+   *
+   * Unlike an inline keyboard, a reply keyboard belongs to the client, not to
+   * a message: it survives the bot that installed it, and the only way to take
+   * it back is to send a message carrying `remove_keyboard`. Hence the text
+   * argument — there is no silent form of this call.
+   */
+  clearReplyKeyboard(chatId: number, text: string): Promise<SentMessage>;
   answerCallback(callbackId: string, text?: string): Promise<void>;
   downloadFile(fileId: string): Promise<Uint8Array>;
   /**
