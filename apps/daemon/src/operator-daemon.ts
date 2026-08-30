@@ -450,6 +450,13 @@ const STALLED_DELIVERY_ATTEMPTS = 10;
 /** At most one delivery alert per chat per minute, whatever produced it. */
 const DELIVERY_ALERT_THROTTLE_MS = 60_000;
 /**
+ * How many times the «могла не дойти» line is re-offered before it is given up
+ * on. Past this the recipient is not reachable at all, and an unbounded retry
+ * would keep one dead chat in the pump forever.
+ */
+const UNCERTAIN_NOTICE_MAX_ATTEMPTS = 5;
+const UNCERTAIN_CHUNK_NOTICE = "⚠️ Предыдущая отправка могла не дойти — скажи, если не видел ответа.";
+/**
  * Package 1.5: how often the watchdog looks. Both deadlines it enforces are
  * measured in tens of seconds at least, so this only bounds the slop.
  */
@@ -859,6 +866,23 @@ export class OperatorDaemon {
   private readonly deliveryAlertSentAt = new Map<number, number>();
   /** Recipients with an alert in flight, so a fire-and-forget send is never launched twice. */
   private readonly deliveryAlertsInFlight = new Set<number>();
+  /**
+   * Uncertain-chunk notices that have not got through yet, keyed by outbox id.
+   *
+   * The loud half of at-most-once: if this line is dropped the owner is never
+   * told that an answer may be missing, which is the one thing that makes the
+   * trade-off honest. So a failed attempt is kept and re-offered by the
+   * reliability pump on the same throttle as a delivery alert, and never
+   * through the outbox — the notice would then queue behind the very jam it is
+   * about. In memory, like the alert throttles: a process that dies again
+   * loses it, and the event stream is what remains of the attempt.
+   */
+  private readonly uncertainNoticeRetries = new Map<
+    string,
+    { chatId: number; destination: TelegramDestination; lastAttemptAt: number; attempts: number }
+  >();
+  /** Outbox ids with an uncertain-chunk notice in flight (same guard as the alerts). */
+  private readonly uncertainNoticesInFlight = new Set<string>();
   private readonly monitorTasks = new Set<Promise<void>>();
   /**
    * Package 4.1 — the two indicator cadences, in one place.
@@ -8558,6 +8582,7 @@ export class OperatorDaemon {
         this.requeueUncertainTelegramOutbox();
         await this.flushTelegramOutbox();
         this.warnBlockedTelegramOutboxHeads();
+        this.retryUncertainChunkNotices();
         await this.drainT3Dispatches();
         this.voice.sweepFallbacks();
         this.queueThreadEventDrain();
@@ -9242,6 +9267,14 @@ export class OperatorDaemon {
    * delivered without proof, so if it never arrived they have to be able to
    * say so. Out of band, like every other delivery notice — routed through the
    * outbox it would queue behind the very item it is about.
+   *
+   * Review finding: this used to be fire-and-forget, and a `sendAlert` that
+   * answered `undefined` was thrown away. That is the whole trade-off failing
+   * silently — the duplicate is prevented AND the owner is never told, leaving
+   * a missing answer nobody knows about. The moment it is most likely to
+   * happen is a boot after a crash, which is exactly when the network is
+   * worst. So a failed attempt is recorded and re-offered, on the same
+   * throttle-and-retry mechanic the delivery alerts use.
    */
   private noticeUncertainChunk(
     item: TelegramOutboxItem<DurableTelegramPayload>,
@@ -9259,18 +9292,73 @@ export class OperatorDaemon {
               : {}),
           }
         : {};
+    this.uncertainNoticeRetries.set(item.id, {
+      chatId: target,
+      destination,
+      lastAttemptAt: 0,
+      attempts: 0,
+    });
+    this.sendUncertainChunkNotice(item.id);
+  }
+
+  /**
+   * One attempt at the «могла не дойти» line. The entry survives the attempt
+   * and is only removed when Telegram really took the message — or when the
+   * recipient has refused it {@link UNCERTAIN_NOTICE_MAX_ATTEMPTS} times, which
+   * is a chat the daemon cannot reach at all.
+   */
+  private sendUncertainChunkNotice(outboxId: string): void {
+    const entry = this.uncertainNoticeRetries.get(outboxId);
+    if (!entry) return;
+    if (this.uncertainNoticesInFlight.has(outboxId)) return;
+    // Spent on the attempt, not on its success — same rule as the alerts.
+    entry.lastAttemptAt = Date.now();
+    entry.attempts += 1;
+    this.uncertainNoticesInFlight.add(outboxId);
     const task = this.telegram
-      .sendAlert(
-        target,
-        "⚠️ Предыдущая отправка могла не дойти — скажи, если не видел ответа.",
-        destination,
-      )
+      .sendAlert(entry.chatId, UNCERTAIN_CHUNK_NOTICE, entry.destination)
+      .then((sent) => {
+        if (sent) {
+          this.uncertainNoticeRetries.delete(outboxId);
+          return;
+        }
+        this.dropUncertainChunkNotice(outboxId, "not_delivered");
+      })
       .catch((error: unknown) => {
-        this.logger.warn({ err: error, outboxId: item.id }, "Uncertain-chunk notice failed");
+        this.dropUncertainChunkNotice(outboxId, classifyOperationalError(error).code, error);
+      })
+      .finally(() => {
+        this.uncertainNoticesInFlight.delete(outboxId);
       })
       .then(() => undefined);
     this.monitorTasks.add(task);
     void task.finally(() => this.monitorTasks.delete(task));
+  }
+
+  /** A notice attempt that did not land: said out loud, and queued for one more go. */
+  private dropUncertainChunkNotice(outboxId: string, reason: string, error?: unknown): void {
+    const entry = this.uncertainNoticeRetries.get(outboxId);
+    const attempts = entry?.attempts ?? 0;
+    const givingUp = attempts >= UNCERTAIN_NOTICE_MAX_ATTEMPTS;
+    if (givingUp) this.uncertainNoticeRetries.delete(outboxId);
+    this.store.appendEvent("operator.delivery.uncertain_notice_dropped", {
+      correlationId: outboxId,
+      payload: { outboxId, reason, attempts, givingUp },
+    });
+    this.logger.warn(
+      { ...(error ? { err: error } : {}), outboxId, reason, attempts },
+      givingUp
+        ? "Uncertain-chunk notice could not be delivered; giving up — the owner was never told the answer may be missing"
+        : "Uncertain-chunk notice did not get through; it will be offered again after the throttle window",
+    );
+  }
+
+  /** The pump's half of the retry: re-offer every notice past its throttle window. */
+  private retryUncertainChunkNotices(): void {
+    for (const [outboxId, entry] of this.uncertainNoticeRetries) {
+      if (Date.now() - entry.lastAttemptAt < this.deliveryAlertThrottleMs) continue;
+      this.sendUncertainChunkNotice(outboxId);
+    }
   }
 
   private recordDurableOutgoing(messages: SentMessage[], payload: DurableTelegramPayload): void {

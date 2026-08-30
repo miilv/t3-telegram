@@ -4630,6 +4630,96 @@ describe("OperatorDaemon product flow", () => {
   });
 
   /**
+   * The loud half of at-most-once, when the loud half itself does not get
+   * through. The notice used to be fire-and-forget: a `sendAlert` that answered
+   * `undefined` was dropped on the floor, so the duplicate was prevented AND
+   * the owner was never told an answer might be missing — and the moment it is
+   * most likely to happen is a boot after a crash, exactly when the network is
+   * worst. It is now recorded and re-offered on the delivery-alert mechanic,
+   * still outside the outbox.
+   */
+  it("re-offers the «могла не дойти» notice when the first attempt is dropped", async () => {
+    const home = tempDirectory("daemon-chunk-notice-retry-");
+    const databasePath = `${home}/operator.db`;
+    const logger = pino({ enabled: false });
+    const payload = {
+      text: "Смета посчитана: 412 000 ₽.",
+      options: { replyToMessageId: 11 },
+      messageType: "operator_answer",
+    };
+
+    const seed = new OperatorStore(databasePath);
+    seed.migrate();
+    seed.setRuntimeState("owner_chat_id", "7");
+    const item = seed.enqueueTelegramOutbox({
+      dedupeKey: "telegram:operator:crashed-turn:final",
+      chatId: 7,
+      operation: "rich",
+      payload,
+    });
+    expect(seed.claimNextTelegramOutbox()?.id).toBe(item.id);
+    seed.updateTelegramOutboxPayload(item.id, { ...payload, pendingChunkIndex: 0 });
+    seed.close();
+
+    const store = new OperatorStore(databasePath);
+    const telegram = new FakeTelegram();
+    telegram.dropAlerts = true;
+    const broker = new FakeBroker();
+    const runtime = new FakeRuntime();
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    // A short throttle window keeps the retry observable inside a test.
+    daemon = new OperatorDaemon(
+      config(home),
+      store,
+      runtime,
+      broker,
+      telegram,
+      artifacts,
+      scheduler,
+      logger,
+      undefined,
+      undefined,
+      undefined,
+      100,
+    );
+    await daemon.initialize();
+    const run = daemon.run();
+
+    const notices = (): number =>
+      telegram.alerts.filter((alert) => alert.text.includes("могла не дойти")).length;
+    await waitFor(() => notices() > 0, 15_000);
+    // The line never left Telegram — and that is said out loud rather than
+    // swallowed, because the owner is now the only one who can notice the loss.
+    await waitFor(
+      () =>
+        (
+          store.db
+            .prepare(
+              "SELECT count(*) AS count FROM daemon_events WHERE event_type='operator.delivery.uncertain_notice_dropped'",
+            )
+            .get() as { count: number }
+        ).count > 0,
+      15_000,
+    );
+
+    telegram.dropAlerts = false;
+    await waitFor(() => notices() > 1, 15_000);
+    const landed = notices();
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+
+    // Once it lands the entry is spent: no third copy of the same warning.
+    expect(notices()).toBe(landed);
+    // Still out of band — the notice must never queue behind the very item it
+    // is about.
+    expect(telegram.sent.some((entry) => entry.text.includes("могла не дойти"))).toBe(false);
+  }, 60_000);
+
+  /**
    * The previous bot left a persistent reply keyboard («🆕 Новый чат») in the
    * client. It belongs to no message and to no bot, so only an explicit
    * `remove_keyboard` takes it back — once, not at every restart.
