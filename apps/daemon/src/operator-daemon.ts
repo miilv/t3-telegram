@@ -5809,9 +5809,14 @@ export class OperatorDaemon {
     // `undefined` — no identity travelled; fall back to the counter.
     const own = identified === undefined && pending > 0;
     if (own) releaseOwnDispatchPending(this.store, threadId);
+    // The notice below is for the TRANSITION into external hands. While the
+    // owner keeps replying directly in T3, every reply is a fresh turn id —
+    // repeating «не дублирую в чат» after each one is noise, not information.
+    const alreadyExternal = this.isExternalTurn(threadId);
     this.store.setRuntimeState(`thread_turn_external:${threadId}`, own ? "" : "1");
     if (own) return;
     this.store.appendEvent("worker.external_turn", { threadId, payload: { turnId } });
+    if (alreadyExternal) return;
     this.enqueueTelegramOutbox(`telegram:external:${threadId}:${turnId}`, chatId, "rich", {
       text: `**${escapeMarkdownText(this.store.getThread(threadId)?.title ?? threadId)}** — тред продолжили напрямую в T3. Шаги и результат этого turn не дублирую в чат.`,
       options: destination,

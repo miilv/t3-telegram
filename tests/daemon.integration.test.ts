@@ -6384,6 +6384,55 @@ describe("OperatorDaemon product flow", () => {
   }, 20_000);
 
 
+  it("announces a thread taken into T3 once, not after the owner's every direct reply", async () => {
+    const home = tempDirectory("daemon-external-once-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    // The owner keeps replying in the T3 web UI: every reply is a fresh turn
+    // id on the same thread. The transition into external hands is announced
+    // once; repeating «не дублирую в чат» after each reply is noise.
+    class ChattyExternalBroker extends FakeBroker {
+      override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+        this.subscriptions.push(threadId);
+        for (const turnId of ["turn_ext_1", "turn_ext_2", "turn_ext_3"]) {
+          yield { type: "started", threadId, turnId, commandId: `cmd_owner_${turnId}` };
+          await Promise.resolve();
+        }
+      }
+    }
+    const broker = new ChattyExternalBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь race condition в auth"));
+    // All three external turns must have been observed before we count.
+    await waitFor(() => store.getRuntimeState("thread_seen_turn:th_1") === "turn_ext_3", 10_000);
+    await waitFor(() =>
+      telegram.sent.some((sent) => sent.text.includes("тред продолжили напрямую в T3")),
+    );
+    expect(
+      telegram.sent.filter((sent) => sent.text.includes("тред продолжили напрямую в T3")),
+    ).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 20_000);
+
   it("keeps the worker's narrative when a foreign turn starts first (package 1.5, deferred 1.2 issue)", async () => {
     const home = tempDirectory("daemon-turn-identity-");
     const store = tempStore();
