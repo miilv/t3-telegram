@@ -7541,6 +7541,89 @@ describe("OperatorDaemon product flow", () => {
    * but not what it asked. In this mode the message goes back in the queue, and
    * the two records stop describing the same message twice.
    */
+  /**
+   * FIFO's missing courtesy. Stepping aside is durable and correct, and
+   * completely invisible: the chat shows nothing while the turn ahead grinds
+   * on. One line, out of band, once per queue — not once per message, or an
+   * owner who writes five times gets five apologies for one wait.
+   */
+  it("acknowledges a long wait once per queue, outside the outbox (OPERATOR_PREEMPTION=off)", async () => {
+    const home = tempDirectory("daemon-fifo-ack-");
+    const store = tempStore();
+    const ocr = heldOcr();
+    const runtime = new DelegatingRuntime(async (envelope) =>
+      envelope.includes("что в итоге") ? "Ответил по всем." : "Париж.",
+    );
+    const telegram = new FakeTelegram();
+    const daemon = fifoDaemon({ home, store, runtime, telegram, media: ocr.media });
+    await daemon.initialize();
+    const run = daemon.run();
+
+    // Both queued messages were sent well over the threshold ago: by the time
+    // they step aside the owner has been waiting, whatever the daemon's own
+    // bookkeeping says about which turn is currently in the slot.
+    const secondsAgo = (seconds: number): number => Math.floor(Date.now() / 1000) - seconds;
+    telegram.push({
+      ...captionedPhotoMessage(1, "посчитай смету по этому чертежу"),
+      date: secondsAgo(120),
+    });
+    await waitFor(() => ocr.calls === 1);
+    telegram.push({ ...message(2, "и ещё вопрос про сроки"), date: secondsAgo(90) });
+    telegram.push(message(3, "что в итоге?"));
+    await waitFor(() => [2, 3].every((id) => pendingIngressMessageIds(store).includes(id)));
+    ocr.release();
+
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Ответил по всем."), 20_000);
+    const envelope = runtime.prompts.find((prompt) => prompt.includes("что в итоге"))!;
+    // Both older messages really did queue — the acknowledgement is about a
+    // wait that happened, not a hypothetical one.
+    expect(envelope).toContain("the owner sent 2 more message(s)");
+
+    const acks = telegram.alerts.filter((alert) => alert.text.includes("Доделываю предыдущее"));
+    expect(acks).toHaveLength(1);
+    expect(acks[0]?.chatId).toBe(7);
+    // Out of band: the outbox is exactly what a jam blocks, so an
+    // acknowledgement routed through it would queue behind the jam it reports.
+    expect(telegram.sent.some((sent) => sent.text.includes("Доделываю предыдущее"))).toBe(false);
+    // One answer, and the queue is spent with its mark.
+    expect(telegram.sent.filter((sent) => sent.text === "Ответил по всем.")).toHaveLength(1);
+    expect(store.getRuntimeState("chat_queue:7:0:0:42") || "").toBe("");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
+  it("says nothing when the queued message has not been waiting (OPERATOR_PREEMPTION=off)", async () => {
+    const home = tempDirectory("daemon-fifo-ack-quiet-");
+    const store = tempStore();
+    const ocr = heldOcr();
+    const runtime = new DelegatingRuntime(async (envelope) =>
+      envelope.includes("что в итоге") ? "Ответил по всем." : "Париж.",
+    );
+    const telegram = new FakeTelegram();
+    const daemon = fifoDaemon({ home, store, runtime, telegram, media: ocr.media });
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(captionedPhotoMessage(1, "посчитай смету по этому чертежу"));
+    await waitFor(() => ocr.calls === 1);
+    telegram.push(message(3, "что в итоге?"));
+    await waitFor(() => pendingIngressMessageIds(store).includes(3));
+    ocr.release();
+
+    await waitFor(() => telegram.sent.some((sent) => sent.text === "Ответил по всем."), 20_000);
+    expect(runtime.prompts.find((prompt) => prompt.includes("что в итоге"))).toContain(
+      "the owner sent 1 more message(s)",
+    );
+    // The answer was seconds away; a heads-up would have landed under it.
+    expect(telegram.alerts.filter((alert) => alert.text.includes("Доделываю предыдущее"))).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
   it("keeps a written-off message's text in the queue and answers it (OPERATOR_PREEMPTION=off)", async () => {
     const home = tempDirectory("daemon-fifo-writeoff-");
     const store = tempStore();

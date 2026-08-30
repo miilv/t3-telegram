@@ -606,6 +606,12 @@ const ZOMBIE_NOTICE_THROTTLE_MS = 60_000;
  */
 const OWNER_QUEUE_MAX = 20;
 /**
+ * OPERATOR_PREEMPTION=off — how long the turn ahead must already have been
+ * running before a message stepping into the queue is worth acknowledging.
+ * Below it the answer is about to arrive and the heads-up would land under it.
+ */
+const OWNER_QUEUE_ACK_AFTER_MS = 30_000;
+/**
  * OPERATOR_PREEMPTION=off — how many BYTES of queued message text one envelope
  * will carry, on top of the depth cap above.
  *
@@ -646,13 +652,17 @@ interface ActiveOperatorTurn {
   /**
    * Package 1.5 — watchdog bookkeeping.
    *
-   * `lastEventAt` is the last sign of life of the provider call: a streamed
+   * `startedAt` is when the turn was admitted (before the media pipeline, not
+   * at the provider call) — the clock the owner is actually waiting on, and
+   * the one an "I am still on the previous message" acknowledgement is owed
+   * to. `lastEventAt` is the last sign of life of the provider call: a streamed
    * token or a tool step. `interruptedAt` is when this turn was told to stop
    * (by preemption or by the watchdog) — the grace window is measured from it,
    * and when the grace expires with the turn still running it is declared a
    * zombie: `abandon()` releases the queue slot, and everything the turn does
    * afterwards is inert.
    */
+  startedAt: number;
   lastEventAt: number;
   /**
    * Package 1.5/3.3: `false` only for a digest interpretation — the owner's
@@ -749,6 +759,15 @@ interface QueuedOwnerMessage {
 interface OwnerMessageQueue {
   messages: QueuedOwnerMessage[];
   stateKey: string;
+  /**
+   * When this queue's «⏳ доделываю предыдущее» acknowledgement was sent.
+   *
+   * On the QUEUE, not on a message: the owner is waiting for one turn, and one
+   * line is what that costs. Somebody who writes five more times gets the same
+   * single «отвечу следом», and the mark dies with the queue that earned it —
+   * so a NEW jam, later, is acknowledged again.
+   */
+  ackedAt?: string;
   /**
    * Review finding М5: the turn's OWN batch, when a replay found its own defer
    * record still in the queue. It is never an envelope block — it is the "User
@@ -1726,6 +1745,7 @@ export class OperatorDaemon {
         ingressJobId: telegramIngressJobId(update),
         superseded: false,
         preemptable: appTurn,
+        startedAt: Date.now(),
         lastEventAt: Date.now(),
       };
       this.activeOperatorTurns.add(systemTurn);
@@ -2152,6 +2172,7 @@ export class OperatorDaemon {
       superseded: false,
       // Package 1.5: the clock starts here, not at the provider call — the
       // media pipeline ahead of it is part of the turn the owner is waiting on.
+      startedAt: Date.now(),
       lastEventAt: Date.now(),
     };
     this.activeOperatorTurns.add(turnOrigin);
@@ -3793,7 +3814,11 @@ export class OperatorDaemon {
       ...queued.messages.filter((message) => batchKey(message.messageIds) !== key),
       entry,
     ];
-    this.store.setRuntimeState(stateKey, JSON.stringify({ messages }));
+    const ackedAt = queued.ackedAt ?? this.acknowledgeOwnerQueueWait(update);
+    this.store.setRuntimeState(
+      stateKey,
+      JSON.stringify({ messages, ...(ackedAt ? { ackedAt } : {}) }),
+    );
     metrics.increment("operator_messages_queued_total");
     this.store.appendEvent("operator.turn.queued", {
       correlationId: correlationForUpdate(update),
@@ -3808,6 +3833,64 @@ export class OperatorDaemon {
       "Owner message queued behind a newer one (OPERATOR_PREEMPTION=off)",
     );
     return true;
+  }
+
+  /**
+   * FIFO's missing half-second of courtesy.
+   *
+   * Stepping aside is invisible: the message is durably queued and will be
+   * answered, but the chat shows nothing at all while the turn ahead grinds
+   * on — and a wait that has already passed half a minute is one the owner has
+   * started to wonder about. So say it, ONCE per queue, and only when the wait
+   * is real: below the threshold the answer is about to arrive anyway and a
+   * heads-up would land under it.
+   *
+   * The wait is measured from TELEGRAM's clock on the message being queued,
+   * not only from a turn the daemon happens to be running. In FIFO the two
+   * come apart: a message that spent twelve minutes as a pending ingress job
+   * behind a long turn reaches this point after that turn has already ended,
+   * and the owner's silence is no shorter for it. A turn genuinely still
+   * running is the other half of the same question, so both count.
+   *
+   * Out of band on purpose (`sendAlert`, not the outbox): the acknowledgement
+   * for a jam must not queue behind the jam. Fire-and-forget, and the attempt
+   * spends the mark whether or not it lands — the alternative is retrying a
+   * courtesy line on every message of a burst.
+   *
+   * Returns the instant to record on the queue, or undefined when nothing was
+   * said.
+   */
+  private acknowledgeOwnerQueueWait(
+    update: Extract<TelegramInbound, { type: "message" }>,
+  ): string | undefined {
+    const conversationKey = this.conversationKey(update);
+    const now = Date.now();
+    const waitedMs = update.date ? now - update.date * 1_000 : 0;
+    const turnRunningMs = Math.max(
+      0,
+      ...[...this.activeOperatorTurns]
+        .filter((turn) => turn.conversationKey === conversationKey && !turn.superseded)
+        .map((turn) => now - turn.startedAt),
+    );
+    if (Math.max(waitedMs, turnRunningMs) < OWNER_QUEUE_ACK_AFTER_MS) return undefined;
+    const task = this.telegram
+      .sendAlert(
+        update.chatId,
+        "⏳ Доделываю предыдущее — отвечу следом.",
+        destinationOfUpdate(update),
+      )
+      .catch((error: unknown) => {
+        this.logger.warn({ err: error }, "Owner queue acknowledgement failed");
+        return undefined;
+      })
+      .then(() => undefined);
+    this.monitorTasks.add(task);
+    void task.finally(() => this.monitorTasks.delete(task));
+    this.store.appendEvent("operator.queue.acknowledged", {
+      correlationId: correlationForUpdate(update),
+      payload: { messageIds: update.messageIds },
+    });
+    return nowIso();
   }
 
   /**
@@ -3880,7 +3963,12 @@ export class OperatorDaemon {
       ...queued.messages.filter((message) => batchKey(message.messageIds) !== key),
       entry,
     ];
-    this.store.setRuntimeState(stateKey, JSON.stringify({ messages }));
+    // The acknowledgement mark rides along: a written-off turn is the same
+    // wait continuing, not a new one to apologise for a second time.
+    this.store.setRuntimeState(
+      stateKey,
+      JSON.stringify({ messages, ...(queued.ackedAt ? { ackedAt: queued.ackedAt } : {}) }),
+    );
     metrics.increment("operator_messages_queued_total");
     this.store.appendEvent("operator.turn.queued", {
       correlationId: correlationForUpdate(update),
@@ -4061,7 +4149,11 @@ export class OperatorDaemon {
       // written: a job that came back from a retry backoff is appended last and
       // would otherwise be read to the model out of the order it was said in.
       messages.sort((left, right) => Math.max(...left.messageIds) - Math.max(...right.messageIds));
-      return { messages, stateKey };
+      return {
+        messages,
+        stateKey,
+        ...(typeof parsed.ackedAt === "string" ? { ackedAt: parsed.ackedAt } : {}),
+      };
     } catch {
       return { messages: [], stateKey };
     }
