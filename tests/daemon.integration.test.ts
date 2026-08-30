@@ -12315,6 +12315,7 @@ function config(home: string): Config {
       allowGroups: false,
       commandMenu: "full",
       pollTimeoutSeconds: 1,
+      batchWindowMs: 2_000,
       apiBase: "https://api.telegram.org",
       maxUploadBytes: 50 * 1024 * 1024,
       localFileRetentionMs: 24 * 60 * 60 * 1_000,

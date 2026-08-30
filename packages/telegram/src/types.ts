@@ -326,7 +326,7 @@ export interface TelegramTransport {
   updates(signal?: AbortSignal): AsyncIterable<TelegramInbound>;
   /**
    * Package 1.1: subscribe to accepted inbound messages. The observer fires as
-   * soon as an authorized message is accepted — before the 2 s batch window
+   * soon as an authorized message is accepted — before the batch window
    * closes and long before it becomes an update on `updates()` — so the daemon
    * can preempt the running Operator turn on the FIRST message of a burst while
    * the rest is still being glued into one job. One observer at a time;

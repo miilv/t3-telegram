@@ -2455,7 +2455,7 @@ export class OperatorDaemon {
    *  - every in-flight turn of that conversation is flagged and its provider
    *    call interrupted, which covers the turn already streaming.
    *
-   * It fires on the RAW message, before the 2 s batch window closes, so the
+   * It fires on the RAW message, before the batch window closes, so the
    * first message of a burst frees the turn slot while the rest of the burst is
    * still being glued into the one job that will replace it.
    *
@@ -2477,7 +2477,7 @@ export class OperatorDaemon {
     // anything, because the turn read the mark itself the moment it reached
     // `answerDirect`. In this mode that message joins the queue instead.
     //
-    // The 2 s batch window upstream is untouched: messages that arrived
+    // The batch window upstream is untouched: messages that arrived
     // together are still glued into one job, and gluing is not preemption.
     if (!this.preemptionEnabled) return;
     const key = this.conversationKey(signal);

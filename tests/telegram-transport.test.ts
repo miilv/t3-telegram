@@ -527,6 +527,71 @@ describe("grammY Telegram transport", () => {
     await consume;
   });
 
+  it("closes the inbound batch on the configured window, not on the built-in 2 s", async () => {
+    // OPERATOR_BATCH_WINDOW_MS: how long a pause has to be before it means
+    // "I am done talking" belongs to the person, not to the protocol. Rick
+    // writes in three short bursts, so his box runs a 5 s window — and with
+    // the hard-coded 2 s the two messages below would have been two turns.
+    vi.useFakeTimers();
+    let call = 0;
+    let releaseFinalPoll: (() => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const parsed = parseApiCall(input, init);
+        if (parsed.method === "getMe") return telegramResponse(getMeResult());
+        if (parsed.method !== "getUpdates") return telegramResponse(messageResult(1));
+        call += 1;
+        if (call === 1) return telegramResponse({ ok: true, result: [rawTextUpdate(1, 1)] });
+        if (call === 2) {
+          return new Promise<Response>((resolve) => {
+            setTimeout(
+              () => resolve(telegramResponse({ ok: true, result: [rawTextUpdate(2, 2)] })),
+              3_000,
+            );
+          });
+        }
+        // Nothing more arrives; the window alone decides when to flush. Held
+        // open so the poll can be released at teardown instead of hanging.
+        return new Promise<Response>((resolve) => {
+          releaseFinalPoll = () => resolve(telegramResponse({ ok: true, result: [] }));
+        });
+      }),
+    );
+    const transport = new TelegramBotTransport(
+      "test-token",
+      42,
+      1,
+      logger,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      5_000,
+    );
+    const controller = new AbortController();
+    const received: TelegramInbound[] = [];
+    const consume = (async () => {
+      for await (const update of transport.updates(controller.signal)) received.push(update);
+    })();
+
+    // Past the default window and well past it: the first message is still
+    // being held, which is the whole difference the setting buys.
+    await vi.advanceTimersByTimeAsync(2_600);
+    expect(received).toHaveLength(0);
+    // The second message lands at 3 s and re-arms the window to 8 s.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(received).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(received).toHaveLength(1);
+    expect((received[0] as TelegramMessageInbound).messageIds).toEqual([1, 2]);
+
+    controller.abort();
+    releaseFinalPoll?.();
+    await vi.advanceTimersByTimeAsync(100);
+    await consume;
+  });
+
   it("holds the getUpdates offset back until buffered messages are flushed to the consumer", async () => {
     vi.useFakeTimers();
     const offsets: Array<number | undefined> = [];

@@ -101,6 +101,7 @@ async function main(): Promise<void> {
     undefined,
     config.telegram.localFiles,
     config.telegram.maxUploadBytes,
+    config.telegram.batchWindowMs,
   );
   const media = new MediaProcessor(
     { ...config.media, maxUploadBytes: config.telegram.maxUploadBytes },

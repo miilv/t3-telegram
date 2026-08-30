@@ -58,7 +58,12 @@ const ALBUM_WINDOW_MS = 650;
  * 180 s budget — a few page round trips are enough.
  */
 const MAX_ALBUM_WAIT_MS = 5_000;
-/** Quiet period that closes an inbound batch when no more pages are pending. */
+/**
+ * Default quiet period that closes an inbound batch when no more pages are
+ * pending. Overridable per box (`OPERATOR_BATCH_WINDOW_MS`): how long a pause
+ * has to be before it means "I am done talking" is a property of the person,
+ * not of the protocol.
+ */
 const BATCH_WINDOW_MS = 2_000;
 /**
  * Package 4.1 review: the shortest gap between two chat actions for one
@@ -253,6 +258,7 @@ export class TelegramBotTransport implements TelegramTransport {
     private readonly fetchImpl: typeof fetch = globalThis.fetch,
     private readonly localFiles?: { serverRoot: string; hostRoot: string },
     private readonly maxUploadBytes: number = MAX_FILE_BYTES,
+    private readonly batchWindowMs: number = BATCH_WINDOW_MS,
   ) {
     this.bot = new Bot(token, {
       client: {
@@ -1118,7 +1124,7 @@ export class TelegramBotTransport implements TelegramTransport {
         return;
       }
       this.flushBatch(key);
-    }, Math.min(BATCH_WINDOW_MS, remainingMs));
+    }, Math.min(this.batchWindowMs, remainingMs));
     timer.unref();
     return timer;
   }

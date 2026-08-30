@@ -151,6 +151,17 @@ const envSchema = z.object({
   OPERATOR_HOME: z.string().min(1).default("~/.operator"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   TELEGRAM_POLL_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(50).default(30),
+  /**
+   * The quiet period that closes an inbound batch: everything the owner sends
+   * within it becomes ONE envelope instead of one turn per line.
+   *
+   * The default is the historical 2 s. It is configurable because the right
+   * value is a property of the person, not of the system — an owner who thinks
+   * in three short messages needs a wider window than one who writes in
+   * paragraphs, and the cost of getting it wrong is a turn spent answering half
+   * a thought. The 180 s ceiling on a batch that keeps re-arming is unchanged.
+   */
+  OPERATOR_BATCH_WINDOW_MS: z.coerce.number().int().min(0).max(60_000).default(2_000),
   // A local Bot API server (telegram-bot-api --local) lifts the cloud 20 MB
   // download cap. In that mode getFile returns an absolute path inside the
   // server's working directory instead of a URL path, so the daemon reads the
@@ -387,6 +398,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       allowGroups: parsed.TELEGRAM_ALLOW_GROUPS === "true",
       commandMenu: parsed.OPERATOR_MENU,
       pollTimeoutSeconds: parsed.TELEGRAM_POLL_TIMEOUT_SECONDS,
+      batchWindowMs: parsed.OPERATOR_BATCH_WINDOW_MS,
       apiBase: parsed.TELEGRAM_API_BASE.replace(/\/$/, ""),
       maxUploadBytes: parsed.TELEGRAM_MAX_UPLOAD_BYTES,
       localFileRetentionMs: parsed.TELEGRAM_LOCAL_FILE_RETENTION_HOURS * 60 * 60 * 1_000,

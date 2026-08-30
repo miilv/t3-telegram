@@ -30,6 +30,17 @@ describe("media configuration", () => {
     expect(config.approval).toMatchObject({ autoAllow: ["safe-read"], ttlHours: 6 });
   });
 
+  it("keeps the inbound batch window at its historical default and lets a box widen it", () => {
+    const base = {
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+    };
+    // Unset means exactly what shipped before the setting existed.
+    expect(loadConfig(base).telegram.batchWindowMs).toBe(2_000);
+    expect(loadConfig({ ...base, OPERATOR_BATCH_WINDOW_MS: "5000" }).telegram.batchWindowMs).toBe(5_000);
+  });
+
   it("carries the watchdog deadlines in milliseconds, defaults included (package 1.5)", () => {
     const base = {
       TELEGRAM_BOT_TOKEN: "test-token",
