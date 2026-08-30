@@ -401,8 +401,9 @@ interface DurableTelegramPayload {
    * an in-flight chunk survives what the confirmation cannot: a lost ACK, a
    * killed process. A retry that finds it treats the chunk as delivered
    * (at-most-once) — see {@link OperatorDaemon.sendDurableRich}. A send that
-   * came back with a DEFINITE error clears it on the spot: Telegram answering
-   * "no" is knowledge, and knowledge is worth more than the assumption.
+   * came BACK clears it on the spot, whatever it came back with: an answer,
+   * even an ambiguous one, is knowledge, and knowledge is worth more than the
+   * assumption. Only an outcome nobody ever learned leaves it standing.
    */
   pendingChunkIndex?: number;
   /** Set when an uncertain delivery was requeued once; a second failure goes dead (bug №2). */
