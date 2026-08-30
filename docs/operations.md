@@ -53,7 +53,23 @@ message, the work behind it (dialogue-flow §4).
   synthetic drain turn rather than waiting for the owner to write again. As with
   the neighbouring enums, an empty value fails validation at start-up — leave
   the variable out or give it one of `supersede|off`. Restart to apply. Full
-  mechanics: `docs/dialogue-flow.md` §4.
+  mechanics: `docs/dialogue-flow.md` §4. Under `off`, a message that steps into
+  the queue after the owner has already been waiting over 30 seconds draws one
+  «⏳ Доделываю предыдущее — отвечу следом» — once per queue, not per message,
+  and sent out of band so the acknowledgement cannot queue behind the jam it
+  reports.
+- `OPERATOR_BATCH_WINDOW_MS` (default `2000`) is the quiet period that closes an
+  inbound batch: everything the owner sends within it becomes one envelope
+  instead of one turn per line. The right value is a property of the person —
+  someone who thinks in three short messages needs a wider window (5000 is a
+  reasonable setting for that) than someone who writes in paragraphs. The 180 s
+  ceiling on a batch that keeps re-arming is unchanged. Restart to apply.
+- Every Operator envelope opens with one `Attached now: MCP …; skills …` line —
+  the extra MCP servers and curated skill directories the daemon is attaching to
+  *that* turn, read fresh through the same ownership gate the runtime uses. It
+  is deliberately not part of the pushed memory state (it moves no diff
+  baseline): the agent is told to take tool availability from that line and
+  never from its own memory notes.
 - Logs are structured JSON. Set `LOG_LEVEL=debug` for adapter diagnostics; message bodies and secrets are not logged.
 - Set `OBSERVABILITY_HASH_SALT` to a random secret so the irreversible chat
   pseudonym remains stable across restarts. Without it, a process-random salt
@@ -245,14 +261,23 @@ SQLite uses WAL mode. On startup the daemon:
 6. restores monitors for running/waiting workers and dispatches due queued follow-ups for idle threads;
 7. replays interrupted idempotent Telegram edits/keyboard cleanup and resumes
    pending outbox work; an interrupted fresh send is marked `uncertain` rather
-   than duplicated;
-8. retries accepted T3 tasks with the original command ID, which T3 deduplicates
+   than duplicated. A rich chunk that was on the wire when the process stopped
+   is recognised by the `pendingChunkIndex` the payload records *before* the
+   send: the retry counts it as delivered instead of putting a second copy in
+   the chat, and says so once out of band («предыдущая отправка могла не
+   дойти»). At-most-once for that one window is deliberate — a duplicate is
+   silent, a loss is not, and it takes a double failure to lose anything;
+8. removes a previous bot's persistent reply keyboard once, marked in
+   `runtime_state` as `legacy_keyboard_cleared` so it is not repeated at every
+   restart (a reply keyboard lives in the client and outlives the bot that
+   installed it);
+9. retries accepted T3 tasks with the original command ID, which T3 deduplicates
    through its transactional command receipt;
-9. refreshes pending approval/question keyboards and resets an interrupted
+10. refreshes pending approval/question keyboards and resets an interrupted
    clarification so the owner's response can be retried;
-10. resumes all-terminal fan-out groups whose synthesis was pending or interrupted;
-11. resets interrupted automation claims and dispatches due unique runs;
-12. delivers an undelivered completion for an Operator-owned thread.
+11. resumes all-terminal fan-out groups whose synthesis was pending or interrupted;
+12. resets interrupted automation claims and dispatches due unique runs;
+13. delivers an undelivered completion for an Operator-owned thread.
 
 ## Memory and maintenance
 
