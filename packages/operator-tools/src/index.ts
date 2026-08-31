@@ -1833,7 +1833,11 @@ export class OperatorToolServer {
     for (const kind of ["document", "photo", "audio", "video"] as const) {
       this.addTool(server, token, {
         name: `telegram.send_${kind}`,
-        description: `Send a validated ${kind.replace("_", " ")} to the current Telegram chat/topic.`,
+        description:
+          `Send a validated ${kind.replace("_", " ")} to the current Telegram chat/topic. ` +
+          "A path is accepted inside the named project's workspace, inside the Operator's own artifact " +
+          "directory and inside its workspaces root — files you produced yourself can be sent as they lie; " +
+          "copying to /tmp first does NOT help and is never needed.",
         schema: z.object({
           artifactId: z.string().min(1).optional(),
           path: z.string().min(1).max(4_096).optional(),

@@ -12,6 +12,20 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/root/.operator/hooks/route-long-work.sh",
+            "timeout": 5
+          }
+        ]
+      }
     ]
+  },
+  "env": {
+    "ENABLE_TOOL_SEARCH": "false"
   }
 }

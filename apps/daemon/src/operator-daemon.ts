@@ -142,6 +142,8 @@ import {
   renderNowDiff,
   renderPersonaDigest,
   renderStateLayers,
+  isSilentOperatorFinal,
+  OPERATOR_SILENCE_MARKER,
   selectNowItemsForRender,
   serializePushBaseline,
   staleOperatorNoteWarning,
@@ -566,6 +568,17 @@ const LEGACY_KEYBOARD_CLEARED_KEY = "legacy_keyboard_cleared";
  * turn, and the line says how the agent finds out otherwise.
  */
 const ATTACHED_TOOLS_HEADER = "Attaching this turn:";
+/**
+ * Схемы MCP-инструментов CLI отдаёт отложенными: предикат отложенности считает
+ * deferrable ЛЮБОЙ инструмент с isMcp=true, поэтому «закрепить» отдельный
+ * инструмент нельзя — его имя модель обязана вспомнить сама. Инвентарь и есть
+ * то место, где имя попадается ей на глаза в момент развилки.
+ */
+const DEFERRED_MCP_HINT =
+  "MCP schemas arrive deferred: load one with ToolSearch (`select:mcp__operator__<tool>`) before its first call. " +
+  "The four you need most and remember least: telegram_ask_choices (a pick between 2-4 short options goes out as buttons, never as \"напиши цифру\"), " +
+  "t3_create_thread and t3_send_turn (anything that will plausibly run longer than ~2 minutes leaves this turn), " +
+  "t3_get_thread_status (what that work is doing now).";
 /**
  * The in-the-moment check (memory-design §2.4.2), in `runtime_state` so it
  * survives a restart: the turn that mutated without recording anything, and how
@@ -3060,6 +3073,7 @@ export class OperatorDaemon {
             "- Several events may arrive together; one coherent message covers them all.",
             "- Never quote the worker verbatim, never show its tool chatter, thread ids, file dumps or raw error text. Retell.",
             "- If there is nothing to say, END THE TURN WITH EMPTY TEXT. An empty answer sends nothing to the chat, which is the correct outcome for routine progress.",
+            `- Whatever you write as final text is delivered to the owner VERBATIM. So a sentence about your silence ("Routine progress — nothing to send.", "No response requested.") is not silence: it is an English note about the owner, sent to the owner. If your harness forces some text, write exactly ${OPERATOR_SILENCE_MARKER} and nothing else.`,
             "- You may use your tools (for example to check a thread) before deciding.",
           ].join("\n"),
           // Package 1.3: no focus line. focus_state survives as the machine
@@ -3143,7 +3157,7 @@ export class OperatorDaemon {
     // Read once per turn, here, where the turn is already async: `composePrompt`
     // may be replayed synchronously for a fresh-session rebuild, and the answer
     // to "what is attached" must be the same one on both passes.
-    const attachedTools = await this.describeAttachedTools();
+    const attachedTools = await this.describeAttachedTools(Boolean(toolLease));
     // The state layers are ADMINISTRATIVE state: the now layer renders every
     // live thread and the index every durable note, exactly what the viewer
     // wall (§1 of dialogue-flow) and `memory.search`'s own role check keep away
@@ -3534,15 +3548,56 @@ export class OperatorDaemon {
     // failure — and an empty outbox row would be a Telegram error, so nothing
     // is enqueued at all. The terminals it covered are settled either way: the
     // Operator has seen them, so the degraded fallback must stop waiting.
-    if (isThreadEventTurn && !finalText) {
+    //
+    // Stand run 30.08, defect Д-3: "empty" was too literal a reading of that
+    // decision. A CLI turn practically never ends with an empty string — the
+    // model writes a sentence ABOUT its silence instead — and 19 of 81 final
+    // messages reached the owner as English meta in the third person. What is
+    // tested here is the DECISION, not its punctuation. An app turn gets the
+    // same treatment for the same reason: a reminder that came out as "No
+    // response requested." is already broken, and silence is strictly less
+    // harmful than delivering that. Its own empty-answer fallback stays
+    // Russian («Не смог сформировать ответ.») and is not matched here.
+    //
+    // Stand run 31.08, defect Д-3-бис: a HUMAN turn leaked the literal
+    // `NO_MESSAGE` into the chat (msg 100137, Т-06) — the model closed its turn
+    // with the marker after it had already answered with a tool, and the fork
+    // above only covered digest/app turns. The marker is a protocol token; it
+    // must never reach the owner from ANY turn. But a human turn keeps its own,
+    // much narrower test: ONLY the exact marker. Its empty-answer fallback
+    // («Не смог сформировать ответ.») stays a real message — a person who wrote
+    // something is owed an answer — and the English SILENCE_PHRASES heuristic is
+    // not applied to human turns at all, so a genuine short English reply to a
+    // direct question can never be swallowed.
+    const isSilentTurn =
+      isThreadEventTurn || isAppTurn
+        ? isSilentOperatorFinal(finalText)
+        : finalText.trim() === OPERATOR_SILENCE_MARKER;
+    if (isSilentTurn) {
       // Durable BEFORE the events are settled: a crash in between replays the
       // job, and the marker is what stops it spending a second provider turn.
       this.store.setRuntimeState(silenceKey, nowIso());
       this.store.appendEvent("operator.turn.silent", {
         correlationId,
-        payload: { operatorTurnId, threadEvents: threadEvents.map((ref) => ref.threadId) },
+        payload: {
+          operatorTurnId,
+          turnOrigin,
+          threadEvents: threadEvents.map((ref) => ref.threadId),
+          // Machine-checkable: how often the model ignores the marker.
+          ...(finalText ? { suppressedText: finalText.slice(0, 200) } : {}),
+          ...(appEvent ? { app: appEvent.app, runId: appEvent.runId } : {}),
+        },
       });
       this.voice.settle(threadEvents);
+      if (!isThreadEventTurn && !isAppTurn) {
+        // A human turn is the one that streams a live draft. Returning without
+        // touching it would leave the marker on screen in the draft instead of
+        // the final message — the same leak one message earlier.
+        await this.discardDraft(writer);
+        // The turn said nothing itself, but it may have sent files/reactions
+        // through tools; those rows must not wait for the next turn's flush.
+        await this.flushTelegramOutbox();
+      }
       return;
     }
 
@@ -7114,7 +7169,7 @@ export class OperatorDaemon {
    * start is invisible from here, and the agent learns it from the failing
    * call, not from a claim in the envelope.
    */
-  private async describeAttachedTools(): Promise<string> {
+  private async describeAttachedTools(operatorTools: boolean): Promise<string> {
     const { claudeSettingsPath, skillsDir, extraMcpConfigPath } = this.config.operator;
     const settingsOk =
       !!claudeSettingsPath &&
@@ -7129,7 +7184,16 @@ export class OperatorDaemon {
         : [];
     const skills = skillsOk && skillsDir ? await this.listCuratedSkills(skillsDir) : [];
     const names = (values: string[]): string => (values.length ? values.join(", ") : "none");
-    return `${ATTACHED_TOOLS_HEADER} MCP ${names(mcpServers)}; skills ${names(skills)} (not listed = not there; a failing call means that server did not start)`;
+    // Процессный operator-сервер не лежит в файле extra-MCP, поэтому в строке
+    // его не было никогда — а системный промпт велит читать отсутствие имени
+    // как железное «этого нет». Инвентарь тем самым отрицал у модели её же
+    // t3.*/telegram.*-инструменты.
+    const attached = operatorTools ? ["operator", ...mcpServers] : mcpServers;
+    return [
+      `${ATTACHED_TOOLS_HEADER} MCP ${names(attached)}; skills ${names(skills)}`,
+      "(not listed = not there; a failing call means that server did not start).",
+      ...(operatorTools ? [DEFERRED_MCP_HINT] : []),
+    ].join(" ");
   }
 
   /** The skill names the CLI would load from `<plugin-dir>/skills/<name>/`. */

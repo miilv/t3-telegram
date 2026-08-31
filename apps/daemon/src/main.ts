@@ -29,6 +29,7 @@ async function main(): Promise<void> {
     config.media.maxInputBytes,
     config.telegram.maxUploadBytes,
     config.operator.artifactRetentionMs,
+    config.operator.outboundRoots,
   );
   const claudeRuntime = new ClaudeCliOperatorRuntime({
     binary: config.operator.claudeBin,

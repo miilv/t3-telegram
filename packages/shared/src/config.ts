@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import { isValidTimeZone } from "./time.js";
 
@@ -158,6 +158,16 @@ const envSchema = z.object({
   PROVIDER_RELIABILITY_WEIGHT: z.coerce.number().min(0).max(1).default(0.3),
   PROVIDER_MODEL_COSTS_USD: z.string().default(""),
   OPERATOR_HOME: z.string().min(1).default("~/.operator"),
+  /**
+   * Extra roots the Operator may send files FROM, comma separated.
+   *
+   * The box's own storage (an Obsidian vault, a documents tree) is one tree
+   * split across several narrow project workspaces, and a conversation bound
+   * to one of them must still be able to hand the owner a file from a
+   * neighbouring folder. Deliberately opt-in and empty by default: on a
+   * multi-person box the per-project boundary is a real one.
+   */
+  OPERATOR_STORAGE_ROOTS: z.string().default(""),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   TELEGRAM_POLL_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(50).default(30),
   /**
@@ -358,6 +368,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const operatorHome = parsed.OPERATOR_HOME.startsWith("~/")
     ? resolve(homedir(), parsed.OPERATOR_HOME.slice(2))
     : resolve(parsed.OPERATOR_HOME);
+  const artifactDir = resolve(operatorHome, "artifacts");
+  const workspacesDir = resolve(operatorHome, "workspaces");
   const approvalAutoAllow = [
     ...new Set(
       parsed.APPROVAL_AUTO_ALLOW.split(",")
@@ -452,7 +464,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       threadStallMs: parsed.THREAD_STALL_MINUTES * 60_000,
       home: operatorHome,
       runtimeDir: resolve(operatorHome, "runtime"),
-      artifactDir: resolve(operatorHome, "artifacts"),
+      artifactDir,
+      workspacesDir,
+      /**
+       * Roots that are outbound-legal regardless of which project the turn
+       * speaks for. The Operator's own two directories are always here: what
+       * the bot MAKES lands there, and a bot that cannot hand over its own
+       * output is the blocker this list exists to remove. `operatorHome`
+       * itself is deliberately NOT here — operator.db lives in it.
+       */
+      outboundRoots: [
+        artifactDir,
+        workspacesDir,
+        ...parseStorageRoots(parsed.OPERATOR_STORAGE_ROOTS),
+      ],
       artifactRetentionMs: parsed.ARTIFACT_RETENTION_DAYS * 24 * 60 * 60 * 1_000,
       databasePath: resolve(operatorHome, "operator.db"),
       codex: parsed.OPERATOR_CODEX_ENABLED === "true"
@@ -543,4 +568,47 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     },
     logLevel: parsed.LOG_LEVEL,
   } as const;
+}
+
+/**
+ * A misconfigured root is the whole risk of this feature: `/` or `$HOME` would
+ * turn "send me that file" into arbitrary file read. Fail at startup, loudly,
+ * instead of at the first send.
+ */
+const FORBIDDEN_OUTBOUND_ROOTS = new Set([
+  "/",
+  "/bin",
+  "/boot",
+  "/dev",
+  "/etc",
+  "/home",
+  "/lib",
+  "/proc",
+  "/root",
+  "/run",
+  "/sbin",
+  "/sys",
+  "/usr",
+  "/var",
+  homedir(),
+]);
+
+function parseStorageRoots(raw: string): string[] {
+  const roots = [
+    ...new Set(
+      raw
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .map((value) =>
+          value.startsWith("~/") ? resolve(homedir(), value.slice(2)) : resolve(value),
+        ),
+    ),
+  ];
+  for (const root of roots) {
+    if (!isAbsolute(root) || FORBIDDEN_OUTBOUND_ROOTS.has(root)) {
+      throw new Error(`OPERATOR_STORAGE_ROOTS refuses a system or home root: ${root}`);
+    }
+  }
+  return roots;
 }
