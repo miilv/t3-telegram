@@ -5248,6 +5248,126 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   }, 40_000);
 
+  it("opens the draft only when answer text begins; thinking/tools run on typing alone (диагноз 31.08)", async () => {
+    const home = tempDirectory("daemon-late-draft-");
+    const store = tempStore();
+    // One tool step, a long silent think, then the answer — the shape that
+    // used to hold an updated draft in the chat for the whole turn, which is
+    // exactly what made Telegram park the owner's own outgoing messages.
+    const runtime = new ThinkingThenAnswerRuntime(900);
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    daemon.livenessTimings.heartbeatMs = 400;
+    daemon.livenessTimings.typingMs = 120;
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "разберись, почему падает сборка"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Париж."), 25_000);
+
+    // Exactly one draft, and it was born with the first token of the answer —
+    // not at turn entry. Nothing was discarded: no draft ever preceded a tool.
+    const drafts = telegram.visible.filter((entry) => entry.kind === "draft");
+    expect(drafts).toHaveLength(1);
+    expect(runtime.textStartedAt).toBeGreaterThan(0);
+    expect(drafts[0]!.at).toBeGreaterThanOrEqual(runtime.textStartedAt);
+    expect(telegram.discardedDrafts).toHaveLength(0);
+    // The silent phase was not dead air: the typing pulse carried it.
+    const typing = telegram.chatActions.filter((entry) => entry.action === "typing");
+    expect(typing.filter((entry) => entry.at < runtime.textStartedAt).length).toBeGreaterThanOrEqual(3);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
+  it("tears the draft down when narration turns out to precede a tool call (диагноз 31.08)", async () => {
+    const home = tempDirectory("daemon-narration-draft-");
+    const store = tempStore();
+    const runtime = new NarratingToolRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "почини сборку"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Готово: сборка починена."), 25_000);
+
+    // The narration opened a draft; the tool call reclassified it and tore it
+    // down (one discard), and the real answer opened a fresh one.
+    const drafts = telegram.visible.filter((entry) => entry.kind === "draft");
+    expect(drafts).toHaveLength(2);
+    expect(telegram.discardedDrafts).toHaveLength(1);
+    // Bug №40 still holds: the discarded narration never resurfaces as final.
+    expect(telegram.sent.some((entry) => entry.text.includes("Сейчас посмотрю"))).toBe(false);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
+  it("never opens a draft on a turn whose answer arrives without a text stream (диагноз 31.08)", async () => {
+    const home = tempDirectory("daemon-result-only-");
+    const store = tempStore();
+    const runtime = new ResultOnlyRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "короткий вопрос"));
+    await waitFor(() => telegram.sent.some((entry) => entry.text === "Готово."), 25_000);
+
+    // No token ever streamed, so no draft ever existed — the final answer is
+    // simply a fresh message. Before the fix this turn held an idle draft
+    // (plus its «Думаю…» heartbeats) for its whole duration.
+    expect(telegram.visible.filter((entry) => entry.kind === "draft")).toHaveLength(0);
+    expect(telegram.discardedDrafts).toHaveLength(0);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 40_000);
+
   it("keeps a queued message alive while another turn holds the lane (package 4.1 review, finding 8)", async () => {
     const home = tempDirectory("daemon-lane-wait-");
     const store = tempStore();
@@ -12636,6 +12756,10 @@ function config(home: string): Config {
       effort: "high",
       compactThresholdPercent: 80,
       turnTimeoutMs: 600_000,
+      // The production cadence; the draft-lifecycle tests only care about
+      // call order, not timing, so the defaults are safe here.
+      draftDebounceMs: 300,
+      draftMaxWaitMs: 800,
       interruptGraceMs: 8_000,
       // The canon, so every existing test keeps judging the behaviour that
       // ships by default; the FIFO tests override it explicitly.
@@ -14241,6 +14365,64 @@ class SilentSlowRuntime extends FakeRuntime {
     await new Promise((resolve) => setTimeout(resolve, this.holdMs));
     yield { type: "text_delta", text: "Париж." };
     yield { type: "result", text: "Париж.", sessionId: input.sessionId };
+  }
+}
+
+/**
+ * Диагноз 31.08 («часики»): a tool step, a long silent think, then the answer —
+ * records when the answer text began, so tests can pin the draft's birth to it.
+ */
+class ThinkingThenAnswerRuntime extends FakeRuntime {
+  textStartedAt = 0;
+
+  constructor(private readonly holdMs: number) {
+    super();
+  }
+
+  protected override async *stream(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    this.prompts.push(input.prompt);
+    yield { type: "tool_started", tool: "mcp__operator__t3_get_thread_status" };
+    await new Promise((resolve) => setTimeout(resolve, this.holdMs));
+    this.textStartedAt = Date.now();
+    yield { type: "text_delta", text: "Париж." };
+    yield { type: "result", text: "Париж.", sessionId: input.sessionId };
+  }
+}
+
+/**
+ * Диагноз 31.08: narration, then the tool it announced, then the real answer.
+ * The pause after the narration is what lets its draft actually open before
+ * the tool call reclassifies it.
+ */
+class NarratingToolRuntime extends FakeRuntime {
+  protected override async *stream(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    this.prompts.push(input.prompt);
+    yield { type: "text_delta", text: "Сейчас посмотрю логи." };
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    yield { type: "tool_started", tool: "mcp__operator__t3_get_thread_status" };
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    yield { type: "text_delta", text: "Готово: сборка починена." };
+    yield { type: "result", text: "Готово: сборка починена.", sessionId: input.sessionId };
+  }
+}
+
+/** Диагноз 31.08: the answer arrives only in `result` — no text ever streams. */
+class ResultOnlyRuntime extends FakeRuntime {
+  protected override async *stream(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    this.prompts.push(input.prompt);
+    yield { type: "result", text: "Готово.", sessionId: input.sessionId };
   }
 }
 

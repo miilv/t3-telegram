@@ -2958,20 +2958,16 @@ export class OperatorDaemon {
     // the owner must never get the flat template and the real story in a row.
     if (isThreadEventTurn) this.voice.beginRelay(threadEvents);
     let writer: DraftWriter | undefined;
+    // Диагноз «часики» 31.08: Telegram придерживает ИСХОДЯЩИЕ сообщения
+    // владельца, пока бот держит в чате обновляемый драфт, — весь долгий ход
+    // чат был фактически заперт. Поэтому драфт больше не открывается на входе
+    // в ход: фазы thinking/tools живут на одном typing-индикаторе, а драфт
+    // появляется лишь с первым текстом ответа (и сносится, если этот текст
+    // оказался наррацией перед tool-вызовом) — см. openDraft/dropDraft ниже.
     // Package 1.2: no live preview for a thread-event turn. The owner wrote
     // nothing, so a «⏳ Работаю…» bubble appearing by itself would be the daemon
     // speaking — and this turn may legitimately end in silence.
-    if (!isThreadEventTurn && !isAppTurn) {
-      try {
-        const draft = await this.telegram.startDraft(update.chatId, replyOptions(update));
-        writer = new DraftWriter(this.telegram, draft);
-      } catch (error) {
-        this.logger.warn(
-          { errorCode: classifyOperationalError(error, "telegram").code },
-          "Telegram draft unavailable; continuing Operator turn without preview",
-        );
-      }
-    }
+    const wantPreview = !isThreadEventTurn && !isAppTurn;
     // Bug №28: a crash mid-turn replays the whole ingress job. Threads the
     // previous attempt already created/continued are recorded per job, so the
     // replayed envelope tells the agent to continue them, not to start twins.
@@ -3232,10 +3228,60 @@ export class OperatorDaemon {
     // Telegram rejected that write.
     let previewTouched = false;
     const previewLive = (): boolean => previewTouched && Boolean(writer?.healthy);
-    // Keep the ephemeral draft alive while the model works silently; without
-    // this the preview vanishes from the chat mid-turn. It also runs before the
-    // first tool call now: a pure reasoning turn used to be dead air for up to
-    // ten minutes (bug №18) — «Думаю…» is the sign of life until then.
+    let draftBroken = false;
+    let draftOpening = false;
+    let pendingDraftText = "";
+    // One lifecycle lane for the draft: open and drop always run in the order
+    // they were requested, so a token racing a tool call can never resurrect a
+    // draft that was just torn down.
+    let draftOps: Promise<void> = Promise.resolve();
+    const openDraft = (): void => {
+      if (!wantPreview || draftBroken || draftOpening || writer) return;
+      draftOpening = true;
+      draftOps = draftOps.then(async () => {
+        try {
+          // The text this draft was opened for may already be gone — a tool
+          // call landed first and reclassified it as narration. An empty draft
+          // bubble would hold the owner's messages back for nothing.
+          if (!pendingDraftText) return;
+          const draft = await this.telegram.startDraft(update.chatId, replyOptions(update));
+          writer = new DraftWriter(
+            this.telegram,
+            draft,
+            this.config.operator.draftDebounceMs,
+            this.config.operator.draftMaxWaitMs,
+          );
+          writer.append(pendingDraftText);
+          pendingDraftText = "";
+          previewTouched = true;
+        } catch (error) {
+          draftBroken = true;
+          this.logger.warn(
+            { errorCode: classifyOperationalError(error, "telegram").code },
+            "Telegram draft unavailable; continuing Operator turn without preview",
+          );
+        } finally {
+          draftOpening = false;
+        }
+      });
+    };
+    const dropDraft = (): void => {
+      pendingDraftText = "";
+      draftOps = draftOps.then(async () => {
+        const current = writer;
+        if (!current) return;
+        writer = undefined;
+        // The chat has no preview again: the typing pulse below takes back over.
+        previewTouched = false;
+        await current.abort().catch(() => undefined);
+        await this.discardDraft(current);
+      });
+    };
+    // Keep the ephemeral draft alive while the model pauses mid-answer;
+    // without this the preview vanishes from the chat between two text bursts.
+    // Before the first text segment there is no draft at all (диагноз 31.08) —
+    // the typing pulse below is the sign of life for thinking/tools, so this
+    // deliberately does nothing until the answer starts streaming.
     const heartbeat = setInterval(() => {
       if (!writer) return;
       writer.refresh(operatorHeartbeatText(Date.now() - operatorStartedAt, toolSteps));
@@ -3298,6 +3344,11 @@ export class OperatorDaemon {
           if (writer) {
             writer.append(delta);
             previewTouched = true;
+          } else if (wantPreview && !draftBroken) {
+            // First text of a segment: the draft opens NOW, not at turn start —
+            // thinking/tools ran on the typing indicator alone (диагноз 31.08).
+            pendingDraftText += delta;
+            openDraft();
           }
         },
         ...(toolLease?.access ? { toolAccess: toolLease.access } : {}),
@@ -3307,14 +3358,13 @@ export class OperatorDaemon {
           // for ten minutes between two tool calls is working, not wedged.
           if (turn) turn.lastEventAt = Date.now();
           toolSteps += 1;
-          // Only the preamble before the very first tool call is throwaway
-          // narration ("I'll take a look"). Everything the model writes between
-          // later tool calls is real commentary and stays in the live preview,
-          // which is what the T3 thread shows too.
-          if (toolSteps === 1 && writer) {
-            writer.reset("⏳ Работаю…");
-            previewTouched = true;
-          }
+          // A tool call reclassifies whatever text streamed before it as
+          // narration, not the answer — and while tools run the chat must not
+          // hold a live draft (диагноз 31.08: an updated draft blocks the
+          // owner's outgoing messages). Tear the preview down; the typing
+          // pulse carries the sign of life until the next text segment. The
+          // final answer never resurrects narration anyway (bug №40).
+          dropDraft();
         },
         turnToken: operatorTurnId,
         ...(abandonHandle ? { abandon: abandonHandle } : {}),
@@ -3397,6 +3447,9 @@ export class OperatorDaemon {
       if (turn && !abandoned) turn.settled = true;
       clearInterval(heartbeat);
       clearInterval(typing);
+      // The draft lane settles first: a lazily-opening draft must either fully
+      // exist (so the close below flushes its last frame) or never appear.
+      await draftOps.catch(() => undefined);
       await writer?.closePreview().catch((error) => {
         this.logger.debug(
           { errorCode: classifyOperationalError(error, "telegram").code },

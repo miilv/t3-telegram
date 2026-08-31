@@ -41,6 +41,32 @@ describe("media configuration", () => {
     expect(loadConfig({ ...base, OPERATOR_BATCH_WINDOW_MS: "5000" }).telegram.batchWindowMs).toBe(5_000);
   });
 
+  it("exposes the draft cadence with shipped defaults and clamps the ceiling to the debounce", () => {
+    const base = {
+      TELEGRAM_BOT_TOKEN: "test-token",
+      TELEGRAM_ALLOWED_USER_ID: "42",
+      OPERATOR_HOME: "/tmp/t3-telegram-config-test",
+    };
+    // Unset means exactly the cadence that was hardcoded before (300/800).
+    expect(loadConfig(base).operator.draftDebounceMs).toBe(300);
+    expect(loadConfig(base).operator.draftMaxWaitMs).toBe(800);
+    const slowed = loadConfig({
+      ...base,
+      OPERATOR_DRAFT_DEBOUNCE_MS: "2000",
+      OPERATOR_DRAFT_MAX_WAIT_MS: "4000",
+    });
+    expect(slowed.operator.draftDebounceMs).toBe(2_000);
+    expect(slowed.operator.draftMaxWaitMs).toBe(4_000);
+    // A ceiling below the debounce would make the max-wait fire first on every
+    // frame and quietly cancel the slowdown the box asked for.
+    const clamped = loadConfig({
+      ...base,
+      OPERATOR_DRAFT_DEBOUNCE_MS: "3000",
+      OPERATOR_DRAFT_MAX_WAIT_MS: "1000",
+    });
+    expect(clamped.operator.draftMaxWaitMs).toBe(3_000);
+  });
+
   it("carries the watchdog deadlines in milliseconds, defaults included (package 1.5)", () => {
     const base = {
       TELEGRAM_BOT_TOKEN: "test-token",

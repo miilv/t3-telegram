@@ -53,6 +53,15 @@ const envSchema = z.object({
   OPERATOR_COMPACT_THRESHOLD_PERCENT: z.coerce.number().min(50).max(95).default(80),
   OPERATOR_TURN_TIMEOUT_MS: z.coerce.number().int().min(30_000).max(3_600_000).default(600_000),
   /**
+   * Cadence of the live answer preview: the quiet debounce and the hard
+   * ceiling between two draft edits of one streaming answer. Telegram holds
+   * outgoing OWNER messages while a bot draft is being updated in the chat
+   * (часики, 31.08), so a box that still sees them can slow the stream down
+   * without a redeploy. The ceiling is clamped to at least the debounce.
+   */
+  OPERATOR_DRAFT_DEBOUNCE_MS: z.coerce.number().int().min(100).max(30_000).default(300),
+  OPERATOR_DRAFT_MAX_WAIT_MS: z.coerce.number().int().min(200).max(60_000).default(800),
+  /**
    * Package 1.1: grace between the SIGINT of an interrupted turn and the
    * SIGKILL that guarantees the single turn slot is actually released.
    */
@@ -427,6 +436,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       fullAccess: parsed.OPERATOR_FULL_ACCESS === "true",
       compactThresholdPercent: parsed.OPERATOR_COMPACT_THRESHOLD_PERCENT,
       turnTimeoutMs: parsed.OPERATOR_TURN_TIMEOUT_MS,
+      draftDebounceMs: parsed.OPERATOR_DRAFT_DEBOUNCE_MS,
+      draftMaxWaitMs: Math.max(parsed.OPERATOR_DRAFT_MAX_WAIT_MS, parsed.OPERATOR_DRAFT_DEBOUNCE_MS),
       interruptGraceMs: parsed.OPERATOR_INTERRUPT_GRACE_MS,
       preemption: parsed.OPERATOR_PREEMPTION,
       envPassthrough,

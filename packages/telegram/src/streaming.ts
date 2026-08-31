@@ -112,6 +112,19 @@ export class DraftWriter {
     await this.chain;
   }
 
+  /**
+   * Close WITHOUT the final flush. For a preview that turned out to be
+   * narration (a tool call followed it): what is buffered must not be written,
+   * the caller is about to discard the draft slot itself.
+   */
+  async abort(): Promise<void> {
+    if (this.closed) return;
+    this.disarm();
+    this.closed = true;
+    this.pendingText = undefined;
+    await this.chain;
+  }
+
   get text(): string {
     return this.buffer;
   }

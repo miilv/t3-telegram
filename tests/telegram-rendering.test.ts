@@ -402,6 +402,26 @@ describe("DraftWriter keep-alive", () => {
     }
   });
 
+  it("abort drops buffered text without ever writing it (диагноз 31.08)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { updates, transport } = fakeTransport();
+      const writer = new DraftWriter(transport, draftSlot(8));
+      // Narration streamed, but a tool call reclassified it before the quiet
+      // timer fired — the draft is being torn down, and a late flush here
+      // would put the narration back on screen after the discard.
+      writer.append("Сейчас посмотрю логи");
+      await writer.abort();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(updates).toEqual([]);
+      // Closed for good: the keep-alive path must not resurrect it either.
+      writer.refresh("⏳ Работаю…");
+      expect(updates).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports a preview Telegram refused, and takes it back when one lands (package 4.1, finding «латентность №1»)", async () => {
     let failure: Error | undefined = telegramError(400, "Bad Request: MESSAGE_ID_INVALID");
     const writer = new DraftWriter(
