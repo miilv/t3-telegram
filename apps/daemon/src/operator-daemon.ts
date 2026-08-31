@@ -144,6 +144,7 @@ import {
   renderStateLayers,
   isSilentOperatorFinal,
   OPERATOR_SILENCE_MARKER,
+  operatorStepCountFinal,
   selectNowItemsForRender,
   serializePushBaseline,
   staleOperatorNoteWarning,
@@ -9832,16 +9833,30 @@ export class OperatorDaemon {
     let lastInterSegment = "";
     let sawTool = false;
     let toolCount = 0;
+    let declaredSilence = false;
     let result = "";
     // Bug №40: the final answer never resurrects the pre-tool preamble the
     // live preview already dropped. Prefer the text after the LAST tool
     // call; without it fall back to the last inter-tool commentary, and as
     // a last resort report the completed steps instead of the preamble.
+    //
+    // Incident 31.08 ~10:56 UTC: that last resort must not override a silence
+    // the model already declared. A digest turn wrote `NO_MESSAGE`, then made
+    // a tool call and closed — the marker was discarded with the preamble, the
+    // step-count stub took its place, and the stub (Russian, so past every
+    // brake in `isSilentOperatorFinal`) landed in the owner's chat. A declared
+    // silence is sticky: it survives the tool calls and comes back OUT as the
+    // marker, which every delivery gate already knows how to swallow. The
+    // marker in `result` is the same declaration — with tools in the turn the
+    // fallback chain never consulted `result` at all.
     const finalAnswer = (): string => {
       if (!sawTool) return streamed || result;
       if (segment.trim()) return segment;
       if (lastInterSegment.trim()) return lastInterSegment;
-      return `Готово — выполнено шагов: ${toolCount}.`;
+      if (declaredSilence || result.trim() === OPERATOR_SILENCE_MARKER) {
+        return OPERATOR_SILENCE_MARKER;
+      }
+      return operatorStepCountFinal(toolCount);
     };
     try {
       for await (const event of this.runtime.sendTurn({
@@ -9860,8 +9875,14 @@ export class OperatorDaemon {
           onDelta?.(event.text);
         } else if (event.type === "tool_started") {
           // Text before the first tool call is throwaway narration; text
-          // between later tool calls is real commentary worth keeping.
-          if (sawTool && segment.trim()) lastInterSegment = segment;
+          // between later tool calls is real commentary worth keeping — and
+          // a segment that IS the silence marker is neither: it is the
+          // turn's decision, remembered so the fallback honors it.
+          if (segment.trim() === OPERATOR_SILENCE_MARKER) {
+            declaredSilence = true;
+          } else if (sawTool && segment.trim()) {
+            lastInterSegment = segment;
+          }
           sawTool = true;
           toolCount += 1;
           segment = "";
@@ -9900,6 +9921,7 @@ export class OperatorDaemon {
         lastInterSegment = "";
         sawTool = false;
         toolCount = 0;
+        declaredSilence = false;
         for await (const event of this.runtime.sendTurn({
           sessionId: this.operatorSessionId,
           prompt: sent,
@@ -9915,7 +9937,11 @@ export class OperatorDaemon {
             segment += event.text;
             onDelta?.(event.text);
           } else if (event.type === "tool_started") {
-            if (sawTool && segment.trim()) lastInterSegment = segment;
+            if (segment.trim() === OPERATOR_SILENCE_MARKER) {
+              declaredSilence = true;
+            } else if (sawTool && segment.trim()) {
+              lastInterSegment = segment;
+            }
             sawTool = true;
             toolCount += 1;
             segment = "";

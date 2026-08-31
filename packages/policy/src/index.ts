@@ -316,11 +316,31 @@ const SILENCE_PHRASES: readonly RegExp[] = [
   /^\(?no message\)?\.?$/,
 ];
 
+/**
+ * The daemon's last-resort final for a turn that ran tools but left no text
+ * behind (Bug №40). It lives here, next to its matcher, so the two can never
+ * drift apart: the delivery gate must be able to recognize the daemon's own
+ * voice. On a human turn the stub is a legitimate answer — the person who
+ * asked is owed at least «did N steps». On a digest/app turn nobody asked
+ * anything, so the stub is noise by construction (incident 31.08 ~10:56 UTC:
+ * a worker-digest turn delivered «Готово — выполнено шагов: 1.» to the owner
+ * because the model had put its NO_MESSAGE before the tool call).
+ */
+export function operatorStepCountFinal(toolCount: number): string {
+  return `Готово — выполнено шагов: ${toolCount}.`;
+}
+
+const STEP_COUNT_FINAL = /^готово\s*[\u2012-\u2015\u2212-]\s*выполнено шагов:\s*\d+\.?$/u;
+
 /** Did this turn decide to say nothing — whether by empty text or by marker? */
 export function isSilentOperatorFinal(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
   if (trimmed === OPERATOR_SILENCE_MARKER) return true;
+  // The daemon's own step-count stub — checked BEFORE the Cyrillic brake,
+  // because the stub is Russian by construction and yet is not an answer:
+  // it exists only when the model produced no usable final text at all.
+  if (STEP_COUNT_FINAL.test(trimmed.toLowerCase())) return true;
   if (trimmed.length > 200 || /\p{Script=Cyrillic}/u.test(trimmed)) return false;
   const normalized = trimmed
     .toLowerCase()

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { isSilentOperatorFinal, OPERATOR_SILENCE_MARKER } from "../packages/policy/src/index.js";
+import {
+  isSilentOperatorFinal,
+  OPERATOR_SILENCE_MARKER,
+  operatorStepCountFinal,
+} from "../packages/policy/src/index.js";
 
 /**
  * Д-3 (fix-run 31.08): a turn that decided to stay silent may say so only with
@@ -38,5 +42,22 @@ describe("isSilentOperatorFinal", () => {
     ).toBe(false);
     // The marker inside a sentence is a sentence, not the marker.
     expect(isSilentOperatorFinal("I will reply NO_MESSAGE when there is nothing.")).toBe(false);
+  });
+
+  // Incident 31.08 ~10:56 UTC: the daemon's own step-count stub reached the
+  // owner from a digest turn — Russian text sails past the Cyrillic brake, yet
+  // the stub exists only when the model produced no usable final at all.
+  it("recognizes the daemon's step-count stub as silence", () => {
+    expect(isSilentOperatorFinal(operatorStepCountFinal(1))).toBe(true);
+    expect(isSilentOperatorFinal(operatorStepCountFinal(12))).toBe(true);
+    expect(isSilentOperatorFinal(`  ${operatorStepCountFinal(3)}\n`)).toBe(true);
+  });
+
+  it("never mistakes a real Russian answer for the stub", () => {
+    expect(isSilentOperatorFinal("Готово.")).toBe(false);
+    expect(isSilentOperatorFinal("Готово — выполнено всё, что просил.")).toBe(false);
+    // The stub inside a sentence is a sentence, not the stub.
+    expect(isSilentOperatorFinal(`Кстати, ${operatorStepCountFinal(2)}`)).toBe(false);
+    expect(isSilentOperatorFinal(`${operatorStepCountFinal(2)} Продолжаю.`)).toBe(false);
   });
 });
