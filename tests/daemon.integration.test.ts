@@ -5368,6 +5368,120 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   }, 40_000);
 
+  it("suppresses English meta about silence from a digest turn instead of delivering it (Д-3)", async () => {
+    const home = tempDirectory("daemon-silence-meta-");
+    const store = tempStore();
+    // The real failure shape (stand run 30.08): the worker digest wakes the
+    // Operator, the harness will not close a turn with truly empty text, and
+    // the model writes an English sentence ABOUT its silence instead.
+    const runtime = new MetaSilenceDelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1" },
+      { type: "progress", threadId: "th_1", summary: "Читаю логи CI…" },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь flaky тест"));
+    await waitFor(
+      () =>
+        (store.db
+          .prepare("SELECT COUNT(*) AS count FROM daemon_events WHERE event_type='operator.turn.silent'")
+          .get() as { count: number }).count >= 1,
+      15_000,
+    );
+    // The decision was recorded — with the suppressed text for telemetry —
+    // and the owner heard nothing: no chat message, no durable outbox row.
+    const silent = store.db
+      .prepare("SELECT payload_json FROM daemon_events WHERE event_type='operator.turn.silent'")
+      .all() as Array<{ payload_json: string }>;
+    expect(silent.some((row) => row.payload_json.includes("Routine progress"))).toBe(true);
+    expect(telegram.sent.some((entry) => entry.text.includes("Routine progress"))).toBe(false);
+    const outbox = store.db
+      .prepare("SELECT payload_json FROM telegram_outbox")
+      .all() as Array<{ payload_json: string }>;
+    expect(outbox.some((row) => row.payload_json.includes("Routine progress"))).toBe(false);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
+  it("swallows a literal NO_MESSAGE from a human turn and tears its draft down (Д-3-бис)", async () => {
+    const home = tempDirectory("daemon-human-marker-");
+    const store = tempStore();
+    // The stand leak: the model answered with a tool (a button card), then
+    // closed the turn with the protocol marker — which streamed into the
+    // draft and, before the fix, landed in the chat as a message.
+    class MarkerCloseRuntime extends FakeRuntime {
+      protected override async *stream(input: {
+        sessionId: string;
+        prompt: string;
+        toolAccess?: OperatorToolAccess;
+      }): AsyncIterable<OperatorEvent> {
+        this.prompts.push(input.prompt);
+        yield { type: "text_delta", text: "NO_MESSAGE" };
+        yield { type: "result", text: "NO_MESSAGE", sessionId: input.sessionId };
+      }
+    }
+    const runtime = new MarkerCloseRuntime();
+    const broker = new FakeBroker();
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.compact(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "выбери сам и сделай"));
+    await waitFor(
+      () =>
+        (store.db
+          .prepare("SELECT COUNT(*) AS count FROM daemon_events WHERE event_type='operator.turn.silent'")
+          .get() as { count: number }).count >= 1,
+      15_000,
+    );
+    // The marker never reached the chat — not as a message, and not as the
+    // stream draft it was typed into (the draft is explicitly discarded).
+    expect(telegram.sent.some((entry) => entry.text.includes("NO_MESSAGE"))).toBe(false);
+    expect(telegram.discardedDrafts.length).toBeGreaterThanOrEqual(1);
+    const silent = store.db
+      .prepare("SELECT payload_json FROM daemon_events WHERE event_type='operator.turn.silent'")
+      .get() as { payload_json: string };
+    const payload = JSON.parse(silent.payload_json) as { turnOrigin?: string; suppressedText?: string };
+    expect(payload.turnOrigin).toBe("human");
+    expect(payload.suppressedText).toBe("NO_MESSAGE");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  }, 30_000);
+
   it("keeps a queued message alive while another turn holds the lane (package 4.1 review, finding 8)", async () => {
     const home = tempDirectory("daemon-lane-wait-");
     const store = tempStore();
@@ -11674,7 +11788,10 @@ describe("Operator push envelope (package 2.1)", () => {
     expect(second).not.toContain("Current state changed since your last turn");
     // The live tool inventory is not pushed STATE: it leads every envelope,
     // including one that pushes nothing, and the body follows it directly.
-    expect(second.startsWith("Attaching this turn: MCP none; skills none")).toBe(true);
+    // Д-2: the process-scoped operator server is named now — the inventory no
+    // longer denies the model its own t3.*/telegram.* tools.
+    expect(second.startsWith("Attaching this turn: MCP operator; skills none")).toBe(true);
+    expect(second).toContain("MCP schemas arrive deferred");
     expect(second.slice(second.indexOf("\n") + 1).trimStart()).toMatch(
       /^Handle the user's Telegram message/u,
     );
@@ -12785,6 +12902,9 @@ function config(home: string): Config {
       home,
       runtimeDir: `${home}/runtime`,
       artifactDir: `${home}/artifacts`,
+      workspacesDir: `${home}/workspaces`,
+      // Д-1: the operator's own two output dirs are always outbound-legal.
+      outboundRoots: [`${home}/artifacts`, `${home}/workspaces`],
       artifactRetentionMs: 30 * 24 * 60 * 60 * 1_000,
       databasePath: `${home}/operator.db`,
       codex: undefined,
@@ -13210,6 +13330,29 @@ class DelegatingRuntime extends FakeRuntime {
     }
     yield { type: "text_delta", text };
     yield { type: "result", text, sessionId: input.sessionId };
+  }
+}
+
+/**
+ * Д-3: the failure shape of the stand run — a digest turn that closes with an
+ * English sentence ABOUT its silence instead of empty text. DelegatingRuntime
+ * itself routes digest prompts past the script, so the phrase is injected at
+ * the stream level, exactly where a real CLI provider produced it.
+ */
+class MetaSilenceDelegatingRuntime extends DelegatingRuntime {
+  override async *stream(input: {
+    sessionId: string;
+    prompt: string;
+    toolAccess?: OperatorToolAccess;
+  }): AsyncIterable<OperatorEvent> {
+    if (input.prompt.includes("system message from thread")) {
+      this.prompts.push(input.prompt);
+      const text = "Routine progress — nothing to send.";
+      yield { type: "text_delta", text };
+      yield { type: "result", text, sessionId: input.sessionId };
+      return;
+    }
+    yield* super.stream(input);
   }
 }
 
