@@ -142,6 +142,8 @@ import {
   renderNowDiff,
   renderPersonaDigest,
   renderStateLayers,
+  isSilentOperatorFinal,
+  OPERATOR_SILENCE_MARKER,
   selectNowItemsForRender,
   serializePushBaseline,
   staleOperatorNoteWarning,
@@ -3075,6 +3077,7 @@ export class OperatorDaemon {
             "- Several events may arrive together; one coherent message covers them all.",
             "- Never quote the worker verbatim, never show its tool chatter, thread ids, file dumps or raw error text. Retell.",
             "- If there is nothing to say, END THE TURN WITH EMPTY TEXT. An empty answer sends nothing to the chat, which is the correct outcome for routine progress.",
+            `- Whatever you write as final text is delivered to the owner VERBATIM. So a sentence about your silence ("Routine progress — nothing to send.", "No response requested.") is not silence: it is an English note about the owner, sent to the owner. If your harness forces some text, write exactly ${OPERATOR_SILENCE_MARKER} and nothing else.`,
             "- You may use your tools (for example to check a thread) before deciding.",
           ].join("\n"),
           // Package 1.3: no focus line. focus_state survives as the machine
@@ -3492,15 +3495,56 @@ export class OperatorDaemon {
     // failure — and an empty outbox row would be a Telegram error, so nothing
     // is enqueued at all. The terminals it covered are settled either way: the
     // Operator has seen them, so the degraded fallback must stop waiting.
-    if (isThreadEventTurn && !finalText) {
+    //
+    // Stand run 30.08, defect Д-3: "empty" was too literal a reading of that
+    // decision. A CLI turn practically never ends with an empty string — the
+    // model writes a sentence ABOUT its silence instead — and 19 of 81 final
+    // messages reached the owner as English meta in the third person. What is
+    // tested here is the DECISION, not its punctuation. An app turn gets the
+    // same treatment for the same reason: a reminder that came out as "No
+    // response requested." is already broken, and silence is strictly less
+    // harmful than delivering that. Its own empty-answer fallback stays
+    // Russian («Не смог сформировать ответ.») and is not matched here.
+    //
+    // Stand run 31.08, defect Д-3-бис: a HUMAN turn leaked the literal
+    // `NO_MESSAGE` into the chat (msg 100137, Т-06) — the model closed its turn
+    // with the marker after it had already answered with a tool, and the fork
+    // above only covered digest/app turns. The marker is a protocol token; it
+    // must never reach the owner from ANY turn. But a human turn keeps its own,
+    // much narrower test: ONLY the exact marker. Its empty-answer fallback
+    // («Не смог сформировать ответ.») stays a real message — a person who wrote
+    // something is owed an answer — and the English SILENCE_PHRASES heuristic is
+    // not applied to human turns at all, so a genuine short English reply to a
+    // direct question can never be swallowed.
+    const isSilentTurn =
+      isThreadEventTurn || isAppTurn
+        ? isSilentOperatorFinal(finalText)
+        : finalText.trim() === OPERATOR_SILENCE_MARKER;
+    if (isSilentTurn) {
       // Durable BEFORE the events are settled: a crash in between replays the
       // job, and the marker is what stops it spending a second provider turn.
       this.store.setRuntimeState(silenceKey, nowIso());
       this.store.appendEvent("operator.turn.silent", {
         correlationId,
-        payload: { operatorTurnId, threadEvents: threadEvents.map((ref) => ref.threadId) },
+        payload: {
+          operatorTurnId,
+          turnOrigin,
+          threadEvents: threadEvents.map((ref) => ref.threadId),
+          // Machine-checkable: how often the model ignores the marker.
+          ...(finalText ? { suppressedText: finalText.slice(0, 200) } : {}),
+          ...(appEvent ? { app: appEvent.app, runId: appEvent.runId } : {}),
+        },
       });
       this.voice.settle(threadEvents);
+      if (!isThreadEventTurn && !isAppTurn) {
+        // A human turn is the one that streams a live draft. Returning without
+        // touching it would leave the marker on screen in the draft instead of
+        // the final message — the same leak one message earlier.
+        await this.discardDraft(writer);
+        // The turn said nothing itself, but it may have sent files/reactions
+        // through tools; those rows must not wait for the next turn's flush.
+        await this.flushTelegramOutbox();
+      }
       return;
     }
 

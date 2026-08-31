@@ -262,6 +262,7 @@ Events from your work threads (you are their single voice):
 - Threads you delegated to report back to YOU, never to the owner. Their events arrive as turns whose envelope says "system message from thread "<title>" (<threadId>)" — progress, notes the worker wrote, and the outcome when the work ends. Nobody but you sees them. Persona rules 4, 5 and 10 govern how you speak for them and what you write down when they end.
 - A work that ENDED deserves a message; progress and mid-work notes usually deserve nothing. Take those in silently and keep working, and speak up only when there is something the owner genuinely needs now: a decision only they can make, a finding that changes the plan, or a work that is clearly overrunning.
 - Ending a thread-event turn with EMPTY text is a normal, correct outcome — it sends nothing to the chat. Prefer it over filler like "работа продолжается".
+- If your harness will not let you end with truly empty text, the ONLY thing you may write is the single token NO_MESSAGE on a line of its own. NEVER write a sentence describing your silence ("Routine progress — nothing to send.", "No response requested.", "Staying silent."): the daemon delivers your final text verbatim, so such a sentence is not silence — it is an English note about the owner, sent TO the owner.
 - A section headed "system message ABOUT thread … this is the DAEMON reporting the state of the work" is the runtime speaking, not the worker: a lost connection, a follow-up it dispatched, a recovery attempt, notes it could not interpret. Treat it as fact about the work, never as something the worker said.
 - Several events can arrive in one turn, from one thread or several. Cover them in one coherent message rather than a list of reports.
 - The owner's own messages always take priority over these turns; a work that finished stays finished, so nothing is lost by answering the owner first.
@@ -286,6 +287,47 @@ Tools and evidence:
 }
 
 export const OPERATOR_SYSTEM_PROMPT = buildOperatorSystemPrompt();
+
+/**
+ * The one text a turn that decided to stay silent is allowed to emit.
+ *
+ * The envelope asks for empty text, but a CLI provider practically always
+ * closes a turn with SOMETHING; what the model wrote instead was meta about
+ * itself. Giving the decision an explicit token turns an accident into a
+ * protocol the daemon can act on.
+ */
+export const OPERATOR_SILENCE_MARKER = "NO_MESSAGE";
+
+/**
+ * Belt and braces for the same decision: the marker is what we now ask for,
+ * these are the shapes the model produced before it was asked (stand run
+ * 30.08 — 19 of 81 final messages, defect Д-3).
+ *
+ * Deliberately narrow, because a false positive silences a REAL message. Three
+ * independent brakes: only non-human turns call this, only short text, and only
+ * text with no Cyrillic in it — an answer to a Russian-speaking owner is never
+ * ASCII-only meta.
+ */
+const SILENCE_PHRASES: readonly RegExp[] = [
+  /^no (response|reply|message|update)s? (requested|needed|required|warranted)\.?$/,
+  /^(routine )?progress\b[^.]*\b(nothing (to (send|say|report)|for .{1,40} to act on)|stay(ing)? silent|remain(ing)? silent)\b.*$/,
+  /^nothing (to (send|say|report)|worth (sending|saying|reporting))\.?$/,
+  /^(staying|remaining) silent\.?$/,
+  /^\(?no message\)?\.?$/,
+];
+
+/** Did this turn decide to say nothing — whether by empty text or by marker? */
+export function isSilentOperatorFinal(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  if (trimmed === OPERATOR_SILENCE_MARKER) return true;
+  if (trimmed.length > 200 || /\p{Script=Cyrillic}/u.test(trimmed)) return false;
+  const normalized = trimmed
+    .toLowerCase()
+    .replace(/[\u2012-\u2015\u2212]/g, "-")
+    .replace(/\s+/g, " ");
+  return SILENCE_PHRASES.some((pattern) => pattern.test(normalized));
+}
 
 export function mayAutoApprove(
   risk: ApprovalRiskCategory,
