@@ -488,7 +488,6 @@ without being explained to the model.
 | daemon `buildOperatorMemorySnapshot` | project names, short summaries, and every prose field of the structured summaries, under one marker for the whole snapshot | `worker` |
 | daemon push head (package 2.1) | the BODY of each layer — thread titles, note excerpts, diff labels — under ONE marker for the whole snapshot. The layer headers, the placeholders (`No current work items.`) and the overflow tails stay outside it: those are the daemon's own claims, not content it quotes. The fence costs ~40 characters against a 3000-character budget, and its nonce is canonicalized away before the layer hashes are taken | `worker` |
 | `t3.get_thread_status` / `get_thread_summary` / `get_thread` / `search_threads` / `memory.search` | worker-written titles and summary prose | `worker` |
-| `utility.web_search` | each result's `title` and `snippet` (`url` stays raw) | `tool` |
 | `email.search` | `subject`, `snippet`, and the display names; the connector splits a bare validated `fromAddress`/`toAddress` out of each header and normalizes `date` to ISO, so those stay raw and reusable | `tool` |
 | `calendar.list_events` | each event's `title`, `description`, `location` | `tool` |
 | `artifacts.read_text` | the file body in `content` (the counters keep describing the raw window) | `tool` |

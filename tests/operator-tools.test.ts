@@ -497,11 +497,6 @@ describe("OperatorToolServer", () => {
         started.push(input);
       },
       now: () => new Date("2026-08-21T09:10:11.000Z"),
-      fetchImpl: async () =>
-        new Response(
-          "<rss><channel><item><title>Result &amp; One</title><link>https://example.com/one</link><description>Useful &lt;b&gt;snippet&lt;/b&gt;</description></item></channel></rss>",
-          { status: 200 },
-        ),
     });
     await server.start();
     const lease = server.issue({
@@ -565,22 +560,6 @@ describe("OperatorToolServer", () => {
       expect(await callJson(client, "utility.time", { timeZone: "Mars/Olympus_Mons" })).toMatchObject(
         { timeZone: "UTC", note: 'Unknown time zone "Mars/Olympus_Mons"; answered in UTC.' },
       );
-      // Roadmap 0.5: remote titles and snippets are fenced, the URL and the
-      // echoed query stay raw so the shape remains machine-readable.
-      const search = await callJson(client, "utility.web_search", { query: "test" }) as {
-        query: string;
-        results: Array<{ title: string; url: string; snippet: string }>;
-      };
-      expect(search.query).toBe("test");
-      expect(search.results).toHaveLength(1);
-      expect(search.results[0]!.url).toBe("https://example.com/one");
-      expect(unfenced(search.results[0]!.title)).toBe("Result & One");
-      expect(unfenced(search.results[0]!.snippet)).toBe("Useful snippet");
-      // One unpredictable marker per call, and a different one on the next call.
-      expect(fenceNonce(search.results[0]!.title)).toBe(fenceNonce(search.results[0]!.snippet));
-      const secondSearch = await callJson(client, "utility.web_search", { query: "test" }) as typeof search;
-      expect(fenceNonce(secondSearch.results[0]!.title)).not.toBe(fenceNonce(search.results[0]!.title));
-
       const listing = await callJson(client, "calendar.list_events", {
         timeMin: "2026-08-21T00:00:00Z",
       }) as { events: Array<Record<string, string>>; skipped: number };
