@@ -567,6 +567,17 @@ const LEGACY_KEYBOARD_CLEARED_KEY = "legacy_keyboard_cleared";
  */
 const ATTACHED_TOOLS_HEADER = "Attaching this turn:";
 /**
+ * Схемы MCP-инструментов CLI отдаёт отложенными: предикат отложенности считает
+ * deferrable ЛЮБОЙ инструмент с isMcp=true, поэтому «закрепить» отдельный
+ * инструмент нельзя — его имя модель обязана вспомнить сама. Инвентарь и есть
+ * то место, где имя попадается ей на глаза в момент развилки.
+ */
+const DEFERRED_MCP_HINT =
+  "MCP schemas arrive deferred: load one with ToolSearch (`select:mcp__operator__<tool>`) before its first call. " +
+  "The four you need most and remember least: telegram_ask_choices (a pick between 2-4 short options goes out as buttons, never as \"напиши цифру\"), " +
+  "t3_create_thread and t3_send_turn (anything that will plausibly run longer than ~2 minutes leaves this turn), " +
+  "t3_get_thread_status (what that work is doing now).";
+/**
  * The in-the-moment check (memory-design §2.4.2), in `runtime_state` so it
  * survives a restart: the turn that mutated without recording anything, and how
  * many reminders have gone out back-to-back.
@@ -3147,7 +3158,7 @@ export class OperatorDaemon {
     // Read once per turn, here, where the turn is already async: `composePrompt`
     // may be replayed synchronously for a fresh-session rebuild, and the answer
     // to "what is attached" must be the same one on both passes.
-    const attachedTools = await this.describeAttachedTools();
+    const attachedTools = await this.describeAttachedTools(Boolean(toolLease));
     // The state layers are ADMINISTRATIVE state: the now layer renders every
     // live thread and the index every durable note, exactly what the viewer
     // wall (§1 of dialogue-flow) and `memory.search`'s own role check keep away
@@ -7061,7 +7072,7 @@ export class OperatorDaemon {
    * start is invisible from here, and the agent learns it from the failing
    * call, not from a claim in the envelope.
    */
-  private async describeAttachedTools(): Promise<string> {
+  private async describeAttachedTools(operatorTools: boolean): Promise<string> {
     const { claudeSettingsPath, skillsDir, extraMcpConfigPath } = this.config.operator;
     const settingsOk =
       !!claudeSettingsPath &&
@@ -7076,7 +7087,16 @@ export class OperatorDaemon {
         : [];
     const skills = skillsOk && skillsDir ? await this.listCuratedSkills(skillsDir) : [];
     const names = (values: string[]): string => (values.length ? values.join(", ") : "none");
-    return `${ATTACHED_TOOLS_HEADER} MCP ${names(mcpServers)}; skills ${names(skills)} (not listed = not there; a failing call means that server did not start)`;
+    // Процессный operator-сервер не лежит в файле extra-MCP, поэтому в строке
+    // его не было никогда — а системный промпт велит читать отсутствие имени
+    // как железное «этого нет». Инвентарь тем самым отрицал у модели её же
+    // t3.*/telegram.*-инструменты.
+    const attached = operatorTools ? ["operator", ...mcpServers] : mcpServers;
+    return [
+      `${ATTACHED_TOOLS_HEADER} MCP ${names(attached)}; skills ${names(skills)}`,
+      "(not listed = not there; a failing call means that server did not start).",
+      ...(operatorTools ? [DEFERRED_MCP_HINT] : []),
+    ].join(" ");
   }
 
   /** The skill names the CLI would load from `<plugin-dir>/skills/<name>/`. */
