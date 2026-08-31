@@ -284,6 +284,119 @@ describe("HttpT3Broker", () => {
     });
   });
 
+  it("never ends a resumed turn with the previous turn's final report", async () => {
+    // The regression this pins, seen on 31.08.2026 on thread th_dbc9962e: the
+    // daemon subscribes the instant it dispatches, T3 answers that first read
+    // with the thread as it still stands — the PREVIOUS turn, `completed`, its
+    // report «Готово к рестарту» — and the owner was told the work had ended
+    // and shown the report of the run before it. The real ending, half an hour
+    // later, was then dropped as a duplicate and never reached anyone.
+    const liveClient = new FakeLiveClient();
+    const broker = new HttpT3Broker(
+      {
+        baseUrl: fixture.url,
+        providerInstanceId: "claude",
+        model: "claude-opus-4-1",
+        runtimeMode: "approval-required",
+        pollIntervalMs: 5,
+        liveClient,
+      },
+      store,
+      pino({ enabled: false }),
+    );
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: "/tmp/acme" });
+    const thread = await broker.createThread({ projectId: project.id, title: "Auth" });
+
+    // Turn one runs and ends; that ending is reported.
+    await broker.sendTurn({ threadId: thread.id, text: "Fix auth" });
+    liveClient.threadItems = [
+      t3Event(5, "thread.message-sent", {
+        messageId: "msg_first",
+        role: "assistant",
+        text: "Готово к рестарту.",
+        streaming: false,
+      }),
+      t3Event(6, "thread.session-set", {
+        session: { status: "ready", activeTurnId: null, lastError: null },
+      }),
+    ];
+    const first = [];
+    for await (const event of broker.subscribeThread(thread.id)) first.push(event);
+    expect(first.at(-1)).toEqual({
+      type: "completed",
+      threadId: thread.id,
+      result: "Готово к рестарту.",
+    });
+    fixture.completeThread(thread.id, "Готово к рестарту.", "msg_first");
+
+    // Turn two is dispatched and the server has not picked it up yet, so the
+    // snapshot that opens the new subscription is still turn one's ending.
+    fixture.deferTurnStart = true;
+    await broker.sendTurn({ threadId: thread.id, text: "Продолжай" });
+    liveClient.threadItems = [
+      t3Event(9, "thread.turn-start-requested", { threadId: thread.id, messageId: "msg_user_2" }),
+      t3Event(10, "thread.session-set", {
+        session: { status: "running", activeTurnId: "turn_2", lastError: null },
+      }),
+      // The session goes ready BEFORE the turn's own final message lands —
+      // the second half of the same race.
+      t3Event(11, "thread.session-set", {
+        session: { status: "ready", activeTurnId: null, lastError: null },
+      }),
+      t3Event(12, "thread.message-sent", {
+        messageId: "msg_second",
+        role: "assistant",
+        text: "Гонка починена; сьют зелёный.",
+        streaming: false,
+      }),
+    ];
+    const second = [];
+    for await (const event of broker.subscribeThread(thread.id)) second.push(event);
+
+    const endings = second.filter((event) => event.type === "completed");
+    expect(endings).toEqual([
+      { type: "completed", threadId: thread.id, result: "Гонка починена; сьют зелёный." },
+    ]);
+    // The stale report never travels — neither as an ending nor as narration.
+    expect(second.some((event) => JSON.stringify(event).includes("Готово к рестарту"))).toBe(false);
+    expect(store.getThread(thread.id)?.lastResultSummary).toBe("Гонка починена; сьют зелёный.");
+  });
+
+  it("still reports an ending that arrives while no turn of ours is pending", async () => {
+    // The guard above must not wedge the monitor: a resubscribe onto a thread
+    // that finished while we were down has no dispatch pending, so its
+    // terminal is reported even though it repeats the last one we know of.
+    const liveClient = new FakeLiveClient();
+    const broker = new HttpT3Broker(
+      {
+        baseUrl: fixture.url,
+        providerInstanceId: "claude",
+        model: "claude-opus-4-1",
+        runtimeMode: "approval-required",
+        pollIntervalMs: 5,
+        liveClient,
+      },
+      store,
+      pino({ enabled: false }),
+    );
+    const project = await broker.createProject({ name: "Acme", workspaceRoot: "/tmp/acme" });
+    const thread = await broker.createThread({ projectId: project.id, title: "Auth" });
+    await broker.sendTurn({ threadId: thread.id, text: "Fix auth" });
+    fixture.completeThread(thread.id, "Отчёт единственного turn.", "msg_only");
+    store.setRuntimeState(`thread_reported_terminal_message:${thread.id}`, "msg_only");
+    store.setRuntimeState(`thread_reported_terminal_turn:${thread.id}`, "turn_1");
+    // The daemon is not waiting on a dispatch of its own any more.
+    store.updateThreadStatus(thread.id, "running");
+
+    const events = [];
+    for await (const event of broker.subscribeThread(thread.id)) events.push(event);
+    expect(events.at(-1)).toEqual({
+      type: "completed",
+      threadId: thread.id,
+      result: "Отчёт единственного turn.",
+    });
+  });
+
   it("projects real T3 thread stream deltas and session completion without polling", async () => {
     const liveClient = new FakeLiveClient();
     const broker = new HttpT3Broker(
@@ -804,6 +917,7 @@ class T3Fixture {
   private projects: Array<Record<string, unknown>> = [];
   private threads: Array<Record<string, unknown>> = [];
   private sequence = 0;
+  private turnCounter = 0;
   private server = createServer((request, response) => void this.handle(request, response));
   url = "";
 
@@ -819,7 +933,7 @@ class T3Fixture {
     );
   }
 
-  completeThread(threadId: string, text: string): void {
+  completeThread(threadId: string, text: string, messageId = "msg_result"): void {
     const thread = this.threads.find((candidate) => candidate.id === threadId);
     if (!thread) return;
     const timestamp = new Date().toISOString();
@@ -827,7 +941,7 @@ class T3Fixture {
       ...(thread.latestTurn as Record<string, unknown>),
       state: "completed",
       completedAt: timestamp,
-      assistantMessageId: "msg_result",
+      assistantMessageId: messageId,
     };
     thread.session = {
       ...(thread.session as Record<string, unknown>),
@@ -837,8 +951,33 @@ class T3Fixture {
     };
     thread.messages = [
       ...((thread.messages as unknown[]) ?? []),
-      { id: "msg_result", role: "assistant", text, streaming: false, createdAt: timestamp },
+      { id: messageId, role: "assistant", text, streaming: false, createdAt: timestamp },
     ];
+    thread.updatedAt = timestamp;
+  }
+
+  /**
+   * A dispatched turn the server has NOT picked up yet: the command is
+   * accepted and its message stored, but `latestTurn`/`session` still describe
+   * the previous, finished turn — which is exactly what a snapshot taken right
+   * after `sendTurn` returns.
+   */
+  deferTurnStart = false;
+
+  startTurn(threadId: string, timestamp = new Date().toISOString()): void {
+    const thread = this.threads.find((candidate) => candidate.id === threadId);
+    if (!thread) return;
+    this.turnCounter += 1;
+    const turnId = `turn_${this.turnCounter}`;
+    thread.latestTurn = {
+      turnId,
+      state: "running",
+      requestedAt: timestamp,
+      startedAt: timestamp,
+      completedAt: null,
+      assistantMessageId: null,
+    };
+    thread.session = { status: "running", providerName: "claude", activeTurnId: turnId, lastError: null };
     thread.updatedAt = timestamp;
   }
 
@@ -908,24 +1047,15 @@ class T3Fixture {
     } else if (command.type === "thread.turn.start") {
       const thread = this.threads.find((candidate) => candidate.id === command.threadId)!;
       const message = command.message as Record<string, unknown>;
-      thread.latestTurn = {
-        turnId: "turn_1",
-        state: "running",
-        requestedAt: timestamp,
-        startedAt: timestamp,
-        completedAt: null,
-        assistantMessageId: null,
-      };
-      thread.session = {
-        status: "running",
-        providerName: "claude",
-        activeTurnId: "turn_1",
-        lastError: null,
-      };
+      // Appended, not replaced: a reused thread keeps the previous turn's
+      // messages, and the previous turn's final report is what a stale
+      // snapshot would otherwise hand the daemon as this turn's ending.
       thread.messages = [
+        ...((thread.messages as unknown[]) ?? []),
         { id: message.messageId, role: "user", text: message.text, streaming: false, createdAt: timestamp },
       ];
       thread.updatedAt = timestamp;
+      if (!this.deferTurnStart) this.startTurn(String(command.threadId), timestamp);
     }
   }
 }

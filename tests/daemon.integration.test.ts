@@ -9951,6 +9951,110 @@ describe("OperatorDaemon product flow", () => {
     await daemon.stop();
   });
 
+  it("relays EVERY ending of a reused thread, each with its own final report", async () => {
+    // Package 1.2's delivery guard was a flat per-thread flag: once ONE ending
+    // had been handed to the Operator, every later one on that thread returned
+    // early. A thread that completes, is resumed and completes again — the
+    // normal life of a reused thread — therefore reached the owner exactly
+    // once, and the second, real ending only ever surfaced as routine notes.
+    const home = tempDirectory("daemon-recompletion-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1", turnId: "turn_1" },
+      { type: "completed", threadId: "th_1", result: "Готово к рестарту." },
+      { type: "started", threadId: "th_1", turnId: "turn_2" },
+      { type: "completed", threadId: "th_1", result: "Гонка починена; сьют зелёный." },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь auth race"));
+    const endings = (): string[] =>
+      runtime.prompts.filter((prompt) => prompt.includes('the work ENDED with outcome "completed"'));
+    await waitFor(() => endings().length >= 2, 20_000);
+
+    // Both endings reached the Operator, and each carried its OWN report.
+    expect(endings().some((prompt) => prompt.includes("Готово к рестарту."))).toBe(true);
+    expect(endings().some((prompt) => prompt.includes("Гонка починена; сьют зелёный."))).toBe(true);
+    // A second ending is a new delivery epoch, not a replay of the first.
+    expect(store.getRuntimeState("thread_terminal_epoch:th_1")).not.toBe("1");
+
+    // …and the ending survives maintenance. A recovery snapshot that carries no
+    // messages blanks the thread's result columns, and the periodic summary
+    // refresh then re-persists with nothing in hand — which used to overwrite
+    // the stored final report with the bare placeholder "Thread status: …",
+    // so the Operator's own envelope forgot the ending minutes after it landed.
+    const stored = store.getThread("th_1")!;
+    const { lastResultSummary: _blanked, ...withoutResult } = stored;
+    store.upsertThread({ ...withoutResult, shortSummary: "", lastActivityAt: nowIso() });
+    await daemon.maintain();
+    expect(store.getThreadSummary("th_1")?.currentState).toContain("Гонка починена");
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
+  it("tells one ending once, however often the broker replays it", async () => {
+    // The other half of the same guard: a resubscribe re-emits the terminal it
+    // already emitted, and the owner must not hear the same ending twice.
+    const home = tempDirectory("daemon-ending-replay-");
+    const store = tempStore();
+    const runtime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const broker = new FakeBroker();
+    broker.workerEvents = [
+      { type: "started", threadId: "th_1", turnId: "turn_1" },
+      { type: "completed", threadId: "th_1", result: "Единственный финал." },
+      { type: "completed", threadId: "th_1", result: "Единственный финал." },
+    ];
+    const telegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let daemon: OperatorDaemon;
+    const tools = new OperatorToolServer({
+      broker,
+      store,
+      telegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => daemon.trackOperatorToolThread(input),
+    });
+    const scheduler = new DailyScheduler(() => daemon.maintain(), logger);
+    daemon = new OperatorDaemon(config(home), store, runtime, broker, telegram, artifacts, scheduler, logger, tools);
+    await daemon.initialize();
+    const run = daemon.run();
+
+    telegram.push(message(1, "исправь auth race"));
+    await waitFor(
+      () => runtime.prompts.some((prompt) => prompt.includes("Единственный финал.")),
+      20_000,
+    );
+    await waitForPumpPasses(store, 3);
+    expect(
+      runtime.prompts.filter((prompt) => prompt.includes('the work ENDED with outcome "completed"')),
+    ).toHaveLength(1);
+
+    telegram.finish();
+    await run;
+    await daemon.stop();
+  });
+
   it("issues 48-bit synthetic negative message ids that stay clear of real ones (bug №46)", () => {
     const id = syntheticNegativeMessageId("autorun_example:2026-08-25T10:00:00Z");
     expect(id).toBeLessThan(0);

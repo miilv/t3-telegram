@@ -841,10 +841,25 @@ function normalizeProviderCapabilities(driver: string, operational: boolean): Pr
   };
 }
 
+/**
+ * Which ending this thread has already been told about. Durable because the
+ * projection is rebuilt on every (re)subscribe, and a restart is precisely when
+ * a stale snapshot arrives.
+ */
+const REPORTED_TERMINAL_TURN_PREFIX = "thread_reported_terminal_turn:";
+const REPORTED_TERMINAL_MESSAGE_PREFIX = "thread_reported_terminal_message:";
+
 class ThreadSubscriptionProjection {
   private readonly assistantMessages = new Map<string, string>();
   private readonly seenActivities = new Set<string>();
   private lastCompletedAssistant = "";
+  /** Identity of the message above — what tells THIS turn's report from the last one. */
+  private lastCompletedAssistantId = "";
+  /**
+   * A completion we refused to report because it could only have carried the
+   * PREVIOUS turn's final text. Released the moment this turn writes its own.
+   */
+  private deferredCompletion = false;
   /**
    * The most recent finished assistant message, held back by one: if another
    * message or a terminal state follows, this one was intermediate narration
@@ -868,18 +883,25 @@ class ThreadSubscriptionProjection {
   }
 
   applySnapshot(thread: T3ThreadWire): WorkerEvent[] {
+    // Read BEFORE the upsert: `mapThread` overwrites the local status with the
+    // wire's, and "we asked for a turn the server has not picked up yet" is
+    // exactly what tells a stale terminal from a real one.
+    const dispatchPending = this.store.getThread(this.threadId)?.status === "queued";
     this.store.upsertThread(mapThread(thread));
     this.assistantMessages.clear();
     for (const message of thread.messages ?? []) {
       if (message.role !== "assistant") continue;
       this.assistantMessages.set(message.id, message.text);
-      if (!message.streaming) this.lastCompletedAssistant = message.text;
+      if (!message.streaming) {
+        this.lastCompletedAssistant = message.text;
+        this.lastCompletedAssistantId = message.id;
+      }
     }
 
     const events: WorkerEvent[] = [];
     const state = statusFromWire(thread);
     if (state === "running" || state === "queued") {
-      this.turnObserved = true;
+      this.observeTurn();
       this.pushStarted(events, thread.latestTurn?.turnId);
     }
     if (thread.planProgress?.step) this.pushProgress(events, thread.planProgress.step);
@@ -902,8 +924,12 @@ class ThreadSubscriptionProjection {
       }
       events.push(...this.applyActivity(activity));
     }
-    const terminal = this.terminalForState(state, thread.session?.lastError ?? undefined);
-    if (terminal) events.push(terminal);
+    events.push(
+      ...this.terminalForState(state, thread.session?.lastError ?? undefined, {
+        ...(thread.latestTurn?.turnId ? { turnId: thread.latestTurn.turnId } : {}),
+        dispatchPending,
+      }),
+    );
     return events;
   }
 
@@ -927,7 +953,7 @@ class ThreadSubscriptionProjection {
 
     switch (event.type) {
       case "thread.turn-start-requested": {
-        this.turnObserved = true;
+        this.observeTurn();
         this.store.updateThreadStatus(this.threadId, "queued");
         // Package 1.5 — ownership by identity. `commandId` is a field of the
         // EVENT ENVELOPE (`EventBaseFields` in the orchestration contract), not
@@ -954,29 +980,34 @@ class ThreadSubscriptionProjection {
         const session = payload.session;
         const status = session.status;
         if (status === "starting" || status === "running") {
-          this.turnObserved = true;
+          this.observeTurn();
           this.store.updateThreadStatus(this.threadId, status === "starting" ? "queued" : "running");
           this.pushStarted(events);
           break;
         }
         if (status === "error") {
           this.pendingAssistant = undefined;
+          this.deferredCompletion = false;
           const error = typeof session.lastError === "string" ? session.lastError : "T3 worker failed";
+          this.rememberReportedTerminal();
           this.store.updateThreadStatus(this.threadId, "failed", { result: error });
           events.push({ type: "failed", threadId: this.threadId, error });
           break;
         }
         if (status === "interrupted" || status === "stopped") {
           this.pendingAssistant = undefined;
+          this.deferredCompletion = false;
+          this.rememberReportedTerminal();
           this.store.updateThreadStatus(this.threadId, "cancelled");
           events.push({ type: "cancelled", threadId: this.threadId });
           break;
         }
         if ((status === "ready" || status === "idle") && this.turnObserved) {
           this.pendingAssistant = undefined;
-          const result = this.lastCompletedAssistant || "Worker completed.";
-          this.store.updateThreadStatus(this.threadId, "completed", { result });
-          events.push({ type: "completed", threadId: this.threadId, result });
+          // The session can go ready before the turn's own final message has
+          // been streamed. Reporting the ending here would attach the PREVIOUS
+          // turn's report to it, so the ending waits for its own words.
+          events.push(...this.completionEvents({ dispatchPending: true }));
         }
         break;
       }
@@ -1006,6 +1037,13 @@ class ThreadSubscriptionProjection {
     this.assistantMessages.set(messageId, text);
     if (streaming) return [];
     this.lastCompletedAssistant = text;
+    this.lastCompletedAssistantId = messageId;
+    if (this.deferredCompletion) {
+      // The ending we held back now has this turn's own final report; it is a
+      // result, not narration, so it never travels as an `agent_message`.
+      this.pendingAssistant = undefined;
+      return [this.emitCompleted()];
+    }
     const events: WorkerEvent[] = [];
     if (this.pendingAssistant && this.pendingAssistant.id !== messageId) {
       events.push(...this.releasePendingAssistant());
@@ -1095,23 +1133,91 @@ class ThreadSubscriptionProjection {
     return [];
   }
 
-  private terminalForState(state: ThreadStatus, error?: string): WorkerEvent | undefined {
+  private terminalForState(
+    state: ThreadStatus,
+    error?: string,
+    turn: { turnId?: string; dispatchPending?: boolean } = {},
+  ): WorkerEvent[] {
     // Whatever is still held back is the final answer, delivered as the result.
     if (state === "completed" || state === "failed" || state === "cancelled") {
       this.pendingAssistant = undefined;
     }
-    if (state === "completed") {
-      const result = this.lastCompletedAssistant || "Worker completed.";
-      this.store.updateThreadStatus(this.threadId, "completed", { result });
-      return { type: "completed", threadId: this.threadId, result };
-    }
+    if (state === "completed") return this.completionEvents(turn);
     if (state === "failed") {
+      this.deferredCompletion = false;
       const detail = error || "T3 worker failed";
+      this.rememberReportedTerminal(turn.turnId);
       this.store.updateThreadStatus(this.threadId, "failed", { result: detail });
-      return { type: "failed", threadId: this.threadId, error: detail };
+      return [{ type: "failed", threadId: this.threadId, error: detail }];
     }
-    if (state === "cancelled") return { type: "cancelled", threadId: this.threadId };
-    return undefined;
+    if (state === "cancelled") {
+      this.deferredCompletion = false;
+      this.rememberReportedTerminal(turn.turnId);
+      return [{ type: "cancelled", threadId: this.threadId }];
+    }
+    return [];
+  }
+
+  /**
+   * The single gate a `completed` event passes through.
+   *
+   * A completion is only true if it can carry THIS turn's own final report. The
+   * daemon subscribes the instant it dispatches, and T3 answers that first read
+   * with the thread as it stands — which, until the server picks the turn up,
+   * is still the PREVIOUS turn: state `completed`, and the previous turn's last
+   * assistant message as its result. Relayed as-is that produced the worst
+   * outcome this pipeline has: the owner was told the work had ENDED and shown
+   * the report of the run before it, while the real ending — arriving minutes
+   * later, when the turn actually finished — was dropped as a duplicate.
+   *
+   * So while a dispatched turn is still pending, an ending that repeats the one
+   * we already reported is held back instead of relayed, and `applyMessage`
+   * releases it the moment this turn writes its own final message. A
+   * resubscribe (whose snapshot is no longer "pending") always reports, so a
+   * turn that ends without saying anything can never wedge the monitor.
+   */
+  private completionEvents(turn: { turnId?: string; dispatchPending?: boolean }): WorkerEvent[] {
+    if (turn.dispatchPending && this.repeatsReportedTerminal(turn.turnId)) {
+      this.deferredCompletion = true;
+      return [];
+    }
+    return [this.emitCompleted(turn.turnId)];
+  }
+
+  private emitCompleted(turnId?: string): WorkerEvent {
+    this.deferredCompletion = false;
+    const result = this.lastCompletedAssistant || "Worker completed.";
+    this.rememberReportedTerminal(turnId);
+    this.store.updateThreadStatus(this.threadId, "completed", { result });
+    return { type: "completed", threadId: this.threadId, result };
+  }
+
+  /** What a later stale snapshot is compared against. Durable: restarts resubscribe. */
+  private rememberReportedTerminal(turnId?: string): void {
+    this.store.setRuntimeState(
+      `${REPORTED_TERMINAL_TURN_PREFIX}${this.threadId}`,
+      turnId ?? this.lastTurnId ?? "",
+    );
+    this.store.setRuntimeState(
+      `${REPORTED_TERMINAL_MESSAGE_PREFIX}${this.threadId}`,
+      this.lastCompletedAssistantId,
+    );
+  }
+
+  private repeatsReportedTerminal(turnId?: string): boolean {
+    const reportedTurn = this.store.getRuntimeState(`${REPORTED_TERMINAL_TURN_PREFIX}${this.threadId}`) ?? "";
+    // Turn identity decides outright when both sides carry it: a different turn
+    // is a different ending, whatever its messages look like.
+    if (turnId && reportedTurn) return turnId === reportedTurn;
+    const reportedMessage =
+      this.store.getRuntimeState(`${REPORTED_TERMINAL_MESSAGE_PREFIX}${this.threadId}`) ?? "";
+    return reportedMessage !== "" && reportedMessage === this.lastCompletedAssistantId;
+  }
+
+  /** A turn is running: nothing held back belongs to it. */
+  private observeTurn(): void {
+    this.turnObserved = true;
+    this.deferredCompletion = false;
   }
 
   private pushStarted(events: WorkerEvent[], turnId?: string, commandId?: string): void {

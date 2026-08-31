@@ -6039,8 +6039,21 @@ export class OperatorDaemon {
     route: MonitorRoute,
     event: Extract<WorkerEvent, { type: "completed" }>,
   ): Promise<void> {
-    if (this.store.getRuntimeState(`thread_completion_delivered:${event.threadId}`)) return;
     const summary = safeExcerpt(event.result, 4_000);
+    // A thread is REUSED: it ends once per turn, and the guard that keeps one
+    // ending from being told twice must not also swallow the next one. The flat
+    // "delivered" flag did exactly that — a thread that completed, was resumed
+    // and completed again reached the owner as nothing at all, and so did the
+    // real ending of a turn whose first, stale `completed` had already burned
+    // the flag. Identity is the final report itself: the same report is a
+    // repeat; a different one is a NEW ending and opens its own delivery epoch.
+    const fingerprint = stableTextHash(summary);
+    const fingerprintKey = `thread_completion_fingerprint:${event.threadId}`;
+    if (this.store.getRuntimeState(`thread_completion_delivered:${event.threadId}`)) {
+      if (this.store.getRuntimeState(fingerprintKey) === fingerprint) return;
+      this.resetThreadTerminalDelivery(event.threadId);
+    }
+    this.store.setRuntimeState(fingerprintKey, fingerprint);
     if (this.isExternalTurn(event.threadId) && !this.hadRecentOwnDispatch(event.threadId)) {
       // A collaborator's own turn in the T3 UI: recorded, never relayed.
       this.store.updateThreadStatus(event.threadId, "completed", { result: summary });
@@ -6659,6 +6672,11 @@ export class OperatorDaemon {
       result?.summary ||
       thread.lastResultSummary ||
       thread.shortSummary ||
+      // `refreshStructuredThreadSummaries` re-persists finished threads with no
+      // result in hand. Falling straight through to the placeholder overwrote
+      // the final report this thread HAD stored with "Thread status: completed",
+      // so the Operator's envelope forgot the ending minutes after it happened.
+      previous?.currentState ||
       `Thread status: ${thread.status}`;
     return this.store.upsertThreadSummary({
       threadId,
