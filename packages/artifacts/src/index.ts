@@ -9,7 +9,11 @@ import type { OperatorStore } from "../../storage/src/index.js";
 const MAX_INBOUND_BYTES = 50 * 1024 * 1024;
 const MAX_OUTBOUND_BYTES = 50 * 1024 * 1024;
 const INBOUND_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
-const secretPattern = /(^|[._-])(env|secret|token|credential|id_rsa|id_ed25519)([._-]|$)/i;
+// `credentials.json` and `rclone.conf` slipped past the old boundary: after
+// "credential" came an "s", not a separator. Widening the outbound roots makes
+// that gap reachable, so it closes in the same change.
+const secretPattern =
+  /(^|[._-])(env|secrets?|tokens?|credentials?|password|id_rsa|id_ed25519|rclone)([._-]|$)|\.(pem|key|p12|pfx|kdbx)$/i;
 
 export interface SafeFileMetadata {
   localPath: string;
@@ -27,6 +31,13 @@ export class ArtifactRegistry {
     /** Outbound ceiling; the cloud Bot API caps uploads at 50 MiB. */
     private readonly maxOutboundBytes: number = MAX_OUTBOUND_BYTES,
     private readonly retentionMs: number = INBOUND_RETENTION_MS,
+    /**
+     * Roots that are allowed for outbound on TOP of whatever the call site
+     * passes. A call site knows the roots of the CONVERSATION (the project
+     * workspace); only the registry knows the roots of the OPERATOR ITSELF,
+     * and holding them here is what stops the next call site from forgetting.
+     */
+    private readonly baseOutboundRoots: readonly string[] = [],
   ) {}
 
   private outboundLimitError(kind: string): Error {
@@ -251,7 +262,18 @@ export class ArtifactRegistry {
   async inspectOutbound(path: string, allowedRoots: string[]): Promise<SafeFileMetadata> {
     if (!existsSync(path)) throw new Error("Outbound artifact does not exist");
     const resolvedPath = await realpath(path);
-    const roots = await Promise.all(allowedRoots.map((root) => realpath(root)));
+    // Stand run 30.08, defect Д-1: with only the project workspace here, the
+    // bot could not hand over a file IT had just produced — everything it
+    // makes lands in ~/.operator/artifacts or ~/.operator/workspaces, which is
+    // inside no project workspace at all. Ten sends were refused in one run.
+    const candidates = [...new Set([...allowedRoots, ...this.baseOutboundRoots])];
+    // A configured root that does not exist yet (workspaces before the first
+    // project) must not take the whole check down with an ENOENT: it simply
+    // does not allow anything. The emptiness guard below keeps it fail-closed.
+    const roots = (
+      await Promise.all(candidates.map((root) => realpath(root).catch(() => undefined)))
+    ).filter((root): root is string => root !== undefined);
+    if (!roots.length) throw new Error("Outbound path has no allowed roots");
     if (!roots.some((root) => isInside(root, resolvedPath))) throw new Error("Outbound path is outside allowed roots");
     if (secretPattern.test(basename(resolvedPath))) throw new Error("Secret-like files cannot be sent");
     const metadata = await stat(resolvedPath);
