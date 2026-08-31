@@ -568,7 +568,18 @@ export type WorkerEvent =
    * (package 1.5); when present it settles own/external classification without
    * a race. Absent on servers that do not echo it.
    */
-  | { type: "started"; threadId: string; turnId?: string; commandId?: string }
+  | {
+      type: "started";
+      threadId: string;
+      turnId?: string;
+      commandId?: string;
+      /**
+       * When the SERVER says this turn was asked for. Only a snapshot knows it,
+       * and only the restart path needs it: it is what corroborates that a
+       * still-running turn met after a restart is the one we dispatched.
+       */
+      requestedAt?: string;
+    }
   | { type: "progress"; threadId: string; summary: string }
   | { type: "agent_message"; threadId: string; text: string }
   | {
@@ -915,6 +926,136 @@ export function ownDispatchPendingCount(store: RuntimeStateStore, threadId: stri
   const parsed = Number(raw);
   // Pre-counter deployments stored an ISO timestamp; treat it as one pending.
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 1;
+}
+
+/**
+ * Which turn of this thread is OURS while it runs.
+ *
+ * The own-dispatch marker above is consumed by the very `started` event that
+ * claims it, and the broker's turn bookkeeping (`lastTurnId`, `lastCommandId`,
+ * `startedEmitted`) lives in process memory. So a daemon that restarted in the
+ * middle of its own long turn had nothing left that said "we are the ones
+ * driving this": it resubscribed, the snapshot re-announced the still-running
+ * turn, the marker was long gone and the grace window long expired, and the
+ * turn was classified as somebody working directly in the T3 UI. The owner was
+ * told so, the worker's progress was suppressed, and the final report of our
+ * own work was recorded and never delivered. Reproduced on 2026-08-31: two
+ * `worker.external_turn` events eight seconds after a restart, on two threads
+ * the daemon itself had dispatched.
+ *
+ * This record is durable, so it survives the restart. It is written when a turn
+ * is classified as ours, bound to the server's turn id as soon as one travels,
+ * and cleared when the turn ends.
+ */
+export interface OwnTurnRecord {
+  /** The command id we chose for the dispatch, when the server echoes one. */
+  commandId?: string;
+  /** The server's own id for the turn, bound as soon as one travels with an event. */
+  turnId?: string;
+  /** When we asked for this turn — what corroborates a turn id met after a restart. */
+  dispatchedAt?: string;
+}
+
+function ownTurnKey(threadId: string): string {
+  return `thread_own_turn:${threadId}`;
+}
+
+/**
+ * Record (or extend) the running turn we own. Merging rather than overwriting:
+ * the turn id usually arrives on a later event than the command id, and the
+ * dispatch timestamp is written once, by whoever saw the turn start first.
+ */
+export function markOwnTurnRunning(
+  store: RuntimeStateStore,
+  threadId: string,
+  record: OwnTurnRecord,
+): void {
+  const previous = readOwnTurn(store, threadId);
+  // A different command id is a different turn: keep nothing from the old one,
+  // or a stale turn id would go on claiming ownership of the new turn's events.
+  const carried =
+    previous && record.commandId && previous.commandId && previous.commandId !== record.commandId
+      ? undefined
+      : previous;
+  const commandId = record.commandId ?? carried?.commandId;
+  const turnId = record.turnId ?? carried?.turnId;
+  // The dispatch is dated once, by whoever saw the turn start first.
+  const dispatchedAt = carried?.dispatchedAt ?? record.dispatchedAt;
+  const merged: OwnTurnRecord = {
+    ...(commandId ? { commandId } : {}),
+    ...(turnId ? { turnId } : {}),
+    ...(dispatchedAt ? { dispatchedAt } : {}),
+  };
+  store.setRuntimeState(ownTurnKey(threadId), JSON.stringify(merged));
+}
+
+export function readOwnTurn(store: RuntimeStateStore, threadId: string): OwnTurnRecord | undefined {
+  const raw = store.getRuntimeState(ownTurnKey(threadId)) ?? "";
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return undefined;
+    const record = parsed as Record<string, unknown>;
+    const pick = (key: string): string | undefined => {
+      const value = record[key];
+      return typeof value === "string" && value ? value : undefined;
+    };
+    const commandId = pick("commandId");
+    const turnId = pick("turnId");
+    const dispatchedAt = pick("dispatchedAt");
+    if (!commandId && !turnId && !dispatchedAt) return undefined;
+    return {
+      ...(commandId ? { commandId } : {}),
+      ...(turnId ? { turnId } : {}),
+      ...(dispatchedAt ? { dispatchedAt } : {}),
+    };
+  } catch {
+    // A row written by an older build, or hand-edited during an incident.
+    // Unreadable ownership is no ownership; the counter and grace still apply.
+    return undefined;
+  }
+}
+
+/** The turn ended (or was handed over): stop claiming it. */
+export function clearOwnTurn(store: RuntimeStateStore, threadId: string): void {
+  store.setRuntimeState(ownTurnKey(threadId), "");
+}
+
+/**
+ * How far a server-reported `requestedAt` may sit from the moment we dispatched
+ * and still describe the same turn. It absorbs network latency and clock skew
+ * between the daemon and T3, nothing more: a turn the owner opened in the UI
+ * after ours finished is minutes or hours away, not seconds.
+ */
+export const OWN_TURN_REQUEST_SKEW_MS = 120_000;
+
+/**
+ * Is the turn we are looking at the one this record claims? Called when a turn
+ * id turns up for a thread with a live own-turn record — most importantly on
+ * the snapshot that follows a restart.
+ */
+export function ownTurnMatches(
+  record: OwnTurnRecord,
+  turn: { turnId?: string | undefined; commandId?: string | undefined; requestedAt?: string | undefined },
+): boolean {
+  // A command id settles it outright, in both directions.
+  if (turn.commandId && record.commandId) return turn.commandId === record.commandId;
+  // Once bound, the turn id is the identity: a different one is a different turn.
+  if (record.turnId) return record.turnId === turn.turnId;
+  if (!turn.turnId) return false;
+  // Unbound: this is the first turn id we have seen for a turn we already know
+  // is ours. Corroborate it with the time the server says the turn was asked
+  // for — that is what tells "our turn, still running across the restart" from
+  // "our turn ended while we were down and the owner started their own".
+  const requestedAt = Date.parse(turn.requestedAt ?? "");
+  const dispatchedAt = Date.parse(record.dispatchedAt ?? "");
+  if (!Number.isFinite(requestedAt) || !Number.isFinite(dispatchedAt)) {
+    // A server that dates no turns leaves nothing to check against. Claim it:
+    // wrongly relaying our own turn's steps is noise, wrongly disowning it
+    // loses the report of the work entirely.
+    return true;
+  }
+  return Math.abs(requestedAt - dispatchedAt) <= OWN_TURN_REQUEST_SKEW_MS;
 }
 
 export {

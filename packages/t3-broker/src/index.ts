@@ -902,7 +902,7 @@ class ThreadSubscriptionProjection {
     const state = statusFromWire(thread);
     if (state === "running" || state === "queued") {
       this.observeTurn();
-      this.pushStarted(events, thread.latestTurn?.turnId);
+      this.pushStarted(events, thread.latestTurn?.turnId, undefined, thread.latestTurn?.requestedAt);
     }
     if (thread.planProgress?.step) this.pushProgress(events, thread.planProgress.step);
     const resolvedRequestIds = new Set(
@@ -1220,7 +1220,12 @@ class ThreadSubscriptionProjection {
     this.deferredCompletion = false;
   }
 
-  private pushStarted(events: WorkerEvent[], turnId?: string, commandId?: string): void {
+  private pushStarted(
+    events: WorkerEvent[],
+    turnId?: string,
+    commandId?: string,
+    requestedAt?: string,
+  ): void {
     // A known, different turn id means a NEW turn began inside a live
     // subscription (e.g. someone continued the thread from the T3 UI); it must
     // surface even though this subscription already emitted a start.
@@ -1242,6 +1247,7 @@ class ThreadSubscriptionProjection {
       threadId: this.threadId,
       ...(turnId ? { turnId } : {}),
       ...(commandId ? { commandId } : {}),
+      ...(requestedAt ? { requestedAt } : {}),
     });
   }
 

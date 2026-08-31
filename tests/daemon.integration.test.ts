@@ -45,7 +45,13 @@ import type {
   WorkThread,
   WorkerEvent,
 } from "../packages/shared/src/index.js";
-import { APPROVAL_RISK_RU, nowIso } from "../packages/shared/src/index.js";
+import {
+  APPROVAL_RISK_RU,
+  clearOwnTurn,
+  markOwnTurnRunning,
+  nowIso,
+  readOwnTurn,
+} from "../packages/shared/src/index.js";
 import { DailyScheduler } from "../packages/scheduler/src/index.js";
 import {
   HASH_NOTE_EMBEDDING_MODEL,
@@ -6949,6 +6955,210 @@ describe("OperatorDaemon product flow", () => {
     await run;
     await daemon.stop();
   }, 20_000);
+
+  /**
+   * Restart in the middle of OUR OWN running turn. Reproduced in production on
+   * 2026-08-31: eight seconds after a deploy restart, two `worker.external_turn`
+   * events on two threads the daemon itself had dispatched, two «тред продолжили
+   * напрямую в T3» messages to the owner, and — the part that costs work — the
+   * final reports of both threads filed as a stranger's and never delivered.
+   *
+   * Everything that knew the turn was ours died with the process: the
+   * one-shot dispatch marker had been consumed by the `started` event that
+   * claimed it, the 2-minute grace window was long past on a turn that runs for
+   * an hour, and the broker's turn ids live in process memory. The resubscribe
+   * snapshot then re-announced the still-running turn as a turn id nobody
+   * recognised.
+   */
+  it("keeps its own running turn across a restart instead of handing it to a stranger", async () => {
+    const home = tempDirectory("daemon-restart-own-turn-");
+    // One database, two processes — `stop()` closes the store the way a real
+    // shutdown does, so the restart has to reopen it.
+    const databasePath = `${home}/operator.db`;
+    const store = new OperatorStore(databasePath);
+    store.migrate();
+
+    // ── Before the restart: we dispatch, the turn starts, and it is still
+    // running when the daemon goes down. ────────────────────────────────────
+    const beforeRuntime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const beforeBroker = new RunningTurnBroker();
+    const beforeTelegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let before: OperatorDaemon;
+    const beforeTools = new OperatorToolServer({
+      broker: beforeBroker,
+      store,
+      telegram: beforeTelegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => before.trackOperatorToolThread(input),
+    });
+    before = new OperatorDaemon(
+      config(home), store, beforeRuntime, beforeBroker, beforeTelegram, artifacts,
+      new DailyScheduler(() => before.maintain(), logger), logger, beforeTools,
+    );
+    await before.initialize();
+    const beforeRun = before.run();
+
+    beforeTelegram.push(message(1, "исправь race condition в auth"));
+    // The turn is ours and recorded as ours — durably, which is the whole point.
+    await waitFor(() => Boolean(readOwnTurn(store, "th_1")?.commandId), 10_000);
+    const dispatchedAt = store.getRuntimeState("thread_own_dispatch_at:th_1")!;
+    expect(store.getThread("th_1")?.status).toBe("running");
+
+    beforeTelegram.finish();
+    await beforeRun;
+    await before.stop();
+
+    const restarted = new OperatorStore(databasePath);
+    restarted.migrate();
+    // What the shutdown takes with it: the expected-turn markers die with the
+    // monitor, so nothing identity-shaped is left for the next process.
+    expect(restarted.getRuntimeState("thread_expected_turns:th_1")).toBeFalsy();
+
+    // ── After the restart: a fresh process, a fresh subscription, and a
+    // snapshot that re-announces the same running turn by an id we have never
+    // seen and with no command id — snapshots carry none. ──────────────────
+    const afterRuntime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const afterBroker = new ResubscribedTurnBroker("turn_ours", dispatchedAt);
+    afterBroker.threads.push(...beforeBroker.threads);
+    afterBroker.projects.push(...beforeBroker.projects);
+    const afterTelegram = new FakeTelegram();
+    let after: OperatorDaemon;
+    const afterTools = new OperatorToolServer({
+      broker: afterBroker,
+      store: restarted,
+      telegram: afterTelegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => after.trackOperatorToolThread(input),
+    });
+    after = new OperatorDaemon(
+      config(home), restarted, afterRuntime, afterBroker, afterTelegram, artifacts,
+      new DailyScheduler(() => after.maintain(), logger), logger, afterTools,
+    );
+    await after.initialize();
+    const afterRun = after.run();
+
+    await waitFor(() => restarted.getThread("th_1")?.status === "completed", 10_000);
+    // The thread is still ours: no announcement, no external flag…
+    expect(
+      afterTelegram.sent.some((sent) => sent.text.includes("тред продолжили напрямую в T3")),
+    ).toBe(false);
+    expect(restarted.getRuntimeState("thread_turn_external:th_1")).toBeFalsy();
+    // …and the report of our own work reaches the Operator rather than being
+    // recorded in silence. That is what the bug actually cost.
+    await waitFor(
+      () => afterRuntime.prompts.some((prompt) => prompt.includes("Fixed auth race")),
+      10_000,
+    );
+    // The turn ended, so the claim on the thread is released with it.
+    expect(readOwnTurn(restarted, "th_1")).toBeUndefined();
+
+    afterTelegram.finish();
+    await afterRun;
+    await after.stop();
+  }, 30_000);
+
+  /**
+   * The other direction, and the reason the fix corroborates instead of simply
+   * trusting a leftover record: our turn ended while the daemon was down and
+   * the owner then continued the thread themselves in the T3 UI. The record is
+   * stale, and the turn the snapshot announces is dated hours from our dispatch
+   * — which is what says so.
+   */
+  it("still recognises a turn the owner opened in T3 while the daemon was down", async () => {
+    const home = tempDirectory("daemon-restart-external-turn-");
+    const databasePath = `${home}/operator.db`;
+    const store = new OperatorStore(databasePath);
+    store.migrate();
+
+    const beforeRuntime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    const beforeBroker = new RunningTurnBroker();
+    const beforeTelegram = new FakeTelegram();
+    const logger = pino({ enabled: false });
+    const artifacts = new ArtifactRegistry(`${home}/artifacts`, store);
+    let before: OperatorDaemon;
+    const beforeTools = new OperatorToolServer({
+      broker: beforeBroker,
+      store,
+      telegram: beforeTelegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => before.trackOperatorToolThread(input),
+    });
+    before = new OperatorDaemon(
+      config(home), store, beforeRuntime, beforeBroker, beforeTelegram, artifacts,
+      new DailyScheduler(() => before.maintain(), logger), logger, beforeTools,
+    );
+    await before.initialize();
+    const beforeRun = before.run();
+
+    beforeTelegram.push(message(1, "исправь race condition в auth"));
+    await waitFor(() => Boolean(readOwnTurn(store, "th_1")?.commandId), 10_000);
+    const dispatchedAt = store.getRuntimeState("thread_own_dispatch_at:th_1")!;
+
+    beforeTelegram.finish();
+    await beforeRun;
+    await before.stop();
+
+    const restarted = new OperatorStore(databasePath);
+    restarted.migrate();
+    // Age the dispatch by three hours, which is what the downtime really was:
+    // our turn was asked for long ago and ended while we were away. Both the
+    // record and the own-dispatch clock move, or the bug-№27 grace would still
+    // be open and would (rightly) deliver the terminal whatever the label.
+    const longAgo = new Date(Date.now() - 3 * 3_600_000).toISOString();
+    const claimed = readOwnTurn(restarted, "th_1")!;
+    expect(claimed.dispatchedAt).toBe(dispatchedAt);
+    restarted.setRuntimeState("thread_own_dispatch_at:th_1", longAgo);
+    clearOwnTurn(restarted, "th_1");
+    markOwnTurnRunning(restarted, "th_1", {
+      ...(claimed.commandId ? { commandId: claimed.commandId } : {}),
+      dispatchedAt: longAgo,
+    });
+
+    const afterRuntime = new DelegatingRuntime(delegatingScript({ workPattern: /исправь/u }));
+    // The owner opens their own turn in the T3 UI just before we come back. It
+    // is dated to now — three hours from the dispatch our stale record claims,
+    // and that distance is what disowns it.
+    const afterBroker = new ResubscribedTurnBroker("turn_owner", nowIso());
+    afterBroker.threads.push(...beforeBroker.threads);
+    afterBroker.projects.push(...beforeBroker.projects);
+    const afterTelegram = new FakeTelegram();
+    let after: OperatorDaemon;
+    const afterTools = new OperatorToolServer({
+      broker: afterBroker,
+      store: restarted,
+      telegram: afterTelegram,
+      artifacts,
+      logger,
+      onThreadStarted: (input) => after.trackOperatorToolThread(input),
+    });
+    after = new OperatorDaemon(
+      config(home), restarted, afterRuntime, afterBroker, afterTelegram, artifacts,
+      new DailyScheduler(() => after.maintain(), logger), logger, afterTools,
+    );
+    await after.initialize();
+    const afterRun = after.run();
+
+    await waitFor(
+      () => afterTelegram.sent.some((sent) => sent.text.includes("тред продолжили напрямую в T3")),
+      10_000,
+    );
+    expect(restarted.getRuntimeState("thread_turn_external:th_1")).toBe("1");
+    // A stale claim must not survive the turn that disproved it.
+    expect(readOwnTurn(restarted, "th_1")).toBeUndefined();
+    await waitFor(() => restarted.getThread("th_1")?.status === "completed", 10_000);
+    // Their turn's result stays out of the chat and out of the Operator.
+    expect(afterTelegram.sent.some((sent) => sent.text.includes("Fixed auth race"))).toBe(false);
+    expect(afterRuntime.prompts.some((prompt) => prompt.includes("Fixed auth race"))).toBe(false);
+
+    afterTelegram.finish();
+    await afterRun;
+    await after.stop();
+  }, 30_000);
 
   it("supersedes a turn that is still transcribing when the next message lands (package 1.1)", async () => {
     const home = tempDirectory("daemon-preempt-media-");
@@ -14640,6 +14850,59 @@ class SteadyRuntime extends FakeRuntime {
  * command id that is not one of ours; our own turn follows with the id we chose
  * at dispatch. Ownership by identity is the only thing that can tell them apart.
  */
+/**
+ * A turn that starts and is still running when the process goes away. The
+ * `started` event carries the command id we chose and no turn id, exactly like
+ * the live `thread.turn-start-requested`; the stream then ends only when the
+ * monitor is aborted, i.e. at shutdown.
+ */
+class RunningTurnBroker extends FakeBroker {
+  private ownCommandId: string | undefined;
+
+  override async sendTurn(input: SendThreadTurnInput): Promise<TurnHandle> {
+    this.ownCommandId = input.commandId;
+    return super.sendTurn(input);
+  }
+
+  override async *subscribeThread(threadId: string, signal?: AbortSignal): AsyncIterable<WorkerEvent> {
+    this.subscriptions.push(threadId);
+    yield {
+      type: "started",
+      threadId,
+      ...(this.ownCommandId ? { commandId: this.ownCommandId } : {}),
+    };
+    await new Promise<void>((resolve) => {
+      if (signal?.aborted) {
+        resolve();
+        return;
+      }
+      signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+}
+
+/**
+ * What the daemon meets after a restart: a resubscribe whose first message is a
+ * SNAPSHOT. It re-announces the running turn by the server's turn id, dated
+ * with the server's `requestedAt`, and carries no command id — snapshots never
+ * do, which is why identity alone could not answer the question here.
+ */
+class ResubscribedTurnBroker extends FakeBroker {
+  constructor(
+    private readonly turnId: string,
+    private readonly requestedAt: string,
+  ) {
+    super();
+  }
+
+  override async *subscribeThread(threadId: string): AsyncIterable<WorkerEvent> {
+    this.subscriptions.push(threadId);
+    yield { type: "started", threadId, turnId: this.turnId, requestedAt: this.requestedAt };
+    await Promise.resolve();
+    yield { type: "completed", threadId, result: "Fixed auth race. Tests pass." };
+  }
+}
+
 class TurnIdentityBroker extends FakeBroker {
   private ownCommandId: string | undefined;
 

@@ -529,11 +529,16 @@ describe("HttpT3Broker", () => {
     // The snapshot's own start (it carries a turn id and no command id), then
     // one start per command id off the wire — identity intact in both.
     const starts = events.filter((event) => event.type === "started");
-    expect(starts).toEqual([
+    expect(starts).toMatchObject([
       { type: "started", threadId: thread.id, turnId: "turn_1" },
       { type: "started", threadId: thread.id, commandId: "cmd_theirs" },
       { type: "started", threadId: thread.id, commandId: "cmd_ours" },
     ]);
+    // Only the snapshot dates its turn, and only it can: `requestedAt` is what
+    // lets a daemon restarted mid-turn tell the turn it dispatched from a turn
+    // the owner opened in the UI while it was down.
+    expect(typeof starts[0]?.requestedAt).toBe("string");
+    expect(starts[1]?.requestedAt).toBeUndefined();
   });
 
   it("falls back to the envelope correlation id when a turn start carries no command id (package 1.5)", async () => {
@@ -571,7 +576,7 @@ describe("HttpT3Broker", () => {
     const events = [];
     for await (const event of broker.subscribeThread(thread.id)) events.push(event);
 
-    expect(events.filter((event) => event.type === "started")).toEqual([
+    expect(events.filter((event) => event.type === "started")).toMatchObject([
       { type: "started", threadId: thread.id, turnId: "turn_1" },
       { type: "started", threadId: thread.id, commandId: "cmd_ours" },
     ]);

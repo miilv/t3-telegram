@@ -56,8 +56,12 @@ import {
   openFence,
   ownerLogicalDay,
   claimOwnDispatchMarker,
+  clearOwnTurn,
   forgetOwnDispatchMarker,
+  markOwnTurnRunning,
   ownDispatchPendingCount,
+  ownTurnMatches,
+  readOwnTurn,
   truncateFenceAware,
   raiseOwnDispatchPending,
   releaseOwnDispatchPending,
@@ -4889,6 +4893,7 @@ export class OperatorDaemon {
                 event.turnId,
                 route.destination,
                 event.commandId,
+                event.requestedAt,
               );
             } else if (
               this.isExternalTurn(threadId) &&
@@ -4928,13 +4933,18 @@ export class OperatorDaemon {
             } else if (event.type === "user_input_resolved") {
               await this.reconcileUserInputResolution(event);
             } else if (event.type === "completed") {
+              // Before the recorders run: a failure recovery re-dispatches, and
+              // the new dispatch must be free to claim the thread for itself.
+              clearOwnTurn(this.store, threadId);
               await this.recordCompletion(route, event);
               terminal = true;
               performanceOutcome = true;
             } else if (event.type === "failed") {
+              clearOwnTurn(this.store, threadId);
               terminal = !(await this.recordFailure(route, threadId, event.error));
               if (terminal) performanceOutcome = false;
             } else if (event.type === "cancelled") {
+              clearOwnTurn(this.store, threadId);
               this.recordCancellation(route, threadId);
               terminal = true;
             }
@@ -5937,6 +5947,7 @@ export class OperatorDaemon {
     turnId: string | undefined,
     destination: TelegramDestination,
     commandId?: string,
+    requestedAt?: string,
   ): Promise<void> {
     const pending = ownDispatchPendingCount(this.store, threadId);
     // Identity first: an echoed command id answers the question outright.
@@ -5944,6 +5955,7 @@ export class OperatorDaemon {
     if (identified === true) {
       if (pending > 0) releaseOwnDispatchPending(this.store, threadId);
       if (turnId) this.store.setRuntimeState(`thread_seen_turn:${threadId}`, turnId);
+      this.claimOwnTurn(threadId, { commandId, turnId });
       this.store.setRuntimeState(`thread_turn_external:${threadId}`, "");
       return;
     }
@@ -5951,11 +5963,13 @@ export class OperatorDaemon {
       // A foreign command id without a turn id is still someone else's turn —
       // and it must not consume the slot our own dispatch is still waiting on.
       if (identified === false) {
+        clearOwnTurn(this.store, threadId);
         this.store.setRuntimeState(`thread_turn_external:${threadId}`, "1");
         return;
       }
       if (pending > 0) {
         releaseOwnDispatchPending(this.store, threadId);
+        this.claimOwnTurn(threadId, { commandId });
         this.store.setRuntimeState(`thread_turn_external:${threadId}`, "");
       }
       return;
@@ -5963,11 +5977,37 @@ export class OperatorDaemon {
     const seenKey = `thread_seen_turn:${threadId}`;
     if (this.store.getRuntimeState(seenKey) === turnId) return;
     this.store.setRuntimeState(seenKey, turnId);
+    // The durable record of the turn we are driving. This is what carries
+    // ownership across a restart: the marker was consumed by the `started`
+    // event before we went down, the grace window is long expired, and the
+    // resubscribe snapshot re-announces the very turn we dispatched. Without
+    // this the daemon disowned its own running work — told the owner the thread
+    // had been continued directly in T3, muted the worker's progress, and filed
+    // the final report instead of delivering it.
+    const owned = readOwnTurn(this.store, threadId);
+    if (
+      identified !== false &&
+      owned &&
+      ownTurnMatches(owned, { turnId, commandId, requestedAt })
+    ) {
+      // Bind the id, so a second restart during the same turn is settled by
+      // identity alone and needs no corroboration at all.
+      this.claimOwnTurn(threadId, { commandId, turnId });
+      this.store.setRuntimeState(`thread_turn_external:${threadId}`, "");
+      return;
+    }
     // `identified === false` — a command id that is not one of ours: external
     // by identity, so the pending own dispatch stays pending for OUR turn.
     // `undefined` — no identity travelled; fall back to the counter.
     const own = identified === undefined && pending > 0;
-    if (own) releaseOwnDispatchPending(this.store, threadId);
+    if (own) {
+      releaseOwnDispatchPending(this.store, threadId);
+      this.claimOwnTurn(threadId, { commandId, turnId });
+    } else {
+      // Someone else's turn is running: whatever we thought we owned on this
+      // thread is over, and a stale claim would adopt their next turn too.
+      clearOwnTurn(this.store, threadId);
+    }
     // The notice below is for the TRANSITION into external hands. While the
     // owner keeps replying directly in T3, every reply is a fresh turn id —
     // repeating «не дублирую в чат» after each one is noise, not information.
@@ -5988,6 +6028,25 @@ export class OperatorDaemon {
 
   private isExternalTurn(threadId: string): boolean {
     return this.store.getRuntimeState(`thread_turn_external:${threadId}`) === "1";
+  }
+
+  /**
+   * Write down that the running turn on this thread is ours, durably, so a
+   * restart mid-turn does not hand our own work to a stranger. The dispatch
+   * timestamp comes from the own-dispatch bookkeeping rather than from `now`:
+   * it must date the DISPATCH, which is what a turn id met after a restart is
+   * corroborated against.
+   */
+  private claimOwnTurn(
+    threadId: string,
+    turn: { commandId?: string | undefined; turnId?: string | undefined },
+  ): void {
+    const dispatchedAt = this.store.getRuntimeState(`thread_own_dispatch_at:${threadId}`);
+    markOwnTurnRunning(this.store, threadId, {
+      ...(turn.commandId ? { commandId: turn.commandId } : {}),
+      ...(turn.turnId ? { turnId: turn.turnId } : {}),
+      ...(dispatchedAt ? { dispatchedAt } : {}),
+    });
   }
 
   /**
